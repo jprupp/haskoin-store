@@ -1,19 +1,19 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.36.0.
+-- This file has been generated from package.yaml by hpack version 0.38.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 395f7618b9b83eea598c0c6b4d249eec60158964112f893f89407a97b7836523
+-- hash: 31fba3fe21ec98f60ef5d1bb4dcebec226af6f94e55b46e42c11689b9b92b9e8
 
 name:           haskoin-store-data
-version:        1.4.0
+version:        1.5.16
 synopsis:       Data for Haskoin Store
-description:    Please see the README on GitHub at <https://github.com/haskoin/haskoin-store#readme>
+description:    Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category:       Bitcoin, Finance, Network
-homepage:       http://github.com/haskoin/haskoin-store#readme
-bug-reports:    http://github.com/haskoin/haskoin-store/issues
-author:         Jean-Pierre Rupp
+homepage:       http://github.com/jprupp/haskoin-store#readme
+bug-reports:    http://github.com/jprupp/haskoin-store/issues
+author:         JP Rupp
 maintainer:     jprupp@protonmail.ch
 license:        MIT
 license-file:   LICENSE
@@ -21,7 +21,7 @@ build-type:     Simple
 
 source-repository head
   type: git
-  location: https://github.com/haskoin/haskoin-store.git
+  location: https://github.com/jprupp/haskoin-store.git
 
 library
   exposed-modules:

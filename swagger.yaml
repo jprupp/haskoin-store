@@ -3,19 +3,17 @@ openapi: 3.0.0
 servers:
   - url: 'https://api.haskoin.com/bch/'
   - url: 'https://api.haskoin.com/btc/'
-  - url: 'https://api.haskoin.com/bchtest/'
-  - url: 'https://api.haskoin.com/btctest/'
 
 info:
-  version: &version 1.5.15
-  title: Haskoin Store
+  version: &version 1.5.16
+  title: Haskoin
   contact:
-    name: Haskoin
-    url: https://github.com/haskoin
+    name: JP Rupp
+    url: https://github.com/jprupp
     email: jprupp@protonmail.ch
   license:
     name: MIT
-    url: https://github.com/haskoin/haskoin-store/blob/master/store/LICENSE
+    url: https://github.com/jprupp/haskoin-store/blob/master/store/LICENSE
   description: |
     Rich and fast API to query indexed block chain data for Bitcoin and Bitcoin
     Cash.

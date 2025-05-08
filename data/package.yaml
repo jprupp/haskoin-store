@@ -1,15 +1,15 @@
 name: haskoin-store-data
-version: 1.4.0
+version: 1.5.16
 synopsis: Data for Haskoin Store
-description: Please see the README on GitHub at <https://github.com/haskoin/haskoin-store#readme>
+description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category: Bitcoin, Finance, Network
-author: Jean-Pierre Rupp
+author: JP Rupp
 maintainer: jprupp@protonmail.ch
 license: MIT
 license-file: LICENSE
-github: haskoin/haskoin-store.git
-homepage: http://github.com/haskoin/haskoin-store#readme
-bug-reports: http://github.com/haskoin/haskoin-store/issues
+github: jprupp/haskoin-store.git
+homepage: http://github.com/jprupp/haskoin-store#readme
+bug-reports: http://github.com/jprupp/haskoin-store/issues
 dependencies:
   - aeson >= 1.4.7.1
   - base >=4.9 && <5
