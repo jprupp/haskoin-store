@@ -1,4 +1,5 @@
 {-# LANGUAGE DuplicateRecordFields #-}
+
 module Haskoin.Store
   ( Store (..),
     StoreConfig (..),

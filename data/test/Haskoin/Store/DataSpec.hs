@@ -10,12 +10,13 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Haskoin.Store.DataSpec (spec) where
+module Haskoin.Store.DataSpec (spec, arbitraryDeriveType) where
 
 import Control.Arrow (second)
 import Control.Monad (forM_)
 import Data.Aeson (FromJSON (..))
 import Data.ByteString qualified as B
+import Data.Maybe (isJust)
 import Data.String.Conversions (cs)
 import Haskoin
 import Haskoin.Store.Data
@@ -24,8 +25,8 @@ import Haskoin.Util.Arbitrary
 import Test.Hspec
 import Test.QuickCheck
 
-identityTests :: Ctx -> IdentityTests
-identityTests ctx =
+identityTests :: Network -> Ctx -> IdentityTests
+identityTests net ctx =
   IdentityTests
     { readTests = [],
       marshalTests = [],
@@ -56,21 +57,21 @@ identityTests ctx =
           JsonBox (arbitrary :: Gen BinfoBlockInfos)
         ],
       serialTests =
-        [ SerialBox (arbitrary :: Gen DeriveType),
-          SerialBox (arbitraryXPubSpec ctx :: Gen XPubSpec),
+        [ SerialBox (arbitraryDeriveType net),
+          SerialBox (arbitraryXPubSpec net ctx),
           SerialBox (arbitrary :: Gen BlockRef),
           SerialBox (arbitrary :: Gen TxRef),
-          SerialBox (arbitrary :: Gen Balance),
-          SerialBox (arbitrary :: Gen Unspent),
+          SerialBox (arbitraryBalance net),
+          SerialBox (arbitraryUnspent net),
           SerialBox (arbitrary :: Gen BlockData),
-          SerialBox (arbitrary :: Gen StoreInput),
+          SerialBox (arbitraryStoreInput net),
           SerialBox (arbitrary :: Gen Spender),
-          SerialBox (arbitrary :: Gen StoreOutput),
+          SerialBox (arbitraryStoreOutput net),
           SerialBox (arbitrary :: Gen Prev),
           SerialBox (arbitraryTxData ctx :: Gen TxData),
-          SerialBox (arbitrary :: Gen Transaction),
-          SerialBox (arbitrary :: Gen XPubBal),
-          SerialBox (arbitrary :: Gen XPubUnspent),
+          SerialBox (arbitraryTransaction net),
+          SerialBox (arbitraryXPubBal net),
+          SerialBox (arbitraryXPubUnspent net),
           SerialBox (arbitrary :: Gen XPubSummary),
           SerialBox (arbitrary :: Gen HealthCheck),
           SerialBox (arbitrary :: Gen Event),
@@ -81,39 +82,40 @@ identityTests ctx =
           SerialBox (arbitrary :: Gen (RawResultList BlockData))
         ],
       marshalJsonTests =
-        [ MarshalJsonBox (withNet (arbitrary :: Gen Balance)),
-          MarshalJsonBox (withNet (arbitrary :: Gen StoreOutput)),
-          MarshalJsonBox (withNet (arbitrary :: Gen Unspent)),
-          MarshalJsonBox (withNet (arbitrary :: Gen XPubBal)),
-          MarshalJsonBox (withNet (arbitrary :: Gen XPubUnspent)),
-          MarshalJsonBox arbitraryStoreInputNet,
-          MarshalJsonBox arbitraryBlockDataNet,
-          MarshalJsonBox (withNet (arbitrary :: Gen Transaction)),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoMultiAddr),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoBalance),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoBlock),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoTx),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoTxInput),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoTxOutput),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoXPubPath),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoUnspent),
-          MarshalJsonBox (withNetCtx ctx (listOf . arbitraryBinfoBlock)),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoRawAddr),
-          MarshalJsonBox (withNetCtx ctx arbitraryBinfoMempool)
+        [ MarshalJsonBox (withNet net arbitraryBalance),
+          MarshalJsonBox (withNet net arbitraryStoreOutput),
+          MarshalJsonBox (withNet net arbitraryUnspent),
+          MarshalJsonBox (withNet net arbitraryXPubBal),
+          MarshalJsonBox (withNet net arbitraryXPubUnspent),
+          MarshalJsonBox (withNet net arbitraryStoreInput),
+          MarshalJsonBox (withNet net arbitraryBlockData),
+          MarshalJsonBox (withNet net arbitraryTransaction),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoMultiAddr),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoBalance),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoBlock),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoTx),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoTxInput),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoTxOutput),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoXPubPath),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoUnspent),
+          MarshalJsonBox (withNetCtx net ctx (\net _ -> listOf $ arbitraryBinfoBlock net ctx)),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoRawAddr),
+          MarshalJsonBox (withNetCtx net ctx arbitraryBinfoMempool)
         ]
     }
 
-withNetCtx :: Ctx -> (Ctx -> Gen a) -> Gen ((Network, Ctx), a)
-withNetCtx ctx g = do
-  net <- arbitraryNetwork
-  x <- g ctx
+withNetCtx :: Network -> Ctx -> (Network -> Ctx -> Gen a) -> Gen ((Network, Ctx), a)
+withNetCtx net ctx g = do
+  x <- g net ctx
   return ((net, ctx), x)
 
-withNet :: Gen a -> Gen (Network, a)
-withNet g = (,) <$> arbitraryNetwork <*> g
+withNet :: Network -> (Network -> Gen a) -> Gen (Network, a)
+withNet net g = do
+  x <- g net
+  return (net, x)
 
 spec :: Spec
-spec = prepareContext (testIdentity . identityTests)
+spec = forM_ allNets $ \net -> prepareContext (testIdentity . identityTests net)
 
 instance Arbitrary BlockRef where
   arbitrary =
@@ -133,8 +135,9 @@ arbitraryTxData ctx =
     <*> arbitrary
     <*> arbitrary
 
-instance Arbitrary StoreInput where
-  arbitrary =
+arbitraryStoreInput :: Network -> Gen StoreInput
+arbitraryStoreInput net = do
+  store <-
     oneof
       [ StoreCoinbase
           <$> arbitraryOutPoint
@@ -148,17 +151,12 @@ instance Arbitrary StoreInput where
           <*> arbitraryBS1
           <*> arbitrary
           <*> listOf arbitraryBS1
-          <*> arbitraryMaybe arbitraryAddress
+          <*> arbitraryMaybe (arbitraryAddress net)
       ]
-
-arbitraryStoreInputNet :: Gen (Network, StoreInput)
-arbitraryStoreInputNet = do
-  net <- arbitraryNetwork
-  store <- arbitrary
   let res
         | net.segWit = store
         | otherwise = witless store
-  return (net, res)
+  return res
   where
     witless StoreInput {..} = StoreInput {witness = [], ..}
     witless StoreCoinbase {..} = StoreCoinbase {witness = [], ..}
@@ -166,29 +164,29 @@ arbitraryStoreInputNet = do
 instance Arbitrary Spender where
   arbitrary = Spender <$> arbitraryTxHash <*> arbitrary
 
-instance Arbitrary StoreOutput where
-  arbitrary =
-    StoreOutput
-      <$> arbitrary
-      <*> arbitraryBS1
-      <*> arbitrary
-      <*> arbitraryMaybe arbitraryAddress
+arbitraryStoreOutput :: Network -> Gen StoreOutput
+arbitraryStoreOutput net =
+  StoreOutput
+    <$> arbitrary
+    <*> arbitraryBS1
+    <*> arbitrary
+    <*> arbitraryMaybe (arbitraryAddress net)
 
-instance Arbitrary Transaction where
-  arbitrary =
-    Transaction
-      <$> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitraryTxHash
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
+arbitraryTransaction :: Network -> Gen Transaction
+arbitraryTransaction net =
+  Transaction
+    <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> listOf (arbitraryStoreInput net)
+    <*> listOf (arbitraryStoreOutput net)
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitraryTxHash
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
 
 instance Arbitrary PeerInfo where
   arbitrary =
@@ -249,11 +247,14 @@ instance Arbitrary RejectCode where
         RejectCheckpoint
       ]
 
-arbitraryXPubSpec :: Ctx -> Gen XPubSpec
-arbitraryXPubSpec ctx = XPubSpec <$> arbitraryXPubKey ctx <*> arbitrary
+arbitraryXPubSpec :: Network -> Ctx -> Gen XPubSpec
+arbitraryXPubSpec net ctx = XPubSpec <$> arbitraryXPubKey ctx <*> arbitraryDeriveType net
 
-instance Arbitrary DeriveType where
-  arbitrary = elements [DeriveNormal, DeriveP2SH, DeriveP2WPKH]
+arbitraryDeriveType :: Network -> Gen DeriveType
+arbitraryDeriveType net =
+  if net.segWit
+    then elements [DeriveNormal, DeriveP2SH, DeriveP2WPKH]
+    else return DeriveNormal
 
 instance Arbitrary TxId where
   arbitrary = TxId <$> arbitraryTxHash
@@ -261,24 +262,24 @@ instance Arbitrary TxId where
 instance Arbitrary TxRef where
   arbitrary = TxRef <$> arbitrary <*> arbitraryTxHash
 
-instance Arbitrary Balance where
-  arbitrary =
-    Balance
-      <$> arbitraryAddress
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
-      <*> arbitrary
+arbitraryBalance :: Network -> Gen Balance
+arbitraryBalance net =
+  Balance
+    <$> arbitraryAddress net
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
 
-instance Arbitrary Unspent where
-  arbitrary =
-    Unspent
-      <$> arbitrary
-      <*> arbitraryOutPoint
-      <*> arbitrary
-      <*> arbitraryBS1
-      <*> arbitraryMaybe arbitraryAddress
+arbitraryUnspent :: Network -> Gen Unspent
+arbitraryUnspent net =
+  Unspent
+    <$> arbitrary
+    <*> arbitraryOutPoint
+    <*> arbitrary
+    <*> arbitraryBS1
+    <*> arbitraryMaybe (arbitraryAddress net)
 
 instance Arbitrary BlockData where
   arbitrary =
@@ -294,14 +295,10 @@ instance Arbitrary BlockData where
       <*> arbitrary
       <*> arbitrary
 
-arbitraryBlockDataNet :: Gen (Network, BlockData)
-arbitraryBlockDataNet = do
-  net <- arbitraryNetwork
+arbitraryBlockData :: Network -> Gen BlockData
+arbitraryBlockData net = do
   dat@BlockData {..} <- arbitrary
-  let res
-        | net.segWit = dat
-        | otherwise = BlockData {weight = 0, ..}
-  return (net, res)
+  return $ if net.segWit then dat else BlockData {weight = 0, ..}
 
 instance (Arbitrary a) => Arbitrary (GenericResult a) where
   arbitrary = GenericResult <$> arbitrary
@@ -312,11 +309,11 @@ instance (Arbitrary a) => Arbitrary (RawResult a) where
 instance (Arbitrary a) => Arbitrary (RawResultList a) where
   arbitrary = RawResultList <$> arbitrary
 
-instance Arbitrary XPubBal where
-  arbitrary = XPubBal <$> arbitrary <*> arbitrary
+arbitraryXPubBal :: Network -> Gen XPubBal
+arbitraryXPubBal net = XPubBal <$> arbitrary <*> arbitraryBalance net
 
-instance Arbitrary XPubUnspent where
-  arbitrary = XPubUnspent <$> arbitrary <*> arbitrary
+arbitraryXPubUnspent :: Network -> Gen XPubUnspent
+arbitraryXPubUnspent net = XPubUnspent <$> arbitraryUnspent net <*> arbitrary
 
 instance Arbitrary XPubSummary where
   arbitrary =
@@ -358,21 +355,22 @@ instance Arbitrary BinfoTxId where
         BinfoTxIdIndex <$> arbitrary
       ]
 
-arbitraryBinfoMultiAddr :: Ctx -> Gen BinfoMultiAddr
-arbitraryBinfoMultiAddr ctx = do
-  addresses <- listOf1 $ arbitraryBinfoBalance ctx
+arbitraryBinfoMultiAddr :: Network -> Ctx -> Gen BinfoMultiAddr
+arbitraryBinfoMultiAddr net ctx = do
+  b <- arbitraryBinfoBalance net ctx
+  let addresses = [b]
   wallet <- arbitrary
-  txs <- listOf $ arbitraryBinfoTx ctx
+  txs <- listOf $ arbitraryBinfoTx net ctx
   info <- arbitrary
   recommendFee <- arbitrary
-  cashAddr <- arbitrary
+  let cashAddr = isJust net.cashAddrPrefix
   return BinfoMultiAddr {..}
 
-arbitraryBinfoRawAddr :: Ctx -> Gen BinfoRawAddr
-arbitraryBinfoRawAddr ctx = do
+arbitraryBinfoRawAddr :: Network -> Ctx -> Gen BinfoRawAddr
+arbitraryBinfoRawAddr net ctx = do
   address <-
     oneof
-      [ BinfoAddr <$> arbitraryAddress,
+      [ BinfoAddr <$> arbitraryAddress net,
         BinfoXpub <$> arbitraryXPubKey ctx
       ]
   balance <- arbitrary
@@ -380,15 +378,15 @@ arbitraryBinfoRawAddr ctx = do
   utxo <- arbitrary
   received <- arbitrary
   sent <- arbitrary
-  txs <- listOf $ arbitraryBinfoTx ctx
+  txs <- listOf $ arbitraryBinfoTx net ctx
   return $ BinfoRawAddr {..}
 
 instance Arbitrary BinfoShortBal where
   arbitrary = BinfoShortBal <$> arbitrary <*> arbitrary <*> arbitrary
 
-arbitraryBinfoBalance :: Ctx -> Gen BinfoBalance
-arbitraryBinfoBalance ctx = do
-  address <- arbitraryAddress
+arbitraryBinfoBalance :: Network -> Ctx -> Gen BinfoBalance
+arbitraryBinfoBalance net ctx = do
+  address <- arbitraryAddress net
   txs <- arbitrary
   received <- arbitrary
   sent <- arbitrary
@@ -407,8 +405,8 @@ instance Arbitrary BinfoWallet where
     sent <- arbitrary
     return BinfoWallet {..}
 
-arbitraryBinfoBlock :: Ctx -> Gen BinfoBlock
-arbitraryBinfoBlock ctx = do
+arbitraryBinfoBlock :: Network -> Ctx -> Gen BinfoBlock
+arbitraryBinfoBlock net ctx = do
   hash <- arbitraryBlockHash
   version <- arbitrary
   prev <- arbitraryBlockHash
@@ -424,15 +422,15 @@ arbitraryBinfoBlock ctx = do
   main <- arbitrary
   height <- arbitrary
   weight <- arbitrary
-  txs <- resize 5 $ listOf $ arbitraryBinfoTx ctx
+  txs <- resize 5 $ listOf $ arbitraryBinfoTx net ctx
   return BinfoBlock {..}
 
-arbitraryBinfoTx :: Ctx -> Gen BinfoTx
-arbitraryBinfoTx ctx = do
+arbitraryBinfoTx :: Network -> Ctx -> Gen BinfoTx
+arbitraryBinfoTx net ctx = do
   txid <- arbitraryTxHash
   version <- arbitrary
-  inputs <- resize 5 $ listOf1 $ arbitraryBinfoTxInput ctx
-  outputs <- resize 5 $ listOf1 $ arbitraryBinfoTxOutput ctx
+  inputs <- resize 5 $ listOf1 $ arbitraryBinfoTxInput net ctx
+  outputs <- resize 5 $ listOf1 $ arbitraryBinfoTxOutput net ctx
   let inputCount = fromIntegral $ length inputs
       outputCount = fromIntegral $ length outputs
   size <- arbitrary
@@ -449,17 +447,17 @@ arbitraryBinfoTx ctx = do
   balance <- arbitrary
   return BinfoTx {..}
 
-arbitraryBinfoTxInput :: Ctx -> Gen BinfoTxInput
-arbitraryBinfoTxInput ctx = do
+arbitraryBinfoTxInput :: Network -> Ctx -> Gen BinfoTxInput
+arbitraryBinfoTxInput net ctx = do
   sequence <- arbitrary
   witness <- B.pack <$> listOf arbitrary
   script <- B.pack <$> listOf arbitrary
   index <- arbitrary
-  output <- arbitraryBinfoTxOutput ctx
+  output <- arbitraryBinfoTxOutput net ctx
   return BinfoTxInput {..}
 
-arbitraryBinfoTxOutput :: Ctx -> Gen BinfoTxOutput
-arbitraryBinfoTxOutput ctx = do
+arbitraryBinfoTxOutput :: Network -> Ctx -> Gen BinfoTxOutput
+arbitraryBinfoTxOutput net ctx = do
   typ <- arbitrary
   spent <- arbitrary
   value <- arbitrary
@@ -467,8 +465,8 @@ arbitraryBinfoTxOutput ctx = do
   txidx <- arbitrary
   script <- B.pack <$> listOf arbitrary
   spenders <- arbitrary
-  address <- arbitraryMaybe arbitraryAddress
-  xpub <- arbitraryMaybe $ arbitraryBinfoXPubPath ctx
+  address <- arbitraryMaybe (arbitraryAddress net)
+  xpub <- arbitraryMaybe $ arbitraryBinfoXPubPath net ctx
   return BinfoTxOutput {..}
 
 instance Arbitrary BinfoSpender where
@@ -477,8 +475,8 @@ instance Arbitrary BinfoSpender where
     input <- arbitrary
     return BinfoSpender {..}
 
-arbitraryBinfoXPubPath :: Ctx -> Gen BinfoXPubPath
-arbitraryBinfoXPubPath ctx = do
+arbitraryBinfoXPubPath :: Network -> Ctx -> Gen BinfoXPubPath
+arbitraryBinfoXPubPath net ctx = do
   key <- arbitraryXPubKey ctx
   deriv <- arbitrarySoftPath
   return BinfoXPubPath {..}
@@ -535,20 +533,20 @@ instance Arbitrary BinfoHistory where
     fee <- arbitrary
     return BinfoHistory {..}
 
-arbitraryBinfoUnspent :: Ctx -> Gen BinfoUnspent
-arbitraryBinfoUnspent ctx = do
+arbitraryBinfoUnspent :: Network -> Ctx -> Gen BinfoUnspent
+arbitraryBinfoUnspent net ctx = do
   txid <- arbitraryTxHash
   index <- arbitrary
   script <- B.pack <$> listOf arbitrary
   value <- arbitrary
   confirmations <- arbitrary
   txidx <- arbitrary
-  xpub <- arbitraryMaybe $ arbitraryBinfoXPubPath ctx
+  xpub <- arbitraryMaybe $ arbitraryBinfoXPubPath net ctx
   return BinfoUnspent {..}
 
-arbitraryBinfoUnspents :: Ctx -> Gen BinfoUnspents
-arbitraryBinfoUnspents ctx =
-  fmap BinfoUnspents $ listOf $ arbitraryBinfoUnspent ctx
+arbitraryBinfoUnspents :: Network -> Ctx -> Gen BinfoUnspents
+arbitraryBinfoUnspents net ctx =
+  fmap BinfoUnspents $ listOf $ arbitraryBinfoUnspent net ctx
 
 instance Arbitrary BinfoHeader where
   arbitrary =
@@ -559,9 +557,9 @@ instance Arbitrary BinfoHeader where
       <*> arbitrary
       <*> arbitrary
 
-arbitraryBinfoMempool :: Ctx -> Gen BinfoMempool
-arbitraryBinfoMempool ctx =
-  fmap BinfoMempool $ listOf $ arbitraryBinfoTx ctx
+arbitraryBinfoMempool :: Network -> Ctx -> Gen BinfoMempool
+arbitraryBinfoMempool net ctx =
+  fmap BinfoMempool $ listOf $ arbitraryBinfoTx net ctx
 
 instance Arbitrary BinfoBlockInfos where
   arbitrary = BinfoBlockInfos <$> arbitrary

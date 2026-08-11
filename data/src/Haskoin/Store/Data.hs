@@ -2160,11 +2160,7 @@ instance MarshalJSON (Network, Ctx) BinfoRawAddr where
       h160 =
         encodeHex . runPutS . serialize
           <$> case r.address of
-            BinfoAddr a -> case a of
-              PubKeyAddress h -> Just h
-              ScriptAddress h -> Just h
-              WitnessPubKeyAddress h -> Just h
-              _ -> Nothing
+            BinfoAddr a -> addressHash160 a
             _ -> Nothing
 
   marshalEncoding (net, ctx) r =
@@ -2186,11 +2182,7 @@ instance MarshalJSON (Network, Ctx) BinfoRawAddr where
       h160 =
         hexEncoding . runPutL . serialize
           <$> case r.address of
-            BinfoAddr a -> case a of
-              PubKeyAddress h -> Just h
-              ScriptAddress h -> Just h
-              WitnessPubKeyAddress h -> Just h
-              _ -> Nothing
+            BinfoAddr a -> addressHash160 a
             _ -> Nothing
 
   unmarshalValue (net, ctx) =
@@ -2400,7 +2392,7 @@ instance MarshalJSON (Network, Ctx) BinfoUnspent where
         "tx_index" .= u.txidx
       ]
         <> [ "xpub" .= marshalValue (net, ctx) x
-             | x <- maybeToList u.xpub
+           | x <- maybeToList u.xpub
            ]
 
   marshalEncoding (net, ctx) u =
@@ -2746,10 +2738,10 @@ instance MarshalJSON (Network, Ctx) BinfoTxOutput where
         "script" .= encodeHex o.script
       ]
         <> [ "addr" .= marshalValue net a
-             | a <- maybeToList o.address
+           | a <- maybeToList o.address
            ]
         <> [ "xpub" .= marshalValue (net, ctx) x
-             | x <- maybeToList o.xpub
+           | x <- maybeToList o.xpub
            ]
 
   marshalEncoding (net, ctx) o =
@@ -2764,10 +2756,10 @@ instance MarshalJSON (Network, Ctx) BinfoTxOutput where
           "script" `A.pair` hexEncoding (B.fromStrict o.script)
         ]
           <> [ "addr" `A.pair` marshalEncoding net a
-               | a <- maybeToList o.address
+             | a <- maybeToList o.address
              ]
           <> [ "xpub" `A.pair` marshalEncoding (net, ctx) x
-               | x <- maybeToList o.xpub
+             | x <- maybeToList o.xpub
              ]
 
   unmarshalValue (net, ctx) =

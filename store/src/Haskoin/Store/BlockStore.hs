@@ -832,22 +832,22 @@ processMempool = guardMempool . notify Nothing $ do
 pruneMempool :: (MonadLoggerIO m) => BlockT m ()
 pruneMempool =
   guardMempool . notify Nothing $ do
-  days <- asks (.config.mempoolTimeout)
-  when (days > 0) $ do
-    mempool <- reverse <$> getMempool
-    time <- (floor . utcTimeToPOSIXSeconds) <$> liftIO getCurrentTime
-    let thresh = time - (fromIntegral days * 24 * 60 * 60)
-        txs = take 1000 $ map snd $ takeWhile ((< thresh) . fst) mempool
-    net <- getNetwork
-    ctx <- getCtx
-    when (length txs > 0) $ do
-      $(logInfoS) "BlockStore" $
-        "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
-      runImport net ctx (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
-        Left e ->
-          $(logErrorS) "BlockStore" $
-            "Error pruning mempool: " <> cs (show e)
-        Right () -> return ()
+    days <- asks (.config.mempoolTimeout)
+    when (days > 0) $ do
+      mempool <- reverse <$> getMempool
+      time <- (floor . utcTimeToPOSIXSeconds) <$> liftIO getCurrentTime
+      let thresh = time - (fromIntegral days * 24 * 60 * 60)
+          txs = take 1000 $ map snd $ takeWhile ((< thresh) . fst) mempool
+      net <- getNetwork
+      ctx <- getCtx
+      when (length txs > 0) $ do
+        $(logInfoS) "BlockStore" $
+          "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
+        runImport net ctx (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
+          Left e ->
+            $(logErrorS) "BlockStore" $
+              "Error pruning mempool: " <> cs (show e)
+          Right () -> return ()
 
 processTxs ::
   (MonadLoggerIO m) =>

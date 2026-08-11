@@ -1,5 +1,5 @@
 name: haskoin-store-data
-version: 1.5.16
+version: 1.6.0
 synopsis: Data for Haskoin Store
 description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category: Bitcoin, Finance, Network

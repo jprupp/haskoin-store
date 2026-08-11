@@ -526,7 +526,7 @@ runWeb config = do
     healthCheckLoop v = forever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
-    opts = def {S.settings = settings defaultSettings}
+    opts = S.defaultOptions {S.settings = settings defaultSettings}
     settings = setPort config.port . setHost (fromString config.host)
 
 getRates ::
@@ -2362,7 +2362,11 @@ scottyBinfoAddrToHash =
   withMetrics (.binfoQaddresstohash) $ do
     addr <- getAddress =<< S.captureParam "addr"
     setHeaders
-    S.text $ encodeHexLazy $ runPutL $ serialize addr.hash160
+    if
+      | Just h <- addressHash160 addr ->
+          S.text $ encodeHexLazy $ runPutL $ serialize h
+      | Just h <- addressHash256 addr ->
+          S.text $ encodeHexLazy $ runPutL $ serialize h
 
 scottyBinfoHashToAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHashToAddr =
@@ -2444,7 +2448,11 @@ scottyBinfoHashPubkey =
       Nothing -> raise $ UserError "Could not decode public key"
       Just pk -> return $ pubKeyAddr ctx pk
     setHeaders
-    S.text $ encodeHexLazy $ runPutL $ serialize addr.hash160
+    if
+      | Just h <- addressHash160 addr ->
+          S.text $ encodeHexLazy $ runPutL $ serialize h
+      | Just h <- addressHash256 addr ->
+          S.text $ encodeHexLazy $ runPutL $ serialize h
 
 -- GET Network Information --
 

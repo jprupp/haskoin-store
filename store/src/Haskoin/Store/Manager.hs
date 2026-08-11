@@ -347,15 +347,15 @@ storeDispatch b pub (PeerEvent pe) =
         MNotFound (NotFound is) -> do
           let blocks =
                 [ BlockHash h
-                  | InvVector t h <- is,
-                    t == InvBlock || t == InvWitnessBlock
+                | InvVector t h <- is,
+                  t == InvBlock || t == InvWitnessBlock
                 ]
           unless (null blocks) $ blockStoreNotFoundSTM p blocks b
         MInv (Inv is) -> do
           let txs =
                 [ TxHash h
-                  | InvVector t h <- is,
-                    t == InvTx || t == InvWitnessTx
+                | InvVector t h <- is,
+                  t == InvTx || t == InvWitnessTx
                 ]
           publishSTM (StoreTxAnnounce p txs) pub
           unless (null txs) $ blockStoreTxHashSTM p txs b

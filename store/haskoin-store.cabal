@@ -1,11 +1,11 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.38.0.
+-- This file has been generated from package.yaml by hpack version 0.39.6.
 --
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.5.16
+version:        1.6.0
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category:       Bitcoin, Finance, Network
@@ -54,7 +54,7 @@ library
     , hashtables >=1.2.4.2
     , haskoin-core >=1.0.0
     , haskoin-node >=1.0.0
-    , haskoin-store-data ==1.5.16
+    , haskoin-store-data ==1.6.0
     , hedis >=0.12.13
     , http-types >=0.12.3
     , lens >=4.18.1
@@ -108,7 +108,7 @@ executable haskoin-store
     , haskoin-core >=1.0.0
     , haskoin-node >=1.0.0
     , haskoin-store
-    , haskoin-store-data ==1.5.16
+    , haskoin-store-data ==1.6.0
     , hedis >=0.12.13
     , http-types >=0.12.3
     , lens >=4.18.1
@@ -167,7 +167,7 @@ test-suite spec
     , haskoin-core >=1.0.0
     , haskoin-node >=1.0.0
     , haskoin-store
-    , haskoin-store-data ==1.5.16
+    , haskoin-store-data ==1.6.0
     , hedis >=0.12.13
     , hspec >=2.7.1
     , http-types >=0.12.3

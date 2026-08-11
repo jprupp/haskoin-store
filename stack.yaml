@@ -1,4 +1,4 @@
-resolver: lts-23.21
+resolver: nightly-2026-08-11
 ghc-options:
   "$everything": -O2
 nix:
@@ -15,3 +15,7 @@ packages:
 extra-deps:
   - hashtables-1.4.2@sha256:4940cab94a15d469845ccf5225f9cb3d354c15e8127ebb58425c8b681f7721d9,10386
   - statsd-rupp-0.5.0.0@sha256:04049a06a6a92aaecd052d1caa36321bfc68c43bcc8e48e93b1f87218c182e0b,2017
+  - github: jprupp/haskoin-core
+    commit: 'ecb6cefa40b0fcb49c04b78f604c2bfca0f9a028'
+  - github: jprupp/haskoin-node
+    commit: '61bf11b72a0300b1eff494744beed59748b42225'

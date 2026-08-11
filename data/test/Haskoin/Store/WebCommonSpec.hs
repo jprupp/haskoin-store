@@ -15,7 +15,7 @@ import Data.String.Conversions (cs)
 import Data.Word
 import Haskoin
 import Haskoin.Store.Data
-import Haskoin.Store.DataSpec ()
+import Haskoin.Store.DataSpec (arbitraryDeriveType)
 import Haskoin.Store.WebCommon
 import Haskoin.Util
 import Haskoin.Util.Arbitrary
@@ -25,10 +25,10 @@ import Test.QuickCheck
 
 data GenBox = forall p. (Show p, Eq p, Param p) => GenBox (Gen p)
 
-params :: Ctx -> [GenBox]
-params ctx =
-  [ GenBox arbitraryAddress,
-    GenBox (listOf arbitraryAddress),
+params :: Network -> Ctx -> [GenBox]
+params net ctx =
+  [ GenBox (arbitraryAddress net),
+    GenBox (listOf (arbitraryAddress net)),
     GenBox (arbitrary :: Gen StartParam),
     GenBox (arbitrarySizedNatural :: Gen OffsetParam),
     GenBox (arbitrarySizedNatural :: Gen LimitParam),
@@ -36,7 +36,7 @@ params ctx =
     GenBox (arbitrary :: Gen HeightsParam),
     GenBox (arbitrarySizedNatural :: Gen TimeParam),
     GenBox (arbitraryXPubKey ctx :: Gen XPubKey),
-    GenBox (arbitrary :: Gen DeriveType),
+    GenBox (arbitraryDeriveType net),
     GenBox (NoCache <$> arbitrary :: Gen NoCache),
     GenBox (NoTx <$> arbitrary :: Gen NoTx),
     GenBox arbitraryBlockHash,
@@ -46,17 +46,17 @@ params ctx =
   ]
 
 spec :: Spec
-spec = prepareContext $ \ctx ->
+spec = prepareContext $ \ctx -> forM_ allNets $ \net ->
   describe "Parameter encoding" $
-    forM_ (params ctx) $
-      \(GenBox g) -> testParam ctx g
+    forM_ (params net ctx) $
+      \(GenBox g) -> testParam net ctx g
 
-testParam :: (Eq a, Show a, Param a) => Ctx -> Gen a -> Spec
-testParam ctx pGen =
+testParam :: (Eq a, Show a, Param a) => Network -> Ctx -> Gen a -> Spec
+testParam net ctx pGen =
   prop ("encodeParam/parseParam identity for parameter " <> name) $
     forAll pGen $ \p ->
-      case encodeParam btc ctx p of
-        Just txts -> parseParam btc ctx txts `shouldBe` Just p
+      case encodeParam net ctx p of
+        Just txts -> parseParam net ctx txts `shouldBe` Just p
         _ -> expectationFailure "Param encoding failed"
   where
     name = cs $ proxyLabel $ proxy pGen

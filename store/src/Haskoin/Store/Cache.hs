@@ -56,6 +56,7 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as I
 import Data.List (sort)
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Maybe
   ( catMaybes,
@@ -629,9 +630,9 @@ getAllFromMap n = do
     xs <- fxs
     return
       [ (k, v)
-        | (k', v') <- xs,
-          let k = fromRight undefined $ decode k',
-          let v = fromRight undefined $ decode v'
+      | (k', v') <- xs,
+        let k = fromRight undefined $ decode k',
+        let v = fromRight undefined $ decode v'
       ]
 
 data CacheWriterMessage
@@ -733,7 +734,7 @@ refreshLock l = void . runRedis $ do
   Redis.setOpts l "locked" opts
 
 unlockIt :: (MonadLoggerIO m) => ByteString -> CacheX m ()
-unlockIt l = void $ runRedis (Redis.del [l])
+unlockIt l = void . runRedis . Redis.del $ NonEmpty.singleton l
 
 withLock ::
   (MonadLoggerIO m, MonadUnliftIO m) =>
@@ -864,7 +865,8 @@ newXPubC xpub xbals =
           Redis.setCondition = Just Redis.Nx
         }
     red = Redis.setOpts key "1" opts
-    unset_index y = when y . void . runRedis $ Redis.del [key]
+    unset_index y =
+      when y . void . runRedis . Redis.del $ NonEmpty.singleton key
     set_index = do
       conn <- asks (.redis)
       liftIO (Redis.runRedis conn red) <&> isRight
@@ -1251,8 +1253,10 @@ redisAddToMempool btxs =
 
 redisRemFromMempool ::
   (Applicative f, RedisCtx m f) => [TxHash] -> m (f Integer)
-redisRemFromMempool [] = return (pure 0)
-redisRemFromMempool xs = zrem mempoolSetKey $ map encode xs
+redisRemFromMempool xs =
+  case NonEmpty.nonEmpty xs of
+    Nothing -> return (pure 0)
+    Just xs' -> zrem mempoolSetKey $ NonEmpty.map encode xs'
 
 redisSetAddrInfo ::
   (Functor f, RedisCtx m f) => Address -> AddressXPub -> m (f ())
@@ -1287,13 +1291,13 @@ redisDelXPubKeys xpub bals = go $ map (.balance.address) bals
   where
     go addrs = do
       addrcount <-
-        case addrs of
-          [] -> return (pure 0)
-          _ -> Redis.del (map ((addrPfx <>) . encode) addrs)
-      txsetcount <- Redis.del [txSetPfx <> encode xpub]
-      utxocount <- Redis.del [utxoPfx <> encode xpub]
-      balcount <- Redis.del [balancesPfx <> encode xpub]
-      x <- Redis.zrem maxKey [encode xpub]
+        case NonEmpty.nonEmpty addrs of
+          Nothing -> return (pure 0)
+          Just addrs' -> Redis.del $ NonEmpty.map ((addrPfx <>) . encode) addrs'
+      txsetcount <- Redis.del $ NonEmpty.singleton (txSetPfx <> encode xpub)
+      utxocount <- Redis.del $ NonEmpty.singleton (utxoPfx <> encode xpub)
+      balcount <- Redis.del $ NonEmpty.singleton (balancesPfx <> encode xpub)
+      x <- Redis.zrem maxKey $ NonEmpty.singleton (encode xpub)
       return $ do
         _ <- x
         addrs' <- addrcount
@@ -1311,8 +1315,10 @@ redisAddXPubTxs xpub btxs =
 
 redisRemXPubTxs ::
   (Applicative f, RedisCtx m f) => XPubSpec -> [TxHash] -> m (f Integer)
-redisRemXPubTxs _ [] = return (pure 0)
-redisRemXPubTxs xpub txhs = zrem (txSetPfx <> encode xpub) (map encode txhs)
+redisRemXPubTxs xpub txhs =
+  case NonEmpty.nonEmpty txhs of
+    Nothing -> return (pure 0)
+    Just txhs' -> zrem (txSetPfx <> encode xpub) (NonEmpty.map encode txhs')
 
 redisAddXPubUnspents ::
   (Applicative f, RedisCtx m f) =>
@@ -1330,23 +1336,26 @@ redisRemXPubUnspents ::
 redisRemXPubUnspents _ [] =
   return (pure 0)
 redisRemXPubUnspents xpub ops =
-  zrem (utxoPfx <> encode xpub) (map encode ops)
+  case NonEmpty.nonEmpty ops of
+    Nothing -> return (pure 0)
+    Just ops' -> zrem (utxoPfx <> encode xpub) (NonEmpty.map encode ops')
 
 redisAddXPubBalances ::
   (Monad f, RedisCtx m f) => XPubSpec -> [XPubBal] -> m (f ())
-redisAddXPubBalances _ [] = return (pure ())
-redisAddXPubBalances xpub bals = do
-  xs <- mapM (uncurry (Redis.hset (balancesPfx <> encode xpub))) entries
-  ys <- forM bals $ \b ->
-    redisSetAddrInfo
-      b.balance.address
-      AddressXPub
-        { spec = xpub,
-          path = b.path
-        }
-  return $ sequence_ xs >> sequence_ ys
-  where
-    entries = map (\b -> (encode b.path, encode b.balance)) bals
+redisAddXPubBalances xpub bals =
+  case NonEmpty.nonEmpty bals of
+    Nothing -> return (pure ())
+    Just bals' -> do
+      let bs = NonEmpty.map (\b -> (encode b.path, encode b.balance)) bals'
+      Redis.hset (balancesPfx <> encode xpub) bs
+      ys <- forM bals' $ \b ->
+        redisSetAddrInfo
+          b.balance.address
+          AddressXPub
+            { spec = xpub,
+              path = b.path
+            }
+      return $ sequence_ ys
 
 redisSetHead :: (RedisCtx m f) => BlockHash -> m (f Redis.Status)
 redisSetHead bh = Redis.set bestBlockKey (encode bh)
@@ -1440,8 +1449,7 @@ redisGetMempool = do
     f t s = ((scoreBlockRef s).timestamp, t)
 
 xpubText ::
-  ( StoreReadBase m
-  ) =>
+  (StoreReadBase m) =>
   XPubSpec ->
   CacheX m Text
 xpubText xpub = do
