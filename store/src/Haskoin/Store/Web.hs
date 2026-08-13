@@ -87,7 +87,6 @@ import Data.Aeson.Encoding
   ( encodingToLazyByteString,
     list,
   )
-import Data.Aeson.Text (encodeToLazyText)
 import Data.Base16.Types (assertBase16)
 import Data.ByteString.Base16 (decodeBase16, isBase16)
 import Data.ByteString.Builder (lazyByteString)
@@ -120,7 +119,6 @@ import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
-import Data.Text.Lazy (toStrict)
 import Data.Text.Lazy qualified as TL
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
@@ -2570,9 +2568,7 @@ peerHealthCheck cfg = do
   return CountHealth {min = fromIntegral cfg.minPeers, count}
 
 healthCheck ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadBase m) =>
-  WebConfig ->
-  m HealthCheck
+  (MonadUnliftIO m, StoreReadBase m) => WebConfig -> m HealthCheck
 healthCheck cfg = do
   blocks <- blockHealthCheck cfg
   lastBlock <- lastBlockHealthCheck cfg.store.chain cfg.limits
@@ -2580,16 +2576,12 @@ healthCheck cfg = do
   pendingTxs <- pendingTxsHealthCheck cfg
   peers <- peerHealthCheck cfg
   time <- round <$> liftIO getPOSIXTime
-  let check =
-        HealthCheck
-          { network = cfg.store.net.name,
-            version = cfg.version,
-            ..
-          }
-  unless (isOK check) $ do
-    let t = toStrict $ encodeToLazyText check
-    $(logErrorS) "Web" $ "Health check failed: " <> t
-  return check
+  return
+    HealthCheck
+      { network = cfg.store.net.name,
+        version = cfg.version,
+        ..
+      }
 
 scottyDbStats :: (MonadUnliftIO m) => ActionT m ()
 scottyDbStats =

@@ -100,7 +100,7 @@ import UnliftIO
     atomically,
     liftIO,
     link,
-    withAsync
+    withAsync,
   )
 import UnliftIO.Concurrent (threadDelay)
 
