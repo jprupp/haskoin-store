@@ -719,7 +719,10 @@ lockIt l = do
               Redis.SetOpts
                 { Redis.setSeconds = Just 300,
                   Redis.setMilliseconds = Nothing,
-                  Redis.setCondition = Just Redis.Nx
+                  Redis.setUnixSeconds = Nothing,
+                  Redis.setUnixMilliseconds = Nothing,
+                  Redis.setCondition = Just Redis.Nx,
+                  Redis.setKeepTTL = False
                 }
         Redis.setOpts l "locked" opts
 
@@ -729,7 +732,10 @@ refreshLock l = void . runRedis $ do
         Redis.SetOpts
           { Redis.setSeconds = Just 300,
             Redis.setMilliseconds = Nothing,
-            Redis.setCondition = Just Redis.Xx
+            Redis.setUnixSeconds = Nothing,
+            Redis.setUnixMilliseconds = Nothing,
+            Redis.setCondition = Just Redis.Xx,
+            Redis.setKeepTTL = False
           }
   Redis.setOpts l "locked" opts
 
@@ -862,7 +868,10 @@ newXPubC xpub xbals =
       Redis.SetOpts
         { Redis.setSeconds = Just 600,
           Redis.setMilliseconds = Nothing,
-          Redis.setCondition = Just Redis.Nx
+          Redis.setUnixSeconds = Nothing,
+          Redis.setUnixMilliseconds = Nothing,
+          Redis.setCondition = Just Redis.Nx,
+          Redis.setKeepTTL = False
         }
     red = Redis.setOpts key "1" opts
     unset_index y =
@@ -879,7 +888,7 @@ inSync =
     Nothing -> return False
     Just bb -> do
       ch <- asks (.chain)
-      cb <- chainGetBest ch
+      cb <- liftIO $ chainGetBest ch
       return $ cb.height > 0 && headerHash cb.header == bb
 
 newBlockC ::
@@ -910,18 +919,18 @@ newBlockC =
         Just best_block_hash -> get_block_node best_block_hash
     get_block_node block_hash = do
       ch <- asks (.chain)
-      chainGetBlock block_hash ch
+      liftIO $ chainGetBlock ch block_hash
     get_blocks left_node right_node = do
       ch <- asks (.chain)
-      split_node <- chainGetSplitBlock left_node right_node ch
+      split_node <- liftIO $ chainGetSplitBlock ch left_node right_node
       let split_node_hash = headerHash split_node.header
           right_node_hash = headerHash right_node.header
       if split_node_hash == right_node_hash
         then return []
         else do
           let fork_height = split_node.height + 1
-          left_parents <- chainGetParents fork_height left_node ch
-          right_parents <- chainGetParents fork_height right_node ch
+          left_parents <- liftIO $ chainGetParents ch fork_height left_node
+          right_parents <- liftIO $ chainGetParents ch fork_height right_node
           let blocks = reverse left_parents <> right_parents <> pure right_node
           return $ map (headerHash . (.header)) blocks
 
@@ -1384,13 +1393,13 @@ addrsToAdd ctx gap xbals addrinfo
   | otherwise =
       zipWith f addrs list
   where
-    haschange = any ((== 1) . head . (.path)) xbals
+    haschange = any ((== 1) . (!! 0) . (.path)) xbals
     f a p = (a, AddressXPub {spec = xpub, path = p})
-    dchain = head addrinfo.path
-    fbals = filter ((== dchain) . head . (.path)) xbals
-    maxidx = maximum (map (head . tail . (.path)) fbals)
+    dchain = addrinfo.path !! 0
+    fbals = filter ((== dchain) . (!! 0) . (.path)) xbals
+    maxidx = maximum (map ((!! 1) . (.path)) fbals)
     xpub = addrinfo.spec
-    aidx = (head . tail) addrinfo.path
+    aidx = addrinfo.path !! 1
     ixs =
       if gap > maxidx - aidx
         then [maxidx + 1 .. aidx + gap]

@@ -173,12 +173,12 @@ revertBlock bh = do
   insertBlock bd {main = False}
   $(logDebugS) "BlockStore" $
     "Updated as not in main chain: " <> blockHashToHex bh
-  forM_ (tail tds) unConfirmTx
+  forM_ (drop 1 tds) unConfirmTx
   $(logDebugS) "BlockStore" $
     "Unconfirmed " <> cs (show (length tds)) <> " transactions"
-  deleteConfirmedTx (txHash (head tds).tx)
+  deleteConfirmedTx (txHash (tds !! 0).tx)
   $(logDebugS) "BlockStore" $
-    "Deleted coinbase: " <> txHashToHex (txHash (head tds).tx)
+    "Deleted coinbase: " <> txHashToHex (txHash (tds !! 0).tx)
 
 checkNewBlock :: (MonadImport m) => Block -> BlockNode -> m ()
 checkNewBlock b n =
@@ -267,7 +267,7 @@ importBlock b n = do
   return (bd, tds)
   where
     ts_out_val =
-      sum $ map (sum . map (.value) . (.outputs)) $ tail $ b.txs
+      sum $ map (sum . map (.value) . (.outputs)) (drop 1 b.txs)
     w =
       let f t = (t :: Tx) {witness = []}
           b' = (b :: Block) {txs = map f b.txs}

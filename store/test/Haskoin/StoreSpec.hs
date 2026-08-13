@@ -47,7 +47,7 @@ spec = prepareContext $ \ctx -> do
           StoreBestBlock b -> Just b
           _ -> Nothing
         let bestHash = last bs
-        bestNodeM <- chainGetBlock bestHash testStoreChain
+        bestNodeM <- liftIO $ chainGetBlock testStoreChain bestHash
         bestNodeM `shouldSatisfy` isJust
         let bestNode = fromJust bestNodeM
             bestHeight = bestNode.height

@@ -124,7 +124,7 @@ instance (MonadIO m) => StoreWrite (WriterT m) where
       liftIO $ H.insert outputTable k (Just v)
     where
       k = (a, u.block, u.outpoint)
-      v = OutVal {value = u.value, script = u.script}
+      v = OutVal u.value u.script
   deleteAddrUnspent a u =
     ReaderT $ \Writer {memory = Memory {..}} ->
       liftIO $ H.insert outputTable k Nothing
@@ -169,7 +169,7 @@ runWriter net ctx bdb@DatabaseReader {db} f = do
   hm <- newMemory net ctx mempool
   x <- R.runReaderT f Writer {reader = bdb, memory = hm}
   ops <- hashMapOps db hm
-  writeBatch db ops
+  liftIO $ writeBatch db ops
   return x
 
 hashMapOps :: (MonadIO m) => DB -> Memory -> m [BatchOp]
@@ -229,21 +229,12 @@ addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
     f (a, b, p) (Just l) =
       insertOpCF
         (addrOutCF db)
-        ( AddrOutKey
-            { address = a,
-              block = b,
-              outpoint = p
-            }
-        )
+        (AddrOutKey a b p)
         l
     f (a, b, p) Nothing =
       deleteOpCF
         (addrOutCF db)
-        AddrOutKey
-          { address = a,
-            block = b,
-            outpoint = p
-          }
+        (AddrOutKey a b p)
 
 mempoolOp :: (MonadIO m) => MempoolTable -> m [BatchOp]
 mempoolOp t =

@@ -27,16 +27,8 @@ module Haskoin.Store.Database.Reader
 where
 
 import Conduit
-  ( ConduitT,
-    dropWhileC,
-    lift,
-    mapC,
-    runConduit,
-    sinkList,
-    (.|),
-  )
-import Control.Monad.Except (runExceptT, throwError)
-import Control.Monad.Reader (MonadReader, ReaderT, asks, runReaderT)
+import Control.Monad (forM_)
+import Control.Monad.Reader
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
@@ -47,28 +39,14 @@ import Data.Maybe (fromMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (encode)
 import Data.Word (Word32)
-import Database.RocksDB
-  ( ColumnFamily,
-    Config (..),
-    DB (..),
-    Iterator,
-    withDBCF,
-    withIterCF,
-  )
+import Database.RocksDB hiding (withDB)
 import Database.RocksDB.Query
-  ( insert,
-    matching,
-    matchingAsListCF,
-    matchingSkip,
-    retrieve,
-    retrieveCF,
-  )
 import Haskoin
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Types
 import System.Metrics.StatsD
-import UnliftIO (MonadIO, MonadUnliftIO, bracket_, liftIO)
+import UnliftIO
 
 type DatabaseReaderT = ReaderT DatabaseReader
 
@@ -96,7 +74,7 @@ data DataMetrics = DataMetrics
     dataIters :: !StatGauge
   }
 
-createDataMetrics :: (MonadIO m) => Stats -> m DataMetrics
+createDataMetrics :: Stats -> IO DataMetrics
 createDataMetrics s = do
   dataBestCount <- newStatCounter s "db.best_block" n
   dataBlockCount <- newStatCounter s "db.blocks" n
@@ -134,19 +112,20 @@ withDatabaseReader ::
   Maybe DataMetrics ->
   DatabaseReaderT m a ->
   m a
-withDatabaseReader net ctx igap gap dir bloom stats f =
-  withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
-    let bdb =
-          DatabaseReader
-            { db = db,
-              maxGap = gap,
-              net = net,
-              initGap = igap,
-              metrics = stats,
-              ctx = ctx
-            }
-    initRocksDB bdb
-    runReaderT f bdb
+withDatabaseReader net ctx igap gap dir bloom stats m =
+  withRunInIO $ \run ->
+    withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
+      let bdb =
+            DatabaseReader
+              { db = db,
+                maxGap = gap,
+                net = net,
+                initGap = igap,
+                metrics = stats,
+                ctx = ctx
+              }
+      initRocksDB bdb
+      run $ runReaderT m bdb
   where
     cfg = def {createIfMissing = True}
 
@@ -163,7 +142,7 @@ columnFamilyConfig bloom =
   ]
 
 addrTxCF :: DB -> ColumnFamily
-addrTxCF = head . columnFamilies
+addrTxCF db = columnFamilies db !! 0
 
 addrOutCF :: DB -> ColumnFamily
 addrOutCF db = columnFamilies db !! 1
@@ -183,81 +162,93 @@ heightCF db = columnFamilies db !! 6
 balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
-initRocksDB :: (MonadIO m) => DatabaseReader -> m ()
-initRocksDB DatabaseReader {db = db} = do
-  e <-
-    runExceptT $
-      retrieve db VersionKey >>= \case
-        Just v
-          | v == dataVersion -> return ()
-          | otherwise -> throwError "Incorrect RocksDB database version"
-        Nothing -> setInitRocksDB db
-  case e of
-    Left s -> error s
-    Right () -> return ()
+initRocksDB :: DatabaseReader -> IO ()
+initRocksDB DatabaseReader {db = db} =
+  retrieve db VersionKey >>= \case
+    Just v
+      | v == dataVersion -> return ()
+      | otherwise -> error "Incorrect RocksDB database version"
+    Nothing -> setInitRocksDB db
 
-setInitRocksDB :: (MonadIO m) => DB -> m ()
+setInitRocksDB :: DB -> IO ()
 setInitRocksDB db = insert db VersionKey dataVersion
 
 addressConduit ::
-  (MonadUnliftIO m) =>
+  (MonadIO m) =>
   Address ->
   Maybe Start ->
   Iterator ->
   ConduitT i TxRef (DatabaseReaderT m) ()
-addressConduit a s it =
-  x .| mapC (uncurry f)
+addressConduit a s it = do
+  pipe .| mapC (uncurry f)
   where
     f (AddrTxKey _ t) () = t
     f _ _ = undefined
-    x = case s of
+    pipe = case s of
       Nothing ->
-        matching it (AddrTxKeyA a)
+        readerC $ \_ ->
+          transPipe liftIO $
+            matching it (AddrTxKeyA a)
       Just (AtBlock bh) ->
-        matchingSkip
-          it
-          (AddrTxKeyA a)
-          (AddrTxKeyB a (BlockRef bh maxBound))
+        readerC $ \_ ->
+          transPipe liftIO $
+            matchingSkip
+              it
+              (AddrTxKeyA a)
+              (AddrTxKeyB a (BlockRef bh maxBound))
       Just (AtTx txh) ->
         lift (getTxData txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
-            matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a b)
+            readerC $ \_ ->
+              transPipe liftIO $
+                matchingSkip
+                  it
+                  (AddrTxKeyA a)
+                  (AddrTxKeyB a b)
           Just TxData {block = MemRef {}} ->
             let cond (AddrTxKey _ (TxRef MemRef {} th)) = th /= txh
                 cond (AddrTxKey _ (TxRef BlockRef {} _)) = False
                 cond _ = undefined
-             in matching it (AddrTxKeyA a)
-                  .| (dropWhileC (cond . fst) >> mapC id)
+             in readerC $ \_ ->
+                  transPipe liftIO $
+                    matching it (AddrTxKeyA a)
+                      .| (dropWhileC (cond . fst) >> mapC id)
           Nothing -> return ()
 
 unspentConduit ::
-  (MonadUnliftIO m) =>
+  (MonadIO m) =>
   Ctx ->
   Address ->
   Maybe Start ->
   Iterator ->
   ConduitT i Unspent (DatabaseReaderT m) ()
 unspentConduit ctx a s it =
-  x .| mapC (uncurry (toUnspent ctx))
+  x .| mapC (uncurry (toUnspent ctx)) .| concatC
   where
     x = case s of
       Nothing ->
-        matching it (AddrOutKeyA a)
+        readerC $ \_ -> transPipe liftIO $ matching it (AddrOutKeyA a)
       Just (AtBlock h) ->
-        matchingSkip
-          it
-          (AddrOutKeyA a)
-          (AddrOutKeyB a (BlockRef h maxBound))
+        readerC $ \_ ->
+          transPipe liftIO $
+            matchingSkip
+              it
+              (AddrOutKeyA a)
+              (AddrOutKeyB a (BlockRef h maxBound))
       Just (AtTx txh) ->
         lift (getTxData txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
-            matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
+            readerC $ \_ ->
+              transPipe liftIO $
+                matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
           Just TxData {block = MemRef {}} ->
             let cond (AddrOutKey _ MemRef {} p) = p.hash /= txh
                 cond (AddrOutKey _ BlockRef {} _) = False
                 cond _ = undefined
-             in matching it (AddrOutKeyA a)
-                  .| (dropWhileC (cond . fst) >> mapC id)
+             in readerC $ \_ ->
+                  transPipe liftIO $
+                    matching it (AddrOutKeyA a)
+                      .| (dropWhileC (cond . fst) >> mapC id)
           Nothing -> return ()
 
 withIterCFStat ::
@@ -266,10 +257,16 @@ withIterCFStat ::
   ColumnFamily ->
   (Iterator -> DatabaseReaderT m a) ->
   DatabaseReaderT m a
-withIterCFStat db cf = bracket_ open close . withIterCF db cf
+withIterCFStat db cf f = do
+  m <- asks (.metrics)
+  bracket_ (open m) (close m) go
   where
-    open = asks (.metrics) >>= mapM_ (\m -> incrementGauge m.dataIters 1)
-    close = asks (.metrics) >>= mapM_ (\m -> decrementGauge m.dataIters 1)
+    open (Just m) = incrementGauge m.dataIters 1
+    open Nothing = return ()
+    close (Just m) = decrementGauge m.dataIters 1
+    close Nothing = return ()
+    go = withRunInIO $ \run ->
+      withIterCF db cf $ \it -> run (f it)
 
 withManyIters ::
   (MonadUnliftIO m) =>
@@ -297,7 +294,7 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
 
   getTxData th = do
     db <- asks (.db)
-    retrieveCF db (txCF db) (TxKey th) >>= \case
+    liftIO (retrieveCF db (txCF db) (TxKey th)) >>= \case
       Nothing -> return Nothing
       Just t -> do
         withMetrics $ \s -> incrementCounter s.dataTxCount 1
@@ -311,7 +308,7 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
   getUnspent p = do
     db <- asks (.db)
     ctx <- asks (.ctx)
-    val <- retrieveCF db (unspentCF db) (UnspentKey p)
+    val <- liftIO (retrieveCF db (unspentCF db) (UnspentKey p))
     case fmap (valToUnspent ctx p) val of
       Nothing -> return Nothing
       Just u -> do
@@ -321,20 +318,20 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
   getBalance a = do
     db <- asks (.db)
     withMetrics $ \s -> incrementCounter s.dataBalanceCount 1
-    fmap (valToBalance a) <$> retrieveCF db (balanceCF db) (BalKey a)
+    fmap (valToBalance a) <$> liftIO (retrieveCF db (balanceCF db) (BalKey a))
 
   getMempool = do
     db <- asks (.db)
     withMetrics $ \s -> incrementCounter s.dataMempoolCount 1
-    fromMaybe [] <$> retrieve db MemKey
+    fromMaybe [] <$> liftIO (retrieve db MemKey)
 
   getBestBlock = do
     withMetrics $ \s -> incrementCounter s.dataBestCount 1
-    asks (.db) >>= (`retrieve` BestKey)
+    asks (.db) >>= liftIO . (`retrieve` BestKey)
 
   getBlocksAtHeight h = do
     db <- asks (.db)
-    retrieveCF db (heightCF db) (HeightKey h) >>= \case
+    liftIO (retrieveCF db (heightCF db) (HeightKey h)) >>= \case
       Nothing -> return []
       Just ls -> do
         withMetrics $ \s -> incrementCounter s.dataBlockCount (length ls)
@@ -342,7 +339,7 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
 
   getBlock h = do
     db <- asks (.db)
-    retrieveCF db (blockCF db) (BlockKey h) >>= \case
+    liftIO (retrieveCF db (blockCF db) (BlockKey h)) >>= \case
       Nothing -> return Nothing
       Just b -> do
         withMetrics $ \s -> incrementCounter s.dataBlockCount 1
@@ -395,17 +392,16 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
 
   getInitialGap = asks (.initGap)
 
-  getNumTxData i = do
-    db <- asks (.db)
+  getNumTxData i = ReaderT $ \r -> do
     let (sk, w) = decodeTxKey i
-    ls <- liftIO $ matchingAsListCF db (txCF db) (TxKeyS sk)
+    ls <- liftIO $ matchingAsListCF r.db (txCF r.db) (TxKeyS sk)
     let f t =
           let bs = encode $ txHash t.tx
               b = BS.head (BS.drop 6 bs)
               w' = b .&. 0xf8
            in w == w'
         txs = filter f $ map snd ls
-    withMetrics $ \s -> incrementCounter s.dataTxCount (length txs)
+    forM_ r.metrics $ \s -> incrementCounter s.dataTxCount (length txs)
     return txs
 
   getBalances as = do
@@ -416,8 +412,8 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
 
   xPubBals xpub = do
     ctx <- asks (.ctx)
-    igap <- getInitialGap
-    gap <- getMaxGap
+    igap <- asks (.initGap)
+    gap <- asks (.maxGap)
     ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) (aderiv ctx 0 0))
     if all nullxb ext1
       then do

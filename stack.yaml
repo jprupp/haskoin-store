@@ -15,7 +15,8 @@ packages:
 extra-deps:
   - hashtables-1.4.2@sha256:4940cab94a15d469845ccf5225f9cb3d354c15e8127ebb58425c8b681f7721d9,10386
   - statsd-rupp-0.5.0.0@sha256:04049a06a6a92aaecd052d1caa36321bfc68c43bcc8e48e93b1f87218c182e0b,2017
-  - github: jprupp/haskoin-core
-    commit: 'ecb6cefa40b0fcb49c04b78f604c2bfca0f9a028'
-  - github: jprupp/haskoin-node
-    commit: '61bf11b72a0300b1eff494744beed59748b42225'
+  - secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
+  - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
+  - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+  - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+  - haskoin-node-1.4.1@sha256:3646352fee7065fa13ac16ac399d1f483061cadbfea7b793e3856704d4df6e4a,2213

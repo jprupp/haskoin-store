@@ -98,8 +98,9 @@ import UnliftIO
     MonadUnliftIO,
     STM,
     atomically,
+    liftIO,
     link,
-    withAsync,
+    withAsync
   )
 import UnliftIO.Concurrent (threadDelay)
 
@@ -196,7 +197,7 @@ connectDB ::
   DatabaseReaderT m a ->
   m a
 connectDB cfg f = do
-  stats <- mapM createDataMetrics cfg.stats
+  stats <- liftIO $ mapM createDataMetrics cfg.stats
   withDatabaseReader
     cfg.net
     cfg.ctx

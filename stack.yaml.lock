@@ -19,27 +19,40 @@ packages:
   original:
     hackage: statsd-rupp-0.5.0.0@sha256:04049a06a6a92aaecd052d1caa36321bfc68c43bcc8e48e93b1f87218c182e0b,2017
 - completed:
-    name: haskoin-core
+    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
     pantry-tree:
-      sha256: d671064cd7300a51fc2399414c41d280f2e6576629c1694d05aaa7d3ac9661ee
-      size: 7356
-    sha256: 951f1ec3723c0fea0bba5af913cc76f77bb38ce7d330b5f412d51c1387f4d2a5
-    size: 480479
-    url: https://github.com/jprupp/haskoin-core/archive/ecb6cefa40b0fcb49c04b78f604c2bfca0f9a028.tar.gz
-    version: 1.3.0
+      sha256: 3c3cbc95e94347d2d37c3a74e3703fd0b65161bfe353e37caa3cf8ddf2018463
+      size: 881
   original:
-    url: https://github.com/jprupp/haskoin-core/archive/ecb6cefa40b0fcb49c04b78f604c2bfca0f9a028.tar.gz
+    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
 - completed:
-    name: haskoin-node
+    hackage: rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
     pantry-tree:
-      sha256: f0ca1bac89d198387dadef6cf191bc0638de891ef56597f1560945f99e0120fd
-      size: 997
-    sha256: 3935ec893fb7a9153a97efcc094a8e34edfc5d1ea94775b9499174b58ca0f5af
-    size: 25327
-    url: https://github.com/jprupp/haskoin-node/archive/61bf11b72a0300b1eff494744beed59748b42225.tar.gz
-    version: 1.2.0
+      sha256: 6cbad8da561372c2e016fefba73f0034cc1429377df2c01c0661ab85bbe92f59
+      size: 711
   original:
-    url: https://github.com/jprupp/haskoin-node/archive/61bf11b72a0300b1eff494744beed59748b42225.tar.gz
+    hackage: rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
+- completed:
+    hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+    pantry-tree:
+      sha256: 516c59b74d9a9153b11cde9e28d6f9b28f8562f212c4523d980b31be03b19c1e
+      size: 381
+  original:
+    hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+- completed:
+    hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+    pantry-tree:
+      sha256: eda2a7abb536fba628b4e48a735c55ce4c3dd6b60013ecdad191c19336f09505
+      size: 6681
+  original:
+    hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+- completed:
+    hackage: haskoin-node-1.4.1@sha256:3646352fee7065fa13ac16ac399d1f483061cadbfea7b793e3856704d4df6e4a,2213
+    pantry-tree:
+      sha256: 9862cff9efb37ce1dbf95ec24cdc685335fda2dfa8aba5659290bca91f5c72f1
+      size: 635
+  original:
+    hackage: haskoin-node-1.4.1@sha256:3646352fee7065fa13ac16ac399d1f483061cadbfea7b793e3856704d4df6e4a,2213
 snapshots:
 - completed:
     sha256: f0a8c26c47051319c3acc86a8c1020c7ca995a2d454261696777ced26f74b744

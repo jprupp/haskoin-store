@@ -1185,15 +1185,15 @@ publishTx ::
   Tx ->
   m ()
 publishTx cfg tx = do
-  ps <- getPeers cfg.store.peerMgr
+  ps <- liftIO $ getPeers cfg.store.peerMgr
   let c = max 1 (length ps `div` 2)
   forM_ (take c ps) $ \p -> do
-    sendMessage (MTx tx) p.mailbox
+    liftIO $ sendMessage (MTx tx) p.mailbox
     void . async $ do
       threadDelay (5 * 1000 * 1000)
       let v = if cfg.store.net.segWit then InvWitnessTx else InvTx
           g = MGetData (GetData [InvVector v (txHash tx).get])
-      sendMessage g p.mailbox
+      liftIO $ sendMessage g p.mailbox
 
 -- GET Mempool / Events --
 
@@ -1482,7 +1482,7 @@ getNumTxId = fmap not $ param "txidindex" `rescue` return False
 
 getChainHeight :: (MonadUnliftIO m) => ActionT m H.BlockHeight
 getChainHeight =
-  fmap (.height) $ chainGetBest =<< askl (.config.store.chain)
+  fmap (.height) $ liftIO . chainGetBest =<< askl (.config.store.chain)
 
 scottyBinfoUnspent :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
 scottyBinfoUnspent =
@@ -2073,7 +2073,7 @@ scottyFirstSeen =
   withMetrics (.binfoQaddressfirstseen) $ do
     a <- getAddress =<< S.captureParam "addr"
     ch <- askl (.config.store.chain)
-    bb <- chainGetBest ch
+    bb <- liftIO $ chainGetBest ch
     let top = bb.height
         bot = 0
     i <- go ch bb a bot top
@@ -2093,7 +2093,7 @@ scottyFirstSeen =
         | z -> go ch bb a mid top
         | otherwise -> return 0
     getblocktime ch bb h =
-      chainGetAncestor h bb ch >>= \case
+      liftIO (chainGetAncestor ch h bb) >>= \case
         Just b -> return b.header.timestamp
         Nothing -> do
           lift . $(logErrorS) "Web" $
@@ -2331,7 +2331,7 @@ scottyBinfoGetBlockCount :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoGetBlockCount =
   withMetrics (.binfoQgetblockcount) $ do
     ch <- askl (.config.store.chain)
-    bn <- chainGetBest ch
+    bn <- liftIO $ chainGetBest ch
     setHeaders
     S.text $ TL.pack $ show bn.height
 
@@ -2339,7 +2339,7 @@ scottyBinfoLatestHash :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoLatestHash =
   withMetrics (.binfoQlatesthash) $ do
     ch <- askl (.config.store.chain)
-    bn <- chainGetBest ch
+    bn <- liftIO $ chainGetBest ch
     setHeaders
     S.text $ TL.fromStrict $ H.blockHashToHex $ H.headerHash bn.header
 
@@ -2348,7 +2348,7 @@ scottyBinfoSubsidy =
   withMetrics (.binfoQbcperblock) $ do
     ch <- askl (.config.store.chain)
     net <- askl (.config.store.net)
-    bn <- chainGetBest ch
+    bn <- liftIO $ chainGetBest ch
     setHeaders
     S.text $
       cs $
@@ -2367,6 +2367,8 @@ scottyBinfoAddrToHash =
           S.text $ encodeHexLazy $ runPutL $ serialize h
       | Just h <- addressHash256 addr ->
           S.text $ encodeHexLazy $ runPutL $ serialize h
+      | otherwise ->
+          return ()
 
 scottyBinfoHashToAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHashToAddr =
@@ -2453,6 +2455,8 @@ scottyBinfoHashPubkey =
           S.text $ encodeHexLazy $ runPutL $ serialize h
       | Just h <- addressHash256 addr ->
           S.text $ encodeHexLazy $ runPutL $ serialize h
+      | otherwise ->
+          return ()
 
 -- GET Network Information --
 
@@ -2468,7 +2472,7 @@ scottyPeers _ =
 getPeersInformation ::
   (MonadLoggerIO m) => PeerMgr -> m [PeerInfo]
 getPeersInformation mgr =
-  mapMaybe toInfo <$> getPeers mgr
+  mapMaybe toInfo <$> liftIO (getPeers mgr)
   where
     toInfo op = do
       ver <- op.version
@@ -2495,7 +2499,7 @@ blockHealthCheck ::
   m BlockHealth
 blockHealthCheck cfg = do
   let ch = cfg.store.chain
-  headers <- (.height) <$> chainGetBest ch
+  headers <- (.height) <$> liftIO (chainGetBest ch)
   blocks <-
     maybe 0 (.height)
       <$> runMaybeT (MaybeT getBestBlock >>= MaybeT . getBlock)
@@ -2513,7 +2517,7 @@ lastBlockHealthCheck ::
   m TimeHealth
 lastBlockHealthCheck ch WebLimits {blockTimeout} = do
   n <- round <$> liftIO getPOSIXTime
-  t <- fromIntegral . (.header.timestamp) <$> chainGetBest ch
+  t <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
   return
     TimeHealth
       { age = n - t,
@@ -2526,7 +2530,7 @@ lastTxHealthCheck ::
   m TimeHealth
 lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
   n <- round <$> liftIO getPOSIXTime
-  b <- fromIntegral . (.header.timestamp) <$> chainGetBest ch
+  b <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
   t <-
     getMempool >>= \case
       t : _ ->
@@ -2562,7 +2566,7 @@ peerHealthCheck ::
   WebConfig ->
   m CountHealth
 peerHealthCheck cfg = do
-  count <- fromIntegral . length <$> getPeers cfg.store.peerMgr
+  count <- fromIntegral . length <$> liftIO (getPeers cfg.store.peerMgr)
   return CountHealth {min = fromIntegral cfg.minPeers, count}
 
 healthCheck ::
@@ -2592,7 +2596,7 @@ scottyDbStats =
   withMetrics (.db) $ do
     setHeaders
     db <- askl (.config.store.db.db)
-    statsM <- lift (getProperty db Stats)
+    statsM <- liftIO (getProperty db Stats)
     S.text $ maybe "Could not get stats" cs statsM
 
 -----------------------

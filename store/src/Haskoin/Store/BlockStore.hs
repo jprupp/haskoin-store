@@ -126,7 +126,6 @@ import Haskoin.Node
   ( Chain,
     OnlinePeer (..),
     Peer (..),
-    PeerException (..),
     PeerMgr,
     chainBlockMain,
     chainGetAncestor,
@@ -269,7 +268,7 @@ setStoreHeight = void $ runMaybeT $ do
 setHeadersHeight :: (MonadIO m) => BlockT m ()
 setHeadersHeight = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
-  n <- chainGetBest =<< asks (.config.chain)
+  n <- liftIO . chainGetBest =<< asks (.config.chain)
   setGauge m.headers (fromIntegral n.height)
 
 setPendingTxs :: (MonadIO m) => BlockT m ()
@@ -281,7 +280,7 @@ setPendingTxs = void $ runMaybeT $ do
 setPeersConnected :: (MonadIO m) => BlockT m ()
 setPeersConnected = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
-  p <- getPeers =<< asks (.config.peerMgr)
+  p <- liftIO . getPeers =<< asks (.config.peerMgr)
   setGauge m.peers (length p)
 
 setMempoolSize :: (MonadIO m) => BlockT m ()
@@ -473,7 +472,7 @@ isInSync =
       $(logErrorS) "BlockStore" "Block database uninitialized"
       throwIO Uninitialized
     Just bb -> do
-      cb <- asks (.config.chain) >>= chainGetBest
+      cb <- asks (.config.chain) >>= liftIO . chainGetBest
       if headerHash cb.header == bb
         then clearSyncingState >> return True
         else return False
@@ -494,7 +493,7 @@ syncMempool p =
       $(logDebugS) "BlockStore" $
         "Requesting mempool from peer: " <> p.label
       atomically . modifyTVar m $ HashSet.insert p.label
-      MMempool `sendMessage` p
+      liftIO $ MMempool `sendMessage` p
 
 processBlock ::
   (MonadUnliftIO m, MonadLoggerIO m) =>
@@ -510,7 +509,7 @@ processBlock peer block = void . runMaybeT $ do
           <> peer.label
           <> " sent me a block: "
           <> blockHashToHex blockhash
-      PeerMisbehaving "Sent unexpected block" `killPeer` peer
+      liftIO $ killPeer peer
       mzero
   node <-
     getBlockNode blockhash >>= \case
@@ -521,7 +520,7 @@ processBlock peer block = void . runMaybeT $ do
             <> peer.label
             <> " sent unknown block: "
             <> blockHashToHex blockhash
-        PeerMisbehaving "Sent unknown block" `killPeer` peer
+        liftIO $ killPeer peer
         mzero
   $(logDebugS) "BlockStore" $
     "Processing block: "
@@ -557,7 +556,7 @@ processBlock peer block = void . runMaybeT $ do
           <> peer.label
           <> ": "
           <> cs (show e)
-      killPeer (PeerMisbehaving (show e)) peer
+      liftIO $ killPeer peer
 
 setSyncingBlocks ::
   (MonadReader BlockStore m, MonadIO m) =>
@@ -607,8 +606,9 @@ getBlockNode ::
   (MonadLoggerIO m, MonadReader BlockStore m) =>
   BlockHash ->
   m (Maybe BlockNode)
-getBlockNode blockhash =
-  chainGetBlock blockhash =<< asks (.config.chain)
+getBlockNode blockhash = do
+  ch <- asks (.config.chain)
+  liftIO $ chainGetBlock ch blockhash
 
 processNoBlocks ::
   (MonadLoggerIO m) =>
@@ -626,7 +626,7 @@ processNoBlocks p hs = do
         <> blockHashToHex h
         <> " not found by peer: "
         <> p.label
-  killPeer (PeerMisbehaving "Did not find requested block(s)") p
+  liftIO $ killPeer p
 
 processTx :: (MonadLoggerIO m) => Peer -> Tx -> BlockT m ()
 processTx p tx = guardMempool $ do
@@ -908,7 +908,7 @@ processTxs p hs = guardMempool . guardSync $ do
       let inv = if net.segWit then InvWitnessTx else InvTx
           vec = map (InvVector inv . (.get)) xs
           msg = MGetData (GetData vec)
-      msg `sendMessage` p
+      liftIO $ msg `sendMessage` p
 
 touchPeer ::
   ( MonadIO m,
@@ -940,7 +940,7 @@ checkTime =
         when (now `diffUTCTime` t > peer_time_out) $ do
           $(logErrorS) "BlockStore" $
             "Syncing peer timeout: " <> p.label
-          killPeer PeerTimeout p
+          liftIO $ killPeer p
 
 revertToMainChain :: (MonadLoggerIO m) => BlockT m ()
 revertToMainChain = do
@@ -948,7 +948,7 @@ revertToMainChain = do
   ch <- asks (.config.chain)
   net <- getNetwork
   ctx <- getCtx
-  chainBlockMain h ch >>= \x -> unless x $ do
+  liftIO (chainBlockMain ch h) >>= \x -> unless x $ do
     $(logWarnS) "BlockStore" $
       "Reverting best block: "
         <> blockHashToHex h
@@ -972,7 +972,7 @@ getBest = do
         $(logErrorS) "BlockStore" "No best block set"
         throwIO Uninitialized
   ch <- asks (.config.chain)
-  chainGetBlock bb ch >>= \case
+  liftIO (chainGetBlock ch bb) >>= \case
     Just x -> return x
     Nothing -> do
       $(logErrorS) "BlockStore" $
@@ -992,7 +992,7 @@ getSyncBest = do
             throwIO Uninitialized
       hs -> return $ last hs
   ch <- asks (.config.chain)
-  chainGetBlock bb ch >>= \case
+  liftIO (chainGetBlock ch bb) >>= \case
     Just x -> return x
     Nothing -> do
       $(logErrorS) "BlockStore" $
@@ -1028,7 +1028,7 @@ syncMe = do
             <> " blocks from peer: "
             <> p.label
         addSyncingBlocks $ map (headerHash . (.header)) bns
-        MGetData (GetData iv) `sendMessage` p
+        liftIO $ MGetData (GetData iv) `sendMessage` p
   where
     getiv bns = do
       w <- asks (.config.net.segWit)
@@ -1036,12 +1036,12 @@ syncMe = do
           f = InvVector i . (.get) . headerHash . (.header)
       return $ map f bns
     getbh =
-      chainGetBest =<< asks (.config.chain)
+      liftIO . chainGetBest =<< asks (.config.chain)
     sel bb bh = do
       let sh = geth bb bh
       t <- top sh bh
       ch <- asks (.config.chain)
-      ps <- chainGetParents (bb.height + 1) t ch
+      ps <- liftIO $ chainGetParents ch (bb.height + 1) t
       return $
         if 500 > length ps
           then ps <> [bh]
@@ -1060,7 +1060,7 @@ findAncestor ::
   m BlockNode
 findAncestor height target = do
   ch <- asks (.config.chain)
-  chainGetAncestor height target ch >>= \case
+  liftIO (chainGetAncestor ch height target) >>= \case
     Just ancestor -> return ancestor
     Nothing -> do
       let h = headerHash target.header
@@ -1086,7 +1086,7 @@ finishPeer p = do
     reset_it box = do
       atomically $ writeTVar box Nothing
       $(logDebugS) "BlockStore" $ "Releasing peer: " <> p.label
-      setFree p
+      liftIO $ setFree p
 
 trySetPeer :: (MonadLoggerIO m) => Peer -> BlockT m Bool
 trySetPeer p =
@@ -1095,7 +1095,7 @@ trySetPeer p =
     Nothing -> set_it
   where
     set_it =
-      setBusy p >>= \case
+      liftIO (setBusy p) >>= \case
         False -> return False
         True -> do
           $(logDebugS) "BlockStore" $
@@ -1126,7 +1126,7 @@ trySyncing =
         False -> recurse ps
         True -> syncMe
     online_peer = do
-      ops <- getPeers =<< asks (.config.peerMgr)
+      ops <- liftIO . getPeers =<< asks (.config.peerMgr)
       let ps = map (.mailbox) ops
       recurse ps
 

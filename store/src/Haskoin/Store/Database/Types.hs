@@ -3,6 +3,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
@@ -77,38 +78,26 @@ import Haskoin.Store.Data
 -- | Database key for an address transaction.
 data AddrTxKey
   = -- | key for a transaction affecting an address
-    AddrTxKey
-      { address :: !Address,
-        tx :: !TxRef
-      }
+    AddrTxKey !Address !TxRef
   | -- | short key that matches all entries
-    AddrTxKeyA
-      { address :: !Address
-      }
-  | AddrTxKeyB
-      { address :: !Address,
-        block :: !BlockRef
-      }
+    AddrTxKeyA !Address
+  | AddrTxKeyB !Address !BlockRef
   | AddrTxKeyS
   deriving (Show, Eq, Ord, Generic, Hashable)
 
 instance Serialize AddrTxKey where
   -- 0x05 · Address · BlockRef · TxHash
 
-  put
-    AddrTxKey
-      { address = a,
-        tx = TxRef {block = b, txid = t}
-      } = do
-      put AddrTxKeyB {address = a, block = b}
-      put t
+  put (AddrTxKey a TxRef {block = b, txid = t}) = do
+    put (AddrTxKeyB a b)
+    put t
   -- 0x05 · Address
-  put AddrTxKeyA {address = a} = do
+  put (AddrTxKeyA a) = do
     put AddrTxKeyS
     put a
   -- 0x05 · Address · BlockRef
-  put AddrTxKeyB {address = a, block = b} = do
-    put AddrTxKeyA {address = a}
+  put (AddrTxKeyB a b) = do
+    put (AddrTxKeyA a)
     put b
   -- 0x05
   put AddrTxKeyS = putWord8 0x05
@@ -117,11 +106,7 @@ instance Serialize AddrTxKey where
     a <- get
     b <- get
     t <- get
-    return
-      AddrTxKey
-        { address = a,
-          tx = TxRef {block = b, txid = t}
-        }
+    return $ AddrTxKey a TxRef {block = b, txid = t}
 
 instance Key AddrTxKey
 
@@ -130,34 +115,25 @@ instance KeyValue AddrTxKey ()
 -- | Database key for an address output.
 data AddrOutKey
   = -- | full key
-    AddrOutKey
-      { address :: !Address,
-        block :: !BlockRef,
-        outpoint :: !OutPoint
-      }
+    AddrOutKey !Address !BlockRef !OutPoint
   | -- | short key for all spent or unspent outputs
-    AddrOutKeyA
-      { address :: !Address
-      }
-  | AddrOutKeyB
-      { address :: !Address,
-        block :: !BlockRef
-      }
+    AddrOutKeyA !Address
+  | AddrOutKeyB !Address !BlockRef
   | AddrOutKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize AddrOutKey where
   -- 0x06 · StoreAddr · BlockRef · OutPoint
 
-  put AddrOutKey {address = a, block = b, outpoint = p} = do
-    put AddrOutKeyB {address = a, block = b}
+  put (AddrOutKey a b p) = do
+    put (AddrOutKeyB a b)
     put p
   -- 0x06 · StoreAddr · BlockRef
-  put AddrOutKeyB {address = a, block = b} = do
-    put AddrOutKeyA {address = a}
+  put (AddrOutKeyB a b) = do
+    put (AddrOutKeyA a)
     put b
   -- 0x06 · StoreAddr
-  put AddrOutKeyA {address = a} = do
+  put (AddrOutKeyA a) = do
     put AddrOutKeyS
     put a
   -- 0x06
@@ -168,18 +144,15 @@ instance Serialize AddrOutKey where
 
 instance Key AddrOutKey
 
-data OutVal = OutVal
-  { value :: !Word64,
-    script :: !ByteString
-  }
+data OutVal = OutVal !Word64 !ByteString
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize)
 
 instance KeyValue AddrOutKey OutVal
 
 -- | Transaction database key.
 data TxKey
-  = TxKey {txid :: TxHash}
-  | TxKeyS {short :: (Word32, Word16)}
+  = TxKey !TxHash
+  | TxKeyS !(Word32, Word16)
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize TxKey where
@@ -200,11 +173,14 @@ decodeTxKey i =
       wb = masked `shift` 11
       bs = runPut (putWord64be wb)
       g = do
-        w1 <- getWord32be
-        w2 <- getWord16be
-        w3 <- getWord8
-        return (w1, w2, w3)
-      Right (w1, w2, w3) = runGet g bs
+        w1' <- getWord32be
+        w2' <- getWord16be
+        w3' <- getWord8
+        return (w1', w2', w3')
+      (w1, w2, w3) =
+        case runGet g bs of
+          Right x -> x
+          Left e -> error e
    in ((w1, w2), w3)
 
 instance Key TxKey
@@ -213,19 +189,19 @@ instance KeyValue TxKey TxData
 
 -- | Unspent output database key.
 data UnspentKey
-  = UnspentKey {outpoint :: !OutPoint}
-  | UnspentKeyS {txid :: !TxHash}
+  = UnspentKey !OutPoint
+  | UnspentKeyS !TxHash
   | UnspentKeyB
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize UnspentKey where
   -- 0x09 · TxHash · Index
-  put UnspentKey {outpoint = OutPoint {hash = h, index = i}} = do
+  put (UnspentKey OutPoint {hash = h, index = i}) = do
     putWord8 0x09
     put h
     put i
   -- 0x09 · TxHash
-  put UnspentKeyS {txid = t} = do
+  put (UnspentKeyS t) = do
     putWord8 0x09
     put t
   -- 0x09
@@ -240,15 +216,17 @@ instance Key UnspentKey
 
 instance KeyValue UnspentKey UnspentVal
 
-toUnspent :: Ctx -> AddrOutKey -> OutVal -> Unspent
-toUnspent ctx AddrOutKey {..} OutVal {..} =
-  Unspent
-    { block = block,
-      value = value,
-      script = script,
-      outpoint = outpoint,
-      address = eitherToMaybe (scriptToAddressBS ctx script)
-    }
+toUnspent :: Ctx -> AddrOutKey -> OutVal -> Maybe Unspent
+toUnspent ctx (AddrOutKey _address block outpoint) (OutVal value script) =
+  Just
+    Unspent
+      { block = block,
+        value = value,
+        script = script,
+        outpoint = outpoint,
+        address = eitherToMaybe (scriptToAddressBS ctx script)
+      }
+toUnspent _ _ _ = Nothing
 
 -- | Mempool transaction database key.
 data MemKey
@@ -267,9 +245,7 @@ instance Key MemKey
 instance KeyValue MemKey [(UnixTime, TxHash)]
 
 -- | Block entry database key.
-newtype BlockKey = BlockKey
-  { hash :: BlockHash
-  }
+newtype BlockKey = BlockKey BlockHash
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize BlockKey where
@@ -286,9 +262,7 @@ instance Key BlockKey
 instance KeyValue BlockKey BlockData
 
 -- | Block height database key.
-newtype HeightKey = HeightKey
-  { height :: BlockHeight
-  }
+newtype HeightKey = HeightKey BlockHeight
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize HeightKey where
@@ -306,9 +280,7 @@ instance KeyValue HeightKey [BlockHash]
 
 -- | Address balance database key.
 data BalKey
-  = BalKey
-      { address :: !Address
-      }
+  = BalKey !Address
   | BalKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
@@ -328,8 +300,7 @@ instance Key BalKey
 instance KeyValue BalKey BalVal
 
 -- | Key for best block in database.
-data BestKey
-  = BestKey
+data BestKey = BestKey
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize BestKey where
@@ -344,8 +315,7 @@ instance Key BestKey
 instance KeyValue BestKey BlockHash
 
 -- | Key for database version.
-data VersionKey
-  = VersionKey
+data VersionKey = VersionKey
   deriving (Eq, Show, Read, Ord, Generic, Hashable)
 
 instance Serialize VersionKey where
