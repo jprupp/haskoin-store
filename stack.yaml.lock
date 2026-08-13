@@ -47,12 +47,16 @@ packages:
   original:
     hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
 - completed:
-    hackage: haskoin-node-1.4.2@sha256:09e85e5ab8b0455d0682788340d9da210659e0449f757a5391ac6eaa16147481,2213
+    name: haskoin-node
     pantry-tree:
-      sha256: 928d6fad7bb2aec4af3883f74bd92b8b36cb6beb31a1031fa0ce109e542ad419
-      size: 635
+      sha256: 8e45ca21a441e01b09bbc58d6a18e1ed1be68c8381c646cfb0baed9578f22602
+      size: 997
+    sha256: 106bc6b6059c676c676000b54200d512400cf2f03555931240ed377f6924c0aa
+    size: 23747
+    url: https://github.com/jprupp/haskoin-node/archive/4fa58a3e85b6f3757646018076244159694cbaed.tar.gz
+    version: 1.4.3
   original:
-    hackage: haskoin-node-1.4.2@sha256:09e85e5ab8b0455d0682788340d9da210659e0449f757a5391ac6eaa16147481,2213
+    url: https://github.com/jprupp/haskoin-node/archive/4fa58a3e85b6f3757646018076244159694cbaed.tar.gz
 snapshots:
 - completed:
     sha256: f0a8c26c47051319c3acc86a8c1020c7ca995a2d454261696777ced26f74b744

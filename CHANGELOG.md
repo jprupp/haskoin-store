@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- Fix upstream regression in haskoin-node.
+- Fix upstream regressions in haskoin-node.
 
 ## [1.6.1] - 2026-08-13
 
