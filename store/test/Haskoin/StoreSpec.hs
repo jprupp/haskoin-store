@@ -18,7 +18,7 @@ import Data.ByteString qualified as B
 import Data.ByteString.Base64
 import Data.Either
 import Data.List (find)
-import Data.Maybe (fromJust, fromMaybe, isJust, mapMaybe)
+import Data.Maybe
 import Data.Serialize
 import Data.Time.Clock.POSIX
 import Data.Word
@@ -70,9 +70,8 @@ spec = prepareContext $ \ctx -> do
           lift $ do
             bd.height `shouldBe` 15
             length bd.txs `shouldBe` 1
-            head bd.txs `shouldBe` h1
-            t1 `shouldSatisfy` isJust
-            txHash (transactionData (fromJust t1)) `shouldBe` h1
+            listToMaybe bd.txs `shouldBe` Just h1
+            fmap (txHash . transactionData) t1 `shouldBe` Just h1
 
 withTestStore ::
   (MonadUnliftIO m) =>
