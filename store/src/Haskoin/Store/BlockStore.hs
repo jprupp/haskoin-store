@@ -507,9 +507,9 @@ processBlock peer block = void . runMaybeT $ do
       $(logErrorS) "BlockStore" $
         "Non-syncing peer "
           <> peer.label
-          <> " sent me a block: "
+          <> " sent block "
           <> blockHashToHex blockhash
-      liftIO $ killPeer peer
+      killPeer peer
       mzero
   node <-
     getBlockNode blockhash >>= \case
@@ -518,14 +518,14 @@ processBlock peer block = void . runMaybeT $ do
         $(logErrorS) "BlockStore" $
           "Peer "
             <> peer.label
-            <> " sent unknown block: "
+            <> " sent unknown block "
             <> blockHashToHex blockhash
-        liftIO $ killPeer peer
+        killPeer peer
         mzero
   $(logDebugS) "BlockStore" $
-    "Processing block: "
+    "Processing block "
       <> blockText node Nothing
-      <> " from peer: "
+      <> " from peer "
       <> peer.label
   net <- lift getNetwork
   ctx <- lift getCtx
@@ -556,7 +556,7 @@ processBlock peer block = void . runMaybeT $ do
           <> peer.label
           <> ": "
           <> cs (show e)
-      liftIO $ killPeer peer
+      killPeer peer
 
 setSyncingBlocks ::
   (MonadReader BlockStore m, MonadIO m) =>
@@ -626,7 +626,7 @@ processNoBlocks p hs = do
         <> blockHashToHex h
         <> " not found by peer: "
         <> p.label
-  liftIO $ killPeer p
+  killPeer p
 
 processTx :: (MonadLoggerIO m) => Peer -> Tx -> BlockT m ()
 processTx p tx = guardMempool $ do
@@ -940,7 +940,7 @@ checkTime =
         when (now `diffUTCTime` t > peer_time_out) $ do
           $(logErrorS) "BlockStore" $
             "Syncing peer timeout: " <> p.label
-          liftIO $ killPeer p
+          killPeer p
 
 revertToMainChain :: (MonadLoggerIO m) => BlockT m ()
 revertToMainChain = do
