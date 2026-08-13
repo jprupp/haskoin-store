@@ -20,4 +20,4 @@ extra-deps:
   - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
   - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
   - github: jprupp/haskoin-node
-    commit: '968265b0415b2b6fa4f6d56283a77723c18189d1'
+    commit: '48a4b4cd92b1a98a3f31a35bfddd1ffbe296b8a9'
