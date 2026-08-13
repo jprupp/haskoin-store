@@ -49,14 +49,14 @@ packages:
 - completed:
     name: haskoin-node
     pantry-tree:
-      sha256: a8a9e400d8bb8957a7ab980b863313d12e32db84f37e6bd8dcd629beb32c9be4
+      sha256: 9be7e72754927e9a87b986951ef28bac9c59b6c2a6371702c35464e1df62f83d
       size: 997
-    sha256: 29de55fafc968f25fa53e8fcb72d6c0cd95a09e8c3401a7bb258a6268f742b01
-    size: 23761
-    url: https://github.com/jprupp/haskoin-node/archive/de01afb00510c0eb6b11ec756410f3831eaff224.tar.gz
+    sha256: a7e8bfd4947bc028dd9f9271c90c89c9aafb6354a99bb26ebc914fd7fc5f8da4
+    size: 23758
+    url: https://github.com/jprupp/haskoin-node/archive/968265b0415b2b6fa4f6d56283a77723c18189d1.tar.gz
     version: 1.4.3
   original:
-    url: https://github.com/jprupp/haskoin-node/archive/de01afb00510c0eb6b11ec756410f3831eaff224.tar.gz
+    url: https://github.com/jprupp/haskoin-node/archive/968265b0415b2b6fa4f6d56283a77723c18189d1.tar.gz
 snapshots:
 - completed:
     sha256: f0a8c26c47051319c3acc86a8c1020c7ca995a2d454261696777ced26f74b744
