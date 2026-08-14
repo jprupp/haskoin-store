@@ -13,7 +13,7 @@
 
 module Main (main) where
 
-import Control.Monad (when)
+import Control.Monad (forever, void, when)
 import Control.Monad.Cont (ContT (ContT), runContT)
 import Control.Monad.Logger
   ( LogLevel (..),
@@ -36,12 +36,14 @@ import Haskoin
   )
 import Haskoin.Node (withConnection)
 import Haskoin.Store
-  ( StoreConfig (..),
+  ( Store (..),
+    StoreConfig (..),
     WebConfig (..),
     WebLimits (..),
     runWeb,
     withStore,
   )
+import NQE (receive, withSubscription)
 import Options.Applicative
   ( Parser,
     auto,
@@ -129,7 +131,8 @@ data Config = Config
     noBlockchainInfo :: !Bool,
     noXPub :: !Bool,
     healthCheckInterval :: !Int,
-    bloom :: !Bool
+    bloom :: !Bool,
+    noWeb :: !Bool
   }
 
 env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
@@ -211,6 +214,8 @@ defConfig = do
     env "HEALTH_CHECK_INTERVAL" 30 readMaybe
   bloom <-
     env "BLOOM" False parseBool
+  noWeb <-
+    env "NO_WEB" False parseBool
   return Config {version = False, ..}
   where
     tickerString =
@@ -329,6 +334,10 @@ config c = do
         <> help "Minimum number of connected peers for health check"
         <> showDefault
         <> value c.minPeers
+  noWeb <-
+    flag c.noWeb True $
+      long "noweb"
+        <> help "Disable web server"
   webLimits <- do
     maxItemCount <-
       option auto $
@@ -566,53 +575,58 @@ run cfg =
       $(logInfoS) "haskoin-store" $
         "Creating working directory (if not found): " <> cs dir
       createDirectoryIfMissing True dir
-      store <-
-        ContT $
-          withStore
-            StoreConfig
-              { maxPeers = cfg.maxPeers,
-                initPeers = cfg.peers,
-                discover = cfg.discover,
-                db = dir </> "db",
-                net = net,
-                ctx = ctx,
-                redis = if cfg.redis then Just cfg.redisURL else Nothing,
-                gap = cfg.webLimits.xpubGap,
-                initGap = cfg.webLimits.xpubGapInit,
-                redisMinAddrs = cfg.redisMinAddrs,
-                redisMaxKeys = cfg.redisMaxKeys,
-                wipeMempool = cfg.wipeMempool,
-                noMempool = cfg.noMempool,
-                syncMempool = cfg.syncMempool,
-                mempoolTimeout = cfg.mempoolTimeout,
-                peerTimeout = fromIntegral cfg.peerTimeout,
-                maxPeerLife = fromIntegral cfg.maxPeerLife,
-                connect = withConnection,
-                stats = stats,
-                redisSyncInterval = cfg.redisSyncInterval,
-                bloom = cfg.bloom
-              }
-      lift $
-        runWeb
-          WebConfig
-            { host = cfg.host,
-              port = cfg.port,
-              store = store,
-              limits = cfg.webLimits,
-              maxPendingTxs = cfg.maxPendingTxs,
-              maxLaggingBlocks = cfg.maxLaggingBlocks,
-              minPeers = cfg.minPeers,
-              version = haskoinStoreVersion,
-              noMempool = cfg.noMempool,
-              stats = stats,
-              tickerRefresh = cfg.tickerRefresh,
-              tickerURL = cfg.tickerURL,
-              priceHistoryURL = cfg.priceHistoryURL,
-              noXPub = cfg.noXPub,
-              noBlockchainInfo = cfg.noBlockchainInfo,
-              healthCheckInterval = cfg.healthCheckInterval
-            }
+      store <- ContT $ run_store net ctx stats dir
+      if cfg.noWeb
+        then lift . withSubscription store.pub $ \sub ->
+          forever $ void (receive sub)
+        else do
+          lift $ run_web stats store
   where
+    run_store net ctx stats dir =
+      withStore
+        StoreConfig
+          { maxPeers = cfg.maxPeers,
+            initPeers = cfg.peers,
+            discover = cfg.discover,
+            db = dir </> "db",
+            net = net,
+            ctx = ctx,
+            redis = if cfg.redis then Just cfg.redisURL else Nothing,
+            gap = cfg.webLimits.xpubGap,
+            initGap = cfg.webLimits.xpubGapInit,
+            redisMinAddrs = cfg.redisMinAddrs,
+            redisMaxKeys = cfg.redisMaxKeys,
+            wipeMempool = cfg.wipeMempool,
+            noMempool = cfg.noMempool,
+            syncMempool = cfg.syncMempool,
+            mempoolTimeout = cfg.mempoolTimeout,
+            peerTimeout = fromIntegral cfg.peerTimeout,
+            maxPeerLife = fromIntegral cfg.maxPeerLife,
+            connect = withConnection,
+            stats = stats,
+            redisSyncInterval = cfg.redisSyncInterval,
+            bloom = cfg.bloom
+          }
+    run_web stats store =
+      runWeb
+        WebConfig
+          { host = cfg.host,
+            port = cfg.port,
+            store = store,
+            limits = cfg.webLimits,
+            maxPendingTxs = cfg.maxPendingTxs,
+            maxLaggingBlocks = cfg.maxLaggingBlocks,
+            minPeers = cfg.minPeers,
+            version = haskoinStoreVersion,
+            noMempool = cfg.noMempool,
+            stats = stats,
+            tickerRefresh = cfg.tickerRefresh,
+            tickerURL = cfg.tickerURL,
+            priceHistoryURL = cfg.priceHistoryURL,
+            noXPub = cfg.noXPub,
+            noBlockchainInfo = cfg.noBlockchainInfo,
+            healthCheckInterval = cfg.healthCheckInterval
+          }
     with_stats net go
       | cfg.statsd = do
           $(logInfoS) "Main" $
