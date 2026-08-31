@@ -47,19 +47,15 @@ packages:
   original:
     hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
 - completed:
-    name: haskoin-node
+    hackage: haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
     pantry-tree:
-      sha256: 8dfa59f8c6a2414b522ef5153cb42a21d162fc418eaaa0c7b7362db523856c2d
-      size: 943
-    sha256: 868ce0e354fb3fed989600f7838631d46a28f5d88e14a00096c0752778028073
-    size: 23764
-    url: https://github.com/jprupp/haskoin-node/archive/d70a018593d82b7ac00a93430f3419e33d0086cc.tar.gz
-    version: 1.4.4
+      sha256: b1d3dd912c1d35c1e8f020cde772b5ea54ff145c732c94c3f87e21b6cd732a29
+      size: 635
   original:
-    url: https://github.com/jprupp/haskoin-node/archive/d70a018593d82b7ac00a93430f3419e33d0086cc.tar.gz
+    hackage: haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
 snapshots:
 - completed:
-    sha256: 253ee7f8dd9a2d30fde05040dd35f5aa7365b43bda0cf38ada10c0cedf4782bb
-    size: 773507
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/8/20.yaml
-  original: nightly-2026-08-20
+    sha256: 6a751c3fdab86bdc1605c9983f0bceebb072f7ffecef2eaa3be3f8ff19807a47
+    size: 774375
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/8/31.yaml
+  original: nightly-2026-08-31

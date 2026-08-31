@@ -1,4 +1,4 @@
-resolver: nightly-2026-08-20
+resolver: nightly-2026-08-31
 ghc-options:
   "$everything": -O2
 nix:
@@ -19,5 +19,4 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
   - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
   - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
-  - github: jprupp/haskoin-node
-    commit: 'd70a018593d82b7ac00a93430f3419e33d0086cc'
+  - haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
