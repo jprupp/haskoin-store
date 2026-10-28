@@ -44,7 +44,6 @@ import Control.Applicative ((<|>))
 import Control.Lens ((.~), (^.))
 import Control.Monad
   ( forM_,
-    forever,
     unless,
     void,
     when,
@@ -521,7 +520,7 @@ runWeb config = do
           config.tickerURL
           config.tickerRefresh
     runHealthCheck = runReaderT (healthCheck config) config.store.db
-    healthCheckLoop v = forever $ do
+    healthCheckLoop v = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
     opts = S.defaultOptions {S.settings = settings defaultSettings}
@@ -560,7 +559,7 @@ price ::
   Int ->
   TVar (HashMap Text BinfoTicker) ->
   m ()
-price net session url pget v = forM_ purl $ \u -> forever $ do
+price net session url pget v = forM_ purl $ \u -> loopForever $ do
   let err e = $(logErrorS) "Price" $ cs (show e)
   handleAny err $ do
     r <- liftIO $ Wreq.asJSON =<< Wreq.Session.get session u
@@ -1218,7 +1217,7 @@ webSocketEvents s =
       if path == "/events"
         then do
           conn <- acceptRequest pending
-          forever $
+          loopForever $
             receiveEvent sub >>= \case
               Nothing -> return ()
               Just event -> sendTextData conn (A.encode event)
@@ -1244,7 +1243,7 @@ scottyEvents =
     pub <- askl (.config.store.pub)
     S.stream $ \io flush' ->
       withSubscription pub $ \sub ->
-        forever $ do
+        loopForever $ do
           flush'
           receiveEvent sub >>= \case
             Nothing -> return ()

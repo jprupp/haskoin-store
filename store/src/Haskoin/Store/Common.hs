@@ -36,6 +36,7 @@ module Haskoin.Store.Common
     microseconds,
     streamThings,
     joinDescStreams,
+    loopForever,
   )
 where
 
@@ -306,6 +307,18 @@ sortTxs txs = ts
 
 nub' :: (Hashable a) => [a] -> [a]
 nub' = H.toList . H.fromList
+
+-- | A 'forever' that stays a flat loop in any monad. 'forever' sequences
+-- with @*>@; monad-logger's @LoggingT@ leaves @*>@ at its default
+-- @(id <$ a) <*> b@ and @ReaderT@ defines @>>@ as @*>@, so a loop that is
+-- polymorphic in its monad and not specialised by GHC keeps an @<*>@
+-- continuation frame and two thunks per iteration for its whole lifetime.
+-- Sequencing with @>>=@ only is a tail call in all these stacks.
+loopForever :: (Monad m) => m a -> m b
+loopForever action = go
+  where
+    go = action >>= \_ -> go
+{-# INLINE loopForever #-}
 
 microseconds :: (MonadIO m) => m Integer
 microseconds =

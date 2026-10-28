@@ -13,7 +13,7 @@
 
 module Main (main) where
 
-import Control.Monad (forever, void, when)
+import Control.Monad (when)
 import Control.Monad.Cont (ContT (ContT), runContT)
 import Control.Monad.Logger
   ( LogLevel (..),
@@ -35,6 +35,7 @@ import Haskoin
     withContext,
   )
 import Haskoin.Node (withConnection)
+import Haskoin.Store.Common (loopForever)
 import Haskoin.Store
   ( Store (..),
     StoreConfig (..),
@@ -578,7 +579,7 @@ run cfg =
       store <- ContT $ run_store net ctx stats dir
       if cfg.noWeb
         then lift . withSubscription store.pub $ \sub ->
-          forever $ void (receive sub)
+          loopForever (receive sub)
         else do
           lift $ run_web stats store
   where

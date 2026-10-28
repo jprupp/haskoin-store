@@ -40,7 +40,6 @@ where
 import Control.Monad
   ( forM,
     forM_,
-    forever,
     mzero,
     unless,
     void,
@@ -460,7 +459,7 @@ runBlockStoreLoop ::
   mbox BlockStoreMessage ->
   ReaderT BlockStore m b
 runBlockStoreLoop inbox =
-  forever $ do
+  loopForever $ do
     $(logDebugS) "BlockStore" "Waiting for new event..."
     msg <- receive inbox
     ReaderT $ runReaderT $ processBlockStoreMessage msg
@@ -1212,7 +1211,7 @@ processBlockStoreMessage (BlockPing r) = do
 
 pingMe :: (MonadLoggerIO m) => Mailbox BlockStoreMessage -> m ()
 pingMe mbox =
-  forever $ do
+  loopForever $ do
     BlockPing `query` mbox
     delay <- liftIO $ randomRIO (100 * 1000, 1000 * 1000)
     threadDelay delay

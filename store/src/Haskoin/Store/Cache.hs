@@ -37,7 +37,7 @@ module Haskoin.Store.Cache
 where
 
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, forM_, forever, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.Logger
   ( MonadLoggerIO,
     logDebugS,
@@ -678,7 +678,7 @@ cacheWriter cfg inbox =
     go = do
       newBlockC
       syncMempoolC
-      forever $ do
+      loopForever $ do
         $(logDebugS) "Cache" "Awaiting event..."
         x <- receive inbox
         cacheWriterReact x
@@ -753,7 +753,7 @@ withLock l f =
     False -> return Nothing
   where
     go = withAsync refresh $ const f
-    refresh = forever $ do
+    refresh = loopForever $ do
       threadDelay (150 * 1000 * 1000)
       refreshLock l
 
