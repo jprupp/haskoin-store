@@ -439,7 +439,7 @@ freeOutputs ::
   (MonadImport m) =>
   -- | only delete transaction if unconfirmed
   Bool ->
-  -- | only delete RBF
+  -- | only delete if network has RBF
   Bool ->
   Tx ->
   m ()
@@ -468,7 +468,7 @@ deleteTx ::
   (MonadImport m) =>
   -- | only delete transaction if unconfirmed
   Bool ->
-  -- | only delete RBF
+  -- | only delete if network has RBF
   Bool ->
   TxHash ->
   m ()
@@ -485,7 +485,7 @@ getChain ::
   (MonadImport m) =>
   -- | only delete transaction if unconfirmed
   Bool ->
-  -- | only delete RBF
+  -- | only delete if network has RBF
   Bool ->
   TxHash ->
   m [Tx]
@@ -508,13 +508,14 @@ getChain memonly rbfcheck th' = do
                   <> txHashToHex th
               throwError TxConfirmed
           | rbfcheck ->
-              isRBF td.block td.tx >>= \case
-                True -> return $ Just td
-                False -> do
-                  $(logErrorS) "BlockStore" $
-                    "Double-spending transaction: "
-                      <> txHashToHex th
-                  throwError DoubleSpend
+              getNetwork >>= \net ->
+                if net.replaceByFee
+                  then return $ Just td
+                  else do
+                    $(logErrorS) "BlockStore" $
+                      "Double-spending transaction: "
+                        <> txHashToHex th
+                    throwError DoubleSpend
           | otherwise -> return $ Just td
     go txm pdg = do
       let ths = filter (not . (`M.member` txm)) (H.toList pdg)
