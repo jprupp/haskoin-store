@@ -175,6 +175,7 @@ import UnliftIO
     liftIO,
     link,
     modifyTVar,
+    modifyTVar',
     newTVarIO,
     readTVar,
     readTVarIO,
@@ -641,8 +642,9 @@ pruneOrphans :: (MonadIO m) => BlockT m ()
 pruneOrphans = guardMempool $ do
   ts <- asks (.txs)
   now <- liftIO getCurrentTime
-  atomically . modifyTVar ts . HashMap.filter $ \p ->
-    now `diffUTCTime` p.time > 3600
+  -- keep pending transactions received within the last hour, drop older ones
+  atomically . modifyTVar' ts . HashMap.filter $ \p ->
+    now `diffUTCTime` p.time <= 3600
 
 addPendingTx :: (MonadIO m) => PendingTx -> BlockT m ()
 addPendingTx p = do
