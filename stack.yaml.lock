@@ -58,6 +58,17 @@ packages:
   original:
     url: https://github.com/jprupp/nqe/archive/d592ebfccaf33dcd62ab72584f334a5fa30e6526.tar.gz
 - completed:
+    name: monad-logger
+    pantry-tree:
+      sha256: 622dfb2cad9dd8ce914d135652c99a2ff62447ae7adf84d14d7e24e99da28fa2
+      size: 944
+    sha256: e391c94f9510987b59f6e3ac77b4311bc0575b25922a6b4a8bd58dee2bd2bb24
+    size: 15735
+    url: https://github.com/tzwierzbicki/monad-logger/archive/9c042483a4537b4134dd1072455c975029b5d8cc.tar.gz
+    version: 0.3.42
+  original:
+    url: https://github.com/tzwierzbicki/monad-logger/archive/9c042483a4537b4134dd1072455c975029b5d8cc.tar.gz
+- completed:
     name: haskoin-node
     pantry-tree:
       sha256: fab0d82ede81085e2a37884c57274fa1e1e0026d042f08041b89d2b97bc08a13
