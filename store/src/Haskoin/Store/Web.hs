@@ -1217,10 +1217,14 @@ webSocketEvents s =
       if path == "/events"
         then do
           conn <- acceptRequest pending
-          loopForever $
-            receiveEvent sub >>= \case
-              Nothing -> return ()
-              Just event -> sendTextData conn (A.encode event)
+          -- The ping thread detects dead clients; without it a half-open
+          -- connection keeps its (unbounded) event inbox growing until the
+          -- TCP stack gives up.
+          WebSockets.withPingThread conn 30 (return ()) $
+            loopForever $
+              receiveEvent sub >>= \case
+                Nothing -> return ()
+                Just event -> sendTextData conn (A.encode event)
         else
           rejectRequestWith
             pending
