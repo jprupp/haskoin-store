@@ -47,26 +47,27 @@ packages:
   original:
     hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
 - completed:
-    hackage: haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
+    name: nqe
     pantry-tree:
-      sha256: b1d3dd912c1d35c1e8f020cde772b5ea54ff145c732c94c3f87e21b6cd732a29
-      size: 635
+      sha256: 82e3b1bf1255573afdc237430a7ab1f06146c76aac8bf645899e59241c10dc6c
+      size: 871
+    sha256: 39e466ecb646d3ece7c563645a4dc4304b8562e6c5845b7d7c2e40b0daa00b01
+    size: 9916
+    url: https://github.com/jprupp/nqe/archive/d592ebfccaf33dcd62ab72584f334a5fa30e6526.tar.gz
+    version: 0.6.6
   original:
-    hackage: haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
+    url: https://github.com/jprupp/nqe/archive/d592ebfccaf33dcd62ab72584f334a5fa30e6526.tar.gz
 - completed:
-    hackage: nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
+    name: haskoin-node
     pantry-tree:
-      sha256: e412a03f46beb9b93fa5fc7cc6dbbf6677fb048719097c04d434cd612c8c624a
-      size: 665
+      sha256: fab0d82ede81085e2a37884c57274fa1e1e0026d042f08041b89d2b97bc08a13
+      size: 1007
+    sha256: ac66e7b4ef55f0ac676d8696d775b87076dafd46fb1b67cb544985407ee6977f
+    size: 24365
+    url: https://github.com/jprupp/haskoin-node/archive/a9588cd6c411553b6039bcc4e67b1323a872841e.tar.gz
+    version: 1.4.4
   original:
-    hackage: nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
-- completed:
-    hackage: monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679
-    pantry-tree:
-      sha256: 7a5d065ced62c4c8d6f4e1caaa885fd7d35125f2422e161ecbe1bc8249e371fb
-      size: 396
-  original:
-    hackage: monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679
+    url: https://github.com/jprupp/haskoin-node/archive/a9588cd6c411553b6039bcc4e67b1323a872841e.tar.gz
 snapshots:
 - completed:
     sha256: 6a751c3fdab86bdc1605c9983f0bceebb072f7ffecef2eaa3be3f8ff19807a47

@@ -27,7 +27,10 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
   - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
   - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
-  - haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
   # Same versions as the snapshot; listed so the ghc-options above apply.
-  - nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
-  - monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679
+  - github: jprupp/nqe
+    commit: 'd592ebfccaf33dcd62ab72584f334a5fa30e6526'
+  - github: tzwierzbicki/monad-logger
+    commit: '28d34aeff2b639a6ab6cbf0e1e86ed668d3a7031'
+  - github: jprupp/haskoin-node
+    commit: 'a9588cd6c411553b6039bcc4e67b1323a872841e'
