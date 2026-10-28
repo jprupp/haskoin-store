@@ -160,7 +160,10 @@ data StoreConfig = StoreConfig
     -- | sync mempool against cache every this many seconds
     redisSyncInterval :: !Int,
     -- | database Bloom filters
-    bloom :: !Bool
+    bloom :: !Bool,
+    -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
+    -- and filter blocks stay resident for the life of the process)
+    maxOpenFiles :: !(Maybe Int)
   }
 
 withStore ::
@@ -206,6 +209,7 @@ connectDB cfg f = do
     cfg.gap
     cfg.db
     cfg.bloom
+    cfg.maxOpenFiles
     stats
     f
 
