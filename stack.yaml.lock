@@ -53,6 +53,20 @@ packages:
       size: 635
   original:
     hackage: haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
+- completed:
+    hackage: nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
+    pantry-tree:
+      sha256: e412a03f46beb9b93fa5fc7cc6dbbf6677fb048719097c04d434cd612c8c624a
+      size: 665
+  original:
+    hackage: nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
+- completed:
+    hackage: monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679
+    pantry-tree:
+      sha256: 7a5d065ced62c4c8d6f4e1caaa885fd7d35125f2422e161ecbe1bc8249e371fb
+      size: 396
+  original:
+    hackage: monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679
 snapshots:
 - completed:
     sha256: 6a751c3fdab86bdc1605c9983f0bceebb072f7ffecef2eaa3be3f8ff19807a47

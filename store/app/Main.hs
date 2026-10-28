@@ -13,7 +13,7 @@
 
 module Main (main) where
 
-import Control.Monad (forever, void, when)
+import Control.Monad (when)
 import Control.Monad.Cont (ContT (ContT), runContT)
 import Control.Monad.Logger
   ( LogLevel (..),
@@ -35,6 +35,7 @@ import Haskoin
     withContext,
   )
 import Haskoin.Node (withConnection)
+import Haskoin.Store.Common (loopForever)
 import Haskoin.Store
   ( Store (..),
     StoreConfig (..),
@@ -132,7 +133,8 @@ data Config = Config
     noXPub :: !Bool,
     healthCheckInterval :: !Int,
     bloom :: !Bool,
-    noWeb :: !Bool
+    noWeb :: !Bool,
+    maxOpenFiles :: !Int
   }
 
 env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
@@ -216,6 +218,8 @@ defConfig = do
     env "BLOOM" False parseBool
   noWeb <-
     env "NO_WEB" False parseBool
+  maxOpenFiles <-
+    env "MAX_OPEN_FILES" 2000 readMaybe
   return Config {version = False, ..}
   where
     tickerString =
@@ -540,6 +544,13 @@ config c = do
     flag c.bloom True $
       long "bloom"
         <> help "RocksDB Bloom filters"
+  maxOpenFiles <-
+    option auto $
+      metavar "COUNT"
+        <> long "max-open-files"
+        <> help "RocksDB max_open_files; bounds index/filter memory (0 = unlimited)"
+        <> showDefault
+        <> value c.maxOpenFiles
   pure Config {..}
 
 networkReader :: String -> Either String Network
@@ -578,7 +589,7 @@ run cfg =
       store <- ContT $ run_store net ctx stats dir
       if cfg.noWeb
         then lift . withSubscription store.pub $ \sub ->
-          forever $ void (receive sub)
+          loopForever (receive sub)
         else do
           lift $ run_web stats store
   where
@@ -605,7 +616,8 @@ run cfg =
             connect = withConnection,
             stats = stats,
             redisSyncInterval = cfg.redisSyncInterval,
-            bloom = cfg.bloom
+            bloom = cfg.bloom,
+            maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing
           }
     run_web stats store =
       runWeb

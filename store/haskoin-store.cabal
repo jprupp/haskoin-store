@@ -79,7 +79,7 @@ library
     , wai >=3.2.2.1
     , wai-websockets >=3.0.1.2
     , warp >=3.3.10
-    , websockets >=0.12.4
+    , websockets >=0.13
     , wreq >=0.5.3.2
   default-language: Haskell2010
 
@@ -134,7 +134,7 @@ executable haskoin-store
     , wai >=3.2.2.1
     , wai-websockets >=3.0.1.2
     , warp >=3.3.10
-    , websockets >=0.12.4
+    , websockets >=0.13
     , wreq >=0.5.3.2
   default-language: Haskell2010
 
@@ -193,7 +193,7 @@ test-suite spec
     , wai >=3.2.2.1
     , wai-websockets >=3.0.1.2
     , warp >=3.3.10
-    , websockets >=0.12.4
+    , websockets >=0.13
     , wreq >=0.5.3.2
   default-language: Haskell2010
   build-tool-depends: hspec-discover:hspec-discover

@@ -109,7 +109,8 @@ withTestStore net ctx t f =
                 connect = dummyPeerConnect net ad,
                 stats = Nothing,
                 redisSyncInterval = 30,
-                bloom = True
+                bloom = True,
+                maxOpenFiles = Nothing
               }
       withStore cfg $ \store ->
         withSubscription store.pub $ \sub ->

@@ -1,6 +1,14 @@
 resolver: nightly-2026-08-31
 ghc-options:
   "$everything": -O2
+  # The message loops are polymorphic in their monad and run at LoggingT IO.
+  # Unless GHC specialises them, forever goes through LoggingT's default (*>)
+  # and retains a stack frame and two thunks per message.
+  haskoin-store: -fspecialise-aggressively -fexpose-all-unfoldings
+  haskoin-store-data: -fspecialise-aggressively -fexpose-all-unfoldings
+  haskoin-node: -fspecialise-aggressively -fexpose-all-unfoldings
+  nqe: -fspecialise-aggressively -fexpose-all-unfoldings
+  monad-logger: -fspecialise-aggressively -fexpose-all-unfoldings
 nix:
   packages:
   - perl
@@ -20,3 +28,6 @@ extra-deps:
   - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
   - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
   - haskoin-node-1.4.4@sha256:fec21546631d8845f0009cf7e92f6f9001743f54683df6f15b7d23751c1bd819,2213
+  # Same versions as the snapshot; listed so the ghc-options above apply.
+  - nqe-0.6.6@sha256:12b0c35d6e7194476da86ca5b2a74c2495f794cc59d334522fda22d29c49fef0,1619
+  - monad-logger-0.3.42@sha256:a0439d36e81b16773323db52df45be1d3058d7e14455db82cc2bd0609e1f16f4,1679

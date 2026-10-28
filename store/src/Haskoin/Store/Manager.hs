@@ -11,7 +11,7 @@ module Haskoin.Store.Manager
   )
 where
 
-import Control.Monad (forever, unless)
+import Control.Monad (unless)
 import Control.Monad.Cont
   ( ContT (..),
     runContT,
@@ -74,6 +74,7 @@ import Haskoin.Store.Cache
   )
 import Haskoin.Store.Common
   ( StoreEvent (..),
+    loopForever,
   )
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
@@ -159,7 +160,10 @@ data StoreConfig = StoreConfig
     -- | sync mempool against cache every this many seconds
     redisSyncInterval :: !Int,
     -- | database Bloom filters
-    bloom :: !Bool
+    bloom :: !Bool,
+    -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
+    -- and filter blocks stay resident for the life of the process)
+    maxOpenFiles :: !(Maybe Int)
   }
 
 withStore ::
@@ -205,6 +209,7 @@ connectDB cfg f = do
     cfg.gap
     cfg.db
     cfg.bloom
+    cfg.maxOpenFiles
     stats
     f
 
@@ -300,11 +305,11 @@ cacheWriterProcesses interval evts cwm action =
 cacheWriterEvents :: (MonadUnliftIO m) => Int -> Inbox StoreEvent -> CacheWriter -> m ()
 cacheWriterEvents interval evts cwm =
   withAsync mempool . const $
-    forever $
+    loopForever $
       receive evts >>= \e ->
         e `cacheWriterDispatch` cwm
   where
-    mempool = forever $ do
+    mempool = loopForever $ do
       threadDelay (interval * 1000 * 1000)
       cacheSyncMempool cwm
 
@@ -321,7 +326,7 @@ nodeForwarder ::
   Inbox NodeEvent ->
   m ()
 nodeForwarder b pub sub =
-  forever $ receive sub >>= atomically . storeDispatch b pub
+  loopForever $ receive sub >>= atomically . storeDispatch b pub
 
 -- | Dispatcher of node events.
 storeDispatch ::

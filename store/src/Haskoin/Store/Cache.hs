@@ -37,7 +37,7 @@ module Haskoin.Store.Cache
 where
 
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, forM_, forever, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.Logger
   ( MonadLoggerIO,
     logDebugS,
@@ -123,8 +123,11 @@ import NQE
   ( Inbox,
     Listen,
     Mailbox,
+    mailboxEmptySTM,
     query,
     receive,
+    receiveSTM,
+    requeueSTM,
     send,
   )
 import System.Metrics.StatsD
@@ -638,6 +641,8 @@ getAllFromMap n = do
 data CacheWriterMessage
   = CacheNewBlock
   | CacheNewTx !TxHash
+  | -- | internal: a batch of coalesced 'CacheNewTx' events
+    CacheNewTxs ![TxHash]
   | CacheSyncMempool !(Listen ())
 
 type CacheWriterInbox = Inbox CacheWriterMessage
@@ -678,10 +683,29 @@ cacheWriter cfg inbox =
     go = do
       newBlockC
       syncMempoolC
-      forever $ do
+      loopForever $ do
         $(logDebugS) "Cache" "Awaiting event..."
         x <- receive inbox
-        cacheWriterReact x
+        case x of
+          CacheNewTx txid -> do
+            -- Coalesce: every queued CacheNewTx is synced in one pass instead
+            -- of one Redis round-trip sequence per transaction, so the inbox
+            -- cannot grow without bound when Redis is slower than the mempool.
+            more <- liftIO (atomically (drainNewTxs []))
+            cacheWriterReact (CacheNewTxs (txid : more))
+          _ -> cacheWriterReact x
+    drainNewTxs acc
+      | length acc >= 1000 = return (reverse acc)
+      | otherwise = do
+          empty <- mailboxEmptySTM inbox
+          if empty
+            then return (reverse acc)
+            else
+              receiveSTM inbox >>= \case
+                CacheNewTx t -> drainNewTxs (t : acc)
+                other -> do
+                  requeueSTM other inbox
+                  return (reverse acc)
 
 lockIt :: (MonadLoggerIO m) => ByteString -> CacheX m Bool
 lockIt l = do
@@ -753,7 +777,7 @@ withLock l f =
     False -> return Nothing
   where
     go = withAsync refresh $ const f
-    refresh = forever $ do
+    refresh = loopForever $ do
       threadDelay (150 * 1000 * 1000)
       refreshLock l
 
@@ -801,11 +825,13 @@ cacheWriterReact CacheNewBlock = do
   pruneDB
   newBlockC
   syncMempoolC
-cacheWriterReact (CacheNewTx txid) = do
+cacheWriterReact (CacheNewTx txid) =
+  cacheWriterReact (CacheNewTxs [txid])
+cacheWriterReact (CacheNewTxs txids) = do
   $(logDebugS) "Cache" $
-    "Received new transaction event: " <> txHashToHex txid
+    "Received " <> cs (show (length txids)) <> " new transaction event(s)"
   pruneDB
-  syncNewTxC [txid]
+  syncNewTxC txids
 cacheWriterReact (CacheSyncMempool l) = do
   $(logDebugS) "Cache" "Received sync mempool event"
   pruneDB

@@ -44,7 +44,6 @@ import Control.Applicative ((<|>))
 import Control.Lens ((.~), (^.))
 import Control.Monad
   ( forM_,
-    forever,
     unless,
     void,
     when,
@@ -186,6 +185,11 @@ import Network.WebSockets
     sendTextData,
   )
 import Network.WebSockets qualified as WebSockets
+import Network.WebSockets.Connection.PingPong
+  ( PingPongOptions (..),
+    defaultPingPongOptions,
+    withPingPong,
+  )
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Session as Wreq (Session)
 import Network.Wreq.Session qualified as Wreq.Session
@@ -202,6 +206,7 @@ import UnliftIO
     handleAny,
     liftIO,
     newTVarIO,
+    race_,
     readTVarIO,
     withAsync,
     writeTVar,
@@ -521,7 +526,7 @@ runWeb config = do
           config.tickerURL
           config.tickerRefresh
     runHealthCheck = runReaderT (healthCheck config) config.store.db
-    healthCheckLoop v = forever $ do
+    healthCheckLoop v = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
     opts = S.defaultOptions {S.settings = settings defaultSettings}
@@ -560,7 +565,7 @@ price ::
   Int ->
   TVar (HashMap Text BinfoTicker) ->
   m ()
-price net session url pget v = forM_ purl $ \u -> forever $ do
+price net session url pget v = forM_ purl $ \u -> loopForever $ do
   let err e = $(logErrorS) "Price" $ cs (show e)
   handleAny err $ do
     r <- liftIO $ Wreq.asJSON =<< Wreq.Session.get session u
@@ -1209,6 +1214,7 @@ webSocketEvents s =
   websocketsOr defaultConnectionOptions (wrap . events)
   where
     pub = s.config.store.pub
+    pingPong = defaultPingPongOptions {pingInterval = 30, pongTimeout = 60}
     gauge = (.events) <$> s.metrics
     wrap f = case gauge of
       Nothing -> f
@@ -1218,10 +1224,17 @@ webSocketEvents s =
       if path == "/events"
         then do
           conn <- acceptRequest pending
-          forever $
-            receiveEvent sub >>= \case
-              Nothing -> return ()
-              Just event -> sendTextData conn (A.encode event)
+          -- Drop clients that stop answering pings: a dead or stalled
+          -- client would otherwise keep its (unbounded) event inbox growing.
+          -- websockets only sees pongs while reading, hence the reader.
+          withPingPong pingPong conn $ \c ->
+            race_
+              (loopForever (WebSockets.receiveDataMessage c))
+              ( loopForever $
+                  receiveEvent sub >>= \case
+                    Nothing -> return ()
+                    Just event -> sendTextData c (A.encode event)
+              )
         else
           rejectRequestWith
             pending
@@ -1244,7 +1257,7 @@ scottyEvents =
     pub <- askl (.config.store.pub)
     S.stream $ \io flush' ->
       withSubscription pub $ \sub ->
-        forever $ do
+        loopForever $ do
           flush'
           receiveEvent sub >>= \case
             Nothing -> return ()
