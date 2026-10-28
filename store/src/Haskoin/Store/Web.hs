@@ -185,6 +185,11 @@ import Network.WebSockets
     sendTextData,
   )
 import Network.WebSockets qualified as WebSockets
+import Network.WebSockets.Connection.PingPong
+  ( PingPongOptions (..),
+    defaultPingPongOptions,
+    withPingPong,
+  )
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Session as Wreq (Session)
 import Network.Wreq.Session qualified as Wreq.Session
@@ -201,6 +206,7 @@ import UnliftIO
     handleAny,
     liftIO,
     newTVarIO,
+    race_,
     readTVarIO,
     withAsync,
     writeTVar,
@@ -1208,6 +1214,7 @@ webSocketEvents s =
   websocketsOr defaultConnectionOptions (wrap . events)
   where
     pub = s.config.store.pub
+    pingPong = defaultPingPongOptions {pingInterval = 30, pongTimeout = 60}
     gauge = (.events) <$> s.metrics
     wrap f = case gauge of
       Nothing -> f
@@ -1217,14 +1224,17 @@ webSocketEvents s =
       if path == "/events"
         then do
           conn <- acceptRequest pending
-          -- The ping thread detects dead clients; without it a half-open
-          -- connection keeps its (unbounded) event inbox growing until the
-          -- TCP stack gives up.
-          WebSockets.withPingThread conn 30 (return ()) $
-            loopForever $
-              receiveEvent sub >>= \case
-                Nothing -> return ()
-                Just event -> sendTextData conn (A.encode event)
+          -- Drop clients that stop answering pings: a dead or stalled
+          -- client would otherwise keep its (unbounded) event inbox growing.
+          -- websockets only sees pongs while reading, hence the reader.
+          withPingPong pingPong conn $ \c ->
+            race_
+              (loopForever (WebSockets.receiveDataMessage c))
+              ( loopForever $
+                  receiveEvent sub >>= \case
+                    Nothing -> return ()
+                    Just event -> sendTextData c (A.encode event)
+              )
         else
           rejectRequestWith
             pending
