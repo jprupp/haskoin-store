@@ -92,3 +92,4 @@ tests:
       - hspec >= 2.7.1
       - QuickCheck >= 2.13.2
       - base64 >= 0.4.1
+      - fast-logger >= 3.0
