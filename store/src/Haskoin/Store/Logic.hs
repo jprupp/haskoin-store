@@ -426,10 +426,25 @@ confTx t mbr = do
   let td = (t :: TxData) {block = new, rbf = rbf}
   insertTx td
   updateMempool td
+  updateSpendersRBF td
   return td
   where
     new = fromMaybe (MemRef t.timestamp) mbr
     old = t.block
+
+-- | Spenders inherit BIP125 signalling from unconfirmed parents only, so their
+-- flag can change when a parent is confirmed or unconfirmed.
+updateSpendersRBF :: TxData -> ImportM ()
+updateSpendersRBF td =
+  forM_ (nub' (map (.txid) (I.elems td.spenders))) $ \h ->
+    getActiveTxData h >>= mapM_ update
+  where
+    update s = do
+      rbf <- isRBF s.block s.tx
+      when (rbf /= s.rbf) $ do
+        let s' = (s :: TxData) {rbf = rbf}
+        insertTx s'
+        updateSpendersRBF s'
 
 freeOutputs ::
   -- | only delete transaction if unconfirmed

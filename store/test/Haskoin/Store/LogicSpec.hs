@@ -234,6 +234,16 @@ spec = prepareContext $ \ctx -> do
         rbfFlag db tx `shouldReturn` Just True
         txData db (coinbaseTx 2) `shouldReturn` Nothing
 
+    it "flags mempool descendants of the signalling transactions it returns" $
+      withCoin btcRegTest ctx $ \db coin -> do
+        let parent = spendRBF [coin] [1000]
+            child = spend [out parent 0] [900]
+        block <- mine db [parent]
+        addTx db child `shouldReturn` Right True
+        rbfFlag db child `shouldReturn` Just False
+        importing db (revertBlock (headerHash block.header)) `shouldReturn` Right ()
+        rbfFlag db child `shouldReturn` Just True
+
     it "only reverts the best block" $
       withDB btcRegTest ctx $ \db -> do
         importing db (revertBlock genesis) `shouldReturn` Left BestBlockNotFound
