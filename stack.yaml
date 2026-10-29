@@ -8,7 +8,6 @@ ghc-options:
   haskoin-store-data: -fspecialise-aggressively -fexpose-all-unfoldings
   haskoin-node: -fspecialise-aggressively -fexpose-all-unfoldings
   nqe: -fspecialise-aggressively -fexpose-all-unfoldings
-  monad-logger: -fspecialise-aggressively -fexpose-all-unfoldings
 nix:
   packages:
   - perl
@@ -29,7 +28,5 @@ extra-deps:
   - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
   - github: jprupp/nqe
     commit: 'd592ebfccaf33dcd62ab72584f334a5fa30e6526'
-  - github: tzwierzbicki/monad-logger
-    commit: '9c042483a4537b4134dd1072455c975029b5d8cc'
   - github: jprupp/haskoin-node
-    commit: 'a9588cd6c411553b6039bcc4e67b1323a872841e'
+    commit: '03056bf1c96fed55656b9c390ff139dd2fb632ba'

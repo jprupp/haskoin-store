@@ -11,7 +11,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
@@ -38,12 +37,6 @@ where
 
 import Control.DeepSeq (NFData)
 import Control.Monad (forM, forM_, unless, void, when)
-import Control.Monad.Logger
-  ( MonadLoggerIO,
-    logDebugS,
-    logErrorS,
-    logInfoS,
-  )
 import Control.Monad.Reader (ReaderT (..), asks)
 import Control.Monad.Trans (lift)
 import Data.Bits (shift, (.&.), (.|.))
@@ -111,10 +104,13 @@ import Haskoin
   )
 import Haskoin.Node
   ( Chain,
+    LogLevel (..),
+    Logger,
     chainGetBest,
     chainGetBlock,
     chainGetParents,
     chainGetSplitBlock,
+    logAt,
   )
 import Haskoin.Store.Common
 import Haskoin.Store.Data
@@ -143,17 +139,19 @@ import UnliftIO
   )
 import UnliftIO.Concurrent (threadDelay)
 
-runRedis :: (MonadLoggerIO m) => Redis (Either Reply a) -> CacheX m a
+runRedis :: (MonadIO m) => Redis (Either Reply a) -> CacheX m a
 runRedis action = do
   conn <- asks (.redis)
-  withRedis conn action
+  logger <- asks (.logger)
+  withRedis logger conn action
 
-withRedis :: (MonadLoggerIO m) => Connection -> Redis (Either Reply a) -> m a
-withRedis conn action =
+withRedis ::
+  (MonadIO m) => Logger -> Connection -> Redis (Either Reply a) -> m a
+withRedis logger conn action =
   liftIO (Redis.runRedis conn action) >>= \case
     Right x -> return x
     Left e -> do
-      $(logErrorS) "Cache" $ "Got error from Redis: " <> cs (show e)
+      logAt LevelError logger $ "Got error from Redis: " <> cs (show e)
       throwIO (RedisError e)
 
 data CacheConfig = CacheConfig
@@ -161,7 +159,8 @@ data CacheConfig = CacheConfig
     minAddrs :: !Int,
     maxKeys :: !Integer,
     chain :: !Chain,
-    metrics :: !(Maybe CacheMetrics)
+    metrics :: !(Maybe CacheMetrics),
+    logger :: !Logger
   }
 
 data CacheMetrics = CacheMetrics
@@ -179,12 +178,13 @@ data CacheMetrics = CacheMetrics
   }
 
 newCacheMetrics ::
-  (MonadLoggerIO m) =>
+  (MonadIO m) =>
+  Logger ->
   Stats ->
   Connection ->
   DatabaseReader ->
   m CacheMetrics
-newCacheMetrics s r db = do
+newCacheMetrics logger s r db = do
   h <- redisBest
   hits <- c "cache.hits"
   misses <- c "cache.misses"
@@ -200,7 +200,7 @@ newCacheMetrics s r db = do
   return CacheMetrics {..}
   where
     redisBest =
-      maybe dbBest dbBlock =<< withRedis r redisGetHead
+      maybe dbBest dbBlock =<< withRedis logger r redisGetHead
     dbBlock h =
       maybe 0 (fromIntegral . (.height)) <$> withDB db (getBlock h)
     dbBest =
@@ -232,6 +232,14 @@ withMetrics go = asks (.metrics) >>= mapM_ go
 type CacheT = ReaderT (Maybe CacheConfig)
 
 type CacheX = ReaderT CacheConfig
+
+logDebug, logInfo, logError :: (MonadIO m) => Text -> CacheX m ()
+logDebug = cacheLog LevelDebug
+logInfo = cacheLog LevelInfo
+logError = cacheLog LevelError
+
+cacheLog :: (MonadIO m) => LogLevel -> Text -> CacheX m ()
+cacheLog l msg = asks (.logger) >>= \lg -> logAt l lg msg
 
 data CacheError
   = RedisError Reply
@@ -274,7 +282,7 @@ instance (StoreReadBase m) => StoreReadBase (CacheT m) where
   getMempool = lift getMempool
 
 instance
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   StoreReadExtra (CacheX m)
   where
   getBalances = lift . getBalances
@@ -291,7 +299,7 @@ instance
   xPubUnspents = getXPubUnspents
 
 instance
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   StoreReadExtra (CacheT m)
   where
   getBalances = lift . getBalances
@@ -338,7 +346,7 @@ xpubLock :: XPubSpec -> ByteString
 xpubLock xpub = "xlock-" <> encode xpub
 
 getXPubTxs ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   Limits ->
@@ -354,7 +362,7 @@ getXPubTxs xpub xbals limits = do
     else lift $ xPubTxs xpub xbals limits
 
 getXPubTxCount ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   CacheX m Word32
@@ -368,7 +376,7 @@ getXPubTxCount xpub xbals = do
     else lift $ xPubTxCount xpub xbals
 
 getXPubUnspents ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   Limits ->
@@ -402,7 +410,7 @@ getXPubUnspents xpub xbals limits = do
     else lift $ xPubUnspents xpub xbals limits
 
 getXPubBalances ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   CacheX m [XPubBal]
 getXPubBalances xpub = do
@@ -421,26 +429,26 @@ getXPubBalances xpub = do
         newXPubC xpub bals
         return bals
 
-isInCache :: (MonadLoggerIO m) => XPubSpec -> CacheT m Bool
+isInCache :: (MonadIO m) => XPubSpec -> CacheT m Bool
 isInCache xpub =
   ReaderT $ \case
     Nothing -> return False
     Just cfg -> runReaderT (isXPubCached xpub) cfg
 
-isXPubCached :: (MonadLoggerIO m) => XPubSpec -> CacheX m Bool
+isXPubCached :: (MonadIO m) => XPubSpec -> CacheX m Bool
 isXPubCached xpub = runRedis (redisIsXPubCached xpub)
 
 redisIsXPubCached :: (RedisCtx m f) => XPubSpec -> m (f Bool)
 redisIsXPubCached xpub = Redis.exists (balancesPfx <> encode xpub)
 
-cacheGetXPubBalances :: (MonadLoggerIO m) => XPubSpec -> CacheX m [XPubBal]
+cacheGetXPubBalances :: (MonadIO m) => XPubSpec -> CacheX m [XPubBal]
 cacheGetXPubBalances xpub = do
   bals <- runRedis $ redisGetXPubBalances xpub
   touchKeys [xpub]
   return bals
 
 cacheGetXPubTxCount ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   XPubSpec ->
   CacheX m Word32
 cacheGetXPubTxCount xpub = do
@@ -452,7 +460,7 @@ redisGetXPubTxCount :: (RedisCtx m f) => XPubSpec -> m (f Integer)
 redisGetXPubTxCount xpub = Redis.zcard (txSetPfx <> encode xpub)
 
 cacheGetXPubTxs ::
-  (StoreReadBase m, MonadLoggerIO m) =>
+  (StoreReadBase m, MonadIO m) =>
   XPubSpec ->
   Limits ->
   CacheX m [TxRef]
@@ -503,7 +511,7 @@ cacheGetXPubTxs xpub limits =
     f t s = TxRef {txid = t, block = scoreBlockRef s}
 
 cacheGetXPubUnspents ::
-  (StoreReadBase m, MonadLoggerIO m) =>
+  (StoreReadBase m, MonadIO m) =>
   XPubSpec ->
   Limits ->
   CacheX m [(BlockRef, OutPoint)]
@@ -673,7 +681,7 @@ xPubAddrFunction ctx DeriveP2SH = xPubCompatWitnessAddr ctx
 xPubAddrFunction ctx DeriveP2WPKH = xPubWitnessAddr ctx
 
 cacheWriter ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   CacheConfig ->
   CacheWriterInbox ->
   m ()
@@ -684,7 +692,7 @@ cacheWriter cfg inbox =
       newBlockC
       syncMempoolC
       loopForever $ do
-        $(logDebugS) "Cache" "Awaiting event..."
+        logDebug "Awaiting event..."
         x <- receive inbox
         case x of
           CacheNewTx txid -> do
@@ -707,32 +715,28 @@ cacheWriter cfg inbox =
                   requeueSTM other inbox
                   return (reverse acc)
 
-lockIt :: (MonadLoggerIO m) => ByteString -> CacheX m Bool
+lockIt :: (MonadIO m) => ByteString -> CacheX m Bool
 lockIt l = do
   go >>= \case
     Right Redis.Ok -> do
-      $(logDebugS) "Cache" "Acquired lock"
+      logDebug "Acquired lock"
       withMetrics $ \s -> incrementCounter s.lockAcquired 1
       return True
     Right Redis.Pong -> do
-      $(logErrorS)
-        "Cache"
-        "Unexpected pong when acquiring lock"
+      logError "Unexpected pong when acquiring lock"
       withMetrics $ \s -> incrementCounter s.lockFailed 1
       return False
     Right (Redis.Status s) -> do
-      $(logErrorS) "Cache" $
+      logError $
         "Unexpected status acquiring lock: " <> cs s
       withMetrics $ \m -> incrementCounter m.lockFailed 1
       return False
     Left (Redis.Bulk Nothing) -> do
-      $(logDebugS) "Cache" "Lock already taken"
+      logDebug "Lock already taken"
       withMetrics $ \s -> incrementCounter s.lockFailed 1
       return False
     Left e -> do
-      $(logErrorS)
-        "Cache"
-        "Error when trying to acquire lock"
+      logError "Error when trying to acquire lock"
       withMetrics $ \s -> incrementCounter s.lockFailed 1
       throwIO (RedisError e)
   where
@@ -750,7 +754,7 @@ lockIt l = do
                 }
         Redis.setOpts l "locked" opts
 
-refreshLock :: (MonadLoggerIO m) => ByteString -> CacheX m ()
+refreshLock :: (MonadIO m) => ByteString -> CacheX m ()
 refreshLock l = void . runRedis $ do
   let opts =
         Redis.SetOpts
@@ -763,11 +767,11 @@ refreshLock l = void . runRedis $ do
           }
   Redis.setOpts l "locked" opts
 
-unlockIt :: (MonadLoggerIO m) => ByteString -> CacheX m ()
+unlockIt :: (MonadIO m) => ByteString -> CacheX m ()
 unlockIt l = void . runRedis . Redis.del $ NonEmpty.singleton l
 
 withLock ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
+  (MonadUnliftIO m) =>
   ByteString ->
   CacheX m a ->
   CacheX m (Maybe a)
@@ -782,7 +786,7 @@ withLock l f =
       refreshLock l
 
 withRetryLock ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
+  (MonadUnliftIO m) =>
   ByteString ->
   CacheX m a ->
   CacheX m a
@@ -797,16 +801,16 @@ withRetryLock l f =
           go (n * 2)
 
 pruneDB ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadBase m) => CacheX m ()
+  (MonadUnliftIO m, StoreReadBase m) => CacheX m ()
 pruneDB = void . withLock "lock" $ do
   x <- asks (.maxKeys)
   s <- runRedis Redis.dbsize
-  $(logDebugS) "Cache" "Pruning old xpubs"
+  logDebug "Pruning old xpubs"
   when (s > x) $
     void . delXPubKeys . map fst
       =<< runRedis (getFromSortedSet maxKey Nothing 0 (fromIntegral (s - x)))
 
-touchKeys :: (MonadLoggerIO m) => [XPubSpec] -> CacheX m ()
+touchKeys :: (MonadIO m) => [XPubSpec] -> CacheX m ()
 touchKeys xpubs = do
   now <- round <$> liftIO getPOSIXTime :: (MonadIO m) => m Int
   runRedis $ redisTouchKeys now xpubs
@@ -817,23 +821,23 @@ redisTouchKeys now xpubs =
   void <$> Redis.zadd maxKey (map ((realToFrac now,) . encode) xpubs)
 
 cacheWriterReact ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   CacheWriterMessage ->
   CacheX m ()
 cacheWriterReact CacheNewBlock = do
-  $(logDebugS) "Cache" "Received new block event"
+  logDebug "Received new block event"
   pruneDB
   newBlockC
   syncMempoolC
 cacheWriterReact (CacheNewTx txid) =
   cacheWriterReact (CacheNewTxs [txid])
 cacheWriterReact (CacheNewTxs txids) = do
-  $(logDebugS) "Cache" $
+  logDebug $
     "Received " <> cs (show (length txids)) <> " new transaction event(s)"
   pruneDB
   syncNewTxC txids
 cacheWriterReact (CacheSyncMempool l) = do
-  $(logDebugS) "Cache" "Received sync mempool event"
+  logDebug "Received sync mempool event"
   pruneDB
   newBlockC
   syncMempoolC
@@ -843,7 +847,7 @@ lenNotNull :: [XPubBal] -> Int
 lenNotNull = length . filter (not . nullBalance . (.balance))
 
 newXPubC ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   CacheX m ()
@@ -852,7 +856,7 @@ newXPubC xpub xbals =
     bracket set_index unset_index $ \j -> when j $
       withTiming (.indexTime) $ do
         xpubtxt <- xpubText xpub
-        $(logDebugS) "Cache" $
+        logDebug $
           "Caching "
             <> xpubtxt
             <> ": "
@@ -861,14 +865,14 @@ newXPubC xpub xbals =
             <> cs (show (lenNotNull xbals))
             <> " used"
         utxo <- lift $ xPubUnspents xpub xbals def
-        $(logDebugS) "Cache" $
+        logDebug $
           "Caching "
             <> xpubtxt
             <> ": "
             <> cs (show (length utxo))
             <> " utxos"
         xtxs <- lift $ xPubTxs xpub xbals def
-        $(logDebugS) "Cache" $
+        logDebug $
           "Caching "
             <> xpubtxt
             <> ": "
@@ -881,7 +885,7 @@ newXPubC xpub xbals =
           d <- redisAddXPubUnspents xpub (map op utxo)
           e <- redisAddXPubTxs xpub xtxs
           return $ b >> c >> d >> e >> return ()
-        $(logDebugS) "Cache" $ "Cached " <> xpubtxt
+        logDebug $ "Cached " <> xpubtxt
   where
     op XPubUnspent {unspent = u} = (u.outpoint, u.block)
     should_index =
@@ -918,21 +922,21 @@ inSync =
       return $ cb.height > 0 && headerHash cb.header == bb
 
 newBlockC ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   CacheX m ()
 newBlockC =
   inSync >>= \s -> when s . void . withLock "lock" $ do
     get_best_block_node >>= \case
-      Nothing -> $(logErrorS) "Cache" "No best block available"
+      Nothing -> logError "No best block available"
       Just best_block_node ->
         cacheGetHead >>= \case
           Nothing -> do
-            $(logInfoS) "Cache" "Initializing best cache block"
+            logInfo "Initializing best cache block"
             importBlockC $ headerHash best_block_node.header
           Just cache_head_hash ->
             get_block_node cache_head_hash >>= \case
               Nothing -> do
-                $(logErrorS) "Cache" $
+                logError $
                   "Could not get best cache block: "
                     <> blockHashToHex cache_head_hash
               Just cache_head_node -> do
@@ -961,7 +965,7 @@ newBlockC =
           return $ map (headerHash . (.header)) blocks
 
 importBlockC ::
-  (MonadUnliftIO m, StoreReadExtra m, MonadLoggerIO m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   BlockHash ->
   CacheX m ()
 importBlockC bh =
@@ -969,20 +973,20 @@ importBlockC bh =
     Just bd -> do
       let ths = bd.txs
       tds <- sortTxData . catMaybes <$> mapM (lift . getTxData) ths
-      $(logDebugS) "Cache" $
+      logDebug $
         "Importing "
           <> cs (show (length tds))
           <> " transactions from block "
           <> blockHashToHex bh
       importMultiTxC tds
-      $(logDebugS) "Cache" $
+      logDebug $
         "Done importing "
           <> cs (show (length tds))
           <> " transactions from block "
           <> blockHashToHex bh
       cacheSetHead bd
     Nothing -> do
-      $(logErrorS) "Cache" $
+      logError $
         "Could not get block: "
           <> blockHashToHex bh
       throwIO . LogicError . cs $
@@ -990,24 +994,24 @@ importBlockC bh =
           <> blockHashToHex bh
 
 importMultiTxC ::
-  (MonadUnliftIO m, StoreReadExtra m, MonadLoggerIO m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   [TxData] ->
   CacheX m ()
 importMultiTxC txs = do
   ctx <- lift getCtx
-  $(logDebugS) "Cache" $ "Processing " <> cs (show (length txs)) <> " txs"
-  $(logDebugS) "Cache" $
+  logDebug $ "Processing " <> cs (show (length txs)) <> " txs"
+  logDebug $
     "Getting address information for "
       <> cs (show (length (alladdrs ctx)))
       <> " addresses"
   addrmap <- getaddrmap ctx
   let addrs = HashMap.keys addrmap
-  $(logDebugS) "Cache" $
+  logDebug $
     "Getting balances for "
       <> cs (show (HashMap.size addrmap))
       <> " addresses"
   balmap <- getbalances addrs
-  $(logDebugS) "Cache" $
+  logDebug $
     "Getting unspent data for "
       <> cs (show (length (allops ctx)))
       <> " outputs"
@@ -1017,7 +1021,7 @@ importMultiTxC txs = do
   let xpubs = allxpubsls addrmap
   forM_ (zip [(1 :: Int) ..] xpubs) $ \(i, xpub) -> do
     xpubtxt <- xpubText xpub
-    $(logDebugS) "Cache" $
+    logDebug $
       "Affected xpub "
         <> cs (show i)
         <> "/"
@@ -1025,19 +1029,19 @@ importMultiTxC txs = do
         <> ": "
         <> xpubtxt
   addrs' <- do
-    $(logDebugS) "Cache" $
+    logDebug $
       "Getting xpub balances for "
         <> cs (show (length xpubs))
         <> " xpubs"
     xmap <- getxbals xpubs
     let addrmap' = faddrmap (HashMap.keysSet xmap) addrmap
-    $(logDebugS) "Cache" "Starting Redis import pipeline"
+    logDebug "Starting Redis import pipeline"
     runRedis $ do
       x <- redisImportMultiTx ctx addrmap' unspentmap txs
       y <- redisUpdateBalances addrmap' balmap
       z <- redisTouchKeys now (HashMap.keys xmap)
       return $ x >> y >> z >> return ()
-    $(logDebugS) "Cache" "Completed Redis pipeline"
+    logDebug "Completed Redis pipeline"
     return $ getNewAddrs ctx gap xmap (HashMap.elems addrmap')
   cacheAddAddresses addrs'
   where
@@ -1152,33 +1156,33 @@ redisUpdateBalances addrmap balmap =
       XPubBal {path = ainfo.path, balance = bal}
 
 cacheAddAddresses ::
-  (StoreReadExtra m, MonadUnliftIO m, MonadLoggerIO m) =>
+  (StoreReadExtra m, MonadUnliftIO m) =>
   [(Address, AddressXPub)] ->
   CacheX m ()
-cacheAddAddresses [] = $(logDebugS) "Cache" "No further addresses to add"
+cacheAddAddresses [] = logDebug "No further addresses to add"
 cacheAddAddresses addrs = do
   ctx <- lift getCtx
-  $(logDebugS) "Cache" $
+  logDebug $
     "Adding " <> cs (show (length addrs)) <> " new generated addresses"
-  $(logDebugS) "Cache" "Getting balances"
+  logDebug "Getting balances"
   balmap <- HashMap.fromListWith (<>) <$> mapM (uncurry getbal) addrs
-  $(logDebugS) "Cache" "Getting unspent outputs"
+  logDebug "Getting unspent outputs"
   utxomap <- HashMap.fromListWith (<>) <$> mapM (uncurry getutxo) addrs
-  $(logDebugS) "Cache" "Getting transactions"
+  logDebug "Getting transactions"
   txmap <- HashMap.fromListWith (<>) <$> mapM (uncurry gettxmap) addrs
-  $(logDebugS) "Cache" "Running Redis pipeline"
+  logDebug "Running Redis pipeline"
   runRedis $ do
     a <- forM (HashMap.toList balmap) (uncurry redisAddXPubBalances)
     b <- forM (HashMap.toList utxomap) (uncurry redisAddXPubUnspents)
     c <- forM (HashMap.toList txmap) (uncurry redisAddXPubTxs)
     return $ sequence_ a >> sequence_ b >> sequence_ c
-  $(logDebugS) "Cache" "Completed Redis pipeline"
+  logDebug "Completed Redis pipeline"
   let xpubs =
         HashSet.toList
           . HashSet.fromList
           . map (.spec)
           $ Map.elems amap
-  $(logDebugS) "Cache" "Getting xpub balances"
+  logDebug "Getting xpub balances"
   xmap <- getbals xpubs
   gap <- lift getMaxGap
   let notnulls = getnotnull balmap
@@ -1231,7 +1235,7 @@ getNewAddrs ctx gap xpubs =
       Just bals -> addrsToAdd ctx gap bals a
 
 syncNewTxC ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   [TxHash] ->
   CacheX m ()
 syncNewTxC ths =
@@ -1239,12 +1243,12 @@ syncNewTxC ths =
     txs <- catMaybes <$> mapM (lift . getTxData) ths
     unless (null txs) $ do
       forM_ txs $ \tx ->
-        $(logDebugS) "Cache" $
+        logDebug $
           "Synchronizing transaction: " <> txHashToHex (txHash tx.tx)
       importMultiTxC txs
 
 syncMempoolC ::
-  (MonadUnliftIO m, MonadLoggerIO m, StoreReadExtra m) =>
+  (MonadUnliftIO m, StoreReadExtra m) =>
   CacheX m ()
 syncMempoolC =
   inSync >>= \s -> when s . void . withLock "lock" $ do
@@ -1256,26 +1260,26 @@ syncMempoolC =
     let tids = HashSet.toList diffset
     txs <- catMaybes <$> mapM (lift . getTxData) tids
     unless (null txs) $ do
-      $(logDebugS) "Cache" $
+      logDebug $
         "Synchronizing " <> cs (show (length txs)) <> " mempool transactions"
       importMultiTxC txs
 
-cacheGetMempool :: (MonadLoggerIO m) => CacheX m [(UnixTime, TxHash)]
+cacheGetMempool :: (MonadIO m) => CacheX m [(UnixTime, TxHash)]
 cacheGetMempool = runRedis redisGetMempool
 
-cacheGetHead :: (MonadLoggerIO m) => CacheX m (Maybe BlockHash)
+cacheGetHead :: (MonadIO m) => CacheX m (Maybe BlockHash)
 cacheGetHead = runRedis redisGetHead
 
-cacheSetHead :: (MonadLoggerIO m, StoreReadBase m) => BlockData -> CacheX m ()
+cacheSetHead :: (MonadIO m) => BlockData -> CacheX m ()
 cacheSetHead bd = do
-  $(logDebugS) "Cache" $ "Cache head set to: " <> blockHashToHex bh
+  logDebug $ "Cache head set to: " <> blockHashToHex bh
   void $ runRedis (redisSetHead bh)
   withMetrics $ \s -> setGauge s.height (fromIntegral bd.height)
   where
     bh = headerHash bd.header
 
 cacheGetAddrsInfo ::
-  (MonadLoggerIO m) => [Address] -> CacheX m [Maybe AddressXPub]
+  (MonadIO m) => [Address] -> CacheX m [Maybe AddressXPub]
 cacheGetAddrsInfo as = runRedis (redisGetAddrsInfo as)
 
 redisAddToMempool :: (Applicative f, RedisCtx m f) => [TxRef] -> m (f Integer)
@@ -1298,7 +1302,7 @@ redisSetAddrInfo ::
 redisSetAddrInfo a i = void <$> Redis.set (addrPfx <> encode a) (encode i)
 
 cacheDelXPubs ::
-  (MonadLoggerIO m, StoreReadBase m) =>
+  (MonadIO m, StoreReadBase m) =>
   [XPubSpec] ->
   CacheT m Integer
 cacheDelXPubs xpubs = ReaderT $ \case
@@ -1306,14 +1310,14 @@ cacheDelXPubs xpubs = ReaderT $ \case
   Nothing -> return 0
 
 delXPubKeys ::
-  (MonadLoggerIO m, StoreReadBase m) =>
+  (MonadIO m, StoreReadBase m) =>
   [XPubSpec] ->
   CacheX m Integer
 delXPubKeys [] = return 0
 delXPubKeys xpubs = do
   forM_ xpubs $ \x -> do
     xtxt <- xpubText x
-    $(logDebugS) "Cache" $ "Deleting xpub: " <> xtxt
+    logDebug $ "Deleting xpub: " <> xtxt
   xbals <-
     runRedis . fmap sequence . forM xpubs $ \xpub -> do
       bs <- redisGetXPubBalances xpub

@@ -53,13 +53,12 @@ library
     , hashable >=1.3.0.0
     , hashtables >=1.2.4.2
     , haskoin-core >=1.3.0
-    , haskoin-node >=1.4.3
+    , haskoin-node >=2.0.0
     , haskoin-store-data ==1.6.3
     , hedis >=0.16.1
     , http-types >=0.12.3
     , lens >=4.18.1
     , monad-control >=1.0.2.3
-    , monad-logger >=0.3.32
     , mtl >=2.2.2
     , network >=3.1.1.1
     , nqe >=0.6.5
@@ -106,14 +105,13 @@ executable haskoin-store
     , hashable >=1.3.0.0
     , hashtables >=1.2.4.2
     , haskoin-core >=1.3.0
-    , haskoin-node >=1.4.3
+    , haskoin-node >=2.0.0
     , haskoin-store
     , haskoin-store-data ==1.6.3
     , hedis >=0.16.1
     , http-types >=0.12.3
     , lens >=4.18.1
     , monad-control >=1.0.2.3
-    , monad-logger >=0.3.32
     , mtl >=2.2.2
     , network >=3.1.1.1
     , nqe >=0.6.5
@@ -165,7 +163,7 @@ test-suite spec
     , hashable >=1.3.0.0
     , hashtables >=1.2.4.2
     , haskoin-core >=1.3.0
-    , haskoin-node >=1.4.3
+    , haskoin-node >=2.0.0
     , haskoin-store
     , haskoin-store-data ==1.6.3
     , hedis >=0.16.1
@@ -173,7 +171,6 @@ test-suite spec
     , http-types >=0.12.3
     , lens >=4.18.1
     , monad-control >=1.0.2.3
-    , monad-logger >=0.3.32
     , mtl >=2.2.2
     , network >=3.1.1.1
     , nqe >=0.6.5
