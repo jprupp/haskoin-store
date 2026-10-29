@@ -6,7 +6,6 @@
 module Haskoin.Store.LogicSpec (spec) where
 
 import Control.Monad (forM_, void)
-import Control.Monad.Except (catchError, runExceptT)
 import Control.Monad.Reader (ask, liftIO, runReaderT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -59,7 +58,7 @@ import Haskoin.Store.Logic
   )
 import System.Log.FastLogger (fromLogStr)
 import Test.Hspec
-import UnliftIO (evaluate, withSystemTempDirectory)
+import UnliftIO (catch, evaluate, try, withSystemTempDirectory)
 
 spec :: Spec
 spec = prepareContext $ \ctx -> do
@@ -145,7 +144,9 @@ spec = prepareContext $ \ctx -> do
         addTx db original `shouldReturn` Right True
         -- The block store imports mempool transactions in batches and skips
         -- the ones that are rejected.
-        let tryAdd tx = newMempoolTx tx 0 `catchError` \_ -> return False
+        let tryAdd tx = newMempoolTx tx 0 `catch` skip
+            skip :: ImportException -> ImportM Bool
+            skip _ = return False
             unfunded = spend [coin1] [5000000001]
             confirmedConflict = spend [coin1, coin2] [2000]
             spendsReplaced = spend [coin1, out original 0] [900]
@@ -164,6 +165,15 @@ spec = prepareContext $ \ctx -> do
       withCoin btcRegTest ctx $ \db coin -> do
         _ <- mine db [spend [coin] [1000]]
         addTx db (spend [coin] [2000]) `shouldReturn` Left TxConfirmed
+
+    it "commits nothing from a batch that fails" $
+      withCoin btcRegTest ctx $ \db coin -> do
+        let good = spend [coin] [1000]
+            orphan = spend [out (coinbaseTx 9) 0] [1]
+        importing db (newMempoolTx good 0 >> newMempoolTx orphan 0)
+          `shouldReturn` Left Orphan
+        mempool db `shouldReturn` []
+        reading db (getSpender coin) `shouldReturn` Nothing
 
   describe "importBlock" $ do
     it "confirms mempool transactions" $
@@ -310,7 +320,7 @@ withCoin net ctx go =
     go db (out (coinbaseTx 1) 0)
 
 importing :: DatabaseReader -> ImportM a -> IO (Either ImportException a)
-importing db = runExceptT . runWriter db.net db.ctx db quiet
+importing db = try . runWriter db.net db.ctx db quiet
   where
     -- Build every message, so that log lines are tested too, but print none.
     quiet =

@@ -44,11 +44,6 @@ import Control.Monad
     void,
     when,
   )
-import Control.Monad.Except
-  ( ExceptT (..),
-    catchError,
-    runExceptT,
-  )
 import Control.Monad.Reader
   ( MonadReader,
     ReaderT (..),
@@ -167,6 +162,7 @@ import UnliftIO
     TVar,
     async,
     atomically,
+    catch,
     liftIO,
     link,
     modifyTVar,
@@ -175,6 +171,7 @@ import UnliftIO
     readTVar,
     readTVarIO,
     throwIO,
+    try,
     withAsync,
     writeTVar,
   )
@@ -345,7 +342,7 @@ runImport ::
   BlockT m (Either ImportException a)
 runImport net ctx f =
   ReaderT $ \r ->
-    liftIO . runExceptT $ runWriter net ctx r.config.db r.config.logger f
+    liftIO . try $ runWriter net ctx r.config.db r.config.logger f
 
 runRocksDB :: ReaderT DatabaseReader m a -> BlockT m a
 runRocksDB f =
@@ -776,9 +773,10 @@ newOrphanTx block_read time tx = do
 
 importMempoolTx :: BlockStore -> UTCTime -> Tx -> ImportM Bool
 importMempoolTx block_read time tx =
-  catchError new_mempool_tx handle_error
+  catch new_mempool_tx handle_error
   where
     tx_hash = txHash tx
+    handle_error :: ImportException -> ImportM Bool
     handle_error Orphan = do
       newOrphanTx block_read time tx
       return False
