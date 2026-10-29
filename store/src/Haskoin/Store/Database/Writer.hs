@@ -8,7 +8,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
-module Haskoin.Store.Database.Writer (WriterT, runWriter) where
+module Haskoin.Store.Database.Writer (WriterT, runWriter, writerLogger) where
 
 import Control.Monad.Reader (ReaderT (..))
 import Control.Monad.Reader qualified as R
@@ -36,6 +36,7 @@ import Haskoin
     headerHash,
     txHash,
   )
+import Haskoin.Node (Logger)
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader
@@ -51,10 +52,15 @@ import UnliftIO
 
 data Writer = Writer
   { reader :: !DatabaseReader,
-    memory :: !Memory
+    memory :: !Memory,
+    logger :: !Logger
   }
 
 type WriterT = ReaderT Writer
+
+-- | Logger passed to 'runWriter'.
+writerLogger :: (Monad m) => WriterT m Logger
+writerLogger = R.asks (.logger)
 
 instance (MonadIO m) => StoreReadBase (WriterT m) where
   getNetwork = R.asks (.reader.net)
@@ -162,12 +168,13 @@ runWriter ::
   Network ->
   Ctx ->
   DatabaseReader ->
+  Logger ->
   WriterT m a ->
   m a
-runWriter net ctx bdb@DatabaseReader {db} f = do
+runWriter net ctx bdb@DatabaseReader {db} logger f = do
   mempool <- runReaderT getMempool bdb
   hm <- newMemory net ctx mempool
-  x <- R.runReaderT f Writer {reader = bdb, memory = hm}
+  x <- R.runReaderT f Writer {reader = bdb, memory = hm, logger}
   ops <- hashMapOps db hm
   liftIO $ writeBatch db ops
   return x

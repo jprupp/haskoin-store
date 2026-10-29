@@ -7,7 +7,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
@@ -15,12 +14,6 @@ module Main (main) where
 
 import Control.Monad (when)
 import Control.Monad.Cont (ContT (ContT), runContT)
-import Control.Monad.Logger
-  ( LogLevel (..),
-    filterLogger,
-    logInfoS,
-    runStderrLoggingT,
-  )
 import Control.Monad.Trans (lift)
 import Data.Char (toLower)
 import Data.Default (Default (..))
@@ -34,7 +27,13 @@ import Haskoin
     netByName,
     withContext,
   )
-import Haskoin.Node (withConnection)
+import Haskoin.Node
+  ( LogLevel (..),
+    logInfo,
+    withConnection,
+    withLogger,
+    withSource,
+  )
 import Haskoin.Store.Common (loopForever)
 import Haskoin.Store
   ( Store (..),
@@ -579,21 +578,21 @@ main = do
 run :: Config -> IO ()
 run cfg =
   withContext $ \ctx ->
-    runStderrLoggingT $ filterLogger l $ flip runContT return $ do
+    withLogger level $ \logger -> flip runContT return $ do
       net <- either error return $ networkReader cfg.net
-      stats <- ContT $ with_stats net
+      stats <- ContT $ with_stats logger net
       let dir = cfg.dir </> net.name
-      $(logInfoS) "haskoin-store" $
+      logInfo (withSource "haskoin-store" logger) $
         "Creating working directory (if not found): " <> cs dir
       createDirectoryIfMissing True dir
-      store <- ContT $ run_store net ctx stats dir
+      store <- ContT $ run_store logger net ctx stats dir
       if cfg.noWeb
         then lift . withSubscription store.pub $ \sub ->
           loopForever (receive sub)
         else do
-          lift $ run_web stats store
+          lift $ run_web logger stats store
   where
-    run_store net ctx stats dir =
+    run_store logger net ctx stats dir =
       withStore
         StoreConfig
           { maxPeers = cfg.maxPeers,
@@ -617,9 +616,10 @@ run cfg =
             stats = stats,
             redisSyncInterval = cfg.redisSyncInterval,
             bloom = cfg.bloom,
-            maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing
+            maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing,
+            logger = logger
           }
-    run_web stats store =
+    run_web logger stats store =
       runWeb
         WebConfig
           { host = cfg.host,
@@ -637,11 +637,12 @@ run cfg =
             priceHistoryURL = cfg.priceHistoryURL,
             noXPub = cfg.noXPub,
             noBlockchainInfo = cfg.noBlockchainInfo,
-            healthCheckInterval = cfg.healthCheckInterval
+            healthCheckInterval = cfg.healthCheckInterval,
+            logger = withSource "Web" logger
           }
-    with_stats net go
+    with_stats logger net go
       | cfg.statsd = do
-          $(logInfoS) "Main" $
+          logInfo (withSource "Main" logger) $
             "Sending stats to "
               <> T.pack cfg.statsdHost
               <> ":"
@@ -658,6 +659,6 @@ run cfg =
               }
             (go . Just)
       | otherwise = go Nothing
-    l _ lvl
-      | cfg.debug = True
-      | otherwise = LevelInfo <= lvl
+    level
+      | cfg.debug = LevelDebug
+      | otherwise = LevelInfo

@@ -10,7 +10,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
@@ -48,11 +47,6 @@ import Control.Monad
     void,
     when,
     (<=<),
-  )
-import Control.Monad.Logger
-  ( MonadLoggerIO,
-    logDebugS,
-    logErrorS,
   )
 import Control.Monad.Reader
   ( MonadReader,
@@ -131,12 +125,16 @@ import Haskoin.Crypto.Keys
 import Haskoin.Network
 import Haskoin.Node
   ( Chain,
+    Logger,
     OnlinePeer (..),
     PeerMgr,
     chainGetAncestor,
     chainGetBest,
     getPeers,
+    logDebug,
+    logError,
     sendMessage,
+    withSource,
   )
 import Haskoin.Script
 import Haskoin.Store.BlockStore
@@ -259,7 +257,8 @@ data WebConfig = WebConfig
     priceHistoryURL :: !String,
     noXPub :: !Bool,
     noBlockchainInfo :: !Bool,
-    healthCheckInterval :: !Int
+    healthCheckInterval :: !Int,
+    logger :: !Logger
   }
 
 data WebState = WebState
@@ -455,7 +454,7 @@ instance
   getMempool = runInWebReader getMempool
 
 instance
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   StoreReadExtra (ReaderT WebState m)
   where
   getMaxGap = runInWebReader getMaxGap
@@ -483,7 +482,7 @@ instance (MonadUnliftIO m) => StoreReadBase (ActionT m) where
   getBalance = lift . getBalance
   getMempool = lift getMempool
 
-instance (MonadUnliftIO m, MonadLoggerIO m) => StoreReadExtra (ActionT m) where
+instance (MonadUnliftIO m) => StoreReadExtra (ActionT m) where
   getBalances = lift . getBalances
   getAddressesTxs as = lift . getAddressesTxs as
   getAddressTxs a = lift . getAddressTxs a
@@ -501,7 +500,7 @@ instance (MonadUnliftIO m, MonadLoggerIO m) => StoreReadExtra (ActionT m) where
 -- Path Handlers --
 -------------------
 
-runWeb :: (MonadUnliftIO m, MonadLoggerIO m) => WebConfig -> m ()
+runWeb :: (MonadUnliftIO m) => WebConfig -> m ()
 runWeb config = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
@@ -510,17 +509,17 @@ runWeb config = do
   let state = WebState {..}
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health) $ \_a2 -> do
-      logger <- logIt
       runner <- askRunInIO
       S.scottyOptsT opts (runner . flip runReaderT state) $ do
         S.middleware $ webSocketEvents state
-        S.middleware logger
+        S.middleware (logIt config.logger)
         handlePaths config
         S.notFound $ raise ThingNotFound
   where
     priceUpdater session =
       unless config.noBlockchainInfo
         . price
+          (withSource "Price" config.logger)
           config.store.net
           session
           config.tickerURL
@@ -533,14 +532,15 @@ runWeb config = do
     settings = setPort config.port . setHost (fromString config.host)
 
 getRates ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
+  Logger ->
   Network ->
   Wreq.Session ->
   String ->
   Text ->
   [Word64] ->
   m [BinfoRate]
-getRates net session url currency times = do
+getRates logger net session url currency times = do
   handleAny err $ do
     r <-
       liftIO $
@@ -549,7 +549,7 @@ getRates net session url currency times = do
     return $ r ^. Wreq.responseBody
   where
     err _ = do
-      $(logErrorS) "Web" "Could not get historic prices"
+      logError logger "Could not get historic prices"
       return []
     body = toJSON times
     base =
@@ -558,15 +558,16 @@ getRates net session url currency times = do
     opts = base & Wreq.param "quote" .~ [currency]
 
 price ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
+  Logger ->
   Network ->
   Wreq.Session ->
   String ->
   Int ->
   TVar (HashMap Text BinfoTicker) ->
   m ()
-price net session url pget v = forM_ purl $ \u -> loopForever $ do
-  let err e = $(logErrorS) "Price" $ cs (show e)
+price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
+  let err e = logError logger $ cs (show e)
   handleAny err $ do
     r <- liftIO $ Wreq.asJSON =<< Wreq.Session.get session u
     atomically . writeTVar v $ r ^. Wreq.responseBody
@@ -606,7 +607,7 @@ errStatus ServerTimeout = status500
 errStatus RequestTooLarge = status413
 
 handlePaths ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   WebConfig ->
   S.ScottyT (ReaderT WebState m) ()
 handlePaths cfg = do
@@ -1026,7 +1027,7 @@ scottyBlockHeightRaw (GetBlockHeightRaw h) =
 -- GET BlockTime / BlockTimeRaw --
 
 scottyBlockTime ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetBlockTime ->
   ActionT m BlockData
 scottyBlockTime (GetBlockTime (TimeParam t) (NoTx notx)) =
@@ -1037,7 +1038,7 @@ scottyBlockTime (GetBlockTime (TimeParam t) (NoTx notx)) =
       Just b -> return $ pruneTx notx b
 
 scottyBlockMTP ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetBlockMTP ->
   ActionT m BlockData
 scottyBlockMTP (GetBlockMTP (TimeParam t) (NoTx notx)) =
@@ -1048,7 +1049,7 @@ scottyBlockMTP (GetBlockMTP (TimeParam t) (NoTx notx)) =
       Just b -> return $ pruneTx notx b
 
 scottyBlockTimeRaw ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetBlockTimeRaw ->
   ActionT m (RawResult H.Block)
 scottyBlockTimeRaw (GetBlockTimeRaw (TimeParam t)) =
@@ -1059,7 +1060,7 @@ scottyBlockTimeRaw (GetBlockTimeRaw (TimeParam t)) =
       Just b -> RawResult <$> lift (toRawBlock b)
 
 scottyBlockMTPRaw ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetBlockMTPRaw ->
   ActionT m (RawResult H.Block)
 scottyBlockMTPRaw (GetBlockMTPRaw (TimeParam t)) =
@@ -1283,19 +1284,19 @@ receiveEvent sub =
 -- GET Address Transactions --
 
 scottyAddrTxs ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetAddrTxs -> ActionT m [TxRef]
+  (MonadUnliftIO m) => GetAddrTxs -> ActionT m [TxRef]
 scottyAddrTxs (GetAddrTxs addr pLimits) =
   withMetrics (.addressTx) $
     getAddressTxs addr =<< paramToLimits False pLimits
 
 scottyAddrsTxs ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetAddrsTxs -> ActionT m [TxRef]
+  (MonadUnliftIO m) => GetAddrsTxs -> ActionT m [TxRef]
 scottyAddrsTxs (GetAddrsTxs addrs pLimits) =
   withMetrics (.addressTx) $
     getAddressesTxs addrs =<< paramToLimits False pLimits
 
 scottyAddrTxsFull ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetAddrTxsFull ->
   ActionT m [Transaction]
 scottyAddrTxsFull (GetAddrTxsFull addr pLimits) =
@@ -1304,7 +1305,7 @@ scottyAddrTxsFull (GetAddrTxsFull addr pLimits) =
     catMaybes <$> mapM (getTransaction . (.txid)) txs
 
 scottyAddrsTxsFull ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetAddrsTxsFull ->
   ActionT m [Transaction]
 scottyAddrsTxsFull (GetAddrsTxsFull addrs pLimits) =
@@ -1317,18 +1318,18 @@ scottyAddrBalance (GetAddrBalance addr) =
   withMetrics (.addressBalance) $ getDefaultBalance addr
 
 scottyAddrsBalance ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetAddrsBalance -> ActionT m [Balance]
+  (MonadUnliftIO m) => GetAddrsBalance -> ActionT m [Balance]
 scottyAddrsBalance (GetAddrsBalance addrs) =
   withMetrics (.addressBalance) $ getBalances addrs
 
 scottyAddrUnspent ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetAddrUnspent -> ActionT m [Unspent]
+  (MonadUnliftIO m) => GetAddrUnspent -> ActionT m [Unspent]
 scottyAddrUnspent (GetAddrUnspent addr pLimits) =
   withMetrics (.addressUnspent) $
     getAddressUnspents addr =<< paramToLimits False pLimits
 
 scottyAddrsUnspent ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetAddrsUnspent -> ActionT m [Unspent]
+  (MonadUnliftIO m) => GetAddrsUnspent -> ActionT m [Unspent]
 scottyAddrsUnspent (GetAddrsUnspent addrs pLimits) =
   withMetrics (.addressUnspent) $
     getAddressesUnspents addrs =<< paramToLimits False pLimits
@@ -1336,14 +1337,14 @@ scottyAddrsUnspent (GetAddrsUnspent addrs pLimits) =
 -- GET XPubs --
 
 scottyXPub ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetXPub -> ActionT m XPubSummary
+  (MonadUnliftIO m) => GetXPub -> ActionT m XPubSummary
 scottyXPub (GetXPub xpub deriv (NoCache noCache)) =
   withMetrics (.xpub) $
     let xs = XPubSpec xpub deriv
      in xPubSummary xs <$> lift (runNoCache noCache $ xPubBals xs)
 
 scottyDelXPub ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   DelCachedXPub ->
   ActionT m (GenericResult Bool)
 scottyDelXPub (DelCachedXPub xpub deriv) =
@@ -1353,7 +1354,7 @@ scottyDelXPub (DelCachedXPub xpub deriv) =
     return $ GenericResult (n > 0)
 
 getXPubTxs ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   XPubKey ->
   DeriveType ->
   LimitsParam ->
@@ -1366,13 +1367,13 @@ getXPubTxs xpub deriv plimits nocache = do
   lift $ runNoCache nocache $ xPubTxs xs xbals limits
 
 scottyXPubTxs ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetXPubTxs -> ActionT m [TxRef]
+  (MonadUnliftIO m) => GetXPubTxs -> ActionT m [TxRef]
 scottyXPubTxs (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
   withMetrics (.xpubTx) $
     getXPubTxs xpub deriv plimits nocache
 
 scottyXPubTxsFull ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetXPubTxsFull ->
   ActionT m [Transaction]
 scottyXPubTxsFull (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
@@ -1382,7 +1383,7 @@ scottyXPubTxsFull (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
         =<< getXPubTxs xpub deriv plimits nocache
 
 scottyXPubBalances ::
-  (MonadUnliftIO m, MonadLoggerIO m) => GetXPubBalances -> ActionT m [XPubBal]
+  (MonadUnliftIO m) => GetXPubBalances -> ActionT m [XPubBal]
 scottyXPubBalances (GetXPubBalances xpub deriv (NoCache noCache)) =
   withMetrics (.xpubBalance) $
     lift $
@@ -1390,7 +1391,7 @@ scottyXPubBalances (GetXPubBalances xpub deriv (NoCache noCache)) =
         xPubBals (XPubSpec xpub deriv)
 
 scottyXPubUnspent ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetXPubUnspent ->
   ActionT m [XPubUnspent]
 scottyXPubUnspent (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
@@ -1495,7 +1496,7 @@ getChainHeight :: (MonadUnliftIO m) => ActionT m H.BlockHeight
 getChainHeight =
   fmap (.height) $ liftIO . chainGetBest =<< askl (.config.store.chain)
 
-scottyBinfoUnspent :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoUnspent :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoUnspent =
   withMetrics (.binfoUnspent) $ do
     (xspecs, addrs) <- getBinfoActive
@@ -1674,7 +1675,7 @@ getBinfoAddr param' = do
       xpub = BinfoXpub <$> xPubImport net ctx txt
   maybe S.next return (addr <|> xpub)
 
-scottyBinfoHistory :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoHistory :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHistory =
   withMetrics (.binfoExportHistory) $ do
     (xspecs, addrs) <- getBinfoActive
@@ -1696,7 +1697,8 @@ scottyBinfoHistory =
     net <- askl (.config.store.net)
     url <- askl (.config.priceHistoryURL)
     session <- askl (.session)
-    rates <- map (.price) <$> lift (getRates net session url code times)
+    logger <- askl (.config.logger)
+    rates <- map (.price) <$> lift (getRates logger net session url code times)
     let hs = zipWith (convert cur aaddrs) txs (rates <> repeat 0.0)
     setHeaders
     streamEncoding $ toEncoding hs
@@ -1762,7 +1764,7 @@ getPrice = do
 getSymbol :: (MonadUnliftIO m) => ActionT m BinfoSymbol
 getSymbol = uncurry binfoTickerToSymbol <$> getPrice
 
-scottyBinfoBlocksDay :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoBlocksDay :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoBlocksDay =
   withMetrics (.binfoBlock) $ do
     t <- min h . (`div` 1000) <$> S.captureParam "milliseconds"
@@ -1781,7 +1783,7 @@ scottyBinfoBlocksDay =
           b' <- getBlock b.header.prev
           (b :) <$> go t b'
 
-scottyMultiAddr :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyMultiAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyMultiAddr =
   withMetrics (.binfoMultiaddr) $ do
     (addrs', _, saddrs, sxpubs, xspecs) <- get_addrs
@@ -1960,7 +1962,7 @@ getBinfoOffset = do
         "offset exceeded: " <> show o <> " > " <> show x
   return (fromIntegral o :: Int)
 
-scottyRawAddr :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyRawAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyRawAddr =
   withMetrics (.binfoAddressRaw) $
     getBinfoAddr "addr" >>= \case
@@ -2079,7 +2081,7 @@ scottyBinfoAddrBalance =
     setHeaders
     S.text $ cs $ show $ b.confirmed + b.unconfirmed
 
-scottyFirstSeen :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyFirstSeen :: (MonadUnliftIO m) => ActionT m ()
 scottyFirstSeen =
   withMetrics (.binfoQaddressfirstseen) $ do
     a <- getAddress =<< S.captureParam "addr"
@@ -2107,7 +2109,8 @@ scottyFirstSeen =
       liftIO (chainGetAncestor ch h bb) >>= \case
         Just b -> return b.header.timestamp
         Nothing -> do
-          lift . $(logErrorS) "Web" $
+          logger <- askl (.config.logger)
+          logError logger $
             "Could not get ancestor at height "
               <> cs (show h)
               <> " for block "
@@ -2117,7 +2120,7 @@ scottyFirstSeen =
       let l = Limits 1 0 (Just (AtBlock h))
       not . null <$> getAddressTxs a l
 
-scottyShortBal :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyShortBal :: (MonadUnliftIO m) => ActionT m ()
 scottyShortBal =
   withMetrics (.binfoBalance) $ do
     (xspecs, addrs) <- getBinfoActive
@@ -2232,7 +2235,7 @@ scottyBinfoBlock =
           streamEncoding $ marshalEncoding (net, ctx) y
 
 getBinfoTx ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
+  (MonadUnliftIO m) =>
   BinfoTxId ->
   ActionT m (Either Except Transaction)
 getBinfoTx txid = do
@@ -2246,7 +2249,7 @@ getBinfoTx txid = do
       let tids = map (txHash . transactionData) ts
        in return $ Left (TxIndexConflict tids)
 
-scottyBinfoTx :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoTx :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTx =
   withMetrics (.binfoTxRaw) $ do
     numtxid <- getNumTxId
@@ -2267,7 +2270,7 @@ scottyBinfoTx =
       setHeaders
       S.text . encodeHexLazy . runPutL . serialize $ transactionData t
 
-scottyBinfoTotalOut :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoTotalOut :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTotalOut =
   withMetrics (.binfoQtxtotalbtcoutput) $ do
     txid <- S.captureParam "txid"
@@ -2277,7 +2280,7 @@ scottyBinfoTotalOut =
         Left e -> raise e
     S.text $ cs $ show $ sum $ map (.value) tx.outputs
 
-scottyBinfoTxFees :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoTxFees :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTxFees =
   withMetrics (.binfoQtxfee) $ do
     txid <- S.captureParam "txid"
@@ -2292,7 +2295,7 @@ scottyBinfoTxFees =
     f StoreInput {} = True
     f StoreCoinbase {} = False
 
-scottyBinfoTxResult :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoTxResult :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTxResult =
   withMetrics (.binfoQtxresult) $ do
     txid <- S.captureParam "txid"
@@ -2310,7 +2313,7 @@ scottyBinfoTxResult =
     g addr StoreOutput {address = Just a} = a == addr
     g _ _ = False
 
-scottyBinfoTotalInput :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoTotalInput :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTotalInput =
   withMetrics (.binfoQtxtotalbtcinput) $ do
     txid <- S.captureParam "txid"
@@ -2405,7 +2408,7 @@ scottyBinfoAddrPubkey =
       Nothing -> raise ThingNotFound
       Just a -> S.text $ TL.fromStrict a
 
-scottyBinfoPubKeyAddr :: (MonadUnliftIO m, MonadLoggerIO m) => ActionT m ()
+scottyBinfoPubKeyAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoPubKeyAddr =
   withMetrics (.binfoQpubkeyaddr) $ do
     addr <- getAddress =<< S.captureParam "addr"
@@ -2472,7 +2475,7 @@ scottyBinfoHashPubkey =
 -- GET Network Information --
 
 scottyPeers ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   GetPeers ->
   ActionT m [PeerInfo]
 scottyPeers _ =
@@ -2481,7 +2484,7 @@ scottyPeers _ =
 
 -- | Obtain information about connected peers from peer manager process.
 getPeersInformation ::
-  (MonadLoggerIO m) => PeerMgr -> m [PeerInfo]
+  (MonadIO m) => PeerMgr -> m [PeerInfo]
 getPeersInformation mgr =
   mapMaybe toInfo <$> liftIO (getPeers mgr)
   where
@@ -2668,7 +2671,7 @@ parseOffset = do
   return res
 
 parseStart ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   Maybe StartParam ->
   ActionT m (Maybe Start)
 parseStart Nothing = return Nothing
@@ -2695,7 +2698,7 @@ parseLimits :: (MonadUnliftIO m) => ActionT m LimitsParam
 parseLimits = LimitsParam <$> paramOptional <*> parseOffset <*> paramOptional
 
 paramToLimits ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   Bool ->
   LimitsParam ->
   ActionT m Limits
@@ -2737,19 +2740,15 @@ runNoCache False = id
 runNoCache True = local $ \s ->
   s {config = s.config {store = s.config.store {cache = Nothing}}}
 
-logIt ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
-  m Middleware
-logIt = do
-  runner <- askRunInIO
-  return $ \app req respond ->
-    app req $ \res -> do
-      let s = responseStatus res
-          msg = fmtReq req <> ": " <> fmtStatus s
-      if statusIsSuccessful s
-        then runner $ $(logDebugS) "Web" msg
-        else runner $ $(logErrorS) "Web" msg
-      respond res
+logIt :: Logger -> Middleware
+logIt logger app req respond =
+  app req $ \res -> do
+    let s = responseStatus res
+        msg = fmtReq req <> ": " <> fmtStatus s
+    if statusIsSuccessful s
+      then logDebug logger msg
+      else logError logger msg
+    respond res
 
 fmtReq :: Request -> Text
 fmtReq req =

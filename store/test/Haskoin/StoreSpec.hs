@@ -11,7 +11,6 @@ module Haskoin.StoreSpec (spec) where
 
 import Conduit
 import Control.Monad
-import Control.Monad.Logger
 import Control.Monad.Reader
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -81,47 +80,46 @@ withTestStore ::
   (TestStore -> m a) ->
   m a
 withTestStore net ctx t f =
-  withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w ->
-    runNoLoggingT $ do
-      let ad =
-            NetworkAddress
-              nodeNetwork
-              (sockToHostAddress (SockAddrInet 0 0))
-          cfg =
-            StoreConfig
-              { maxPeers = 20,
-                initPeers = [],
-                discover = True,
-                db = w,
-                net = net,
-                ctx = ctx,
-                redis = Nothing,
-                gap = gap,
-                initGap = 20,
-                redisMinAddrs = 100,
-                redisMaxKeys = 100 * 1000 * 1000,
-                noMempool = False,
-                wipeMempool = False,
-                syncMempool = False,
-                mempoolTimeout = 14,
-                peerTimeout = 60,
-                maxPeerLife = 48 * 3600,
-                connect = dummyPeerConnect net ad,
-                stats = Nothing,
-                redisSyncInterval = 30,
-                bloom = True,
-                maxOpenFiles = Nothing
-              }
-      withStore cfg $ \store ->
-        withSubscription store.pub $ \sub ->
-          lift $
-            f
-              TestStore
-                { testStoreDB = store.db,
-                  testStoreBlockStore = store.block,
-                  testStoreChain = store.chain,
-                  testStoreEvents = sub
-                }
+  withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
+    let ad =
+          NetworkAddress
+            nodeNetwork
+            (sockToHostAddress (SockAddrInet 0 0))
+        cfg =
+          StoreConfig
+            { maxPeers = 20,
+              initPeers = [],
+              discover = True,
+              db = w,
+              net = net,
+              ctx = ctx,
+              redis = Nothing,
+              gap = gap,
+              initGap = 20,
+              redisMinAddrs = 100,
+              redisMaxKeys = 100 * 1000 * 1000,
+              noMempool = False,
+              wipeMempool = False,
+              syncMempool = False,
+              mempoolTimeout = 14,
+              peerTimeout = 60,
+              maxPeerLife = 48 * 3600,
+              connect = dummyPeerConnect net ad,
+              stats = Nothing,
+              redisSyncInterval = 30,
+              bloom = True,
+              maxOpenFiles = Nothing,
+              logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
+            }
+    withStore cfg $ \store ->
+      withSubscription store.pub $ \sub ->
+        f
+          TestStore
+            { testStoreDB = store.db,
+              testStoreBlockStore = store.block,
+              testStoreChain = store.chain,
+              testStoreEvents = sub
+            }
 
 gap :: Word32
 gap = 32

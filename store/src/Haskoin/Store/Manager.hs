@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
 module Haskoin.Store.Manager
@@ -16,7 +17,6 @@ import Control.Monad.Cont
   ( ContT (..),
     runContT,
   )
-import Control.Monad.Logger (MonadLoggerIO)
 import Control.Monad.Reader (ReaderT (ReaderT), runReaderT)
 import Control.Monad.Trans (lift)
 import Data.Serialize (decode)
@@ -42,6 +42,7 @@ import Haskoin
 import Haskoin.Node
   ( Chain,
     ChainEvent (..),
+    Logger,
     Node (..),
     NodeConfig (..),
     NodeEvent (..),
@@ -49,6 +50,7 @@ import Haskoin.Node
     PeerMgr,
     WithConnection,
     withNode,
+    withSource,
   )
 import Haskoin.Store.BlockStore
   ( BlockStore,
@@ -163,11 +165,13 @@ data StoreConfig = StoreConfig
     bloom :: !Bool,
     -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
     -- and filter blocks stay resident for the life of the process)
-    maxOpenFiles :: !(Maybe Int)
+    maxOpenFiles :: !(Maybe Int),
+    -- | log messages here
+    logger :: !Logger
   }
 
 withStore ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
+  (MonadUnliftIO m) =>
   StoreConfig ->
   (Store -> m a) ->
   m a
@@ -232,7 +236,8 @@ blockStoreCfg cfg node pub db =
       syncMempool = cfg.syncMempool,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,
-      stats = cfg.stats
+      stats = cfg.stats,
+      logger = withSource "BlockStore" cfg.logger
     }
 
 nodeCfg ::
@@ -255,11 +260,12 @@ nodeCfg cfg db pub =
       net = cfg.net,
       timeout = cfg.peerTimeout,
       maxPeerLife = cfg.maxPeerLife,
-      connect = cfg.connect
+      connect = cfg.connect,
+      logger = cfg.logger
     }
 
 withCache ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
+  (MonadUnliftIO m) =>
   StoreConfig ->
   Chain ->
   DatabaseReader ->
@@ -272,7 +278,7 @@ withCache cfg chain db pub action =
       action Nothing
     Just redisurl -> do
       conn <- connectRedis redisurl
-      metrics <- mapM (\s -> newCacheMetrics s conn db) cfg.stats
+      metrics <- mapM (\s -> newCacheMetrics logger s conn db) cfg.stats
       withSubscription pub $ \evts ->
         let conf = c conn metrics
          in withProcess (f conf) $ \p ->
@@ -283,13 +289,15 @@ withCache cfg chain db pub action =
                 (action (Just conf))
   where
     f conf cwinbox = runReaderT (cacheWriter conf cwinbox) db
+    logger = withSource "Cache" cfg.logger
     c conn metrics =
       CacheConfig
         { redis = conn,
           minAddrs = cfg.redisMinAddrs,
           chain = chain,
           maxKeys = cfg.redisMaxKeys,
-          metrics = metrics
+          metrics = metrics,
+          logger = logger
         }
 
 cacheWriterProcesses ::
