@@ -129,9 +129,12 @@ newMempoolTx tx w =
     Just _ ->
       return False
     Nothing -> do
-      freeOutputs True True tx
+      -- Check everything before writing, so that a rejected transaction
+      -- leaves the mempool as it was.
+      replaced <- getConflicts True True tx
+      checkNewTx (map txHash replaced) tx
+      mapM_ (deleteSingleTx . txHash) replaced
       rbf <- isRBF (MemRef w) tx
-      checkNewTx tx
       _ <- importTx (MemRef w) w rbf tx
       return True
 
@@ -273,15 +276,17 @@ importBlock b n = do
           s = B.length (encode b')
        in fromIntegral $ s * 3 + x
 
-checkNewTx :: Tx -> ImportM ()
-checkNewTx tx = do
+-- | Check a transaction that will replace these ones. Outputs that they spend
+-- count as unspent, and outputs that they create as missing.
+checkNewTx :: [TxHash] -> Tx -> ImportM ()
+checkNewTx replaced tx = do
   when (unique_inputs < length tx.inputs) $ do
     logError $
       "Transaction spends same output twice: "
         <> txHashToHex (txHash tx)
     throwError DuplicatePrevOutput
-  us <- getUnspentOutputs tx
-  when (any isNothing us) $ do
+  prevs <- mapM prev_output (prevOuts tx)
+  when (any isNothing prevs) $ do
     logError $
       "Orphan: " <> txHashToHex (txHash tx)
     throwError Orphan
@@ -290,16 +295,16 @@ checkNewTx tx = do
       "Coinbase cannot be imported into mempool: "
         <> txHashToHex (txHash tx)
     throwError UnexpectedCoinbase
-  when (length (prevOuts tx) > length us) $ do
-    logError $
-      "Orphan: " <> txHashToHex (txHash tx)
-    throwError Orphan
-  when (outputs > unspents us) $ do
+  when (outputs > sum (map (.value) (catMaybes prevs))) $ do
     logError $
       "Insufficient funds for tx: " <> txHashToHex (txHash tx)
     throwError InsufficientFunds
   where
-    unspents = sum . map (.value) . catMaybes
+    prev_output op
+      | op.hash `elem` replaced = return Nothing
+      | otherwise = do
+          parent <- getActiveTxData op.hash
+          return (parent >>= getTxOut op.index . (.tx))
     outputs = sum (map (.value) tx.outputs)
     unique_inputs = length (nub' (map (.outpoint) tx.inputs))
 
@@ -446,22 +451,30 @@ updateSpendersRBF td =
         insertTx s'
         updateSpendersRBF s'
 
-freeOutputs ::
+freeOutputs :: Bool -> Bool -> Tx -> ImportM ()
+freeOutputs memonly rbfcheck tx =
+  getConflicts memonly rbfcheck tx >>= mapM_ (deleteSingleTx . txHash)
+
+-- | Transactions that spend the same outputs as this one, with their
+-- descendants, in an order in which they can be deleted.
+getConflicts ::
   -- | only delete transaction if unconfirmed
   Bool ->
   -- | only delete if network has RBF
   Bool ->
   Tx ->
-  ImportM ()
-freeOutputs memonly rbfcheck tx = do
+  ImportM [Tx]
+getConflicts memonly rbfcheck tx = do
   logDebug $
-    "Freeing outputs for tx " <> txHashToHex (txHash tx) <> "..."
+    "Getting conflicts for tx " <> txHashToHex (txHash tx) <> "..."
   let prevs = prevOuts tx
   unspents <- mapM getUnspent prevs
   let spents = [p | (p, Nothing) <- zip prevs unspents]
   spndrs <- catMaybes <$> mapM getSpender spents
   let txids = H.fromList $ filter (/= txHash tx) $ map (.txid) spndrs
-  mapM_ (deleteTx memonly rbfcheck) $ H.toList txids
+  chains <- mapM (getChain memonly rbfcheck) (H.toList txids)
+  return . reverse . map snd . sortTxs . M.elems $
+    M.fromList [(txHash t, t) | t <- concat chains]
 
 deleteConfirmedTx :: TxHash -> ImportM ()
 deleteConfirmedTx = deleteTx False False

@@ -137,14 +137,20 @@ spec = prepareContext $ \ctx -> do
         mempool db `shouldReturn` [txHash replacement]
 
     it "leaves the mempool unchanged when it rejects a replacement" $
-      withCoin btcRegTest ctx $ \db coin -> do
-        let original = spend [coin] [1000]
-            invalid = spend [coin] [5000000001]
+      withCoin btcRegTest ctx $ \db coin1 -> do
+        _ <- mine db []
+        let coin2 = out (coinbaseTx 2) 0
+            original = spend [coin1] [1000]
+        _ <- mine db [spend [coin2] [1000]]
         addTx db original `shouldReturn` Right True
         -- The block store imports mempool transactions in batches and skips
         -- the ones that are rejected.
-        importing db (newMempoolTx invalid 0 `catchError` \_ -> return False)
-          `shouldReturn` Right False
+        let tryAdd tx = newMempoolTx tx 0 `catchError` \_ -> return False
+            unfunded = spend [coin1] [5000000001]
+            confirmedConflict = spend [coin1, coin2] [2000]
+            spendsReplaced = spend [coin1, out original 0] [900]
+        importing db (mapM tryAdd [unfunded, confirmedConflict, spendsReplaced])
+          `shouldReturn` Right [False, False, False]
         mempool db `shouldReturn` [txHash original]
 
     it "rejects double spends on networks without RBF" $
