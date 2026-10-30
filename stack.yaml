@@ -25,7 +25,8 @@ extra-deps:
   - secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
   - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
   - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
-  - haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+  - github: jprupp/haskoin-core
+    commit: 'eff2c21ae02aa9a09e5932b6dfcb1e972b232165'
   - github: jprupp/nqe
     commit: 'd592ebfccaf33dcd62ab72584f334a5fa30e6526'
   - github: jprupp/haskoin-node
