@@ -30,7 +30,6 @@ import Control.Monad
     when,
     zipWithM_,
   )
-import Control.Monad.Except (ExceptT, throwError)
 import qualified Data.ByteString as B
 import Data.Either (rights)
 import qualified Data.HashMap.Strict as M
@@ -76,11 +75,12 @@ import Haskoin.Node (LogLevel (..), logAt)
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Writer (WriterT, writerLogger)
-import UnliftIO (Exception)
+import UnliftIO (Exception, throwIO)
 
--- | Block and transaction import. Writes are buffered and committed together
--- when 'runWriter' finishes.
-type ImportM = WriterT (ExceptT ImportException IO)
+-- | Block and transaction import. Failures are thrown as 'ImportException'.
+-- Writes are buffered and committed together when 'runWriter' finishes, so a
+-- failed batch commits nothing.
+type ImportM = WriterT IO
 
 logDebug, logError :: Text -> ImportM ()
 logDebug msg = writerLogger >>= \l -> logAt LevelDebug l msg
@@ -129,9 +129,12 @@ newMempoolTx tx w =
     Just _ ->
       return False
     Nothing -> do
-      freeOutputs True True tx
+      -- Check everything before writing, so that a rejected transaction
+      -- leaves the mempool as it was.
+      replaced <- getConflicts True True tx
+      checkNewTx (map txHash replaced) tx
+      mapM_ (deleteSingleTx . txHash) replaced
       rbf <- isRBF (MemRef w) tx
-      checkNewTx tx
       _ <- importTx (MemRef w) w rbf tx
       return True
 
@@ -141,12 +144,12 @@ bestBlockData = do
     getBestBlock >>= \case
       Nothing -> do
         logError "Best block unknown"
-        throwError BestBlockNotFound
+        throwIO BestBlockNotFound
       Just h -> return h
   getBlock h >>= \case
     Nothing -> do
       logError "Best block not found"
-      throwError BestBlockNotFound
+      throwIO BestBlockNotFound
     Just b -> return b
 
 revertBlock :: BlockHash -> ImportM ()
@@ -158,7 +161,7 @@ revertBlock bh = do
         else do
           logError $
             "Cannot revert non-head block: " <> blockHashToHex bh
-          throwError BlockNotBest
+          throwIO BlockNotBest
   logDebug $
     "Obtained block data for " <> blockHashToHex bh
   tds <- mapM getImportTxData bd.txs
@@ -187,14 +190,14 @@ checkNewBlock b n =
           logError $
             "Cannot import non-genesis block: "
               <> blockHashToHex (headerHash b.header)
-          throwError BestBlockNotFound
+          throwIO BestBlockNotFound
     Just h
       | b.header.prev == h -> return ()
       | otherwise -> do
           logError $
             "Block does not build on head: "
               <> blockHashToHex (headerHash b.header)
-          throwError PrevBlockNotBest
+          throwIO PrevBlockNotBest
 
 importOrConfirm :: BlockNode -> [Tx] -> ImportM [TxData]
 importOrConfirm bn txns = do
@@ -221,7 +224,7 @@ importOrConfirm bn txns = do
           logError $
             "Cannot find tx to confirm: "
               <> txHashToHex (txHash tx)
-          throwError TxNotFound
+          throwIO TxNotFound
     import_it i tx = do
       logDebug $
         "Importing tx: " <> txHashToHex (txHash tx)
@@ -273,33 +276,35 @@ importBlock b n = do
           s = B.length (encode b')
        in fromIntegral $ s * 3 + x
 
-checkNewTx :: Tx -> ImportM ()
-checkNewTx tx = do
+-- | Check a transaction that will replace these ones. Outputs that they spend
+-- count as unspent, and outputs that they create as missing.
+checkNewTx :: [TxHash] -> Tx -> ImportM ()
+checkNewTx replaced tx = do
   when (unique_inputs < length tx.inputs) $ do
     logError $
       "Transaction spends same output twice: "
         <> txHashToHex (txHash tx)
-    throwError DuplicatePrevOutput
-  us <- getUnspentOutputs tx
-  when (any isNothing us) $ do
+    throwIO DuplicatePrevOutput
+  prevs <- mapM prev_output (prevOuts tx)
+  when (any isNothing prevs) $ do
     logError $
       "Orphan: " <> txHashToHex (txHash tx)
-    throwError Orphan
+    throwIO Orphan
   when (isCoinbaseTx tx) $ do
     logError $
       "Coinbase cannot be imported into mempool: "
         <> txHashToHex (txHash tx)
-    throwError UnexpectedCoinbase
-  when (length (prevOuts tx) > length us) $ do
-    logError $
-      "Orphan: " <> txHashToHex (txHash tx)
-    throwError Orphan
-  when (outputs > unspents us) $ do
+    throwIO UnexpectedCoinbase
+  when (outputs > sum (map (.value) (catMaybes prevs))) $ do
     logError $
       "Insufficient funds for tx: " <> txHashToHex (txHash tx)
-    throwError InsufficientFunds
+    throwIO InsufficientFunds
   where
-    unspents = sum . map (.value) . catMaybes
+    prev_output op
+      | op.hash `elem` replaced = return Nothing
+      | otherwise = do
+          parent <- getActiveTxData op.hash
+          return (parent >>= getTxOut op.index . (.tx))
     outputs = sum (map (.value) tx.outputs)
     unique_inputs = length (nub' (map (.outpoint) tx.inputs))
 
@@ -336,7 +341,7 @@ importTx br tt rbf tx = do
       logError $
         "Attempted to import a tx missing UTXO: "
           <> txHashToHex (txHash tx)
-      throwError Orphan
+      throwIO Orphan
     Just u -> return u
   let td = prepareTxData rbf br tt tx us
   commitAddTx td
@@ -426,27 +431,50 @@ confTx t mbr = do
   let td = (t :: TxData) {block = new, rbf = rbf}
   insertTx td
   updateMempool td
+  updateSpendersRBF td
   return td
   where
     new = fromMaybe (MemRef t.timestamp) mbr
     old = t.block
 
-freeOutputs ::
+-- | Spenders inherit BIP125 signalling from unconfirmed parents only, so their
+-- flag can change when a parent is confirmed or unconfirmed.
+updateSpendersRBF :: TxData -> ImportM ()
+updateSpendersRBF td =
+  forM_ (nub' (map (.txid) (I.elems td.spenders))) $ \h ->
+    getActiveTxData h >>= mapM_ update
+  where
+    update s = do
+      rbf <- isRBF s.block s.tx
+      when (rbf /= s.rbf) $ do
+        let s' = (s :: TxData) {rbf = rbf}
+        insertTx s'
+        updateSpendersRBF s'
+
+freeOutputs :: Bool -> Bool -> Tx -> ImportM ()
+freeOutputs memonly rbfcheck tx =
+  getConflicts memonly rbfcheck tx >>= mapM_ (deleteSingleTx . txHash)
+
+-- | Transactions that spend the same outputs as this one, with their
+-- descendants, in an order in which they can be deleted.
+getConflicts ::
   -- | only delete transaction if unconfirmed
   Bool ->
   -- | only delete if network has RBF
   Bool ->
   Tx ->
-  ImportM ()
-freeOutputs memonly rbfcheck tx = do
+  ImportM [Tx]
+getConflicts memonly rbfcheck tx = do
   logDebug $
-    "Freeing outputs for tx " <> txHashToHex (txHash tx) <> "..."
+    "Getting conflicts for tx " <> txHashToHex (txHash tx) <> "..."
   let prevs = prevOuts tx
   unspents <- mapM getUnspent prevs
   let spents = [p | (p, Nothing) <- zip prevs unspents]
   spndrs <- catMaybes <$> mapM getSpender spents
   let txids = H.fromList $ filter (/= txHash tx) $ map (.txid) spndrs
-  mapM_ (deleteTx memonly rbfcheck) $ H.toList txids
+  chains <- mapM (getChain memonly rbfcheck) (H.toList txids)
+  return . reverse . map snd . sortTxs . M.elems $
+    M.fromList [(txHash t, t) | t <- concat chains]
 
 deleteConfirmedTx :: TxHash -> ImportM ()
 deleteConfirmedTx = deleteTx False False
@@ -499,7 +527,7 @@ getChain memonly rbfcheck th' = do
               logError $
                 "Transaction already confirmed: "
                   <> txHashToHex th
-              throwError TxConfirmed
+              throwIO TxConfirmed
           | rbfcheck ->
               getNetwork >>= \net ->
                 if net.replaceByFee
@@ -508,7 +536,7 @@ getChain memonly rbfcheck th' = do
                     logError $
                       "Double-spending transaction: "
                         <> txHashToHex th
-                    throwError DoubleSpend
+                    throwIO DoubleSpend
           | otherwise -> return $ Just td
     go txm pdg = do
       let ths = filter (not . (`M.member` txm)) (H.toList pdg)
@@ -534,7 +562,7 @@ deleteSingleTx th =
     Nothing -> do
       logError $
         "Already deleted: " <> txHashToHex th
-      throwError TxNotFound
+      throwIO TxNotFound
     Just td ->
       if I.null td.spenders
         then do
@@ -545,7 +573,7 @@ deleteSingleTx th =
           logError $
             "Tried to delete spent tx: "
               <> txHashToHex th
-          throwError TxSpent
+          throwIO TxSpent
 
 commitDelTx :: TxData -> ImportM ()
 commitDelTx = commitModTx False
@@ -674,7 +702,7 @@ getImportTxData th =
   getActiveTxData th >>= \case
     Nothing -> do
       logDebug $ "Tx not found: " <> txHashToHex th
-      throwError TxNotFound
+      throwIO TxNotFound
     Just d -> return d
 
 getTxOut :: Word32 -> Tx -> Maybe TxOut
