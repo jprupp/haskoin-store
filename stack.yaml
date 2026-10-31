@@ -1,4 +1,4 @@
-resolver: nightly-2026-08-31
+resolver: nightly-2026-10-28
 ghc-options:
   "$everything": -O2
   # The message loops are polymorphic in their monad and run at LoggingT IO.
@@ -20,14 +20,12 @@ packages:
   - store
   - data
 extra-deps:
-  - hashtables-1.4.2@sha256:4940cab94a15d469845ccf5225f9cb3d354c15e8127ebb58425c8b681f7721d9,10386
-  - statsd-rupp-0.5.0.0@sha256:04049a06a6a92aaecd052d1caa36321bfc68c43bcc8e48e93b1f87218c182e0b,2017
-  - secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
-  - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
-  - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
-  - github: jprupp/haskoin-core
-    commit: 'eff2c21ae02aa9a09e5932b6dfcb1e972b232165'
-  - github: jprupp/nqe
-    commit: 'd592ebfccaf33dcd62ab72584f334a5fa30e6526'
-  - github: jprupp/haskoin-node
-    commit: '03056bf1c96fed55656b9c390ff139dd2fb632ba'
+  - base16-2.0
+  - hashtables-1.4.2
+  - statsd-rupp-0.5.0.0
+  - secp256k1-haskell-1.7.0
+  - rocksdb-haskell-jprupp-2.3.0
+  - rocksdb-query-0.6.0
+  - nqe-0.6.7
+  - haskoin-node-2.0.0
+  - haskoin-core-1.4.0

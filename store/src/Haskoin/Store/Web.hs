@@ -80,8 +80,7 @@ import Data.Aeson.Encoding
   ( encodingToLazyByteString,
     list,
   )
-import Data.Base16.Types (assertBase16)
-import Data.ByteString.Base16 (decodeBase16, isBase16)
+import Data.ByteString.Base16 (decodeBase16, parseBase16)
 import Data.ByteString.Builder (lazyByteString)
 import Data.ByteString.Char8 qualified as C
 import Data.ByteString.Lazy qualified as L
@@ -2657,9 +2656,9 @@ parseBody = do
     bin = runGetS deserialize
     hex b =
       let ns = C.filter (not . isSpace) b
-       in if isBase16 ns
-            then bin . decodeBase16 $ assertBase16 ns
-            else Left "Invalid hex input"
+       in case parseBase16 ns of
+            Right b16 -> bin $ decodeBase16 b16
+            Left e -> Left (cs e)
 
 parseOffset :: (MonadUnliftIO m) => ActionT m OffsetParam
 parseOffset = do

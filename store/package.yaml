@@ -1,5 +1,5 @@
 name: haskoin-store
-version: 1.6.3
+version: 1.6.4
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category: Bitcoin, Finance, Network
@@ -14,7 +14,7 @@ dependencies:
   - aeson >= 1.4.7.1
   - aeson-pretty >= 0.8.8
   - base >=4.9 && <5
-  - base16 >= 1.0
+  - base16 >= 2.0
   - bytes >= 0.17
   - bytestring >= 0.10.10.0
   - cereal >= 0.5.8.1

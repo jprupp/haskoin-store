@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Fixed
 
 - Support full-RBF: accept replacements of transactions that do not signal BIP125.
+- Correct various space leaks.
+
+### Added
+
+- Support for testnet4 on both networks.
 
 ## [1.6.3] - 2026-08-31
 
