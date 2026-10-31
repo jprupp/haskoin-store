@@ -40,12 +40,16 @@ packages:
   original:
     hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
 - completed:
-    hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+    name: haskoin-core
     pantry-tree:
-      sha256: eda2a7abb536fba628b4e48a735c55ce4c3dd6b60013ecdad191c19336f09505
-      size: 6681
+      sha256: b87ca9b8e786accc05bdf25d4e783755cddf95b699e9ec68d2e8e352096bb5f5
+      size: 7358
+    sha256: c00b17849a193b1b3f125ce9df09b025d677aeaa9db0601003c7add8729bf3c6
+    size: 482456
+    url: https://github.com/jprupp/haskoin-core/archive/eff2c21ae02aa9a09e5932b6dfcb1e972b232165.tar.gz
+    version: 1.4.0
   original:
-    hackage: haskoin-core-1.3.0@sha256:2eb3ecdcfcc5d04e0fdb38d6c6f6daf7244c93b8293c153dffa97e8386e36ea5,5544
+    url: https://github.com/jprupp/haskoin-core/archive/eff2c21ae02aa9a09e5932b6dfcb1e972b232165.tar.gz
 - completed:
     name: nqe
     pantry-tree:

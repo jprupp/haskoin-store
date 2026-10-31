@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [1.6.4] - Unreleased
 
+### Added
+
+- Support Bitcoin testnet4 (`NET=btctest4`), from haskoin-core 1.4.0.
+
 ### Changed
 
 - Replace monad-logger with the fast-logger `Logger` from haskoin-node 2.0.0.
