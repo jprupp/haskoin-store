@@ -115,6 +115,7 @@ data Config = Config
     noMempool :: !Bool,
     wipeMempool :: !Bool,
     syncMempool :: !Bool,
+    blockWindow :: !Int,
     peerTimeout :: !Int,
     maxPeerLife :: !Int,
     mempoolTimeout :: !Int,
@@ -181,6 +182,8 @@ defConfig = do
     env "WIPE_MEMPOOL" False parseBool
   syncMempool <-
     env "SYNC_MEMPOOL" False parseBool
+  blockWindow <-
+    env "BLOCK_WINDOW" 64 readMaybe
   mempoolTimeout <-
     env "MEMPOOL_TIMEOUT" 14 readMaybe
   peerTimeout <-
@@ -442,6 +445,13 @@ config c = do
     flag c.syncMempool True $
       long "sync-mempool"
         <> help "Attempt to download peer mempools"
+  blockWindow <-
+    option auto $
+      metavar "COUNT"
+        <> long "block-window"
+        <> help "Blocks to request from the syncing peer at a time"
+        <> showDefault
+        <> value c.blockWindow
   mempoolTimeout <-
     option auto $
       metavar "DAYS"
@@ -609,6 +619,7 @@ run cfg =
             wipeMempool = cfg.wipeMempool,
             noMempool = cfg.noMempool,
             syncMempool = cfg.syncMempool,
+            blockWindow = cfg.blockWindow,
             mempoolTimeout = cfg.mempoolTimeout,
             peerTimeout = fromIntegral cfg.peerTimeout,
             maxPeerLife = fromIntegral cfg.maxPeerLife,

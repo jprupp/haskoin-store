@@ -7,16 +7,13 @@ module Haskoin.Store.LogicSpec (spec) where
 
 import Control.Monad (forM_, void)
 import Control.Monad.Reader (ask, liftIO, runReaderT)
-import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.List (sort)
-import Data.Serialize (encode)
 import Data.Word (Word32, Word64)
 import Haskoin
   ( Block (..),
     BlockHash,
     BlockHeader (..),
-    BlockHeight,
     BlockNode (..),
     Ctx,
     Network,
@@ -27,10 +24,8 @@ import Haskoin
     TxOut (..),
     bchRegTest,
     btcRegTest,
-    buildMerkleRoot,
     genesisNode,
     headerHash,
-    nullOutPoint,
     prepareContext,
     scriptToAddressBS,
     txHash,
@@ -56,6 +51,7 @@ import Haskoin.Store.Logic
     newMempoolTx,
     revertBlock,
   )
+import Haskoin.Store.TestBlocks (coinbaseTx, nextBlock, script)
 import System.Log.FastLogger (fromLogStr)
 import Test.Hspec
 import UnliftIO (catch, evaluate, try, withSystemTempDirectory)
@@ -231,8 +227,8 @@ spec = prepareContext $ \ctx -> do
 
     it "rejects blocks that do not build on the best block" $
       withDB btcRegTest ctx $ \db -> do
-        let (block1, node1) = nextBlock 0 (genesisNode btcRegTest).header []
-            (block2, node2) = nextBlock 1 node1.header []
+        let (block1, node1) = nextBlock btcRegTest 0 (genesisNode btcRegTest).header []
+            (block2, node2) = nextBlock btcRegTest 1 node1.header []
         importing db (void (importBlock block1 node1)) `shouldReturn` Left BestBlockNotFound
         importing db initBest `shouldReturn` Right ()
         importing db (void (importBlock block2 node2)) `shouldReturn` Left PrevBlockNotBest
@@ -350,24 +346,11 @@ tryMine :: DatabaseReader -> [Tx] -> IO (Either ImportException Block)
 tryMine db txs = do
   Just h <- reading db getBestBlock
   Just parent <- reading db (getBlock h)
-  let (block, node) = nextBlock parent.height parent.header txs
+  let (block, node) = nextBlock db.net parent.height parent.header txs
   fmap (const block) <$> importing db (importBlock block node)
 
 mine :: DatabaseReader -> [Tx] -> IO Block
 mine db txs = tryMine db txs >>= either (fail . ("Block rejected: " <>) . show) return
-
--- | The next block, 600 seconds after its parent.
-nextBlock :: BlockHeight -> BlockHeader -> [Tx] -> (Block, BlockNode)
-nextBlock height parent txs = (Block header all_txs, BlockNode header (height + 1) 0 prev)
-  where
-    prev = headerHash parent
-    all_txs = coinbaseTx (height + 1) : txs
-    merkle = buildMerkleRoot (map txHash all_txs)
-    header = BlockHeader 0x20000000 prev merkle (parent.timestamp + 600) parent.bits 0
-
--- | Coinbase of the block at this height.
-coinbaseTx :: BlockHeight -> Tx
-coinbaseTx h = Tx 1 [TxIn nullOutPoint (encode h) maxBound] [TxOut 5000000000 script] [] 0
 
 -- | Spend outputs into new ones of the given values.
 spend :: [OutPoint] -> [Word64] -> Tx
@@ -387,8 +370,3 @@ out tx = OutPoint (txHash tx)
 -- | Bitcoin regtest genesis block.
 genesis :: BlockHash
 genesis = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-
--- | Every output pays to this pay-to-public-key-hash script, so that address
--- balances are kept for all of them.
-script :: ByteString
-script = "\x76\xa9\x14" <> B.replicate 20 0x11 <> "\x88\xac"

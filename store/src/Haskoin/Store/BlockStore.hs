@@ -33,6 +33,7 @@ module Haskoin.Store.BlockStore
     blockStoreTxHashSTM,
     blockStorePendingTxs,
     blockStorePendingTxsSTM,
+    needsMoreBlocks,
   )
 where
 
@@ -313,9 +314,11 @@ data BlockStoreConfig = BlockStoreConfig
     wipeMempool :: !Bool,
     -- | sync mempool from peers
     syncMempool :: !Bool,
-    -- | disconnect syncing peer if inactive for this long
-    mempoolTimeout :: !Int,
+    -- | blocks to request from the syncing peer in one batch
+    blockWindow :: !Int,
     -- | delete transactions older than this number of days from mempool
+    mempoolTimeout :: !Int,
+    -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
     stats :: !(Maybe Stats),
     -- | log messages here
@@ -1002,6 +1005,7 @@ getSyncBest = do
           <> blockHashToHex bb
       throwIO (BlockNotInChain bb)
 
+-- | The syncing peer, when it is time to ask it for the next batch of blocks.
 shouldSync :: (MonadIO m) => BlockT m (Maybe Peer)
 shouldSync =
   isInSync >>= \case
@@ -1009,10 +1013,28 @@ shouldSync =
     False ->
       getSyncingState >>= \case
         Nothing -> return Nothing
-        Just Syncing {peer = p, blocks = bs}
-          | 100 > length bs -> return (Just p)
-          | otherwise -> return Nothing
+        Just Syncing {peer = p, blocks = bs} -> do
+          window <- blockWindow
+          return $
+            if needsMoreBlocks window (length bs)
+              then Just p
+              else Nothing
 
+-- | Blocks to request from the syncing peer in one batch. Never below one,
+-- or the store would never ask for any block.
+blockWindow :: (Monad m) => BlockT m Int
+blockWindow = asks (max 1 . (.config.blockWindow))
+
+-- | Whether to ask for the next batch, given the window size and how many
+-- requested blocks are still waiting to be imported. Asking once fewer than
+-- a quarter of the window remain keeps the peer busy, while the queue of
+-- downloaded blocks never grows much beyond one window. The threshold is at
+-- least one, so that a window smaller than four still refills once empty.
+needsMoreBlocks :: Int -> Int -> Bool
+needsMoreBlocks window outstanding =
+  outstanding < max 1 (window `div` 4)
+
+-- | Ask the syncing peer for the next batch of blocks, if the window has room.
 syncMe :: (MonadIO m) => BlockT m ()
 syncMe = do
   revertToMainChain
@@ -1039,21 +1061,14 @@ syncMe = do
       return $ map f bns
     getbh =
       liftIO . chainGetBest =<< asks (.config.chain)
+    -- The blocks right after the last requested one, up to one window or
+    -- the chain tip, whichever comes first.
     sel bb bh = do
-      let sh = geth bb bh
-      t <- top sh bh
+      window <- blockWindow
+      top <- findAncestor (min (bb.height + fromIntegral window) bh.height) bh
       ch <- asks (.config.chain)
-      ps <- liftIO $ chainGetParents ch (bb.height + 1) t
-      return $
-        if 500 > length ps
-          then ps <> [bh]
-          else ps
-    geth bb bh =
-      min (bb.height + 501) bh.height
-    top sh bh =
-      if sh == bh.height
-        then return bh
-        else findAncestor sh bh
+      ps <- liftIO $ chainGetParents ch (bb.height + 1) top
+      return $ ps <> [top]
 
 findAncestor ::
   (MonadIO m, MonadReader BlockStore m) =>
