@@ -24,6 +24,7 @@ import Data.Word
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store
+import Haskoin.Store.TestBlocks (nextBlock)
 import NQE
 import Network.Socket
 import System.Random
@@ -34,7 +35,9 @@ data TestStore = TestStore
   { testStoreDB :: !DatabaseReader,
     testStoreBlockStore :: !BlockStore,
     testStoreChain :: !Chain,
-    testStoreEvents :: !(Inbox StoreEvent)
+    testStoreEvents :: !(Inbox StoreEvent),
+    -- | How many blocks each getdata sent to the mock peer asked for, oldest first.
+    testStoreBlockRequests :: !(TVar [Int])
   }
 
 spec :: Spec
@@ -71,6 +74,14 @@ spec = prepareContext $ \ctx -> do
             length bd.txs `shouldBe` 1
             listToMaybe bd.txs `shouldBe` Just h1
             fmap (txHash . transactionData) t1 `shouldBe` Just h1
+    it "downloads 80 blocks with a request for 64 and one for the remaining 16" $
+      withTestStore bchRegTest ctx "block-window" $ \TestStore {..} -> do
+        bs <- replicateM 80 . receiveMatch testStoreEvents $ \case
+          StoreBestBlock b -> Just b
+          _ -> Nothing
+        bestNodeM <- liftIO $ chainGetBlock testStoreChain (last bs)
+        fmap (.height) bestNodeM `shouldBe` Just 80
+        readTVarIO testStoreBlockRequests `shouldReturn` [64, 16]
 
 withTestStore ::
   (MonadUnliftIO m) =>
@@ -81,6 +92,7 @@ withTestStore ::
   m a
 withTestStore net ctx t f =
   withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
+    requests <- newTVarIO []
     let ad =
           NetworkAddress
             nodeNetwork
@@ -101,10 +113,11 @@ withTestStore net ctx t f =
               noMempool = False,
               wipeMempool = False,
               syncMempool = False,
+              blockWindow = 64,
               mempoolTimeout = 14,
               peerTimeout = 60,
               maxPeerLife = 48 * 3600,
-              connect = dummyPeerConnect net ad,
+              connect = dummyPeerConnect requests net ad,
               stats = Nothing,
               redisSyncInterval = 30,
               bloom = True,
@@ -118,21 +131,31 @@ withTestStore net ctx t f =
             { testStoreDB = store.db,
               testStoreBlockStore = store.block,
               testStoreChain = store.chain,
-              testStoreEvents = sub
+              testStoreEvents = sub,
+              testStoreBlockRequests = requests
             }
 
 gap :: Word32
 gap = 32
 
+-- | The 15 canned blocks followed by 65 mined on top of them: more than one
+-- 64-block window, so that a download needs a second request.
 allBlocks :: [Block]
-allBlocks =
+allBlocks = take 80 (cannedBlocks <> mined (length cannedBlocks) (last cannedBlocks))
+  where
+    mined height parent = block : mined (height + 1) block
+      where
+        (block, _) = nextBlock bchRegTest (fromIntegral height) parent.header []
+
+cannedBlocks :: [Block]
+cannedBlocks =
   fromRight (error "Could not decode blocks") $
-    runGet f (decodeBase64Lenient allBlocksBase64)
+    runGet f (decodeBase64Lenient cannedBlocksBase64)
   where
     f = mapM (const get) [(1 :: Int) .. 15]
 
-allBlocksBase64 :: ByteString
-allBlocksBase64 =
+cannedBlocksBase64 :: ByteString
+cannedBlocksBase64 =
   "AAAAIAYibkYRGgtZyq8SYEPrW78ow086XjMqH8eytzzxiJEPakRJalmWTFwdvzNuH8fHLZEjn+4N\
   \FNMANdB7ez2M4a3TFbNe//9/IAMAAAABAgAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
   \AAAAAP////8MUQEBCC9FQjMyLjAv/////wEA8gUqAQAAACMhAwTspkCjMezKs47BPpafou1jjsHf\
@@ -184,8 +207,8 @@ allBlocksBase64 =
   \AAAAAAAAAAAAAAAAAAD/////DF8BAQgvRUIzMi4wL/////8BAPIFKgEAAAAjIQME7KZAozHsyrOO\
   \wT6Wn6LtY47B39Th44JKsZ8BGJCvc6wAAAAA"
 
-dummyPeerConnect :: Network -> NetworkAddress -> SockAddr -> WithConnection
-dummyPeerConnect net ad sa f = do
+dummyPeerConnect :: TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
+dummyPeerConnect requests net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
@@ -204,6 +227,7 @@ dummyPeerConnect net ad sa f = do
       runConduit $
         forever (receive r >>= yield)
           .| inc
+          .| iterMC (recordBlockRequest requests)
           .| concatMapC mockPeerReact
           .| outc
           .| awaitForever (`send` s)
@@ -220,6 +244,12 @@ dummyPeerConnect net ad sa f = do
             Left e ->
               error $
                 "Dummy peer could not decode payload: " <> show e
+
+-- | Note how many blocks a getdata asks for.
+recordBlockRequest :: TVar [Int] -> Message -> IO ()
+recordBlockRequest requests (MGetData (GetData ivs)) =
+  atomically $ modifyTVar' requests (<> [length [() | InvVector InvBlock _ <- ivs]])
+recordBlockRequest _ _ = return ()
 
 mockPeerReact :: Message -> [Message]
 mockPeerReact (MPing (Ping n)) = [MPong (Pong n)]

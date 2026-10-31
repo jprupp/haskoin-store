@@ -9,10 +9,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Added
 
 - Support Bitcoin testnet4 (`NET=btctest4`), from haskoin-core 1.4.0.
+- Option `--block-window` (`BLOCK_WINDOW`) to set how many blocks to request
+  from the syncing peer at a time.
 
 ### Changed
 
 - Replace monad-logger with the fast-logger `Logger` from haskoin-node 2.0.0.
+- Request 64 blocks at a time from the syncing peer instead of 500, and ask
+  for more once fewer than 16 remain, to bound memory use while catching up.
 
 ### Fixed
 

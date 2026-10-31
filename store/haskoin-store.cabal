@@ -140,8 +140,10 @@ test-suite spec
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Haskoin.Store.BlockStoreSpec
       Haskoin.Store.CacheSpec
       Haskoin.Store.LogicSpec
+      Haskoin.Store.TestBlocks
       Haskoin.StoreSpec
       Paths_haskoin_store
   hs-source-dirs:

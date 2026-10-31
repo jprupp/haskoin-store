@@ -149,9 +149,11 @@ data StoreConfig = StoreConfig
     wipeMempool :: !Bool,
     -- | sync mempool from peers
     syncMempool :: !Bool,
-    -- | disconnect peer if message not received for this many seconds
-    mempoolTimeout :: !Int,
+    -- | blocks to request from the syncing peer in one batch
+    blockWindow :: !Int,
     -- | delete mempool transactions older than this number of days
+    mempoolTimeout :: !Int,
+    -- | disconnect peer if message not received for this many seconds
     peerTimeout :: !NominalDiffTime,
     -- | disconnect peer if it has been connected this long
     maxPeerLife :: !NominalDiffTime,
@@ -234,6 +236,7 @@ blockStoreCfg cfg node pub db =
       noMempool = cfg.noMempool,
       wipeMempool = cfg.wipeMempool,
       syncMempool = cfg.syncMempool,
+      blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,
       stats = cfg.stats,
