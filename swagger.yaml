@@ -3,9 +3,11 @@ openapi: 3.0.0
 servers:
   - url: 'https://api.haskoin.com/bch/'
   - url: 'https://api.haskoin.com/btc/'
+  - url: 'https://api.haskoin.com/bchtest4/'
+  - url: 'https://api.haskoin.com/btctest4/'
 
 info:
-  version: &version 1.6.3
+  version: &version 1.6.4
   title: Haskoin
   contact:
     name: JP Rupp
