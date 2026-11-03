@@ -253,7 +253,10 @@ instance Serial XPubSpec where
     parent <- deserialize
     index <- getWord32be
     chain <- deserialize
-    key <- PubKey <$> getByteString 64
+    -- The internal form of libsecp256k1, as the key was stored; pubKey
+    -- checks that it is one, which the raw constructor of secp256k1-haskell
+    -- 1.x did not
+    key <- maybe (fail "XPubSpec: not a public key") return . pubKey =<< getByteString 64
     deriv <- deserialize
     return XPubSpec {key = XPubKey {..}, deriv}
 

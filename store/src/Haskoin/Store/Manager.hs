@@ -19,7 +19,6 @@ import Control.Monad.Cont
   )
 import Control.Monad.Reader (ReaderT (ReaderT), runReaderT)
 import Control.Monad.Trans (lift)
-import Data.Serialize (decode)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32)
 import Haskoin
@@ -376,17 +375,10 @@ storeDispatch b pub (PeerEvent pe) =
                 ]
           publishSTM (StoreTxAnnounce p txs) pub
           unless (null txs) $ blockStoreTxHashSTM p txs b
-        MReject Reject {message = MCTx, extra, code, reason} ->
-          case decode extra of
-            Left _ -> return ()
-            Right th ->
-              let reject =
-                    StoreTxReject
-                      p
-                      th
-                      code
-                      reason.get
-               in publishSTM reject pub
+        -- A reject that names no transaction hash cannot be attributed to a
+        -- transaction and falls through to the catch-all below.
+        MReject Reject {message = MCTx, extra = Just h, code, reason} ->
+          publishSTM (StoreTxReject p (TxHash h) code reason.get) pub
         _ -> return ()
 storeDispatch b _ (ChainEvent (ChainBestBlock bn)) =
   blockStoreHeadSTM bn b

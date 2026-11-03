@@ -115,13 +115,12 @@ instance Show ImportException where
 
 initBest :: ImportM ()
 initBest = do
-  ctx <- getCtx
   logDebug "Initializing best block"
   net <- getNetwork
   m <- getBestBlock
   when (isNothing m) . void $ do
     logDebug "Importing Genesis block"
-    importBlock (genesisBlock net ctx) (genesisNode net)
+    importBlock (genesisBlock net) (genesisNode net)
 
 newMempoolTx :: Tx -> UnixTime -> ImportM Bool
 newMempoolTx tx w =

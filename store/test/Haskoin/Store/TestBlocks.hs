@@ -40,7 +40,9 @@ nextBlock net height parent txs =
   where
     prev = headerHash parent
     all_txs = coinbaseTx (height + 1) : txs
-    merkle = buildMerkleRoot (map txHash all_txs)
+    -- The list always holds the coinbase, so the root cannot fail for an
+    -- empty block.
+    merkle = either error id (buildMerkleRoot (map txHash all_txs))
     candidate = BlockHeader 0x20000000 prev merkle (parent.timestamp + 600) parent.bits
     -- Regtest accepts about half of all hashes, so the nonce search is short.
     header =

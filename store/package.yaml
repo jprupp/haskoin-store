@@ -27,7 +27,7 @@ dependencies:
   - haskoin-store-data == 1.6.3
   - monad-control >= 1.0.2.3
   - mtl >= 2.2.2
-  - haskoin-core >= 1.4.0
+  - haskoin-core >= 1.5.0
   - haskoin-node >= 2.0.0
   - nqe >= 0.6.5
   - random >= 1.1
@@ -40,7 +40,7 @@ dependencies:
   - hedis >= 0.16.1
   - http-types >= 0.12.3
   - network >= 3.1.1.1
-  - rocksdb-haskell-jprupp >= 2.3.0
+  - rocksdb-haskell-jprupp >= 2.3.1
   - rocksdb-query >= 0.6.0
   - scotty >= 0.22
   - statsd-rupp >= 0.4
