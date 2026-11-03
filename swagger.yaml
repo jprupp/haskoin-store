@@ -1634,7 +1634,7 @@ paths:
                       address: null
                       witness: []
                   outputs:
-                    - address: bitcoincash:qz6jvu30sxevc627jnpdqv8h4mf5ryjpgy8vfq8cwz
+                    - address: null
                       pkscript: 41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac
                       value: 5000000000
                       spent: true

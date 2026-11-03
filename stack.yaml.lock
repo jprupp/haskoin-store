@@ -26,19 +26,23 @@ packages:
   original:
     hackage: statsd-rupp-0.5.0.0
 - completed:
-    hackage: secp256k1-haskell-1.7.0@sha256:b235f096b362c8d18d0b1894d17aa4a35b1e8d851892605d0536ebdefe393593,2077
+    commit: 29e7ca97790254a4f1b4608733fd92473ff0bf27
+    git: https://github.com/jprupp/secp256k1-haskell.git
+    name: secp256k1-haskell
     pantry-tree:
-      sha256: 25df8b13bd37f1690b09ecc24122d35eb98f7c64571a3fc30e2cd8d70f0c2ae8
-      size: 881
+      sha256: bc73509de07e42f6a850519484c155ada6ba2d3c42e95e940bad38f4a66b3bc3
+      size: 1702
+    version: 2.0.0
   original:
-    hackage: secp256k1-haskell-1.7.0
+    commit: 29e7ca97790254a4f1b4608733fd92473ff0bf27
+    git: https://github.com/jprupp/secp256k1-haskell.git
 - completed:
-    hackage: rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
+    hackage: rocksdb-haskell-jprupp-2.3.1@sha256:fc3fc113d7a10fc0a46e01812868e4345c9b1ed0def85aa380983e898ee6cc61,1589
     pantry-tree:
-      sha256: 6cbad8da561372c2e016fefba73f0034cc1429377df2c01c0661ab85bbe92f59
+      sha256: 321c0684d06444454b5e010d28331932a9c0e2a3f056b9c94612c6d6462f5ca3
       size: 711
   original:
-    hackage: rocksdb-haskell-jprupp-2.3.0
+    hackage: rocksdb-haskell-jprupp-2.3.1
 - completed:
     hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
     pantry-tree:
@@ -61,12 +65,16 @@ packages:
   original:
     hackage: haskoin-node-2.0.0
 - completed:
-    hackage: haskoin-core-1.4.0@sha256:67dbe1c1a9af806fab933b028ea694a9238c05eed96c45cfb1b7d1ea6bd4f82b,5544
+    commit: 097b110712227950777e61b087b9e442b2ac20b1
+    git: https://github.com/jprupp/haskoin-core.git
+    name: haskoin-core
     pantry-tree:
-      sha256: d86c9c938e51119e8de41ad7f31d26d5dec0f8938f6b11f1bf1084ebf913e71e
-      size: 6682
+      sha256: 01965148557816f048a027cd7f86d4dac59d1c1bf721ab8bbbd2ad3016398abd
+      size: 7759
+    version: 1.5.0
   original:
-    hackage: haskoin-core-1.4.0
+    commit: 097b110712227950777e61b087b9e442b2ac20b1
+    git: https://github.com/jprupp/haskoin-core.git
 snapshots:
 - completed:
     sha256: 5a365a790387c6fee9c1158c97f3701fdb34e523ba85730c8f0e45e1c4c30a7b
