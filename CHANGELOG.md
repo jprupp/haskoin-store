@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - A pay-to-public-key output has no address any more, as in haskoin-core
   1.5.0. Its coins cannot be spent with the input script of the P2PKH address
   of the same key, so they are no longer counted under that address.
+- Run with four capabilities (`-N4`) instead of one per core (`-N`), so that
+  memory overhead does not grow with the size of the host. Override with
+  `+RTS -N<n> -RTS`.
 
 ### Fixed
 
