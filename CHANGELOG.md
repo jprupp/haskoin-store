@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Option `--write-buffer-mb` (`WRITE_BUFFER_MB`) to cap RocksDB memtables
   across all column families, 256 MiB by default (0 = unlimited). Without a
   cap the nine column families can keep up to 1.1 GiB of memtables.
+- Option `--max-wal-mb` (`MAX_WAL_MB`), 1024 MiB by default (0 = RocksDB
+  default), to bound the RocksDB write-ahead log: once it is larger, the
+  column families holding its oldest file are flushed so the file can be
+  deleted.
+- `/dbstats` starts with the memory RocksDB uses outside the GHC heap:
+  memtables and table readers for each column family, and the block cache.
 
 ### Changed
 

@@ -9,6 +9,7 @@ import Control.Monad (forM_, void)
 import Control.Monad.Reader (ask, liftIO, runReaderT)
 import Data.ByteString qualified as B
 import Data.List (sort)
+import Data.Text qualified as T
 import Data.Word (Word32, Word64)
 import Haskoin
   ( Block (..),
@@ -40,7 +41,7 @@ import Haskoin.Store.Data
     TxData (..),
     Unspent (..),
   )
-import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, withDatabaseReader)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, memoryReport, withDatabaseReader)
 import Haskoin.Store.Database.Writer (runWriter)
 import Haskoin.Store.Logic
   ( ImportException (..),
@@ -64,6 +65,14 @@ spec = prepareContext $ \ctx -> do
         importing db initBest `shouldReturn` Right ()
         importing db initBest `shouldReturn` Right ()
         reading db getBestBlock `shouldReturn` Just genesis
+
+  describe "memoryReport" $
+    it "lists the memory of every column family" $
+      withCoin btcRegTest ctx $ \db _ -> do
+        report <- memoryReport db.db
+        forM_ ["default", "addr-tx", "unspent", "balance", "total", "block cache"] $ \name ->
+          report `shouldSatisfy` T.isInfixOf name
+        report `shouldNotSatisfy` T.isInfixOf "?"
 
   describe "newMempoolTx" $ do
     it "imports a transaction and spends its input" $
@@ -304,7 +313,7 @@ spec = prepareContext $ \ctx -> do
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
 withDB net ctx go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing (ask >>= liftIO . go)
+    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing (ask >>= liftIO . go)
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.

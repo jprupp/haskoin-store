@@ -170,6 +170,9 @@ data StoreConfig = StoreConfig
     -- | bytes of RocksDB memtables across all column families ('Nothing' =
     -- unlimited: each column family keeps up to two 64 MiB memtables)
     writeBufferSize :: !(Maybe Int),
+    -- | bytes of write-ahead log after which the column families holding the
+    -- oldest log file are flushed ('Nothing' = RocksDB default)
+    maxWalSize :: !(Maybe Int),
     -- | log messages here
     logger :: !Logger
   }
@@ -219,6 +222,7 @@ connectDB cfg f = do
     cfg.bloom
     cfg.maxOpenFiles
     cfg.writeBufferSize
+    cfg.maxWalSize
     stats
     f
 

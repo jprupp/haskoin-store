@@ -123,6 +123,7 @@ withTestStore net ctx t f =
               bloom = True,
               maxOpenFiles = Nothing,
               writeBufferSize = Nothing,
+              maxWalSize = Nothing,
               logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
             }
     withStore cfg $ \store ->

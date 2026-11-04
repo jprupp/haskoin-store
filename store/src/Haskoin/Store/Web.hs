@@ -2637,8 +2637,9 @@ scottyDbStats =
   withMetrics (.db) $ do
     setHeaders
     db <- askl (.config.store.db.db)
+    memory <- liftIO (memoryReport db)
     statsM <- liftIO (getProperty db Stats)
-    S.text $ maybe "Could not get stats" cs statsM
+    S.text . cs $ memory <> maybe "Could not get stats" cs statsM
 
 -----------------------
 -- Parameter Parsing --

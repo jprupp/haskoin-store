@@ -40,7 +40,7 @@ dependencies:
   - hedis >= 0.16.1
   - http-types >= 0.12.3
   - network >= 3.1.1.1
-  - rocksdb-haskell-jprupp >= 2.4.0
+  - rocksdb-haskell-jprupp >= 2.5.0
   - rocksdb-query >= 0.6.0
   - scotty >= 0.22
   - statsd-rupp >= 0.4
