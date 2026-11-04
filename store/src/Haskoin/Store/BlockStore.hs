@@ -814,10 +814,11 @@ notify block go = do
       Nothing -> HashSet.empty
 
 processMempool :: (MonadIO m) => BlockT m ()
-processMempool = guardMempool . notify Nothing $ do
+processMempool = guardMempool $ do
   txs <- pendingTxs 2000
   block_read <- ask
-  unless (null txs) (import_txs block_read txs)
+  -- notify reads the whole mempool twice, so only when there is work to do
+  unless (null txs) $ notify Nothing (import_txs block_read txs)
   where
     run_import block_read p =
       importMempoolTx block_read p.time p.tx
@@ -836,7 +837,7 @@ processMempool = guardMempool . notify Nothing $ do
 
 pruneMempool :: (MonadIO m) => BlockT m ()
 pruneMempool =
-  guardMempool . notify Nothing $ do
+  guardMempool $ do
     days <- asks (.config.mempoolTimeout)
     when (days > 0) $ do
       mempool <- reverse <$> getMempool
@@ -845,7 +846,8 @@ pruneMempool =
           txs = take 1000 $ map snd $ takeWhile ((< thresh) . fst) mempool
       net <- getNetwork
       ctx <- getCtx
-      when (length txs > 0) $ do
+      -- notify reads the whole mempool twice, so only when there is work to do
+      unless (null txs) . notify Nothing $ do
         logInfo $
           "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
         runImport net ctx (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
