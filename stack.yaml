@@ -28,4 +28,5 @@ extra-deps:
   - rocksdb-query-0.6.0
   - nqe-0.6.7
   - haskoin-node-2.1.2
-  - haskoin-core-1.5.0
+  - git: https://github.com/jprupp/haskoin-core.git
+    commit: 3b0cb2b28382c1695ad2dcbd755b6bca3fa3e871

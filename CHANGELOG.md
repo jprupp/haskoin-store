@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## Unreleased
+
+### Fixed
+
+- Build on haskoin-core 1.5.1, which evaluates the ASERT difficulty rule at the
+  parent block. With 1.5.0 the store rejected a valid block on Bitcoin Cash
+  mainnet at height 975899.
+
 ## [1.6.4] - 2026-11-04
 
 ### Added
