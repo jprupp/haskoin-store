@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Run with four capabilities (`-N4`) instead of one per core (`-N`), so that
   memory overhead does not grow with the size of the host. Override with
   `+RTS -N<n> -RTS`.
+- Docker image: pin the base image to Debian trixie (RocksDB 9.10) by digest
+  instead of `debian:latest`, and run with `MALLOC_ARENA_MAX=2` to limit
+  malloc fragmentation from RocksDB.
 
 ### Fixed
 
