@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - haskoin-store-data builds against secp256k1-haskell 2.0.0, which hides the
   raw `PubKey` constructor: `XPubSpec` reads its stored key with `pubKey`,
   which checks it.
-- Build on haskoin-core 1.5.0 and secp256k1-haskell 2.0.0. `genesisBlock`
-  no longer takes a context.
+- Build on haskoin-core 1.5.0, haskoin-node 2.1.0 and secp256k1-haskell 2.0.0.
+  `genesisBlock` no longer takes a context.
 - A pay-to-public-key output has no address any more, as in haskoin-core
   1.5.0. Its coins cannot be spent with the input script of the P2PKH address
   of the same key, so they are no longer counted under that address.
