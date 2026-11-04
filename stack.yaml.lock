@@ -58,12 +58,12 @@ packages:
   original:
     hackage: nqe-0.6.7
 - completed:
-    hackage: haskoin-node-2.1.0@sha256:d92178b6302d39a9b52255ba88b1dd67b9c34ec5df4a7efadf33cb685b254972,2261
+    hackage: haskoin-node-2.1.1@sha256:3e32a2f34dd8c9a22086cd6c86b0d838bfccbfcca4eeef2ca775292d121f803e,2261
     pantry-tree:
-      sha256: 0710803fe2256a11107fb51d0f7320259c7544f23cb30e384b75e4f8e13e4858
+      sha256: a09cd38f36ba07926d5963392bd60bf609a97b7e8745d28fd4f2bb02d1afc75b
       size: 766
   original:
-    hackage: haskoin-node-2.1.0
+    hackage: haskoin-node-2.1.1
 - completed:
     hackage: haskoin-core-1.5.0@sha256:7e3d2c7c73abc9e9c777dd3ba7949bb1617fa231411cd15b53ea77a4ee1c664c,5818
     pantry-tree:
