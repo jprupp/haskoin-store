@@ -34,9 +34,9 @@ jobs:
       - name: Test haskoin-store-data
         run: stack test haskoin-store-data
 
-      # Includes "keeps the heap flat while syncing": it syncs 5900 regtest
+      # Includes "keeps the heap flat while syncing": it syncs 6000 regtest
       # blocks from a mock peer and fails if the live heap grows by 1 MB or
-      # more between blocks 1000 and 5900, which catches a message loop that
+      # more between blocks 1000 and 6000, which catches a message loop that
       # retains memory per message. The test suite runs with +RTS -T for it.
       - name: Test haskoin-store
         run: stack test haskoin-store

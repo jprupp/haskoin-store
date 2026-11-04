@@ -28,7 +28,7 @@ dependencies:
   - monad-control >= 1.0.2.3
   - mtl >= 2.2.2
   - haskoin-core >= 1.5.0
-  - haskoin-node >= 2.1.1
+  - haskoin-node >= 2.1.2
   - nqe >= 0.6.5
   - random >= 1.1
   - string-conversions >= 0.4.0.1

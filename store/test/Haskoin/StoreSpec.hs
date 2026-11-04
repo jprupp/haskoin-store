@@ -92,11 +92,11 @@ spec = prepareContext $ \ctx -> do
       -- Each block passes messages through the peer, node and store loops.
       -- When forever went through a dictionary, each of six loops kept 33 to
       -- 107 bytes per message, a few hundred bytes per block in all: over
-      -- the 4900 blocks measured, megabytes. The heap normally grows by about
+      -- the 5000 blocks measured, megabytes. The heap normally grows by about
       -- 330 kB here, and a leak of 500 bytes per block fails the test. The
-      -- length is not a multiple of 2000, so the last headers message the
-      -- mock peer sends is not empty.
-      let blocks = chainOf 5900
+      -- length is a multiple of 2000, so the last headers message the mock
+      -- peer sends is empty, which haskoin-node before 2.1.2 did not handle.
+      let blocks = chainOf 6000
       withTestStoreBlocks blocks bchRegTest ctx "heap" $ \TestStore {..} -> do
         let wait_for height =
               receive testStoreEvents >>= \case
@@ -110,10 +110,10 @@ spec = prepareContext $ \ctx -> do
               (.gc.gcdetails_live_bytes) <$> getRTSStats
         wait_for 1000
         live_before <- live
-        wait_for 5900
+        wait_for 6000
         live_after <- live
         let growth = fromIntegral live_after - fromIntegral live_before :: Integer
-        putStrLn $ "heap growth over 4900 blocks: " <> show growth <> " bytes"
+        putStrLn $ "heap growth over 5000 blocks: " <> show growth <> " bytes"
         growth `shouldSatisfy` (< 1024 * 1024)
 
 withTestStore ::

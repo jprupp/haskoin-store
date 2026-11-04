@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - haskoin-store-data builds against secp256k1-haskell 2.0.0, which hides the
   raw `PubKey` constructor: `XPubSpec` reads its stored key with `pubKey`,
   which checks it.
-- Build on haskoin-core 1.5.0, haskoin-node 2.1.1 and secp256k1-haskell 2.0.0.
+- Build on haskoin-core 1.5.0, haskoin-node 2.1.2 and secp256k1-haskell 2.0.0.
   `genesisBlock` no longer takes a context.
 - A pay-to-public-key output has no address any more, as in haskoin-core
   1.5.0. Its coins cannot be spent with the input script of the P2PKH address
@@ -57,7 +57,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   doubled each time.
 
 - Continuous integration on GitHub Actions: build, run both test suites,
-  and check that the heap stays flat while syncing 5900 regtest blocks.
+  and check that the heap stays flat while syncing 6000 regtest blocks.
 
 ### Fixed
 
