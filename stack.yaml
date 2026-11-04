@@ -1,9 +1,9 @@
 resolver: nightly-2026-10-28
 ghc-options:
   "$everything": -O2
-  # The message loops are polymorphic in their monad and run at LoggingT IO.
-  # Unless GHC specialises them, forever goes through LoggingT's default (*>)
-  # and retains a stack frame and two thunks per message.
+  # Specialise the polymorphic message loops to their concrete monads. The
+  # loops already use loopForever, which stays flat in any monad; this keeps
+  # any loop that still goes through a dictionary from leaking too.
   haskoin-store: -fspecialise-aggressively -fexpose-all-unfoldings
   haskoin-store-data: -fspecialise-aggressively -fexpose-all-unfoldings
   haskoin-node: -fspecialise-aggressively -fexpose-all-unfoldings
