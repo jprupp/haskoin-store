@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   deleted.
 - `/dbstats` starts with the memory RocksDB uses outside the GHC heap:
   memtables and table readers for each column family, and the block cache.
+- The mempool is kept in its own column family, one key per transaction,
+  instead of as a single list value that every import batch read, loaded
+  into a hash table and wrote back whole. Data version 19: a version 18
+  database is migrated when it is opened, with no resync.
 
 ### Changed
 

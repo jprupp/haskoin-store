@@ -28,7 +28,7 @@ extra-deps:
   # rocksdb-haskell-jprupp 2.5.0 (memory properties, max_total_wal_size),
   # jprupp/rocksdb-haskell#15, not on Hackage yet
   - git: https://github.com/jprupp/rocksdb-haskell.git
-    commit: 8760346be393cc356eb00c6b69dd67abaa812fac
+    commit: 78fbadeb4d740936a4c89a7f44b806636689b10d
   - rocksdb-query-0.6.0
   - nqe-0.6.7
   - haskoin-node-2.1.0

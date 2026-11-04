@@ -24,6 +24,7 @@ module Haskoin.Store.Database.Reader
     blockCF,
     heightCF,
     balanceCF,
+    mempoolCF,
   )
 where
 
@@ -101,7 +102,7 @@ withMetrics :: (MonadReader DatabaseReader m) => (DataMetrics -> m a) -> m ()
 withMetrics go = asks (.metrics) >>= mapM_ go
 
 dataVersion :: Word32
-dataVersion = 18
+dataVersion = 19
 
 withDB :: DatabaseReader -> DatabaseReaderT m a -> m a
 withDB = flip runReaderT
@@ -138,6 +139,7 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal s
     cfg =
       def
         { createIfMissing = True,
+          createMissingColumnFamilies = True,
           maxFiles = maxOpenFiles,
           dbWriteBufferSize = writeBuffers,
           maxTotalWalSize = maxWal
@@ -184,7 +186,8 @@ columnFamilyConfig bloom =
     ("unspent", def {prefixLength = Just 37, bloomFilter = bloom}),
     ("block", def {prefixLength = Just 33, bloomFilter = bloom}),
     ("height", def {prefixLength = Nothing, bloomFilter = bloom}),
-    ("balance", def {prefixLength = Just 22, bloomFilter = bloom})
+    ("balance", def {prefixLength = Just 22, bloomFilter = bloom}),
+    ("mempool", def {prefixLength = Nothing, bloomFilter = bloom})
   ]
 
 addrTxCF :: DB -> ColumnFamily
@@ -208,13 +211,27 @@ heightCF db = columnFamilies db !! 6
 balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
+mempoolCF :: DB -> ColumnFamily
+mempoolCF db = columnFamilies db !! 8
+
 initRocksDB :: DatabaseReader -> IO ()
 initRocksDB DatabaseReader {db = db} =
   retrieve db VersionKey >>= \case
     Just v
       | v == dataVersion -> return ()
+      | v == 18 -> migrateMempool db
       | otherwise -> error "Incorrect RocksDB database version"
     Nothing -> setInitRocksDB db
+
+-- | Version 18 kept the whole mempool as one list under 'MemKey'. Move each
+-- transaction to its own key in the mempool column family, in the same
+-- batch that sets the new version.
+migrateMempool :: DB -> IO ()
+migrateMempool db = do
+  mempool <- fromMaybe [] <$> (retrieve db MemKey :: IO (Maybe [(UnixTime, TxHash)]))
+  writeBatch db $
+    [insertOpCF (mempoolCF db) (MemTxKey h) t | (t, h) <- mempool]
+      <> [deleteOp MemKey, insertOp VersionKey dataVersion]
 
 setInitRocksDB :: DB -> IO ()
 setInitRocksDB db = insert db VersionKey dataVersion
@@ -369,7 +386,11 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
   getMempool = do
     db <- asks (.db)
     withMetrics $ \s -> incrementCounter s.dataMempoolCount 1
-    fromMaybe [] <$> liftIO (retrieve db MemKey)
+    sortOn Down . mapMaybe entry
+      <$> liftIO (matchingAsListCF db (mempoolCF db) MemTxKeyS)
+    where
+      entry (MemTxKey h, t) = Just (t, h)
+      entry (MemTxKeyS, _) = Nothing
 
   getBestBlock = do
     withMetrics $ \s -> incrementCounter s.dataBestCount 1
