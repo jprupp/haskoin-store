@@ -532,6 +532,55 @@ instance Serialize Unspent where
 
 instance Coin Unspent where
   coinValue = (.value)
+  coinInputKind = scriptInputKind . (.script)
+
+-- | Kind of the input that spends an output with this script, for fee
+-- estimation. Read from the script bytes, as no context is at hand to parse
+-- public keys. A script hash or witness script hash does not tell what it
+-- hides: they are taken for the most common single-key case, a nested
+-- witness public key hash and a one-of-one witness multisig. Any other
+-- script counts as a public key hash.
+scriptInputKind :: ByteString -> InputKind
+scriptInputKind s
+  | len == 25 && B.take 3 s == B.pack [0x76, 0xa9, 0x14] && B.drop 23 s == B.pack [0x88, 0xac] =
+      InputPKHash
+  | len == 23 && B.take 2 s == B.pack [0xa9, 0x14] && B.last s == 0x87 =
+      InputNestedWitnessPKHash
+  | len == 22 && B.take 2 s == B.pack [0x00, 0x14] =
+      InputWitnessPKHash
+  | len == 34 && B.take 2 s == B.pack [0x00, 0x20] =
+      InputWitnessMulSig 1 1
+  | len == 34 && B.take 2 s == B.pack [0x51, 0x20] =
+      InputTaproot
+  | (len == 35 && B.head s == 0x21 || len == 67 && B.head s == 0x41) && B.last s == 0xac =
+      InputPK
+  | Right (Script ops) <- runGetS deserialize s,
+    Just (m, n) <- multisig ops =
+      InputMulSig m n
+  | otherwise =
+      InputPKHash
+  where
+    len = B.length s
+    multisig (op_m : rest)
+      | Just m <- op_int op_m,
+        (op_n : [OP_CHECKMULTISIG]) <- drop (length rest - 2) rest,
+        Just n <- op_int op_n,
+        keys <- take (length rest - 2) rest,
+        length keys == n,
+        all is_key keys,
+        m >= 1,
+        m <= n =
+          Just (m, n)
+    multisig _ = Nothing
+    -- OP_1 to OP_16, or a one-byte push for counts above 16
+    op_int op = case scriptOpToInt op of
+      Right i -> Just i
+      Left _ -> case pushOpData op of
+        Just b | B.length b == 1 -> Just (fromIntegral (B.head b))
+        _ -> Nothing
+    is_key op = case pushOpData op of
+      Just k -> B.length k == 33 || B.length k == 65
+      Nothing -> False
 
 instance MarshalJSON Network Unspent where
   marshalValue net u =
