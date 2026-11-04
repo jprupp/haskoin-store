@@ -122,6 +122,7 @@ withTestStore net ctx t f =
               redisSyncInterval = 30,
               bloom = True,
               maxOpenFiles = Nothing,
+              writeBufferSize = Nothing,
               logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
             }
     withStore cfg $ \store ->

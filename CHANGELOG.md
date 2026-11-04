@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Support Bitcoin testnet4 (`NET=btctest4`), from haskoin-core 1.4.0.
 - Option `--block-window` (`BLOCK_WINDOW`) to set how many blocks to request
   from the syncing peer at a time.
+- Option `--write-buffer-mb` (`WRITE_BUFFER_MB`) to cap RocksDB memtables
+  across all column families, 256 MiB by default (0 = unlimited). Without a
+  cap the nine column families can keep up to 1.1 GiB of memtables.
 
 ### Changed
 

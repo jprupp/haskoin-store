@@ -134,7 +134,8 @@ data Config = Config
     healthCheckInterval :: !Int,
     bloom :: !Bool,
     noWeb :: !Bool,
-    maxOpenFiles :: !Int
+    maxOpenFiles :: !Int,
+    writeBufferMB :: !Int
   }
 
 env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
@@ -222,6 +223,8 @@ defConfig = do
     env "NO_WEB" False parseBool
   maxOpenFiles <-
     env "MAX_OPEN_FILES" 2000 readMaybe
+  writeBufferMB <-
+    env "WRITE_BUFFER_MB" 256 readMaybe
   return Config {version = False, ..}
   where
     tickerString =
@@ -560,6 +563,13 @@ config c = do
         <> help "RocksDB max_open_files; bounds index/filter memory (0 = unlimited)"
         <> showDefault
         <> value c.maxOpenFiles
+  writeBufferMB <-
+    option auto $
+      metavar "MB"
+        <> long "write-buffer-mb"
+        <> help "RocksDB memtable budget across all column families in MiB (0 = unlimited)"
+        <> showDefault
+        <> value c.writeBufferMB
   pure Config {..}
 
 networkReader :: String -> Either String Network
@@ -628,6 +638,10 @@ run cfg =
             redisSyncInterval = cfg.redisSyncInterval,
             bloom = cfg.bloom,
             maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing,
+            writeBufferSize =
+              if cfg.writeBufferMB > 0
+                then Just (cfg.writeBufferMB * 1024 * 1024)
+                else Nothing,
             logger = logger
           }
     run_web logger stats store =

@@ -304,7 +304,7 @@ spec = prepareContext $ \ctx -> do
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
 withDB net ctx go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing (ask >>= liftIO . go)
+    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing (ask >>= liftIO . go)
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.

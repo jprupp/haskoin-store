@@ -110,10 +110,11 @@ withDatabaseReader ::
   FilePath ->
   Bool ->
   Maybe Int ->
+  Maybe Int ->
   Maybe DataMetrics ->
   DatabaseReaderT m a ->
   m a
-withDatabaseReader net ctx igap gap dir bloom maxOpenFiles stats m =
+withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers stats m =
   withRunInIO $ \run ->
     withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
       let bdb =
@@ -128,7 +129,12 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles stats m =
       initRocksDB bdb
       run $ runReaderT m bdb
   where
-    cfg = def {createIfMissing = True, maxFiles = maxOpenFiles}
+    cfg =
+      def
+        { createIfMissing = True,
+          maxFiles = maxOpenFiles,
+          dbWriteBufferSize = writeBuffers
+        }
 
 columnFamilyConfig :: Bool -> [(String, Config)]
 columnFamilyConfig bloom =
