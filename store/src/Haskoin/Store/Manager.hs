@@ -167,6 +167,12 @@ data StoreConfig = StoreConfig
     -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
     -- and filter blocks stay resident for the life of the process)
     maxOpenFiles :: !(Maybe Int),
+    -- | bytes of RocksDB memtables across all column families ('Nothing' =
+    -- unlimited: each column family keeps up to two 64 MiB memtables)
+    writeBufferSize :: !(Maybe Int),
+    -- | bytes of write-ahead log after which the column families holding the
+    -- oldest log file are flushed ('Nothing' = RocksDB default)
+    maxWalSize :: !(Maybe Int),
     -- | log messages here
     logger :: !Logger
   }
@@ -215,6 +221,8 @@ connectDB cfg f = do
     cfg.db
     cfg.bloom
     cfg.maxOpenFiles
+    cfg.writeBufferSize
+    cfg.maxWalSize
     stats
     f
 

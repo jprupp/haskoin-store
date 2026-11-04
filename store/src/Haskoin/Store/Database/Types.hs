@@ -16,6 +16,7 @@ module Haskoin.Store.Database.Types
     BalKey (..),
     HeightKey (..),
     MemKey (..),
+    MemTxKey (..),
     TxKey (..),
     decodeTxKey,
     UnspentKey (..),
@@ -243,6 +244,29 @@ instance Serialize MemKey where
 instance Key MemKey
 
 instance KeyValue MemKey [(UnixTime, TxHash)]
+
+-- | Key of one mempool transaction in the mempool column family, with the
+-- time it entered the mempool as its value. Replaces 'MemKey', which kept
+-- the whole mempool in a single value.
+data MemTxKey
+  = MemTxKey !TxHash
+  | MemTxKeyS
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize MemTxKey where
+  -- 0x08 · TxHash
+  put (MemTxKey h) = do
+    put MemTxKeyS
+    put h
+  -- 0x08
+  put MemTxKeyS = putWord8 0x08
+  get = do
+    guard . (== 0x08) =<< getWord8
+    MemTxKey <$> get
+
+instance Key MemTxKey
+
+instance KeyValue MemTxKey UnixTime
 
 -- | Block entry database key.
 newtype BlockKey = BlockKey BlockHash

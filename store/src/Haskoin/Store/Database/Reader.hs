@@ -16,6 +16,7 @@ module Haskoin.Store.Database.Reader
     withDB,
     createDataMetrics,
     withDatabaseReader,
+    memoryReport,
     addrTxCF,
     addrOutCF,
     txCF,
@@ -23,21 +24,25 @@ module Haskoin.Store.Database.Reader
     blockCF,
     heightCF,
     balanceCF,
+    mempoolCF,
   )
 where
 
 import Conduit
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
 import Control.Monad.Reader
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (encode)
+import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Word (Word32)
 import Database.RocksDB hiding (withDB)
 import Database.RocksDB.Query
@@ -46,6 +51,7 @@ import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Types
 import System.Metrics.StatsD
+import Text.Read (readMaybe)
 import UnliftIO
 
 type DatabaseReaderT = ReaderT DatabaseReader
@@ -96,7 +102,7 @@ withMetrics :: (MonadReader DatabaseReader m) => (DataMetrics -> m a) -> m ()
 withMetrics go = asks (.metrics) >>= mapM_ go
 
 dataVersion :: Word32
-dataVersion = 18
+dataVersion = 19
 
 withDB :: DatabaseReader -> DatabaseReaderT m a -> m a
 withDB = flip runReaderT
@@ -110,10 +116,12 @@ withDatabaseReader ::
   FilePath ->
   Bool ->
   Maybe Int ->
+  Maybe Int ->
+  Maybe Int ->
   Maybe DataMetrics ->
   DatabaseReaderT m a ->
   m a
-withDatabaseReader net ctx igap gap dir bloom maxOpenFiles stats m =
+withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal stats m =
   withRunInIO $ \run ->
     withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
       let bdb =
@@ -128,7 +136,46 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles stats m =
       initRocksDB bdb
       run $ runReaderT m bdb
   where
-    cfg = def {createIfMissing = True, maxFiles = maxOpenFiles}
+    cfg =
+      def
+        { createIfMissing = True,
+          createMissingColumnFamilies = True,
+          maxFiles = maxOpenFiles,
+          dbWriteBufferSize = writeBuffers,
+          maxTotalWalSize = maxWal
+        }
+
+-- | Memory that RocksDB uses outside the GHC heap, per column family:
+-- memtables and table readers (index and filter blocks of open files),
+-- then the block cache shared by all of them. Values are in bytes.
+memoryReport :: DB -> IO Text
+memoryReport db = do
+  rows <- forM cfs $ \(name, cf) -> do
+    mem <- prop cf CurSizeAllMemTables
+    readers <- prop cf EstimateTableReadersMem
+    return (name, mem, readers)
+  cache <- prop Nothing BlockCacheUsage
+  let total f = sum (mapMaybe f rows)
+      line (name, mem, readers) =
+        T.justifyLeft 10 ' ' name
+          <> T.justifyRight 16 ' ' (num mem)
+          <> T.justifyRight 16 ' ' (num readers)
+  return . T.unlines $
+    ["** RocksDB memory (bytes) **", T.justifyLeft 10 ' ' "family" <> T.justifyRight 16 ' ' "memtables" <> T.justifyRight 16 ' ' "table readers"]
+      <> map line rows
+      <> [ line ("total", Just (total (\(_, m, _) -> m)), Just (total (\(_, _, r) -> r))),
+           "block cache: " <> num cache,
+           ""
+         ]
+  where
+    cfs =
+      ("default", Nothing)
+        : zip (map (T.pack . fst) (columnFamilyConfig False)) (map Just (columnFamilies db))
+    prop cf p = do
+      v <- maybe (getProperty db p) (\c -> getPropertyCF db c p) cf
+      return (v >>= readMaybe . BS8.unpack)
+    num :: Maybe Integer -> Text
+    num = maybe "?" (T.pack . show)
 
 columnFamilyConfig :: Bool -> [(String, Config)]
 columnFamilyConfig bloom =
@@ -139,7 +186,8 @@ columnFamilyConfig bloom =
     ("unspent", def {prefixLength = Just 37, bloomFilter = bloom}),
     ("block", def {prefixLength = Just 33, bloomFilter = bloom}),
     ("height", def {prefixLength = Nothing, bloomFilter = bloom}),
-    ("balance", def {prefixLength = Just 22, bloomFilter = bloom})
+    ("balance", def {prefixLength = Just 22, bloomFilter = bloom}),
+    ("mempool", def {prefixLength = Nothing, bloomFilter = bloom})
   ]
 
 addrTxCF :: DB -> ColumnFamily
@@ -163,13 +211,27 @@ heightCF db = columnFamilies db !! 6
 balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
+mempoolCF :: DB -> ColumnFamily
+mempoolCF db = columnFamilies db !! 8
+
 initRocksDB :: DatabaseReader -> IO ()
 initRocksDB DatabaseReader {db = db} =
   retrieve db VersionKey >>= \case
     Just v
       | v == dataVersion -> return ()
+      | v == 18 -> migrateMempool db
       | otherwise -> error "Incorrect RocksDB database version"
     Nothing -> setInitRocksDB db
+
+-- | Version 18 kept the whole mempool as one list under 'MemKey'. Move each
+-- transaction to its own key in the mempool column family, in the same
+-- batch that sets the new version.
+migrateMempool :: DB -> IO ()
+migrateMempool db = do
+  mempool <- fromMaybe [] <$> (retrieve db MemKey :: IO (Maybe [(UnixTime, TxHash)]))
+  writeBatch db $
+    [insertOpCF (mempoolCF db) (MemTxKey h) t | (t, h) <- mempool]
+      <> [deleteOp MemKey, insertOp VersionKey dataVersion]
 
 setInitRocksDB :: DB -> IO ()
 setInitRocksDB db = insert db VersionKey dataVersion
@@ -324,7 +386,11 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
   getMempool = do
     db <- asks (.db)
     withMetrics $ \s -> incrementCounter s.dataMempoolCount 1
-    fromMaybe [] <$> liftIO (retrieve db MemKey)
+    sortOn Down . mapMaybe entry
+      <$> liftIO (matchingAsListCF db (mempoolCF db) MemTxKeyS)
+    where
+      entry (MemTxKey h, t) = Just (t, h)
+      entry (MemTxKeyS, _) = Nothing
 
   getBestBlock = do
     withMetrics $ \s -> incrementCounter s.dataBestCount 1

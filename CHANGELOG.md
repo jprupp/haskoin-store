@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Support Bitcoin testnet4 (`NET=btctest4`), from haskoin-core 1.4.0.
 - Option `--block-window` (`BLOCK_WINDOW`) to set how many blocks to request
   from the syncing peer at a time.
+- Option `--write-buffer-mb` (`WRITE_BUFFER_MB`) to cap RocksDB memtables
+  across all column families, 256 MiB by default (0 = unlimited). Without a
+  cap the nine column families can keep up to 1.1 GiB of memtables.
+- Option `--max-wal-mb` (`MAX_WAL_MB`), 1024 MiB by default (0 = RocksDB
+  default), to bound the RocksDB write-ahead log: once it is larger, the
+  column families holding its oldest file are flushed so the file can be
+  deleted.
+- `/dbstats` starts with the memory RocksDB uses outside the GHC heap:
+  memtables and table readers for each column family, and the block cache.
+- The mempool is kept in its own column family, one key per transaction,
+  instead of as a single list value that every import batch read, loaded
+  into a hash table and wrote back whole. Data version 19: a version 18
+  database is migrated when it is opened, with no resync.
 
 ### Changed
 
@@ -20,16 +33,38 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - haskoin-store-data builds against secp256k1-haskell 2.0.0, which hides the
   raw `PubKey` constructor: `XPubSpec` reads its stored key with `pubKey`,
   which checks it.
-- Build on haskoin-core 1.5.0 and secp256k1-haskell 2.0.0. `genesisBlock`
-  no longer takes a context.
+- Build on haskoin-core 1.5.0, haskoin-node 2.1.2 and secp256k1-haskell 2.0.0.
+  `genesisBlock` no longer takes a context.
 - A pay-to-public-key output has no address any more, as in haskoin-core
   1.5.0. Its coins cannot be spent with the input script of the P2PKH address
   of the same key, so they are no longer counted under that address.
+- The block store no longer reads the whole mempool four extra times on every
+  internal ping: it compares mempool snapshots only when there are pending
+  transactions to import or expired ones to delete.
+- Run with four capabilities (`-N4`) instead of one per core (`-N`), so that
+  memory overhead does not grow with the size of the host. Override with
+  `+RTS -N<n> -RTS`.
+- Docker image: pin the base image to Debian trixie (RocksDB 9.10) by digest
+  instead of `debian:latest`, and run with `MALLOC_ARENA_MAX=2` to limit
+  malloc fragmentation from RocksDB.
+- Each `/events` client, websocket or HTTP stream, gets a queue of at most
+  10,000 events and is disconnected when it fills up, instead of the queue
+  growing for as long as the client stays connected. Store events that
+  `/events` does not show are no longer queued for its clients.
+- A request waiting for another to load an xpub into the cache retries for
+  about 30 seconds, with at most 5 seconds between attempts, and then serves
+  the xpub from the database. It used to retry forever with a delay that
+  doubled each time.
+
+- Continuous integration on GitHub Actions: build, run both test suites,
+  and check that the heap stays flat while syncing 6000 regtest blocks.
 
 ### Fixed
 
 - Support full-RBF: accept replacements of transactions that do not signal BIP125.
 - Correct various space leaks.
+- `Unspent` implements `coinInputKind`, new in haskoin-core 1.5.0, from its
+  output script, so coin selection with it no longer fails at run time.
 
 ### Added
 

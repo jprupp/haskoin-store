@@ -146,9 +146,13 @@ import Haskoin.Store.WebCommon
 import Haskoin.Transaction
 import Haskoin.Util
 import NQE
-  ( Inbox,
-    receive,
-    withSubscription,
+  ( Publisher,
+    mailboxFullSTM,
+    newBoundedInbox,
+    receiveSTM,
+    sendSTM,
+    subscribe,
+    unsubscribe,
   )
 import Network.HTTP.Types
   ( Status (..),
@@ -190,6 +194,7 @@ import Network.WebSockets.Connection.PingPong
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Session as Wreq (Session)
 import Network.Wreq.Session qualified as Wreq.Session
+import Numeric.Natural (Natural)
 import System.Metrics.StatsD
 import UnliftIO
   ( MonadIO,
@@ -200,10 +205,13 @@ import UnliftIO
     atomically,
     bracket,
     bracket_,
+    checkSTM,
     handleAny,
     liftIO,
     newTVarIO,
+    orElse,
     race_,
+    readTVar,
     readTVarIO,
     withAsync,
     writeTVar,
@@ -1219,22 +1227,25 @@ webSocketEvents s =
     wrap f = case gauge of
       Nothing -> f
       Just g -> withGaugeIO g f
-    events pending = withSubscription pub $ \sub -> do
+    events pending = do
       let path = requestPath $ pendingRequest pending
       if path == "/events"
-        then do
+        then withEventSubscription pub $ \next -> do
           conn <- acceptRequest pending
-          -- Drop clients that stop answering pings: a dead or stalled
-          -- client would otherwise keep its (unbounded) event inbox growing.
+          -- Drop clients that stop answering pings, and clients that fall
+          -- so far behind that their event queue fills up.
           -- websockets only sees pongs while reading, hence the reader.
           withPingPong pingPong conn $ \c ->
-            race_
-              (loopForever (WebSockets.receiveDataMessage c))
-              ( loopForever $
-                  receiveEvent sub >>= \case
-                    Nothing -> return ()
-                    Just event -> sendTextData c (A.encode event)
-              )
+            let send_events =
+                  next >>= \case
+                    Nothing ->
+                      WebSockets.sendClose c ("Event queue full" :: Text)
+                    Just event -> do
+                      sendTextData c (A.encode event)
+                      send_events
+             in race_
+                  (loopForever (WebSockets.receiveDataMessage c))
+                  send_events
         else
           rejectRequestWith
             pending
@@ -1256,12 +1267,14 @@ scottyEvents =
     proto <- setupContentType False
     pub <- askl (.config.store.pub)
     S.stream $ \io flush' ->
-      withSubscription pub $ \sub ->
-        loopForever $ do
-          flush'
-          receiveEvent sub >>= \case
-            Nothing -> return ()
-            Just msg -> io (serial proto msg)
+      withEventSubscription pub $ \next ->
+        -- ends the response when the client falls too far behind
+        let send_events = do
+              flush'
+              next >>= \case
+                Nothing -> return ()
+                Just msg -> io (serial proto msg) >> send_events
+         in send_events
   where
     serial proto e =
       lazyByteString $
@@ -1270,11 +1283,32 @@ scottyEvents =
     newLine SerialAsJSON = "\n"
     newLine SerialAsPrettyJSON = mempty
 
-receiveEvent :: Inbox StoreEvent -> IO (Maybe Event)
-receiveEvent sub =
-  go <$> receive sub
+-- | Most events queued for one /events client. A client that does not keep
+-- up is disconnected once this many are waiting, instead of the queue
+-- growing without bound.
+eventQueueSize :: Natural
+eventQueueSize = 10000
+
+-- | Subscribe to the store events that /events clients see. The action gets
+-- a blocking read that returns the next event, or 'Nothing' once the queue
+-- has overflowed, after which the client must be disconnected. Other store
+-- events are dropped by the publisher instead of being queued.
+withEventSubscription ::
+  Publisher StoreEvent -> (IO (Maybe Event) -> IO a) -> IO a
+withEventSubscription pub f = do
+  inbox <- newBoundedInbox eventQueueSize
+  overflow <- newTVarIO False
+  let listen e = forM_ (toEvent e) $ \ev ->
+        mailboxFullSTM inbox >>= \case
+          True -> writeTVar overflow True
+          False -> sendSTM ev inbox
+      next =
+        atomically $
+          (readTVar overflow >>= checkSTM >> return Nothing)
+            `orElse` (Just <$> receiveSTM inbox)
+  bracket (subscribe pub listen) (unsubscribe pub) $ \_ -> f next
   where
-    go = \case
+    toEvent = \case
       StoreBestBlock b -> Just (EventBlock b)
       StoreMempoolNew t -> Just (EventTx t)
       StoreMempoolDelete t -> Just (EventTx t)
@@ -2603,8 +2637,9 @@ scottyDbStats =
   withMetrics (.db) $ do
     setHeaders
     db <- askl (.config.store.db.db)
+    memory <- liftIO (memoryReport db)
     statsM <- liftIO (getProperty db Stats)
-    S.text $ maybe "Could not get stats" cs statsM
+    S.text . cs $ memory <> maybe "Could not get stats" cs statsM
 
 -----------------------
 -- Parameter Parsing --

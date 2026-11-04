@@ -1,9 +1,9 @@
 resolver: nightly-2026-10-28
 ghc-options:
   "$everything": -O2
-  # The message loops are polymorphic in their monad and run at LoggingT IO.
-  # Unless GHC specialises them, forever goes through LoggingT's default (*>)
-  # and retains a stack frame and two thunks per message.
+  # Specialise the polymorphic message loops to their concrete monads. The
+  # loops already use loopForever, which stays flat in any monad; this keeps
+  # any loop that still goes through a dictionary from leaking too.
   haskoin-store: -fspecialise-aggressively -fexpose-all-unfoldings
   haskoin-store-data: -fspecialise-aggressively -fexpose-all-unfoldings
   haskoin-node: -fspecialise-aggressively -fexpose-all-unfoldings
@@ -23,11 +23,9 @@ extra-deps:
   - base16-2.0
   - hashtables-1.4.2
   - statsd-rupp-0.5.0.0
-  - git: https://github.com/jprupp/secp256k1-haskell.git
-    commit: 29e7ca97790254a4f1b4608733fd92473ff0bf27
-  - rocksdb-haskell-jprupp-2.3.1
+  - secp256k1-haskell-2.0.0
+  - rocksdb-haskell-jprupp-2.5.0
   - rocksdb-query-0.6.0
   - nqe-0.6.7
-  - haskoin-node-2.0.0
-  - git: https://github.com/jprupp/haskoin-core.git
-    commit: 097b110712227950777e61b087b9e442b2ac20b1
+  - haskoin-node-2.1.2
+  - haskoin-core-1.5.0

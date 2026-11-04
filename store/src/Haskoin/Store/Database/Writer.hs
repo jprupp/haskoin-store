@@ -12,11 +12,11 @@ module Haskoin.Store.Database.Writer (WriterT, runWriter, writerLogger) where
 
 import Control.Monad.Reader (ReaderT (..))
 import Control.Monad.Reader qualified as R
+import Data.HashMap.Strict qualified as HashMap
 import Data.HashTable.IO qualified as H
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
 import Data.Ord (Down (..))
-import Data.Tuple (swap)
 import Database.RocksDB (BatchOp, DB)
 import Database.RocksDB.Query
   ( deleteOp,
@@ -90,7 +90,8 @@ type AddrTxTable = H.BasicHashTable (Address, TxRef) (Maybe ())
 
 type AddrOutTable = H.BasicHashTable (Address, BlockRef, OutPoint) (Maybe OutVal)
 
-type MempoolTable = H.BasicHashTable TxHash UnixTime
+-- | Mempool changes in this batch: 'Nothing' for a deletion.
+type MempoolTable = H.BasicHashTable TxHash (Maybe UnixTime)
 
 data Memory = Memory
   { net :: !Network,
@@ -138,10 +139,10 @@ instance (MonadIO m) => StoreWrite (WriterT m) where
       k = (a, u.block, u.outpoint)
   addToMempool x t =
     ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert mempoolTable x t
+      liftIO $ H.insert mempoolTable x (Just t)
   deleteFromMempool x =
     ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.delete mempoolTable x
+      liftIO $ H.insert mempoolTable x Nothing
   setBalance b =
     ReaderT $ \Writer {memory = Memory {..}} ->
       liftIO $ H.insert balanceTable b.address (Just b)
@@ -172,8 +173,7 @@ runWriter ::
   WriterT m a ->
   m a
 runWriter net ctx bdb@DatabaseReader {db} logger f = do
-  mempool <- runReaderT getMempool bdb
-  hm <- newMemory net ctx mempool
+  hm <- newMemory net ctx
   x <- R.runReaderT f Writer {reader = bdb, memory = hm, logger}
   ops <- hashMapOps db hm
   liftIO $ writeBatch db ops
@@ -190,7 +190,7 @@ hashMapOps db Memory {..} =
         balOps db balanceTable,
         addrTxOps db addressTable,
         addrOutOps db outputTable,
-        mempoolOp mempoolTable,
+        mempoolOps db mempoolTable,
         unspentOps db unspentTable
       ]
 
@@ -243,9 +243,11 @@ addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
         (addrOutCF db)
         (AddrOutKey a b p)
 
-mempoolOp :: (MonadIO m) => MempoolTable -> m [BatchOp]
-mempoolOp t =
-  return . insertOp MemKey . sortOn Down . map swap <$> liftIO (H.toList t)
+mempoolOps :: (MonadIO m) => DB -> MempoolTable -> m [BatchOp]
+mempoolOps db t = map (uncurry f) <$> liftIO (H.toList t)
+  where
+    f h (Just u) = insertOpCF (mempoolCF db) (MemTxKey h) u
+    f h Nothing = deleteOpCF (mempoolCF db) (MemTxKey h)
 
 unspentOps :: (MonadIO m) => DB -> UnspentTable -> m [BatchOp]
 unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)
@@ -277,18 +279,24 @@ getBalanceI a = getLayered (getBalanceH a) (getBalance a)
 getUnspentI :: (MonadIO m) => OutPoint -> WriterT m (Maybe Unspent)
 getUnspentI op = getLayered (getUnspentH op) (getUnspent op)
 
+-- | The mempool in the database with the changes of this batch applied,
+-- newest first.
 getMempoolI :: (MonadIO m) => WriterT m [(UnixTime, TxHash)]
 getMempoolI =
-  ReaderT $ \Writer {memory = Memory {..}} ->
-    liftIO $ map swap <$> H.toList mempoolTable
+  ReaderT $ \Writer {reader = db, memory = Memory {..}} -> do
+    stored <- runReaderT getMempool db
+    changes <- liftIO $ H.toList mempoolTable
+    let changed = HashMap.fromList changes
+        kept = filter (not . (`HashMap.member` changed) . snd) stored
+        added = [(t, h) | (h, Just t) <- changes]
+    return $ sortOn Down (kept <> added)
 
 newMemory ::
   (MonadIO m) =>
   Network ->
   Ctx ->
-  [(UnixTime, TxHash)] ->
   m Memory
-newMemory net ctx mempool = do
+newMemory net ctx = do
   best <- newIORef Nothing
   blockTable <- liftIO H.new
   heightTable <- liftIO H.new
@@ -297,7 +305,7 @@ newMemory net ctx mempool = do
   balanceTable <- liftIO H.new
   addressTable <- liftIO H.new
   outputTable <- liftIO H.new
-  mempoolTable <- liftIO $ H.fromList (map swap mempool)
+  mempoolTable <- liftIO H.new
   return Memory {..}
 
 getBestBlockH :: Memory -> IO (Maybe (Maybe BlockHash))

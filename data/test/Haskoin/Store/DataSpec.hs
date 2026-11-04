@@ -3,6 +3,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -16,6 +18,8 @@ import Control.Arrow (second)
 import Control.Monad (forM_)
 import Data.Aeson (FromJSON (..))
 import Data.ByteString qualified as B
+import Data.Bytes.Put (runPutS)
+import Data.Bytes.Serial (serialize)
 import Data.Maybe (isJust)
 import Data.String.Conversions (cs)
 import Haskoin
@@ -115,7 +119,35 @@ withNet net g = do
   return (net, x)
 
 spec :: Spec
-spec = forM_ allNets $ \net -> prepareContext (testIdentity . identityTests net)
+spec = do
+  forM_ allNets $ \net -> prepareContext (testIdentity . identityTests net)
+  prepareContext $ \ctx -> describe "Coin instance of Unspent" $
+    it "reads the input kind from the output script" $
+      property $
+        forAll (arbitraryScriptOutput btc ctx) $ \so ->
+          case encodeOutput ctx so of
+            Left _ -> discard
+            Right script ->
+              let u =
+                    Unspent
+                      { block = MemRef 0,
+                        outpoint = OutPoint (TxHash z) 0,
+                        value = 1,
+                        script = runPutS (serialize script),
+                        address = Nothing
+                      }
+               in coinInputKind u `shouldBe` expectedKind so
+  where
+    z = sha256 B.empty
+    expectedKind = \case
+      PayPK {} -> InputPK
+      PayPKHash {} -> InputPKHash
+      PayMulSig {keys, required} -> InputMulSig required (length keys)
+      PayScriptHash {} -> InputNestedWitnessPKHash
+      PayWitnessPKHash {} -> InputWitnessPKHash
+      PayWitnessScriptHash {} -> InputWitnessMulSig 1 1
+      PayWitness 1 bs | B.length bs == 32 -> InputTaproot
+      _ -> InputPKHash
 
 instance Arbitrary BlockRef where
   arbitrary =

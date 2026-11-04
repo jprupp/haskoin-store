@@ -9,7 +9,9 @@ import Control.Monad (forM_, void)
 import Control.Monad.Reader (ask, liftIO, runReaderT)
 import Data.ByteString qualified as B
 import Data.List (sort)
+import Data.Text qualified as T
 import Data.Word (Word32, Word64)
+import Database.RocksDB.Query (insert, retrieve)
 import Haskoin
   ( Block (..),
     BlockHash,
@@ -19,7 +21,8 @@ import Haskoin
     Network,
     OutPoint (..),
     Tx (..),
-    TxHash,
+    TxHash (..),
+    sha256,
     TxIn (..),
     TxOut (..),
     bchRegTest,
@@ -40,7 +43,8 @@ import Haskoin.Store.Data
     TxData (..),
     Unspent (..),
   )
-import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, withDatabaseReader)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, memoryReport, withDatabaseReader)
+import Haskoin.Store.Database.Types (MemKey (..), VersionKey (..))
 import Haskoin.Store.Database.Writer (runWriter)
 import Haskoin.Store.Logic
   ( ImportException (..),
@@ -64,6 +68,30 @@ spec = prepareContext $ \ctx -> do
         importing db initBest `shouldReturn` Right ()
         importing db initBest `shouldReturn` Right ()
         reading db getBestBlock `shouldReturn` Just genesis
+
+  describe "memoryReport" $
+    it "lists the memory of every column family" $
+      withCoin btcRegTest ctx $ \db _ -> do
+        report <- memoryReport db.db
+        forM_ ["default", "addr-tx", "unspent", "balance", "total", "block cache"] $ \name ->
+          report `shouldSatisfy` T.isInfixOf name
+        report `shouldNotSatisfy` T.isInfixOf "?"
+
+  describe "data version 18" $
+    it "moves the mempool into its column family when opened" $
+      withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
+        let open :: DatabaseReaderT IO () -> IO ()
+            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing
+            h1 = TxHash (sha256 ("one" :: B.ByteString))
+            h2 = TxHash (sha256 ("two" :: B.ByteString))
+            old = [(200, h2), (100, h1)] :: [(Word64, TxHash)]
+        open $ ask >>= \r -> liftIO $ do
+          insert r.db VersionKey (18 :: Word32)
+          insert r.db MemKey old
+        open $ ask >>= \r -> liftIO $ do
+          reading r getMempool `shouldReturn` old
+          (retrieve r.db MemKey :: IO (Maybe [(Word64, TxHash)])) `shouldReturn` Nothing
+          retrieve r.db VersionKey `shouldReturn` Just (19 :: Word32)
 
   describe "newMempoolTx" $ do
     it "imports a transaction and spends its input" $
@@ -304,7 +332,7 @@ spec = prepareContext $ \ctx -> do
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
 withDB net ctx go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing (ask >>= liftIO . go)
+    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing (ask >>= liftIO . go)
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.

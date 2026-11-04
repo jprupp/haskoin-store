@@ -233,9 +233,10 @@ type CacheT = ReaderT (Maybe CacheConfig)
 
 type CacheX = ReaderT CacheConfig
 
-logDebug, logInfo, logError :: (MonadIO m) => Text -> CacheX m ()
+logDebug, logInfo, logWarn, logError :: (MonadIO m) => Text -> CacheX m ()
 logDebug = cacheLog LevelDebug
 logInfo = cacheLog LevelInfo
+logWarn = cacheLog LevelWarn
 logError = cacheLog LevelError
 
 cacheLog :: (MonadIO m) => LogLevel -> Text -> CacheX m ()
@@ -424,10 +425,18 @@ getXPubBalances xpub = do
       return xbals
     else do
       withMetrics $ \s -> incrementCounter s.misses 1
-      withRetryLock (xpubLock xpub) $ do
-        bals <- lift $ xPubBals xpub
-        newXPubC xpub bals
-        return bals
+      withRetryLock (xpubLock xpub) (load_and_cache xpub) >>= \case
+        Just bals -> return bals
+        Nothing -> do
+          -- Another thread held the lock for too long: serve from the
+          -- database without caching rather than wait any longer.
+          logWarn "Could not acquire xpub lock, serving from database"
+          lift $ xPubBals xpub
+  where
+    load_and_cache x = do
+      bals <- lift $ xPubBals x
+      newXPubC x bals
+      return bals
 
 isInCache :: (MonadIO m) => XPubSpec -> CacheT m Bool
 isInCache xpub =
@@ -785,20 +794,28 @@ withLock l f =
       threadDelay (150 * 1000 * 1000)
       refreshLock l
 
+-- | Run the action holding the lock, retrying with exponential backoff
+-- while another thread holds it. The delay between attempts grows from
+-- 0.2 s to at most 5 s, and after about 30 s of waiting it gives up and
+-- returns 'Nothing' instead of keeping the calling thread blocked forever.
 withRetryLock ::
   (MonadUnliftIO m) =>
   ByteString ->
   CacheX m a ->
-  CacheX m a
+  CacheX m (Maybe a)
 withRetryLock l f =
-  go (200 * 1000)
+  go 0 (200 * 1000)
   where
-    go n =
+    max_delay = 5 * 1000 * 1000
+    max_wait = 30 * 1000 * 1000
+    go waited n =
       withLock l f >>= \case
-        Just x -> return x
-        Nothing -> do
-          threadDelay n
-          go (n * 2)
+        Just x -> return (Just x)
+        Nothing
+          | waited >= max_wait -> return Nothing
+          | otherwise -> do
+              threadDelay n
+              go (waited + n) (min max_delay (n * 2))
 
 pruneDB ::
   (MonadUnliftIO m, StoreReadBase m) => CacheX m ()
