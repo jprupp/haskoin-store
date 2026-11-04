@@ -37,11 +37,21 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Docker image: pin the base image to Debian trixie (RocksDB 9.10) by digest
   instead of `debian:latest`, and run with `MALLOC_ARENA_MAX=2` to limit
   malloc fragmentation from RocksDB.
+- Each `/events` client, websocket or HTTP stream, gets a queue of at most
+  10,000 events and is disconnected when it fills up, instead of the queue
+  growing for as long as the client stays connected. Store events that
+  `/events` does not show are no longer queued for its clients.
+- A request waiting for another to load an xpub into the cache retries for
+  about 30 seconds, with at most 5 seconds between attempts, and then serves
+  the xpub from the database. It used to retry forever with a delay that
+  doubled each time.
 
 ### Fixed
 
 - Support full-RBF: accept replacements of transactions that do not signal BIP125.
 - Correct various space leaks.
+- `Unspent` implements `coinInputKind`, new in haskoin-core 1.5.0, from its
+  output script, so coin selection with it no longer fails at run time.
 
 ### Added
 
