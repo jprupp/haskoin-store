@@ -16,11 +16,13 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Base64
 import Data.Either
-import Data.List (find)
+import Data.HashMap.Strict qualified as HashMap
 import Data.Maybe
 import Data.Serialize
 import Data.Time.Clock.POSIX
 import Data.Word
+import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
+import System.Mem (performMajorGC)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store
@@ -83,6 +85,37 @@ spec = prepareContext $ \ctx -> do
         fmap (.height) bestNodeM `shouldBe` Just 80
         readTVarIO testStoreBlockRequests `shouldReturn` [64, 16]
 
+  describe "Memory" $
+    it "keeps the heap flat while syncing" $ do
+      enabled <- getRTSStatsEnabled
+      unless enabled $ pendingWith "run with +RTS -T to measure the heap"
+      -- Each block passes messages through the peer, node and store loops.
+      -- When forever went through a dictionary, each of six loops kept 33 to
+      -- 107 bytes per message, a few hundred bytes per block in all: over
+      -- the 4900 blocks measured, megabytes. The heap normally grows by about
+      -- 330 kB here, and a leak of 500 bytes per block fails the test. The
+      -- length is not a multiple of 2000, so the last headers message the
+      -- mock peer sends is not empty.
+      let blocks = chainOf 5900
+      withTestStoreBlocks blocks bchRegTest ctx "heap" $ \TestStore {..} -> do
+        let wait_for height =
+              receive testStoreEvents >>= \case
+                StoreBestBlock b ->
+                  chainGetBlock testStoreChain b >>= \case
+                    Just n | n.height >= height -> return ()
+                    _ -> wait_for height
+                _ -> wait_for height
+            live = do
+              performMajorGC
+              (.gc.gcdetails_live_bytes) <$> getRTSStats
+        wait_for 1000
+        live_before <- live
+        wait_for 5900
+        live_after <- live
+        let growth = fromIntegral live_after - fromIntegral live_before :: Integer
+        putStrLn $ "heap growth over 4900 blocks: " <> show growth <> " bytes"
+        growth `shouldSatisfy` (< 1024 * 1024)
+
 withTestStore ::
   (MonadUnliftIO m) =>
   Network ->
@@ -90,7 +123,18 @@ withTestStore ::
   String ->
   (TestStore -> m a) ->
   m a
-withTestStore net ctx t f =
+withTestStore = withTestStoreBlocks allBlocks
+
+-- | Like 'withTestStore', with the mock peer serving these blocks.
+withTestStoreBlocks ::
+  (MonadUnliftIO m) =>
+  [Block] ->
+  Network ->
+  Ctx ->
+  String ->
+  (TestStore -> m a) ->
+  m a
+withTestStoreBlocks blocks net ctx t f =
   withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
     requests <- newTVarIO []
     let ad =
@@ -117,7 +161,7 @@ withTestStore net ctx t f =
               mempoolTimeout = 14,
               peerTimeout = 60,
               maxPeerLife = 48 * 3600,
-              connect = dummyPeerConnect requests net ad,
+              connect = dummyPeerConnect blocks requests net ad,
               stats = Nothing,
               redisSyncInterval = 30,
               bloom = True,
@@ -143,7 +187,12 @@ gap = 32
 -- | The 15 canned blocks followed by 65 mined on top of them: more than one
 -- 64-block window, so that a download needs a second request.
 allBlocks :: [Block]
-allBlocks = take 80 (cannedBlocks <> mined (length cannedBlocks) (last cannedBlocks))
+allBlocks = chainOf 80
+
+-- | The canned blocks followed by blocks mined on top of them, this many in
+-- all.
+chainOf :: Int -> [Block]
+chainOf n = take n (cannedBlocks <> mined (length cannedBlocks) (last cannedBlocks))
   where
     mined height parent = block : mined (height + 1) block
       where
@@ -209,8 +258,8 @@ cannedBlocksBase64 =
   \AAAAAAAAAAAAAAAAAAD/////DF8BAQgvRUIzMi4wL/////8BAPIFKgEAAAAjIQME7KZAozHsyrOO\
   \wT6Wn6LtY47B39Th44JKsZ8BGJCvc6wAAAAA"
 
-dummyPeerConnect :: TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
-dummyPeerConnect requests net ad sa f = do
+dummyPeerConnect :: [Block] -> TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
+dummyPeerConnect blocks requests net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
@@ -230,7 +279,7 @@ dummyPeerConnect requests net ad sa f = do
         forever (receive r >>= yield)
           .| inc
           .| iterMC (recordBlockRequest requests)
-          .| concatMapC mockPeerReact
+          .| concatMapC (mockPeerReact blocks)
           .| outc
           .| awaitForever (`send` s)
     outc = mapMC $ \msg' -> return $ runPut (putMessage net msg')
@@ -253,16 +302,20 @@ recordBlockRequest requests (MGetData (GetData ivs)) =
   atomically $ modifyTVar' requests (<> [length [() | InvVector InvBlock _ <- ivs]])
 recordBlockRequest _ _ = return ()
 
-mockPeerReact :: Message -> [Message]
-mockPeerReact (MPing (Ping n)) = [MPong (Pong n)]
-mockPeerReact (MVersion _) = [MVerAck]
-mockPeerReact (MGetHeaders (GetHeaders _ _hs _)) = [MHeaders (Headers hs')]
+mockPeerReact :: [Block] -> Message -> [Message]
+mockPeerReact _ (MPing (Ping n)) = [MPong (Pong n)]
+mockPeerReact _ (MVersion _) = [MVerAck]
+mockPeerReact blocks (MGetHeaders (GetHeaders _ locator _)) = [MHeaders (Headers hs')]
   where
     f b = (b.header, VarInt $ fromIntegral $ length b.txs)
-    hs' = map f allBlocks
-mockPeerReact (MGetData (GetData ivs)) = mapMaybe f ivs
+    -- Up to 2000 headers after the first block of the locator that the
+    -- peer has, like a real peer; from the start if it has none of them.
+    heights = HashMap.fromList (zip (map (headerHash . (.header)) blocks) [1 :: Int ..])
+    start = fromMaybe 0 (listToMaybe (mapMaybe (`HashMap.lookup` heights) locator))
+    hs' = map f (take 2000 (drop start blocks))
+mockPeerReact blocks (MGetData (GetData ivs)) = mapMaybe f ivs
   where
-    f (InvVector InvBlock h) = MBlock <$> find (l h) allBlocks
+    f (InvVector InvBlock h) = MBlock <$> HashMap.lookup (BlockHash h) byHash
     f _ = Nothing
-    l h b = headerHash b.header == BlockHash h
-mockPeerReact _ = []
+    byHash = HashMap.fromList [(headerHash b.header, b) | b <- blocks]
+mockPeerReact _ _ = []

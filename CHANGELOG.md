@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the xpub from the database. It used to retry forever with a delay that
   doubled each time.
 
+- Continuous integration on GitHub Actions: build, run both test suites,
+  and check that the heap stays flat while syncing 5900 regtest blocks.
+
 ### Fixed
 
 - Support full-RBF: accept replacements of transactions that do not signal BIP125.

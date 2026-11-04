@@ -86,7 +86,8 @@ tests:
     ghc-options:
       - -threaded
       - -rtsopts
-      - -with-rtsopts=-N4
+      # -T lets the memory test read the heap size
+      - '"-with-rtsopts=-N4 -T"'
     dependencies:
       - haskoin-store
       - hspec >= 2.7.1

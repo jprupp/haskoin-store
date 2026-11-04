@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecp256k1-dev librocksdb-dev pkg-config zlib1g-dev
+
+      - name: Cache Stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+            data/.stack-work
+            store/.stack-work
+          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
+          restore-keys: stack-${{ runner.os }}-
+
+      - name: Build
+        run: stack build --install-ghc --test --no-run-tests
+
+      - name: Test haskoin-store-data
+        run: stack test haskoin-store-data
+
+      # Includes "keeps the heap flat while syncing": it syncs 5900 regtest
+      # blocks from a mock peer and fails if the live heap grows by 1 MB or
+      # more between blocks 1000 and 5900, which catches a message loop that
+      # retains memory per message. The test suite runs with +RTS -T for it.
+      - name: Test haskoin-store
+        run: stack test haskoin-store
