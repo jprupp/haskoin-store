@@ -17,6 +17,7 @@ module Haskoin.Store.Database.Types
     HeightKey (..),
     MemKey (..),
     MemTxKey (..),
+    MemTimeKey (..),
     TxKey (..),
     decodeTxKey,
     UnspentKey (..),
@@ -47,6 +48,7 @@ import Data.Serialize
     getBytes,
     getWord16be,
     getWord32be,
+    getWord64be,
     getWord8,
     putWord64be,
     putWord8,
@@ -268,6 +270,31 @@ instance Serialize MemTxKey where
 instance Key MemTxKey
 
 instance KeyValue MemTxKey UnixTime
+
+-- | Index of the mempool by the time each transaction entered it, in the
+-- mempool column family next to 'MemTxKey'. Keys sort by time, then by
+-- hash, as the pairs in 'getMempool' do, so a page of the mempool is read
+-- with a short scan instead of loading and sorting every entry.
+data MemTimeKey
+  = MemTimeKey !UnixTime !TxHash
+  | MemTimeKeyS
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize MemTimeKey where
+  -- 0x0b · UnixTime (big endian) · TxHash
+  put (MemTimeKey t h) = do
+    put MemTimeKeyS
+    putWord64be t
+    put h
+  -- 0x0b
+  put MemTimeKeyS = putWord8 0x0b
+  get = do
+    guard . (== 0x0b) =<< getWord8
+    MemTimeKey <$> getWord64be <*> get
+
+instance Key MemTimeKey
+
+instance KeyValue MemTimeKey ()
 
 -- | Block entry database key.
 newtype BlockKey = BlockKey BlockHash

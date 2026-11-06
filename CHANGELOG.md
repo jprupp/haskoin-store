@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+
+- Index the mempool by the time each transaction entered it. `/mempool`,
+  `/blockchain/unconfirmed-transactions` and the health check read only the
+  page they return, newest first, instead of loading and sorting the whole
+  mempool on every request. Data version 20: a version 18 or 19 database is
+  migrated when it is opened, with no resync.
+- The block store no longer reads the whole mempool to publish mempool
+  events, to set the mempool gauge or to find expired transactions. Each
+  import reports which transactions it added to the mempool or removed from
+  it; pruning reads only the oldest entries of the index. Before, every
+  block, every batch of new transactions and every clock tick (several per
+  second) read the whole mempool at least once.
+- Count the transactions of an xpub without building the list of all of them
+  when the cache is not used.
+
 ## [1.7.0] - 2026-11-06
 
 ### Changed
