@@ -369,7 +369,7 @@ spec = prepareContext $ \ctx -> do
   describe "address balances" $
     it "follow transactions through the mempool, a block and its reversal" $
       withCoin btcRegTest ctx $ \db coin -> do
-        a <- either fail return (scriptToAddressBS ctx script)
+        a <- either fail return (scriptToAddressBS btcRegTest ctx script)
         let tx = spend [coin] [1000, 2000]
             -- confirmed, unconfirmed, outputs, transactions, received
             balance = do
@@ -382,6 +382,17 @@ spec = prepareContext $ \ctx -> do
         balance `shouldReturn` (5000003000, 0, 3, 3, 10000003000)
         importing db (revertBlock (headerHash block.header)) `shouldReturn` Right ()
         balance `shouldReturn` (0, 3000, 2, 2, 5000003000)
+
+  describe "a coin whose script has no address on the network" $
+    it "is kept without an address" $
+      withCoin btcRegTest ctx $ \db coin -> do
+        -- OP_HASH256, a push of 32 bytes, OP_EQUAL. Bitcoin Cash has an
+        -- address for this script. Bitcoin has none.
+        let hashLock = "\xaa\x20" <> B.replicate 32 0xbb <> "\x87"
+            tx = Tx 2 [TxIn coin "" maxBound] [TxOut 1000 hashLock] [] 0
+        addTx db tx `shouldReturn` Right True
+        coinAddress <- fmap (.address) <$> reading db (getUnspent (out tx 0))
+        coinAddress `shouldBe` Just Nothing
 
 -- | Run with an empty database in a temporary directory.
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a

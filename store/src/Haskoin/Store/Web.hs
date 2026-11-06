@@ -20,6 +20,9 @@ module Haskoin.Store.Web
     Except (..),
     WebLimits (..),
     runWeb,
+
+    -- * Request parsing
+    decodeTxBody,
   )
 where
 
@@ -657,7 +660,7 @@ handlePaths cfg = do
     toEncoding
     toJSON
   pathCompact
-    (PostTx <$> parseBody)
+    (PostTx <$> parseTxBody)
     scottyPostTx
     toEncoding
     toJSON
@@ -2534,6 +2537,7 @@ getPeersInformation mgr =
         PeerInfo
           { userAgent = ver.userAgent.get,
             address = show op.address,
+            -- Signed, as the peer sent it. See 'PeerInfo'.
             version = ver.version,
             services = ver.services,
             relay = ver.relay
@@ -2688,19 +2692,37 @@ paramCapture = do
   where
     label = proxyLabel (Proxy :: Proxy a)
 
-parseBody :: (MonadIO m, Serial a) => ActionT m a
-parseBody = do
+-- | Read the transaction that a request carries in its body.
+parseTxBody :: (MonadUnliftIO m) => ActionT m Tx
+parseTxBody = do
+  net <- askl (.config.store.net)
   b <- L.toStrict <$> S.body
-  case hex b <> bin b of
+  case decodeTxBody net b of
     Left _ -> raise $ UserError "Failed to parse request body"
-    Right x -> return x
+    Right tx -> return tx
+
+-- | Read a transaction from a request body. The body is the transaction in
+-- hex or as raw bytes. White space in the hex is ignored.
+--
+-- The body must hold one transaction and nothing else. Bytes after the
+-- transaction are refused, as Bitcoin Core does for a raw transaction.
+--
+-- The transaction must be in the format that peers of the network read. A
+-- network without SegWit, such as Bitcoin Cash, has the format without
+-- witness only. Its nodes would not read the SegWit format, so the store
+-- does not take it either.
+decodeTxBody :: Network -> C.ByteString -> Either String Tx
+decodeTxBody net body = fromHex <> fromBytes body
   where
-    bin = runGetS deserialize
-    hex b =
-      let ns = C.filter (not . isSpace) b
-       in case parseBase16 ns of
-            Right b16 -> bin $ decodeBase16 b16
-            Left e -> Left (cs e)
+    fromBytes = runGetS $ do
+      tx <- getNetworkTx net
+      done <- isEmpty
+      unless done $ fail "Trailing bytes after transaction"
+      return tx
+    fromHex =
+      case parseBase16 (C.filter (not . isSpace) body) of
+        Right b16 -> fromBytes (decodeBase16 b16)
+        Left e -> Left (cs e)
 
 parseOffset :: (MonadUnliftIO m) => ActionT m OffsetParam
 parseOffset = do

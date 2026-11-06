@@ -1008,15 +1008,15 @@ instance Serialize Prev where
   put = serialize
   get = deserialize
 
-toInput :: Ctx -> TxIn -> Maybe Prev -> WitnessStack -> StoreInput
-toInput ctx i Nothing w =
+toInput :: Network -> Ctx -> TxIn -> Maybe Prev -> WitnessStack -> StoreInput
+toInput _ _ i Nothing w =
   StoreCoinbase
     { outpoint = i.outpoint,
       sequence = i.sequence,
       script = i.script,
       witness = w
     }
-toInput ctx i (Just p) w =
+toInput net ctx i (Just p) w =
   StoreInput
     { outpoint = i.outpoint,
       sequence = i.sequence,
@@ -1024,16 +1024,16 @@ toInput ctx i (Just p) w =
       pkscript = p.script,
       value = p.value,
       witness = w,
-      address = eitherToMaybe (scriptToAddressBS ctx p.script)
+      address = eitherToMaybe (scriptToAddressBS net ctx p.script)
     }
 
-toOutput :: Ctx -> TxOut -> Maybe Spender -> StoreOutput
-toOutput ctx o s =
+toOutput :: Network -> Ctx -> TxOut -> Maybe Spender -> StoreOutput
+toOutput net ctx o s =
   StoreOutput
     { value = o.value,
       script = o.script,
       spender = s,
-      address = eitherToMaybe (scriptToAddressBS ctx o.script)
+      address = eitherToMaybe (scriptToAddressBS net ctx o.script)
     }
 
 data TxData = TxData
@@ -1083,8 +1083,11 @@ txDataFee t =
     inputs = sum $ map (.value) $ IntMap.elems t.prevs
     outputs = sum $ map (.value) t.tx.outputs
 
-toTransaction :: Ctx -> TxData -> Transaction
-toTransaction ctx t =
+-- | Build the API form of a stored transaction. The network decides which
+-- output scripts have an address. A SegWit-shaped script has none on Bitcoin
+-- Cash, for example.
+toTransaction :: Network -> Ctx -> TxData -> Transaction
+toTransaction net ctx t =
   Transaction
     { version = t.tx.version,
       locktime = t.tx.locktime,
@@ -1118,8 +1121,8 @@ toTransaction ctx t =
     outs = zipWith g [0 ..] t.tx.outputs
     outv = sum $ map (.value) outs
     ws = take (length t.tx.inputs) $ t.tx.witness <> repeat []
-    f n i = toInput ctx i (IntMap.lookup n t.prevs) (ws !! n)
-    g n o = toOutput ctx o $ IntMap.lookup n t.spenders
+    f n i = toInput net ctx i (IntMap.lookup n t.prevs) (ws !! n)
+    g n o = toOutput net ctx o $ IntMap.lookup n t.spenders
 
 fromTransaction :: Transaction -> TxData
 fromTransaction t =
@@ -1284,8 +1287,10 @@ data PeerInfo = PeerInfo
     userAgent :: !ByteString,
     -- | network address
     address :: !String,
-    -- | version number
-    version :: !Word32,
+    -- | protocol version from the peer's version message. It is a signed
+    -- number, as in Bitcoin Core and haskoin-core, so a peer that sends
+    -- ffffffff has version -1.
+    version :: !Int32,
     -- | services field
     services :: !Word64,
     -- | will relay transactions
@@ -1297,13 +1302,13 @@ instance Serial PeerInfo where
   serialize p = do
     putLengthBytes p.userAgent
     putLengthBytes $ T.encodeUtf8 $ T.pack p.address
-    putWord32be p.version
+    putInt32be p.version
     putWord64be p.services
     serialize p.relay
   deserialize = do
     userAgent <- getLengthBytes
     address <- T.unpack . T.decodeUtf8 <$> getLengthBytes
-    version <- getWord32be
+    version <- getInt32be
     services <- getWord64be
     relay <- deserialize
     return PeerInfo {..}
@@ -1331,7 +1336,7 @@ instance ToJSON PeerInfo where
       mconcat
         [ "useragent" `A.pair` A.text (T.decodeUtf8 p.userAgent),
           "address" `A.pair` toEncoding p.address,
-          "version" `A.pair` A.word32 p.version,
+          "version" `A.pair` A.int32 p.version,
           "services" `A.pair` hexEncoding (runPutL $ serialize p.services),
           "relay" `A.pair` A.bool p.relay
         ]

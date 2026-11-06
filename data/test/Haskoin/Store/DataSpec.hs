@@ -16,11 +16,14 @@ module Haskoin.Store.DataSpec (spec, arbitraryDeriveType) where
 
 import Control.Arrow (second)
 import Control.Monad (forM_)
-import Data.Aeson (FromJSON (..))
+import Data.Aeson (FromJSON (..), Value)
+import Data.Aeson qualified as A
 import Data.ByteString qualified as B
+import Data.ByteString.Lazy qualified as BL
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (serialize)
-import Data.Maybe (isJust)
+import Data.IntMap qualified as IntMap
+import Data.Maybe (fromJust, isJust)
 import Data.String.Conversions (cs)
 import Haskoin
 import Haskoin.Store.Data
@@ -137,8 +140,53 @@ spec = do
                         address = Nothing
                       }
                in coinInputKind u `shouldBe` expectedKind so
+  prepareContext $ \ctx -> describe "toTransaction" $ do
+    -- The JSON of the only output of a transaction that pays 1000 satoshi
+    -- to a script given in hex.
+    let outputJson net scriptHex =
+          let script = fromJust (decodeHex scriptHex)
+              tx = Tx 2 [TxIn (OutPoint (TxHash z) 0) "" maxBound] [TxOut 1000 script] [] 0
+              td =
+                TxData
+                  { block = MemRef 0,
+                    tx = tx,
+                    prevs = IntMap.empty,
+                    deleted = False,
+                    rbf = False,
+                    timestamp = 0,
+                    spenders = IntMap.empty
+                  }
+           in map (marshalValue net) (toTransaction net ctx td).outputs
+        -- Pay to witness public key hash, from the examples of BIP 173.
+        p2wpkh = "0014751e76e8199196d454941c45d1b3a323f1433bd6"
+        -- OP_HASH256, a push of 32 bytes, OP_EQUAL.
+        hashLock = "aa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb87"
+    it "gives a SegWit output its address on Bitcoin" $
+      outputJson btc p2wpkh
+        `shouldBe` [ json
+                       "{\"address\":\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\",\
+                       \\"pkscript\":\"0014751e76e8199196d454941c45d1b3a323f1433bd6\",\
+                       \\"value\":1000,\"spent\":false,\"spender\":null}"
+                   ]
+    it "gives a SegWit-shaped output no address on Bitcoin Cash, which has no SegWit" $
+      outputJson bch p2wpkh
+        `shouldBe` [ json
+                       "{\"address\":null,\
+                       \\"pkscript\":\"0014751e76e8199196d454941c45d1b3a323f1433bd6\",\
+                       \\"value\":1000,\"spent\":false,\"spender\":null}"
+                   ]
+    it "gives a 256-bit hash lock output no address on Bitcoin, which has no such address" $
+      outputJson btc hashLock
+        `shouldBe` [ json
+                       "{\"address\":null,\
+                       \\"pkscript\":\"aa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb87\",\
+                       \\"value\":1000,\"spent\":false,\"spender\":null}"
+                   ]
   where
     z = sha256 B.empty
+    -- Read a JSON literal.
+    json :: BL.ByteString -> Value
+    json = fromJust . A.decode
     expectedKind = \case
       PayPK {} -> InputPK
       PayPKHash {} -> InputPKHash

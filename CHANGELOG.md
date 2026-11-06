@@ -22,6 +22,47 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Count the transactions of an xpub without building the list of all of them
   when the cache is not used.
 
+## [1.7.0] - 2026-11-06
+
+### Changed
+
+- Build on haskoin-core 1.6.0 and haskoin-node 2.3.0, the releases with the
+  fixes of the November 2026 security review. Their changelogs list the
+  changes to message parsing, header validation and peer handling that the
+  store now runs with.
+- An output has an address only when the network defines one for its script,
+  as in haskoin-core 1.6.0. A SegWit-shaped output has no address on Bitcoin
+  Cash. A 256-bit script hash output (`OP_HASH256`, a push of 32 bytes,
+  `OP_EQUAL`) has none on Bitcoin. Such an output is no longer indexed under
+  an address, and its `address` is `null`. Entries that an older version
+  wrote under such an address stay in the database. No request can name them,
+  since the address has no text form on the network.
+- `POST /transactions` takes a body that holds one transaction and nothing
+  else. Bytes after the transaction are refused, as Bitcoin Core does for a
+  raw transaction. They used to be ignored.
+- `POST /transactions` takes the transaction in the format that peers of the
+  network read. A network without SegWit, such as Bitcoin Cash, has the
+  format without witness only.
+- `GET /peers` gives the `version` of a peer as a signed number, as
+  haskoin-core 1.6.0 reads it. A peer that sends version ffffffff has version
+  -1, where it used to appear as 4294967295.
+- Breaking, in `haskoin-store-data`: `toTransaction` takes the `Network` as
+  its first argument, and the `version` field of `PeerInfo` is an `Int32`.
+  The binary form of `PeerInfo` is the same bytes as before.
+- From haskoin-node 2.3.0: a peer is disconnected when it sends more than
+  50000 entries in an `inv` or `getdata` message. On Bitcoin Cash a message
+  may be at most 2 MiB, unless it carries block content. Transactions from
+  Bitcoin Cash peers are read in the format without witness only.
+
+### Fixed
+
+- A response no longer fails on a transaction with an output that has no
+  address on the network. Since haskoin-core 1.5.0 the JSON encoder of such
+  an address threw, which cut the response off. One such output is in Bitcoin
+  block 211997 (transaction
+  `a4bfa8ab6435ae5f25dae9d89e4eb67dfa94283ca751f393c1ddc5a837bbc31b`,
+  output 0).
+
 ## [1.6.5] - 2026-11-04
 
 ### Fixed
