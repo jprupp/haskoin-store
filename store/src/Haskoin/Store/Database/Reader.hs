@@ -32,7 +32,7 @@ module Haskoin.Store.Database.Reader
 where
 
 import Conduit
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, replicateM, (>=>))
 import Control.Monad.Reader
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
@@ -442,6 +442,11 @@ withIterCFStat db cf f = do
     go = withRunInIO $ \run ->
       withIterCF db cf $ \it -> run (f it)
 
+-- | Run an action with this many iterators on a column family. They are
+-- opened and closed in a single bracket rather than one bracket each: each
+-- bracket leaves a frame on the stack, and every call into RocksDB through
+-- an iterator walks the stack, so with one bracket per address an xpub of a
+-- hundred addresses made each step of each iterator a hundred times slower.
 withManyIters ::
   (MonadUnliftIO m) =>
   DB ->
@@ -449,10 +454,19 @@ withManyIters ::
   Int ->
   ([Iterator] -> DatabaseReaderT m a) ->
   DatabaseReaderT m a
-withManyIters db cf i f = go [] i
+withManyIters db cf i f = do
+  m <- asks (.metrics)
+  bracket_ (gauge m i) (gauge m (negate i)) $
+    withRunInIO $ \run ->
+      bracket (newIORef []) (readIORef >=> mapM_ destroyIterator) $ \ref -> do
+        its <- replicateM i . mask_ $ do
+          it <- createIterator db (Just cf)
+          modifyIORef' ref (it :)
+          return it
+        run (f its)
   where
-    go acc 0 = f acc
-    go acc n = withIterCFStat db cf $ \it -> go (it : acc) (n - 1)
+    gauge (Just m) n = incrementGauge m.dataIters n
+    gauge Nothing _ = return ()
 
 joinConduits ::
   (Monad m, Ord o) =>
