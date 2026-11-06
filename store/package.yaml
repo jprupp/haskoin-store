@@ -94,3 +94,17 @@ tests:
       - QuickCheck >= 2.13.2
       - base64 >= 0.4.1
       - fast-logger >= 3.0
+benchmarks:
+  # Load-test server: syncs a synthetic chain and serves the web API on it.
+  # Build with `stack build --bench --no-run-benchmarks` and run it with
+  # scripts/bench-web.sh.
+  haskoin-store-bench:
+    main: Main.hs
+    source-dirs: bench
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N4
+    dependencies:
+      - haskoin-store
+      - vector
