@@ -24,8 +24,10 @@ SERVER_CPUS=${SERVER_CPUS:-0-2}
 WRK_CPUS=${WRK_CPUS:-3}
 
 cd "$(dirname "$0")/.."
-BIN=$(stack --no-nix --system-ghc path --dist-dir 2>/dev/null)
-BIN=store/$BIN/build/haskoin-store-bench/haskoin-store-bench
+if [ -z "${BIN:-}" ]; then
+  BIN=$(stack --no-nix --system-ghc path --dist-dir 2>/dev/null)
+  BIN=store/$BIN/build/haskoin-store-bench/haskoin-store-bench
+fi
 OUT=$(mktemp)
 trap 'kill $SERVER 2>/dev/null || true; rm -f "$OUT" "$OUT.wrk"' EXIT
 
