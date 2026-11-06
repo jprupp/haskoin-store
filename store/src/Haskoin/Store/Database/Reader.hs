@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -41,7 +42,9 @@ import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Functor ((<&>))
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Serialize (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -659,8 +662,11 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     withMetrics $ \s -> incrementCounter s.dataXPubTxs (length txs)
     return txs
 
-  -- Count the merged streams instead of building the list of every
-  -- transaction of the xpub only to take its length.
+  -- Count the transactions of all the addresses, each once even when it
+  -- touches several of them. The entries of an address are sorted, and the
+  -- same transaction has the same key after the address prefix in every
+  -- address, so merge the addresses by those raw key bytes and count the
+  -- distinct ones, without decoding any key or reading any value.
   xPubTxCount _xspec xbals = do
     withMetrics $ \s -> incrementCounter s.dataXPubTxCount 1
     db <- asks (.db)
@@ -669,5 +675,23 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
             filter (not . nullBalance) $
               map (.balance) xbals
     withManyIters db (addrTxCF db) (length as) $ \its ->
-      runConduit (joinDescStreams (zipWith (`addressConduit` Nothing) as its) .| lengthC)
-        >>= \n -> return (fromIntegral (n :: Int))
+      liftIO $ fromIntegral <$> countDistinctSuffixes (zip (map (encode . AddrTxKeyA) as) its)
+
+-- | Number of distinct keys, after their prefix, in a set of iterators that
+-- each walk the keys with one prefix, in order.
+countDistinctSuffixes :: [(BS.ByteString, Iterator)] -> IO Int
+countDistinctSuffixes streams = do
+  heads <- mapM start streams
+  go 0 (Map.fromListWith (<>) [(k, [x]) | (k, x) <- catMaybes heads])
+  where
+    start x@(pfx, it) = iterSeek it pfx >> current x
+    current x@(pfx, it) =
+      iterKey it <&> \case
+        Just k | pfx `BS.isPrefixOf` k -> Just (BS.drop (BS.length pfx) k, x)
+        _ -> Nothing
+    advance x@(_, it) = iterNext it >> current x
+    go !n m = case Map.minViewWithKey m of
+      Nothing -> return n
+      Just ((_, xs), m') -> do
+        nexts <- catMaybes <$> mapM advance xs
+        go (n + 1) (foldr (\(k, x) -> Map.insertWith (<>) k [x]) m' nexts)
