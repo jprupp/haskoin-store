@@ -354,9 +354,8 @@ confirmTx t br = confTx t (Just br)
 
 replaceAddressTx :: TxData -> BlockRef -> ImportM ()
 replaceAddressTx t new = do
-  net <- getNetwork
   ctx <- getCtx
-  forM_ (txDataAddresses net ctx t) $ \a -> do
+  forM_ (txDataAddresses ctx t) $ \a -> do
     deleteAddrTx
       a
       TxRef
@@ -387,9 +386,8 @@ adjustAddressOutput op o old new = do
       replace_unspent pk
   where
     replace_unspent pk = do
-      net <- getNetwork
       ctx <- getCtx
-      let ma = eitherToMaybe (scriptToAddressBS net ctx pk)
+      let ma = eitherToMaybe (scriptToAddressBS ctx pk)
       deleteUnspent op
       insertUnspent
         Unspent
@@ -584,9 +582,8 @@ commitAddTx = commitModTx True
 
 commitModTx :: Bool -> TxData -> ImportM ()
 commitModTx add tx_data = do
-  net <- getNetwork
   ctx <- getCtx
-  mapM_ mod_addr_tx (txDataAddresses net ctx td)
+  mapM_ mod_addr_tx (txDataAddresses ctx td)
   mod_outputs
   mod_unspent
   insertTx td
@@ -667,28 +664,27 @@ modOutput ::
   TxOut ->
   ImportM ()
 modOutput add br op o = do
-  net <- getNetwork
   ctx <- getCtx
-  let ma = eitherToMaybe (scriptToAddressBS net ctx o.script)
-  mod_unspent ma
-  forM_ ma $ \a -> do
-    mod_addr_unspent a (u ma)
+  mod_unspent ctx
+  forM_ (ma ctx) $ \a -> do
+    mod_addr_unspent a (u ctx)
     modBalance (confirmed br) add a o.value
     modifyReceived a v
   where
     v
       | add = (+ o.value)
       | otherwise = subtract o.value
-    u ma =
+    ma ctx = eitherToMaybe (scriptToAddressBS ctx o.script)
+    u ctx =
       Unspent
         { script = o.script,
           block = br,
           outpoint = op,
           value = o.value,
-          address = ma
+          address = ma ctx
         }
-    mod_unspent ma
-      | add = insertUnspent (u ma)
+    mod_unspent ctx
+      | add = insertUnspent (u ctx)
       | otherwise = deleteUnspent op
     mod_addr_unspent
       | add = insertAddrUnspent
@@ -738,9 +734,8 @@ spendOutput th ix op = do
   deleteUnspent op
   insertSpender op (Spender th ix)
   let pk = u.script
-  net <- getNetwork
   ctx <- getCtx
-  forM_ (scriptToAddressBS net ctx pk) $ \a -> do
+  forM_ (scriptToAddressBS ctx pk) $ \a -> do
     decreaseBalance (confirmed u.block) a u.value
     deleteAddrUnspent a u
 
@@ -749,7 +744,6 @@ unspendOutputs = mapM_ unspendOutput . prevOuts
 
 unspendOutput :: OutPoint -> ImportM ()
 unspendOutput op = do
-  net <- getNetwork
   ctx <- getCtx
   t <-
     getActiveTxData op.hash >>= \case
@@ -759,7 +753,7 @@ unspendOutput op = do
         fromMaybe
           (error ("Could not find output: " <> show op))
           (getTxOut op.index t.tx)
-      m = eitherToMaybe (scriptToAddressBS net ctx o.script)
+      m = eitherToMaybe (scriptToAddressBS ctx o.script)
       u =
         Unspent
           { value = o.value,
@@ -814,15 +808,15 @@ modAddressCount add a = do
       | add = (+ 1)
       | otherwise = subtract 1
 
-txOutAddrs :: Network -> Ctx -> [TxOut] -> [Address]
-txOutAddrs net ctx = nub' . rights . map (scriptToAddressBS net ctx . (.script))
+txOutAddrs :: Ctx -> [TxOut] -> [Address]
+txOutAddrs ctx = nub' . rights . map (scriptToAddressBS ctx . (.script))
 
-txInAddrs :: Network -> Ctx -> [Prev] -> [Address]
-txInAddrs net ctx = nub' . rights . map (scriptToAddressBS net ctx . (.script))
+txInAddrs :: Ctx -> [Prev] -> [Address]
+txInAddrs ctx = nub' . rights . map (scriptToAddressBS ctx . (.script))
 
-txDataAddresses :: Network -> Ctx -> TxData -> [Address]
-txDataAddresses net ctx t =
-  nub' $ txInAddrs net ctx prevs <> txOutAddrs net ctx outs
+txDataAddresses :: Ctx -> TxData -> [Address]
+txDataAddresses ctx t =
+  nub' $ txInAddrs ctx prevs <> txOutAddrs ctx outs
   where
     prevs = I.elems t.prevs
     outs = t.tx.outputs

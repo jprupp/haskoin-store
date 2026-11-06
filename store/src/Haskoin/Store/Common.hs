@@ -208,16 +208,14 @@ xPubSummary _xspec xbals =
 getTransaction ::
   (StoreReadBase m) => TxHash -> m (Maybe Transaction)
 getTransaction h = do
-  net <- getNetwork
   ctx <- getCtx
-  fmap (toTransaction net ctx) <$> getTxData h
+  fmap (toTransaction ctx) <$> getTxData h
 
 getNumTransaction ::
   (StoreReadExtra m) => Word64 -> m [Transaction]
-getNumTransaction i = do
-  net <- getNetwork
-  ctx <- getCtx
-  map (toTransaction net ctx) <$> getNumTxData i
+getNumTransaction i =
+  getCtx >>= \ctx ->
+    map (toTransaction ctx) <$> getNumTxData i
 
 blockAtOrAfter ::
   (MonadIO m, StoreReadExtra m) =>

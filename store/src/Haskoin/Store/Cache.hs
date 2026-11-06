@@ -83,7 +83,6 @@ import Haskoin
     Ctx,
     DerivPathI (..),
     KeyIndex,
-    Network,
     OutPoint (..),
     Tx (..),
     TxHash,
@@ -391,13 +390,12 @@ getXPubUnspents xpub xbals limits = do
     then do
       ops <- map snd <$> cacheGetXPubUnspents xpub limits
       uns <- catMaybes <$> lift (mapM getUnspent ops)
-      net <- lift getNetwork
       ctx <- lift getCtx
       let f u =
             either
               (const Nothing)
               (\a -> Just (a, u))
-              (scriptToAddressBS net ctx u.script)
+              (scriptToAddressBS ctx u.script)
           xm =
             let j x = (x.balance.address, x)
                 k = (> 0) . (.balance.utxo)
@@ -1019,14 +1017,13 @@ importMultiTxC ::
   [TxData] ->
   CacheX m ()
 importMultiTxC txs = do
-  net <- lift getNetwork
   ctx <- lift getCtx
   logDebug $ "Processing " <> cs (show (length txs)) <> " txs"
   logDebug $
     "Getting address information for "
-      <> cs (show (length (alladdrs net ctx)))
+      <> cs (show (length (alladdrs ctx)))
       <> " addresses"
-  addrmap <- getaddrmap net ctx
+  addrmap <- getaddrmap ctx
   let addrs = HashMap.keys addrmap
   logDebug $
     "Getting balances for "
@@ -1035,9 +1032,9 @@ importMultiTxC txs = do
   balmap <- getbalances addrs
   logDebug $
     "Getting unspent data for "
-      <> cs (show (length (allops net ctx)))
+      <> cs (show (length (allops ctx)))
       <> " outputs"
-  unspentmap <- getunspents net ctx
+  unspentmap <- getunspents ctx
   gap <- lift getMaxGap
   now <- round <$> liftIO getPOSIXTime :: (MonadIO m) => m Int
   let xpubs = allxpubsls addrmap
@@ -1059,7 +1056,7 @@ importMultiTxC txs = do
     let addrmap' = faddrmap (HashMap.keysSet xmap) addrmap
     logDebug "Starting Redis import pipeline"
     runRedis $ do
-      x <- redisImportMultiTx net ctx addrmap' unspentmap txs
+      x <- redisImportMultiTx ctx addrmap' unspentmap txs
       y <- redisUpdateBalances addrmap' balmap
       z <- redisTouchKeys now (HashMap.keys xmap)
       return $ x >> y >> z >> return ()
@@ -1067,18 +1064,18 @@ importMultiTxC txs = do
     return $ getNewAddrs ctx gap xmap (HashMap.elems addrmap')
   cacheAddAddresses addrs'
   where
-    alladdrsls net ctx = HashSet.toList (alladdrs net ctx)
+    alladdrsls ctx = HashSet.toList (alladdrs ctx)
     faddrmap xmap = HashMap.filter (\a -> a.spec `elem` xmap)
-    getaddrmap net ctx =
+    getaddrmap ctx =
       HashMap.fromList
         . catMaybes
-        . zipWith (\a -> fmap (a,)) (alladdrsls net ctx)
-        <$> cacheGetAddrsInfo (alladdrsls net ctx)
-    getunspents net ctx =
+        . zipWith (\a -> fmap (a,)) (alladdrsls ctx)
+        <$> cacheGetAddrsInfo (alladdrsls ctx)
+    getunspents ctx =
       HashMap.fromList
         . catMaybes
-        . zipWith (\p -> fmap (p,)) (allops net ctx)
-        <$> lift (mapM getUnspent (allops net ctx))
+        . zipWith (\p -> fmap (p,)) (allops ctx)
+        <$> lift (mapM getUnspent (allops ctx))
     getbalances addrs =
       HashMap.fromList . zip addrs <$> mapM (lift . getDefaultBalance) addrs
     getxbals xpubs = do
@@ -1086,28 +1083,27 @@ importMultiTxC txs = do
         bs <- redisGetXPubBalances xpub
         return $ (,) xpub <$> bs
       return $ HashMap.filter (not . null) (HashMap.fromList bals)
-    allops net ctx =
+    allops ctx =
       map snd $
-        concatMap (txInputs net ctx) txs
-          <> concatMap (txOutputs net ctx) txs
-    alladdrs net ctx =
+        concatMap (txInputs ctx) txs
+          <> concatMap (txOutputs ctx) txs
+    alladdrs ctx =
       HashSet.fromList $
         map fst $
-          concatMap (txInputs net ctx) txs
-            <> concatMap (txOutputs net ctx) txs
+          concatMap (txInputs ctx) txs
+            <> concatMap (txOutputs ctx) txs
     allxpubsls = HashSet.toList . allxpubs
     allxpubs =
       HashSet.fromList . map (.spec) . HashMap.elems
 
 redisImportMultiTx ::
   (Monad f, RedisCtx m f) =>
-  Network ->
   Ctx ->
   HashMap Address AddressXPub ->
   HashMap OutPoint Unspent ->
   [TxData] ->
   m (f ())
-redisImportMultiTx net ctx addrmap unspentmap tds = do
+redisImportMultiTx ctx addrmap unspentmap tds = do
   xs <- mapM importtxentries tds
   return $ sequence_ xs
   where
@@ -1161,7 +1157,7 @@ redisImportMultiTx net ctx addrmap unspentmap tds = do
                  in redisAddToMempool [tr]
               _ -> redisRemFromMempool [txHash td.tx]
           return $ a >> b >> return ()
-    txaddrops td = txInputs net ctx td <> txOutputs net ctx td
+    txaddrops td = txInputs ctx td <> txOutputs ctx td
 
 redisUpdateBalances ::
   (Monad f, RedisCtx m f) =>
@@ -1472,17 +1468,17 @@ sortTxData tds =
       ths = map (txHash . snd) (sortTxs (map (.tx) tds))
    in mapMaybe (`Map.lookup` txm) ths
 
-txInputs :: Network -> Ctx -> TxData -> [(Address, OutPoint)]
-txInputs net ctx td =
+txInputs :: Ctx -> TxData -> [(Address, OutPoint)]
+txInputs ctx td =
   let is = td.tx.inputs
       ps = I.toAscList td.prevs
-      as = map (scriptToAddressBS net ctx . (.script) . snd) ps
+      as = map (scriptToAddressBS ctx . (.script) . snd) ps
       f (Right a) i = Just (a, i.outpoint)
       f (Left _) _ = Nothing
    in catMaybes (zipWith f as is)
 
-txOutputs :: Network -> Ctx -> TxData -> [(Address, OutPoint)]
-txOutputs net ctx td =
+txOutputs :: Ctx -> TxData -> [(Address, OutPoint)]
+txOutputs ctx td =
   let ps =
         zipWith
           ( \i _ ->
@@ -1493,7 +1489,7 @@ txOutputs net ctx td =
           )
           [0 ..]
           td.tx.outputs
-      as = map (scriptToAddressBS net ctx . (.script)) td.tx.outputs
+      as = map (scriptToAddressBS ctx . (.script)) td.tx.outputs
       f (Right a) p = Just (a, p)
       f (Left _) _ = Nothing
    in catMaybes (zipWith f as ps)

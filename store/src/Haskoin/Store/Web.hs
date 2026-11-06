@@ -2534,8 +2534,7 @@ getPeersInformation mgr =
         PeerInfo
           { userAgent = ver.userAgent.get,
             address = show op.address,
-            -- Word32 as before; haskoin-core 1.6.0 reads it signed
-            version = fromIntegral ver.version,
+            version = ver.version,
             services = ver.services,
             relay = ver.relay
           }
