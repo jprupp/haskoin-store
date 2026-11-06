@@ -38,6 +38,8 @@ import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -64,8 +66,51 @@ data DatabaseReader = DatabaseReader
     initGap :: !Word32,
     net :: !Network,
     metrics :: !(Maybe DataMetrics),
-    ctx :: !Ctx
+    ctx :: !Ctx,
+    -- | addresses derived from recently queried xpubs
+    derived :: !(IORef DerivedCache)
   }
+
+-- | Addresses of an xpub, external then change, in order of index. Each
+-- list is infinite and lazy: it is derived as far as queries have needed,
+-- and shared by later queries of the same xpub. Deriving an address costs
+-- an elliptic curve operation and two hashes, which made up most of the
+-- time of an xpub query.
+data Derived = Derived ![(Word32, Address)] ![(Word32, Address)]
+
+-- | Recently used xpubs and their addresses. When the newer generation is
+-- full it becomes the older one, so the cache holds at most twice
+-- 'derivedCacheSize' xpubs, and an xpub stays while it is in use.
+data DerivedCache = DerivedCache
+  { newer :: !(HashMap XPubSpec Derived),
+    older :: !(HashMap XPubSpec Derived)
+  }
+
+derivedCacheSize :: Int
+derivedCacheSize = 512
+
+-- | Addresses of an xpub, from the cache or a new lazy derivation.
+derivedAddrs :: (MonadIO m) => XPubSpec -> DatabaseReaderT m Derived
+derivedAddrs xpub = do
+  ref <- asks (.derived)
+  ctx <- asks (.ctx)
+  let fresh =
+        let addrs m =
+              deriveAddresses
+                (deriveFunction ctx xpub.deriv)
+                (pubSubKey ctx xpub.key m)
+                0
+         in Derived (addrs 0) (addrs 1)
+  liftIO . atomicModifyIORef' ref $ \c ->
+    case HashMap.lookup xpub c.newer of
+      Just d -> (c, d)
+      Nothing ->
+        let d = fromMaybe fresh (HashMap.lookup xpub c.older)
+            c'
+              | HashMap.size c.newer >= derivedCacheSize =
+                  DerivedCache {newer = HashMap.singleton xpub d, older = c.newer}
+              | otherwise = c {newer = HashMap.insert xpub d c.newer}
+         in (c', d)
 
 data DataMetrics = DataMetrics
   { dataBestCount :: !StatCounter,
@@ -126,6 +171,7 @@ withDatabaseReader ::
 withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal stats m =
   withRunInIO $ \run ->
     withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
+      derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
       let bdb =
             DatabaseReader
               { db = db,
@@ -133,7 +179,8 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal s
                 net = net,
                 initGap = igap,
                 metrics = stats,
-                ctx = ctx
+                ctx = ctx,
+                derived = derived
               }
       initRocksDB bdb
       run $ runReaderT m bdb
@@ -546,26 +593,22 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
       f _ (Just b) = b
 
   xPubBals xpub = do
-    ctx <- asks (.ctx)
     igap <- asks (.initGap)
     gap <- asks (.maxGap)
-    ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) (aderiv ctx 0 0))
+    Derived ext chg <- derivedAddrs xpub
+    ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) ext)
     if all nullxb ext1
       then do
         withMetrics $ \s -> incrementCounter s.dataXPubBals (length ext1)
         return ext1
       else do
-        ext2 <- derive_until_gap gap 0 (aderiv ctx 0 igap)
-        chg <- derive_until_gap gap 1 (aderiv ctx 1 0)
-        let bals = ext1 <> ext2 <> chg
+        ext2 <- derive_until_gap gap 0 (drop (fromIntegral igap) ext)
+        chg' <- derive_until_gap gap 1 chg
+        let bals = ext1 <> ext2 <> chg'
         withMetrics $ \s -> incrementCounter s.dataXPubBals (length bals)
         return bals
     where
       nullxb b = nullBalance b.balance
-      aderiv ctx m =
-        deriveAddresses
-          (deriveFunction ctx xpub.deriv)
-          (pubSubKey ctx xpub.key m)
       derive_until_gap gap m adrs =
         let xb b n = XPubBal {path = [m, n], balance = b}
             ig = fromIntegral gap
