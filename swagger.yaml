@@ -7,7 +7,7 @@ servers:
   - url: 'https://api.haskoin.com/btctest4/'
 
 info:
-  version: &version 1.6.5
+  version: &version 1.7.0
   title: Haskoin
   contact:
     name: JP Rupp
@@ -1555,7 +1555,12 @@ paths:
         - Transaction
       operationId: postTransaction
       requestBody:
-        description: Publish Transaction
+        description: >-
+          Publish Transaction. The body holds one transaction and nothing
+          else. Bytes after the transaction are refused. The transaction is
+          in the format that peers of the network read. A network without
+          SegWit, such as Bitcoin Cash, takes the format without witness
+          only.
         content:
           text/plain:
             schema:
@@ -4887,6 +4892,7 @@ components:
         address:
           type: string
           nullable: true
+          description: Null when the script has no address on the network.
         block:
           $ref: '#/components/schemas/BlockRef'
         txid:
@@ -5001,6 +5007,7 @@ components:
         address:
           type: string
           nullable: true
+          description: Null when the script has no address on the network.
         pkscript:
           type: string
           nullable: true
@@ -5034,6 +5041,7 @@ components:
         address:
           type: string
           nullable: true
+          description: Null when the script has no address on the network.
         pkscript:
           type: string
         value:
@@ -5130,6 +5138,11 @@ components:
           type: string
         version:
           type: integer
+          format: int32
+          description: >-
+            Protocol version from the peer's version message. It is a signed
+            number, so it is negative for a peer that sends a version above
+            2147483647.
         services:
           type: string
         relay:

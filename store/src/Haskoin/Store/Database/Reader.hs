@@ -280,13 +280,14 @@ addressConduit a s it = do
 
 unspentConduit ::
   (MonadIO m) =>
+  Network ->
   Ctx ->
   Address ->
   Maybe Start ->
   Iterator ->
   ConduitT i Unspent (DatabaseReaderT m) ()
-unspentConduit ctx a s it =
-  x .| mapC (uncurry (toUnspent ctx)) .| concatC
+unspentConduit net ctx a s it =
+  x .| mapC (uncurry (toUnspent net ctx)) .| concatC
   where
     x = case s of
       Nothing ->
@@ -370,9 +371,10 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
 
   getUnspent p = do
     db <- asks (.db)
+    net <- asks (.net)
     ctx <- asks (.ctx)
     val <- liftIO (retrieveCF db (unspentCF db) (UnspentKey p))
-    case fmap (valToUnspent ctx p) val of
+    case fmap (valToUnspent net ctx p) val of
       Nothing -> return Nothing
       Just u -> do
         withMetrics $ \s -> incrementCounter s.dataUnspentCount 1
@@ -425,21 +427,23 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
 
   getAddressesUnspents addrs limits = do
     db <- asks (.db)
+    net <- asks (.net)
     ctx <- asks (.ctx)
     withManyIters db (addrOutCF db) (length addrs) $ \its -> do
-      uns <- joinConduits (cs ctx its) limits
+      uns <- joinConduits (cs net ctx its) limits
       withMetrics $ \s -> incrementCounter s.dataUnspentCount (length uns)
       return uns
     where
-      cs ctx = zipWith (c ctx) addrs
-      c ctx a = unspentConduit ctx a limits.start
+      cs net ctx = zipWith (c net ctx) addrs
+      c net ctx a = unspentConduit net ctx a limits.start
 
   getAddressUnspents a limits = do
     db <- asks (.db)
+    net <- asks (.net)
     ctx <- asks (.ctx)
     us <- withIterCFStat db (addrOutCF db) $ \it ->
       runConduit $
-        unspentConduit ctx a limits.start it
+        unspentConduit net ctx a limits.start it
           .| applyLimitsC limits
           .| sinkList
     withMetrics $ \s -> incrementCounter s.dataUnspentCount (length us)
