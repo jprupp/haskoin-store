@@ -1095,33 +1095,33 @@ toTransaction net ctx t =
       deleted = t.deleted,
       rbf = t.rbf,
       timestamp = t.timestamp,
-      txid = txHash t.tx,
+      txid = TxHash (doubleSHA256 witless),
       inputs = ins,
       outputs = outs,
-      size =
-        fromIntegral $
-          B.length $
-            runPutS $
-              serialize t.tx,
-      weight =
-        let b = B.length $ runPutS $ serialize witless
-            x = B.length $ runPutS $ serialize t.tx
-         in fromIntegral $ b * 3 + x,
+      size = fromIntegral (B.length full),
+      weight = fromIntegral (B.length witless * 3 + B.length full),
       fee =
         if any isCoinbase ins
           then 0
           else inv - outv
     }
   where
-    ins = zipWith f [0 ..] t.tx.inputs
-    witless =
-      let Tx {..} = t.tx
-       in Tx {witness = [], ..}
+    -- Serialize once with the witness and once without it, and only once
+    -- if there is no witness, when both are the same bytes. The id of the
+    -- transaction is the hash of the bytes without witness, as 'txHash'
+    -- computes it.
+    full, witless :: ByteString
+    full = runPutS (serialize t.tx)
+    witless
+      | hasWitness t.tx =
+          let Tx {..} = t.tx
+           in runPutS (serialize Tx {witness = [], ..})
+      | otherwise = full
+    ins = zipWith3 f [0 ..] t.tx.inputs (t.tx.witness <> repeat [])
     inv = sum (map (.value) ins)
     outs = zipWith g [0 ..] t.tx.outputs
     outv = sum $ map (.value) outs
-    ws = take (length t.tx.inputs) $ t.tx.witness <> repeat []
-    f n i = toInput net ctx i (IntMap.lookup n t.prevs) (ws !! n)
+    f n i w = toInput net ctx i (IntMap.lookup n t.prevs) w
     g n o = toOutput net ctx o $ IntMap.lookup n t.spenders
 
 fromTransaction :: Transaction -> TxData
