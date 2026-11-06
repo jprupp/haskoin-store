@@ -21,6 +21,33 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   second) read the whole mempool at least once.
 - Count the transactions of an xpub without building the list of all of them
   when the cache is not used.
+- Keep the derived addresses of the 512 to 1024 most recently queried xpubs
+  in memory. Every xpub query derived each address again before reading a
+  balance. Addresses depend only on the xpub, so the cache never goes stale.
+- Page the unspent outputs of an xpub by merging its addresses in order of
+  block, stopping once the page is full, instead of decoding up to offset
+  plus limit outputs of every address and sorting them all. The pages are
+  the same.
+- Count the transactions of an xpub by merging the raw keys of its
+  addresses, without decoding keys or reading values.
+- Open the iterators of a query over many addresses in one bracket instead
+  of one bracket each. Every call into RocksDB walked the stack past one
+  frame per address.
+- Double the page, up to 1024 rows, when streaming a source by offset, as
+  `/blockchain/unspent` does. The rows read and skipped grew with the square
+  of the rows returned.
+- Check that an xpub is cached in the same Redis round trip as the read of
+  its balances, transaction count, or a page of its transactions or unspent
+  outputs that does not start at a transaction.
+- Serialize a transaction at most twice to compute its id, size and weight,
+  and stop looking up its witnesses with a quadratic list index.
+
+### Added
+
+- `store/bench`: a benchmark server that syncs a synthetic regtest chain and
+  serves the web API on it, and times the encoding of a response with the
+  argument `micro`. `scripts/bench-web.sh` runs wrk against it and reports
+  the CPU time of the server per request.
 
 ## [1.7.0] - 2026-11-06
 
