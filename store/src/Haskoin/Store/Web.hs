@@ -459,6 +459,7 @@ instance
   getUnspent op = runInWebReader (getUnspent op)
   getBalance a = runInWebReader (getBalance a)
   getMempool = runInWebReader getMempool
+  getMempoolPage = runInWebReader . getMempoolPage
 
 instance
   (MonadUnliftIO m) =>
@@ -488,6 +489,7 @@ instance (MonadUnliftIO m) => StoreReadBase (ActionT m) where
   getUnspent = lift . getUnspent
   getBalance = lift . getBalance
   getMempool = lift getMempool
+  getMempoolPage = lift . getMempoolPage
 
 instance (MonadUnliftIO m) => StoreReadExtra (ActionT m) where
   getBalances = lift . getBalances
@@ -1215,7 +1217,7 @@ scottyMempool (GetMempool limitM (OffsetParam o)) =
     WebLimits {..} <- askl (.config.limits)
     let wl' = WebLimits {maxItemCount = 0, ..}
         l = Limits (validateLimit wl' False limitM) (fromIntegral o) Nothing
-    map snd . applyLimits l <$> getMempool
+    map snd <$> getMempoolPage l
 
 webSocketEvents :: WebState -> Middleware
 webSocketEvents s =
@@ -2365,8 +2367,13 @@ scottyBinfoMempool =
     numtxid <- getNumTxId
     offset <- getBinfoOffset
     n <- getBinfoCount "limit"
-    mempool <- getMempool
-    let txids = map snd $ take n $ drop offset mempool
+    -- a limit of 0 would mean no limit to getMempoolPage
+    txids <-
+      if n <= 0
+        then return []
+        else
+          map snd
+            <$> getMempoolPage (Limits (fromIntegral n) (fromIntegral offset) Nothing)
     txs <- catMaybes <$> mapM getTransaction txids
     net <- askl (.config.store.net)
     setHeaders
@@ -2579,7 +2586,7 @@ lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
   n <- round <$> liftIO getPOSIXTime
   b <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
   t <-
-    getMempool >>= \case
+    getMempoolPage (Limits 1 0 Nothing) >>= \case
       t : _ ->
         let x = fromIntegral $ fst t
          in return $ max x b

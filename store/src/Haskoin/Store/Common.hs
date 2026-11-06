@@ -123,7 +123,14 @@ class (Monad m) => StoreReadBase m where
   getSpender :: OutPoint -> m (Maybe Spender)
   getBalance :: Address -> m (Maybe Balance)
   getUnspent :: OutPoint -> m (Maybe Unspent)
+  -- | Whole mempool, newest first.
   getMempool :: m [(UnixTime, TxHash)]
+
+  -- | Page of the mempool, newest first, from the offset and limit of the
+  -- 'Limits'; its start is ignored. Stores that index the mempool by time
+  -- read only the entries of the page instead of the whole mempool.
+  getMempoolPage :: Limits -> m [(UnixTime, TxHash)]
+  getMempoolPage l = applyLimits l <$> getMempool
 
 class (StoreReadBase m) => StoreReadExtra m where
   getAddressesTxs :: [Address] -> Limits -> m [TxRef]

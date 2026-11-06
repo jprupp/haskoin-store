@@ -8,8 +8,16 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
-module Haskoin.Store.Database.Writer (WriterT, runWriter, writerLogger) where
+module Haskoin.Store.Database.Writer
+  ( WriterT,
+    MempoolChanges (..),
+    runWriter,
+    runWriterMempool,
+    writerLogger,
+  )
+where
 
+import Control.Monad (forM)
 import Control.Monad.Reader (ReaderT (..))
 import Control.Monad.Reader qualified as R
 import Data.HashMap.Strict qualified as HashMap
@@ -23,6 +31,7 @@ import Database.RocksDB.Query
     deleteOpCF,
     insertOp,
     insertOpCF,
+    retrieveCF,
     writeBatch,
   )
 import Haskoin
@@ -172,12 +181,34 @@ runWriter ::
   Logger ->
   WriterT m a ->
   m a
-runWriter net ctx bdb@DatabaseReader {db} logger f = do
+runWriter net ctx bdb logger f =
+  fst <$> runWriterMempool net ctx bdb logger f
+
+-- | Transactions that a batch added to the mempool or removed from it,
+-- compared to what the database held before the batch was written.
+data MempoolChanges = MempoolChanges
+  { added :: ![TxHash],
+    removed :: ![TxHash]
+  }
+  deriving (Eq, Show)
+
+-- | Like 'runWriter', but also say how the batch changed the mempool, so
+-- that callers do not have to read the whole mempool before and after.
+runWriterMempool ::
+  (MonadIO m) =>
+  Network ->
+  Ctx ->
+  DatabaseReader ->
+  Logger ->
+  WriterT m a ->
+  m (a, MempoolChanges)
+runWriterMempool net ctx bdb@DatabaseReader {db} logger f = do
   hm <- newMemory net ctx
   x <- R.runReaderT f Writer {reader = bdb, memory = hm, logger}
   ops <- hashMapOps db hm
-  liftIO $ writeBatch db ops
-  return x
+  (mops, changes) <- mempoolOps db hm.mempoolTable
+  liftIO $ writeBatch db (ops <> mops)
+  return (x, changes)
 
 hashMapOps :: (MonadIO m) => DB -> Memory -> m [BatchOp]
 hashMapOps db Memory {..} =
@@ -190,7 +221,6 @@ hashMapOps db Memory {..} =
         balOps db balanceTable,
         addrTxOps db addressTable,
         addrOutOps db outputTable,
-        mempoolOps db mempoolTable,
         unspentOps db unspentTable
       ]
 
@@ -243,11 +273,32 @@ addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
         (addrOutCF db)
         (AddrOutKey a b p)
 
-mempoolOps :: (MonadIO m) => DB -> MempoolTable -> m [BatchOp]
-mempoolOps db t = map (uncurry f) <$> liftIO (H.toList t)
+-- | Operations for the mempool changes of a batch. Each changed entry is
+-- compared to the database: its time is needed to update the index by
+-- time, and the comparison says which transactions really entered or left
+-- the mempool.
+mempoolOps :: (MonadIO m) => DB -> MempoolTable -> m ([BatchOp], MempoolChanges)
+mempoolOps db t = liftIO $ do
+  changes <- H.toList t
+  rows <- forM changes $ \(h, new) -> do
+    old <- retrieveCF db cf (MemTxKey h)
+    return (h, old, new)
+  return
+    ( concatMap ops rows,
+      MempoolChanges
+        { added = [h | (h, Nothing, Just _) <- rows],
+          removed = [h | (h, Just _, Nothing) <- rows]
+        }
+    )
   where
-    f h (Just u) = insertOpCF (mempoolCF db) (MemTxKey h) u
-    f h Nothing = deleteOpCF (mempoolCF db) (MemTxKey h)
+    cf = mempoolCF db
+    ops (_, Nothing, Nothing) = []
+    ops (h, Nothing, Just n) = mempoolInsertOps db h n
+    ops (h, Just o, Nothing) =
+      [deleteOpCF cf (MemTxKey h), deleteOpCF cf (MemTimeKey o h)]
+    ops (h, Just o, Just n)
+      | o == n = []
+      | otherwise = deleteOpCF cf (MemTimeKey o h) : mempoolInsertOps db h n
 
 unspentOps :: (MonadIO m) => DB -> UnspentTable -> m [BatchOp]
 unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)

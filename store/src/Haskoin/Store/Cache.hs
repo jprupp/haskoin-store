@@ -269,6 +269,7 @@ instance (StoreReadBase m) => StoreReadBase (CacheX m) where
   getBalance = lift . getBalance
   getUnspent = lift . getUnspent
   getMempool = lift getMempool
+  getMempoolPage = lift . getMempoolPage
 
 instance (StoreReadBase m) => StoreReadBase (CacheT m) where
   getCtx = lift getCtx
@@ -281,6 +282,7 @@ instance (StoreReadBase m) => StoreReadBase (CacheT m) where
   getBalance = lift . getBalance
   getUnspent = lift . getUnspent
   getMempool = lift getMempool
+  getMempoolPage = lift . getMempoolPage
 
 instance
   (MonadUnliftIO m, StoreReadExtra m) =>

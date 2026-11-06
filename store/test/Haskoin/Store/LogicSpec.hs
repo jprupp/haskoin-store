@@ -8,10 +8,11 @@ module Haskoin.Store.LogicSpec (spec) where
 import Control.Monad (forM_, void)
 import Control.Monad.Reader (ask, liftIO, runReaderT)
 import Data.ByteString qualified as B
-import Data.List (sort)
+import Data.List (sort, sortOn)
+import Data.Ord (Down (..))
 import Data.Text qualified as T
 import Data.Word (Word32, Word64)
-import Database.RocksDB.Query (insert, retrieve)
+import Database.RocksDB.Query (insert, insertCF, matchingAsListCF, retrieve)
 import Haskoin
   ( Block (..),
     BlockHash,
@@ -34,7 +35,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger (..))
-import Haskoin.Store.Common (StoreReadBase (..), getActiveTxData, getDefaultBalance)
+import Haskoin.Store.Common (Limits (..), StoreReadBase (..), StoreWrite (..), getActiveTxData, getDefaultBalance)
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -43,9 +44,9 @@ import Haskoin.Store.Data
     TxData (..),
     Unspent (..),
   )
-import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, memoryReport, withDatabaseReader)
-import Haskoin.Store.Database.Types (MemKey (..), VersionKey (..))
-import Haskoin.Store.Database.Writer (runWriter)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, getMempoolBefore, memoryReport, mempoolCF, withDatabaseReader)
+import Haskoin.Store.Database.Types (MemKey (..), MemTimeKey (..), MemTxKey (..), VersionKey (..))
+import Haskoin.Store.Database.Writer (MempoolChanges (..), runWriter, runWriterMempool)
 import Haskoin.Store.Logic
   ( ImportException (..),
     ImportM,
@@ -90,8 +91,62 @@ spec = prepareContext $ \ctx -> do
           insert r.db MemKey old
         open $ ask >>= \r -> liftIO $ do
           reading r getMempool `shouldReturn` old
+          reading r (getMempoolPage (Limits 1 1 Nothing)) `shouldReturn` drop 1 old
           (retrieve r.db MemKey :: IO (Maybe [(Word64, TxHash)])) `shouldReturn` Nothing
-          retrieve r.db VersionKey `shouldReturn` Just (19 :: Word32)
+          retrieve r.db VersionKey `shouldReturn` Just (20 :: Word32)
+
+  describe "data version 19" $
+    it "indexes the mempool by time when opened" $
+      withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
+        let open :: DatabaseReaderT IO () -> IO ()
+            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing
+            old = sortOn Down (zip [300, 100, 200] (hashes 3))
+        open $ ask >>= \r -> liftIO $ do
+          insert r.db VersionKey (19 :: Word32)
+          forM_ old $ \(t, h) -> insertCF r.db (mempoolCF r.db) (MemTxKey h) t
+          (matchingAsListCF r.db (mempoolCF r.db) MemTimeKeyS :: IO [(MemTimeKey, ())])
+            `shouldReturn` []
+        open $ ask >>= \r -> liftIO $ do
+          reading r getMempool `shouldReturn` old
+          retrieve r.db VersionKey `shouldReturn` Just (20 :: Word32)
+
+  describe "mempool index" $ do
+    let entries = zip [5, 3, 5, 1, 4, 3, 2] (hashes 7)
+        newest = sortOn Down entries
+        fill db = importing db (forM_ entries (\(t, h) -> addToMempool h t))
+    it "pages the mempool newest first" $
+      withDB btcRegTest ctx $ \db -> do
+        _ <- fill db
+        reading db getMempool `shouldReturn` newest
+        forM_ [(0, 0), (3, 0), (3, 2), (2, 5), (4, 7), (0, 3)] $ \(l, o) ->
+          reading db (getMempoolPage (Limits l o Nothing))
+            `shouldReturn` take' l (drop (fromIntegral o) newest)
+    it "reads the oldest entries before a time" $
+      withDB btcRegTest ctx $ \db -> do
+        _ <- fill db
+        let oldest = reverse newest
+        reading db (getMempoolBefore 4 10) `shouldReturn` takeWhile ((< 4) . fst) oldest
+        reading db (getMempoolBefore 4 2) `shouldReturn` take 2 oldest
+        reading db (getMempoolBefore 1 10) `shouldReturn` []
+    it "reports and indexes what a batch changes" $
+      withDB btcRegTest ctx $ \db -> do
+        let hs = hashes 3
+            (h1, h2, h3) = (hs !! 0, hs !! 1, hs !! 2)
+            batch :: ImportM () -> IO MempoolChanges
+            batch = fmap snd . runWriterMempool db.net db.ctx db quietLogger
+        c <- batch (addToMempool h1 10 >> addToMempool h2 20)
+        (sort c.added, c.removed) `shouldBe` (sort [h1, h2], [])
+        -- a new time moves the entry in the index, and is no change
+        batch (addToMempool h1 30) `shouldReturn` MempoolChanges [] []
+        reading db getMempool `shouldReturn` [(30, h1), (20, h2)]
+        -- removing what is not there, or adding and removing in one batch,
+        -- is no change either
+        batch (deleteFromMempool h3) `shouldReturn` MempoolChanges [] []
+        batch (addToMempool h3 40 >> deleteFromMempool h3) `shouldReturn` MempoolChanges [] []
+        batch (deleteFromMempool h2) `shouldReturn` MempoolChanges [] [h2]
+        reading db getMempool `shouldReturn` [(30, h1)]
+        (matchingAsListCF db.db (mempoolCF db.db) MemTimeKeyS :: IO [(MemTimeKey, ())])
+          `shouldReturn` [(MemTimeKey 30 h1, ())]
 
   describe "newMempoolTx" $ do
     it "imports a transaction and spends its input" $
@@ -344,15 +399,25 @@ withCoin net ctx go =
     go db (out (coinbaseTx 1) 0)
 
 importing :: DatabaseReader -> ImportM a -> IO (Either ImportException a)
-importing db = try . runWriter db.net db.ctx db quiet
-  where
-    -- Build every message, so that log lines are tested too, but print none.
-    quiet =
-      Logger
-        { level = LevelDebug,
-          source = "",
-          push = void . evaluate . B.length . fromLogStr
-        }
+importing db = try . runWriter db.net db.ctx db quietLogger
+
+-- | Build every message, so that log lines are tested too, but print none.
+quietLogger :: Logger
+quietLogger =
+  Logger
+    { level = LevelDebug,
+      source = "",
+      push = void . evaluate . B.length . fromLogStr
+    }
+
+-- | Distinct transaction hashes.
+hashes :: Int -> [TxHash]
+hashes n = [TxHash (sha256 (B.singleton (fromIntegral i))) | i <- [1 .. n]]
+
+-- | 'take' where a limit of 0 means no limit, as in 'Limits'.
+take' :: Word32 -> [a] -> [a]
+take' 0 = id
+take' l = take (fromIntegral l)
 
 reading :: DatabaseReader -> DatabaseReaderT IO a -> IO a
 reading db f = runReaderT f db

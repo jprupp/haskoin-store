@@ -276,12 +276,6 @@ setPeersConnected = void $ runMaybeT $ do
   p <- liftIO . getPeers =<< asks (.config.peerMgr)
   setGauge m.peers (length p)
 
-setMempoolSize :: (MonadIO m) => BlockT m ()
-setMempoolSize = void $ runMaybeT $ do
-  m <- MaybeT (asks (.metrics))
-  p <- lift getMempool
-  setGauge m.mempool (length p)
-
 withBlockTiming :: (MonadIO m) => BlockT m (Either l r) -> BlockT m (Either l r)
 withBlockTiming go = do
   asks (.metrics) >>= \case
@@ -343,9 +337,50 @@ runImport ::
   Ctx ->
   ImportM a ->
   BlockT m (Either ImportException a)
-runImport net ctx f =
-  ReaderT $ \r ->
-    liftIO . try $ runWriter net ctx r.config.db r.config.logger f
+runImport net ctx f = fmap fst <$> runImportMempool net ctx f
+
+-- | Like 'runImport', but also return how the import changed the mempool.
+-- The mempool gauge is kept up to date from those changes instead of
+-- counting the whole mempool on every clock tick.
+runImportMempool ::
+  (MonadIO m) =>
+  Network ->
+  Ctx ->
+  ImportM a ->
+  BlockT m (Either ImportException (a, MempoolChanges))
+runImportMempool net ctx f = do
+  r <- ReaderT $ \r ->
+    liftIO . try $ runWriterMempool net ctx r.config.db r.config.logger f
+  forM_ r $ \(_, c) -> asks (.metrics) >>= mapM_ \m -> do
+    incrementGauge m.mempool (length c.added)
+    decrementGauge m.mempool (length c.removed)
+  return r
+
+-- | Run an import and publish the transactions that it added to the
+-- mempool or removed from it, then the new best block if there is one.
+-- Transactions of the block are not published.
+runImportNotify ::
+  (MonadIO m) =>
+  Maybe Block ->
+  ImportM a ->
+  BlockT m (Either ImportException a)
+runImportNotify block f = do
+  net <- getNetwork
+  ctx <- getCtx
+  runImportMempool net ctx f >>= \case
+    Left e -> return (Left e)
+    Right (x, c) -> do
+      l <- asks (.config.pub)
+      forM_ (filter notInBlock c.removed) $ \h ->
+        publish (StoreMempoolDelete h) l
+      forM_ (filter notInBlock c.added) $ \h ->
+        publish (StoreMempoolNew h) l
+      forM_ block $ \b ->
+        publish (StoreBestBlock (headerHash b.header)) l
+      return (Right x)
+  where
+    inBlock = maybe HashSet.empty (HashSet.fromList . map txHash . (.txs)) block
+    notInBlock = not . (`HashSet.member` inBlock)
 
 runRocksDB :: ReaderT DatabaseReader m a -> BlockT m a
 runRocksDB f =
@@ -372,6 +407,8 @@ instance (MonadIO m) => StoreReadBase (BlockT m) where
     runRocksDB . getBalance
   getMempool =
     runRocksDB getMempool
+  getMempoolPage =
+    runRocksDB . getMempoolPage
 
 instance (MonadUnliftIO m) => StoreReadExtra (BlockT m) where
   getMaxGap =
@@ -535,10 +572,8 @@ processBlock peer block = void . runMaybeT $ do
       <> blockText node Nothing
       <> " from peer "
       <> peer.label
-  net <- lift getNetwork
-  ctx <- lift getCtx
-  lift . notify (Just block) $ do
-    ret <- withBlockTiming $ runImport net ctx (importBlock block node)
+  lift $ do
+    ret <- withBlockTiming $ runImportNotify (Just block) (importBlock block node)
     case ret of
       Left e -> failure e
       Right _ -> success node
@@ -794,42 +829,18 @@ importMempoolTx block_read time tx =
       when t $ fulfillOrphans block_read tx_hash
       return t
 
-notify :: (MonadIO m) => Maybe Block -> BlockT m a -> BlockT m a
-notify block go = do
-  old <- HashSet.union e . HashSet.fromList . map snd <$> getMempool
-  x <- go
-  new <- HashSet.union e . HashSet.fromList . map snd <$> getMempool
-  l <- asks (.config.pub)
-  forM_ (old `HashSet.difference` new) $ \h ->
-    publish (StoreMempoolDelete h) l
-  forM_ (new `HashSet.difference` old) $ \h ->
-    publish (StoreMempoolNew h) l
-  case block of
-    Just b -> publish (StoreBestBlock (headerHash b.header)) l
-    Nothing -> return ()
-  return x
-  where
-    e = case block of
-      Just b -> HashSet.fromList (map txHash b.txs)
-      Nothing -> HashSet.empty
-
 processMempool :: (MonadIO m) => BlockT m ()
 processMempool = guardMempool $ do
   txs <- pendingTxs 2000
   block_read <- ask
-  -- notify reads the whole mempool twice, so only when there is work to do
-  unless (null txs) $ notify Nothing (import_txs block_read txs)
+  unless (null txs) $ import_txs block_read txs
   where
     run_import block_read p =
       importMempoolTx block_read p.time p.tx
     import_txs block_read txs =
-      let r = mapM (run_import block_read) txs
-       in do
-            net <- getNetwork
-            ctx <- getCtx
-            runImport net ctx r >>= \case
-              Left e -> report_error e
-              Right _ -> return ()
+      runImportNotify Nothing (mapM (run_import block_read) txs) >>= \case
+        Left e -> report_error e
+        Right _ -> return ()
     report_error e = do
       logError $
         "Error processing mempool: " <> cs (show e)
@@ -840,17 +851,15 @@ pruneMempool =
   guardMempool $ do
     days <- asks (.config.mempoolTimeout)
     when (days > 0) $ do
-      mempool <- reverse <$> getMempool
       time <- (floor . utcTimeToPOSIXSeconds) <$> liftIO getCurrentTime
       let thresh = time - (fromIntegral days * 24 * 60 * 60)
-          txs = take 1000 $ map snd $ takeWhile ((< thresh) . fst) mempool
-      net <- getNetwork
-      ctx <- getCtx
-      -- notify reads the whole mempool twice, so only when there is work to do
-      unless (null txs) . notify Nothing $ do
+      -- runs on every clock tick: read only the expired entries, oldest
+      -- first, from the index by time
+      txs <- map snd <$> runRocksDB (getMempoolBefore thresh 1000)
+      unless (null txs) $ do
         logInfo $
           "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
-        runImport net ctx (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
+        runImportNotify Nothing (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
           Left e ->
             logError $
               "Error pruning mempool: " <> cs (show e)
@@ -1221,7 +1230,6 @@ processBlockStoreMessage (BlockPing r) = do
   setHeadersHeight
   setPendingTxs
   setPeersConnected
-  setMempoolSize
   trySyncing
   processMempool
   pruneOrphans

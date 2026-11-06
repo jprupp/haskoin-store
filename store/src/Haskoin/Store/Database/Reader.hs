@@ -25,6 +25,8 @@ module Haskoin.Store.Database.Reader
     heightCF,
     balanceCF,
     mempoolCF,
+    getMempoolBefore,
+    mempoolInsertOps,
   )
 where
 
@@ -40,7 +42,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
-import Data.Serialize (encode)
+import Data.Serialize (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
@@ -102,7 +104,7 @@ withMetrics :: (MonadReader DatabaseReader m) => (DataMetrics -> m a) -> m ()
 withMetrics go = asks (.metrics) >>= mapM_ go
 
 dataVersion :: Word32
-dataVersion = 19
+dataVersion = 20
 
 withDB :: DatabaseReader -> DatabaseReaderT m a -> m a
 withDB = flip runReaderT
@@ -219,19 +221,79 @@ initRocksDB DatabaseReader {db = db} =
   retrieve db VersionKey >>= \case
     Just v
       | v == dataVersion -> return ()
+      | v == 19 -> migrateMempoolIndex db
       | v == 18 -> migrateMempool db
       | otherwise -> error "Incorrect RocksDB database version"
     Nothing -> setInitRocksDB db
 
 -- | Version 18 kept the whole mempool as one list under 'MemKey'. Move each
--- transaction to its own key in the mempool column family, in the same
--- batch that sets the new version.
+-- transaction to its own key in the mempool column family, and index it by
+-- time, in the same batch that sets the new version.
 migrateMempool :: DB -> IO ()
 migrateMempool db = do
   mempool <- fromMaybe [] <$> (retrieve db MemKey :: IO (Maybe [(UnixTime, TxHash)]))
   writeBatch db $
-    [insertOpCF (mempoolCF db) (MemTxKey h) t | (t, h) <- mempool]
+    concat [mempoolInsertOps db h t | (t, h) <- mempool]
       <> [deleteOp MemKey, insertOp VersionKey dataVersion]
+
+-- | Version 19 kept one key per mempool transaction, but no index by time,
+-- so every page of the mempool had to read and sort all of it. Build the
+-- index in the same batch that sets the new version.
+migrateMempoolIndex :: DB -> IO ()
+migrateMempoolIndex db = do
+  mempool <- matchingAsListCF db (mempoolCF db) MemTxKeyS
+  writeBatch db $
+    [insertOpCF (mempoolCF db) (MemTimeKey t h) () | (MemTxKey h, t) <- mempool]
+      <> [insertOp VersionKey dataVersion]
+
+-- | Operations that add a transaction to the mempool: its key and its entry
+-- in the index by time.
+mempoolInsertOps :: DB -> TxHash -> UnixTime -> [BatchOp]
+mempoolInsertOps db h t =
+  [ insertOpCF (mempoolCF db) (MemTxKey h) t,
+    insertOpCF (mempoolCF db) (MemTimeKey t h) ()
+  ]
+
+-- | Mempool from the index by time, newest first. The index sorts last in
+-- the mempool column family, so seek past its prefix and walk backwards
+-- until a key is no longer in it.
+mempoolNewestC :: Iterator -> ConduitT i (UnixTime, TxHash) IO ()
+mempoolNewestC it = do
+  liftIO $ do
+    -- 0x0c is the first prefix after the 0x0b of 'MemTimeKey'
+    iterSeek it (BS.singleton 0x0c)
+    iterValid it >>= \case
+      True -> iterPrev it
+      False -> iterLast it
+  go
+  where
+    go =
+      liftIO (iterKey it) >>= \case
+        Just k | Right (MemTimeKey t h) <- decode k -> do
+          yield (t, h)
+          liftIO (iterPrev it)
+          go
+        _ -> return ()
+
+-- | Mempool transactions that entered it before the given time, oldest
+-- first, at most as many as given. Reads only those entries of the index.
+getMempoolBefore ::
+  (MonadIO m) =>
+  UnixTime ->
+  Int ->
+  DatabaseReaderT m [(UnixTime, TxHash)]
+getMempoolBefore time n = do
+  db <- asks (.db)
+  liftIO . withIterCF db (mempoolCF db) $ \it ->
+    runConduit $
+      matching it MemTimeKeyS
+        .| concatMapC entry
+        .| takeWhileC ((< time) . fst)
+        .| takeC n
+        .| sinkList
+  where
+    entry (MemTimeKey t h, ()) = Just (t, h)
+    entry (MemTimeKeyS, ()) = Nothing
 
 setInitRocksDB :: DB -> IO ()
 setInitRocksDB db = insert db VersionKey dataVersion
@@ -383,14 +445,16 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
     withMetrics $ \s -> incrementCounter s.dataBalanceCount 1
     fmap (valToBalance a) <$> liftIO (retrieveCF db (balanceCF db) (BalKey a))
 
-  getMempool = do
+  getMempool = getMempoolPage def
+
+  getMempoolPage limits = do
     db <- asks (.db)
     withMetrics $ \s -> incrementCounter s.dataMempoolCount 1
-    sortOn Down . mapMaybe entry
-      <$> liftIO (matchingAsListCF db (mempoolCF db) MemTxKeyS)
-    where
-      entry (MemTxKey h, t) = Just (t, h)
-      entry (MemTxKeyS, _) = Nothing
+    liftIO . withIterCF db (mempoolCF db) $ \it ->
+      runConduit $
+        mempoolNewestC it
+          .| applyLimitsC limits
+          .| sinkList
 
   getBestBlock = do
     withMetrics $ \s -> incrementCounter s.dataBestCount 1
@@ -537,6 +601,15 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     withMetrics $ \s -> incrementCounter s.dataXPubTxs (length txs)
     return txs
 
-  xPubTxCount xspec xbals = do
+  -- Count the merged streams instead of building the list of every
+  -- transaction of the xpub only to take its length.
+  xPubTxCount _xspec xbals = do
     withMetrics $ \s -> incrementCounter s.dataXPubTxCount 1
-    fromIntegral . length <$> xPubTxs xspec xbals def
+    db <- asks (.db)
+    let as =
+          map (.address) $
+            filter (not . nullBalance) $
+              map (.balance) xbals
+    withManyIters db (addrTxCF db) (length as) $ \its ->
+      runConduit (joinDescStreams (zipWith (`addressConduit` Nothing) as its) .| lengthC)
+        >>= \n -> return (fromIntegral (n :: Int))
