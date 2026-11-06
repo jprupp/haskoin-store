@@ -351,9 +351,9 @@ runImportMempool ::
 runImportMempool net ctx f = do
   r <- ReaderT $ \r ->
     liftIO . try $ runWriterMempool net ctx r.config.db r.config.logger f
-  forM_ r $ \(_, c) -> asks (.metrics) >>= mapM_ \m -> do
+  forM_ r $ \(_, c) -> asks (.metrics) >>= mapM_ (\m -> do
     incrementGauge m.mempool (length c.added)
-    decrementGauge m.mempool (length c.removed)
+    decrementGauge m.mempool (length c.removed))
   return r
 
 -- | Run an import and publish the transactions that it added to the
