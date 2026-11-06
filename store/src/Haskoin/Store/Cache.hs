@@ -349,35 +349,74 @@ idxPfx = "i"
 xpubLock :: XPubSpec -> ByteString
 xpubLock xpub = "xlock-" <> encode xpub
 
+-- | Run a read of the cache entries of an xpub in the same round trip to
+-- Redis as the check that the xpub is cached. Redis pipelines the two
+-- commands, since the reply of the first is not read before the second is
+-- sent. The read is 'Nothing' if the xpub is not cached; it then found no
+-- entries, as the keys of an xpub are all deleted together.
+whenXPubCached ::
+  (MonadIO m) =>
+  XPubSpec ->
+  Redis (Either Reply a) ->
+  CacheX m (Maybe a)
+whenXPubCached xpub action = do
+  (cached, x) <- runRedis $ do
+    e <- redisIsXPubCached xpub
+    r <- action
+    return $ (,) <$> e <*> r
+  return $ if cached then Just x else Nothing
+
+-- | The score to start reading a sorted set of an xpub from, when it does
+-- not need a database lookup.
+startScore :: Maybe Start -> Maybe (Maybe Double)
+startScore Nothing = Just Nothing
+startScore (Just (AtBlock h)) = Just (Just (blockRefScore (BlockRef h maxBound)))
+startScore (Just AtTx {}) = Nothing
+
 getXPubTxs ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   Limits ->
   CacheX m [TxRef]
-getXPubTxs xpub xbals limits = do
-  cached <- isXPubCached xpub
-  if cached
-    then do
-      txs <- cacheGetXPubTxs xpub limits
+getXPubTxs xpub xbals limits =
+  case startScore limits.start of
+    Just score ->
+      whenXPubCached xpub (get_txs score) >>= \case
+        Just xs -> do
+          touchKeys [xpub]
+          hit (map (\(t, s) -> TxRef {txid = t, block = scoreBlockRef s}) xs)
+        Nothing -> lift $ xPubTxs xpub xbals limits
+    Nothing -> do
+      cached <- isXPubCached xpub
+      if cached
+        then hit =<< cacheGetXPubTxs xpub limits
+        else lift $ xPubTxs xpub xbals limits
+  where
+    get_txs score =
+      getFromSortedSet
+        (txSetPfx <> encode xpub)
+        score
+        limits.offset
+        limits.limit
+    hit txs = do
       withMetrics $ \s ->
         incrementCounter s.xTxs (length txs)
       return txs
-    else lift $ xPubTxs xpub xbals limits
 
 getXPubTxCount ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   [XPubBal] ->
   CacheX m Word32
-getXPubTxCount xpub xbals = do
-  cached <- isXPubCached xpub
-  if cached
-    then do
+getXPubTxCount xpub xbals =
+  whenXPubCached xpub (redisGetXPubTxCount xpub) >>= \case
+    Just count -> do
       withMetrics $ \s ->
         incrementCounter s.xTxCount 1
-      cacheGetXPubTxCount xpub
-    else lift $ xPubTxCount xpub xbals
+      touchKeys [xpub]
+      return (fromInteger count)
+    Nothing -> lift $ xPubTxCount xpub xbals
 
 getXPubUnspents ::
   (MonadUnliftIO m, StoreReadExtra m) =>
@@ -385,11 +424,27 @@ getXPubUnspents ::
   [XPubBal] ->
   Limits ->
   CacheX m [XPubUnspent]
-getXPubUnspents xpub xbals limits = do
-  cached <- isXPubCached xpub
-  if cached
-    then do
-      ops <- map snd <$> cacheGetXPubUnspents xpub limits
+getXPubUnspents xpub xbals limits =
+  case startScore limits.start of
+    Just score ->
+      whenXPubCached xpub (get_ops score) >>= \case
+        Just xs -> do
+          touchKeys [xpub]
+          hit (map fst xs)
+        Nothing -> lift $ xPubUnspents xpub xbals limits
+    Nothing -> do
+      cached <- isXPubCached xpub
+      if cached
+        then hit . map snd =<< cacheGetXPubUnspents xpub limits
+        else lift $ xPubUnspents xpub xbals limits
+  where
+    get_ops score =
+      getFromSortedSet
+        (utxoPfx <> encode xpub)
+        score
+        limits.offset
+        limits.limit
+    hit ops = do
       uns <- catMaybes <$> lift (mapM getUnspent ops)
       net <- lift getNetwork
       ctx <- lift getCtx
@@ -412,22 +467,20 @@ getXPubUnspents xpub xbals limits = do
           i a u = h u <$> g a
       withMetrics $ \s -> incrementCounter s.xUnspents (length us)
       return $ mapMaybe (uncurry i) us
-    else lift $ xPubUnspents xpub xbals limits
 
 getXPubBalances ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
   CacheX m [XPubBal]
-getXPubBalances xpub = do
-  cached <- isXPubCached xpub
-  if cached
-    then do
-      xbals <- cacheGetXPubBalances xpub
+getXPubBalances xpub =
+  whenXPubCached xpub (redisGetXPubBalances xpub) >>= \case
+    Just xbals -> do
+      touchKeys [xpub]
       withMetrics $ \s -> do
         incrementCounter s.hits 1
         incrementCounter s.xBalances (length xbals)
       return xbals
-    else do
+    Nothing -> do
       withMetrics $ \s -> incrementCounter s.misses 1
       withRetryLock (xpubLock xpub) (load_and_cache xpub) >>= \case
         Just bals -> return bals
@@ -453,21 +506,6 @@ isXPubCached xpub = runRedis (redisIsXPubCached xpub)
 
 redisIsXPubCached :: (RedisCtx m f) => XPubSpec -> m (f Bool)
 redisIsXPubCached xpub = Redis.exists (balancesPfx <> encode xpub)
-
-cacheGetXPubBalances :: (MonadIO m) => XPubSpec -> CacheX m [XPubBal]
-cacheGetXPubBalances xpub = do
-  bals <- runRedis $ redisGetXPubBalances xpub
-  touchKeys [xpub]
-  return bals
-
-cacheGetXPubTxCount ::
-  (MonadUnliftIO m) =>
-  XPubSpec ->
-  CacheX m Word32
-cacheGetXPubTxCount xpub = do
-  count <- fromInteger <$> runRedis (redisGetXPubTxCount xpub)
-  touchKeys [xpub]
-  return count
 
 redisGetXPubTxCount :: (RedisCtx m f) => XPubSpec -> m (f Integer)
 redisGetXPubTxCount xpub = Redis.zcard (txSetPfx <> encode xpub)
