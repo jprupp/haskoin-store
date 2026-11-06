@@ -350,11 +350,17 @@ streamThings getit gettx limits =
     [] -> return ()
     ls -> mapM_ yield ls >> go limits (last ls)
   where
+    -- Without a transaction to start the next page from, the next page
+    -- starts at an offset, which the store reads and drops. Double the
+    -- page each time, up to 'maxPage', so that the rows read and dropped
+    -- stay in proportion to the rows streamed, instead of growing with
+    -- their square.
     h l x = case gettx of
       Just g -> Just l {offset = 1, start = Just (AtTx (g x))}
       Nothing -> case l.limit of
         0 -> Nothing
-        _ -> Just l {offset = l.offset + l.limit}
+        _ -> Just l {offset = l.offset + l.limit, limit = max l.limit (min maxPage (2 * l.limit))}
+    maxPage = 1024
     go l x = case h l x of
       Nothing -> return ()
       Just l' ->

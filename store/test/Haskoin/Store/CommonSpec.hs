@@ -2,7 +2,8 @@
 
 module Haskoin.Store.CommonSpec (spec) where
 
-import Conduit (runConduitPure, sinkList, yieldMany, (.|))
+import Conduit (runConduit, runConduitPure, sinkList, takeC, yieldMany, (.|))
+import Control.Monad.State.Strict (State, modify', runState)
 import Data.List (sortOn)
 import Data.Ord (Down (..))
 import Data.Word (Word32)
@@ -13,12 +14,24 @@ import Haskoin.Store.Common
     applyLimitsC,
     deOffset,
     mergeDescGroups,
+    streamThings,
   )
 import Test.Hspec
 import Test.QuickCheck
 
 spec :: Spec
-spec =
+spec = do
+  describe "streamThings" $ do
+    it "streams every item in order when paging by offset" $
+      property $ \(NonNegative n) (Positive page) ->
+        let xs = [1 .. n :: Int]
+            (ys, _) = paged (fromIntegral (page `mod` 50 + 1 :: Int)) xs Nothing
+         in ys === xs
+    it "reads a number of rows in proportion to the rows taken" $
+      property $ \(NonNegative n) ->
+        let xs = [1 .. 100000 :: Int]
+            (ys, reads) = paged 16 xs (Just n)
+         in ys === take n xs .&&. counterexample (show reads) (reads <= 4 * n + 2048)
   describe "mergeDescGroups" $ do
     it "pages like sorting the first offset plus limit items of every stream" $
       property $ \(Streams ss) ->
@@ -66,3 +79,18 @@ instance Arbitrary Streams where
     -- number the items so that they are unique across streams
     return . Streams $
       zipWith (\i -> map (\(k, x) -> (k, x * 10 + i))) [0 ..] ss
+
+-- | Stream a list through 'streamThings' paging by offset, taking at most
+-- the given number of items. Also gives the rows that the store read,
+-- counting those it skipped to reach the offset of each page.
+paged :: Word32 -> [Int] -> Maybe Int -> ([Int], Int)
+paged page xs n =
+  flip runState 0 . runConduit $
+    streamThings getit Nothing (Limits page 0 Nothing)
+      .| maybe sinkList (\k -> takeC k .| sinkList) n
+  where
+    getit :: Limits -> State Int [Int]
+    getit l = do
+      let ys = applyLimits l xs
+      modify' (+ (fromIntegral l.offset + length ys))
+      return ys
