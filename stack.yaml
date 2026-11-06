@@ -27,5 +27,8 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.5.0
   - rocksdb-query-0.6.0
   - nqe-0.6.7
-  - haskoin-core-1.5.1
-  - haskoin-node-2.2.0
+  - haskoin-core-1.6.0
+  # haskoin-node 2.2.0 does not build on haskoin-core 1.6.0: use the fix
+  # from GitHub until a release has it
+  - git: https://github.com/jprupp/haskoin-node.git
+    commit: 812ba28e22bbfce3a3cc729755faa1bb4b2c9fd9

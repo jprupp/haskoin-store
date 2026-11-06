@@ -62,6 +62,7 @@ import Haskoin
   ( Address,
     BlockHash,
     BlockHeight,
+    Network,
     OutPoint (..),
     TxHash,
     eitherToMaybe,
@@ -219,17 +220,17 @@ instance Key UnspentKey
 
 instance KeyValue UnspentKey UnspentVal
 
-toUnspent :: Ctx -> AddrOutKey -> OutVal -> Maybe Unspent
-toUnspent ctx (AddrOutKey _address block outpoint) (OutVal value script) =
+toUnspent :: Network -> Ctx -> AddrOutKey -> OutVal -> Maybe Unspent
+toUnspent net ctx (AddrOutKey _address block outpoint) (OutVal value script) =
   Just
     Unspent
       { block = block,
         value = value,
         script = script,
         outpoint = outpoint,
-        address = eitherToMaybe (scriptToAddressBS ctx script)
+        address = eitherToMaybe (scriptToAddressBS net ctx script)
       }
-toUnspent _ _ _ = Nothing
+toUnspent _ _ _ _ = Nothing
 
 -- | Mempool transaction database key.
 data MemKey
@@ -418,8 +419,8 @@ data UnspentVal = UnspentVal
 unspentToVal :: Unspent -> (OutPoint, UnspentVal)
 unspentToVal Unspent {..} = (outpoint, UnspentVal {..})
 
-valToUnspent :: Ctx -> OutPoint -> UnspentVal -> Unspent
-valToUnspent ctx outpoint UnspentVal {..} =
+valToUnspent :: Network -> Ctx -> OutPoint -> UnspentVal -> Unspent
+valToUnspent net ctx outpoint UnspentVal {..} =
   Unspent {..}
   where
-    address = eitherToMaybe (scriptToAddressBS ctx script)
+    address = eitherToMaybe (scriptToAddressBS net ctx script)

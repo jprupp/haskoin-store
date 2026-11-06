@@ -347,8 +347,9 @@ unspentConduit ::
   Maybe Start ->
   Iterator ->
   ConduitT i Unspent (DatabaseReaderT m) ()
-unspentConduit ctx a s it =
-  x .| mapC (uncurry (toUnspent ctx)) .| concatC
+unspentConduit ctx a s it = do
+  net <- lift (asks (.net))
+  x .| mapC (uncurry (toUnspent net ctx)) .| concatC
   where
     x = case s of
       Nothing ->
@@ -432,9 +433,10 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
 
   getUnspent p = do
     db <- asks (.db)
+    net <- asks (.net)
     ctx <- asks (.ctx)
     val <- liftIO (retrieveCF db (unspentCF db) (UnspentKey p))
-    case fmap (valToUnspent ctx p) val of
+    case fmap (valToUnspent net ctx p) val of
       Nothing -> return Nothing
       Just u -> do
         withMetrics $ \s -> incrementCounter s.dataUnspentCount 1

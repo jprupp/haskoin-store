@@ -369,7 +369,7 @@ spec = prepareContext $ \ctx -> do
   describe "address balances" $
     it "follow transactions through the mempool, a block and its reversal" $
       withCoin btcRegTest ctx $ \db coin -> do
-        a <- either fail return (scriptToAddressBS ctx script)
+        a <- either fail return (scriptToAddressBS btcRegTest ctx script)
         let tx = spend [coin] [1000, 2000]
             -- confirmed, unconfirmed, outputs, transactions, received
             balance = do

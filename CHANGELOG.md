@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Build on haskoin-core 1.6.0 from Hackage. haskoin-node 2.2.0 does not build
+  on it, so haskoin-node is taken from GitHub until a release has the fix.
+- Breaking: `toTransaction`, `toInput` and `toOutput` in haskoin-store-data
+  take the `Network` before the `Ctx`. With haskoin-core 1.6.0 an output has
+  an address only if the network has that kind of output: a witness program
+  has none on Bitcoin Cash, and a 256-bit script hash has none on Bitcoin.
+  Such addresses had no text form, so encoding a transaction or unspent
+  output that held one as JSON failed. They are no longer indexed. Entries
+  that an older version indexed for them stay in the database, unused.
+- `/peers` reports the version of a peer as before, an unsigned number,
+  although haskoin-core 1.6.0 reads it signed.
+
 - Index the mempool by the time each transaction entered it. `/mempool`,
   `/blockchain/unconfirmed-transactions` and the health check read only the
   page they return, newest first, instead of loading and sorting the whole

@@ -1008,15 +1008,15 @@ instance Serialize Prev where
   put = serialize
   get = deserialize
 
-toInput :: Ctx -> TxIn -> Maybe Prev -> WitnessStack -> StoreInput
-toInput ctx i Nothing w =
+toInput :: Network -> Ctx -> TxIn -> Maybe Prev -> WitnessStack -> StoreInput
+toInput _ _ i Nothing w =
   StoreCoinbase
     { outpoint = i.outpoint,
       sequence = i.sequence,
       script = i.script,
       witness = w
     }
-toInput ctx i (Just p) w =
+toInput net ctx i (Just p) w =
   StoreInput
     { outpoint = i.outpoint,
       sequence = i.sequence,
@@ -1024,16 +1024,16 @@ toInput ctx i (Just p) w =
       pkscript = p.script,
       value = p.value,
       witness = w,
-      address = eitherToMaybe (scriptToAddressBS ctx p.script)
+      address = eitherToMaybe (scriptToAddressBS net ctx p.script)
     }
 
-toOutput :: Ctx -> TxOut -> Maybe Spender -> StoreOutput
-toOutput ctx o s =
+toOutput :: Network -> Ctx -> TxOut -> Maybe Spender -> StoreOutput
+toOutput net ctx o s =
   StoreOutput
     { value = o.value,
       script = o.script,
       spender = s,
-      address = eitherToMaybe (scriptToAddressBS ctx o.script)
+      address = eitherToMaybe (scriptToAddressBS net ctx o.script)
     }
 
 data TxData = TxData
@@ -1083,8 +1083,10 @@ txDataFee t =
     inputs = sum $ map (.value) $ IntMap.elems t.prevs
     outputs = sum $ map (.value) t.tx.outputs
 
-toTransaction :: Ctx -> TxData -> Transaction
-toTransaction ctx t =
+-- | The addresses of inputs and outputs are those of the network: an output
+-- kind that the network does not have gets none.
+toTransaction :: Network -> Ctx -> TxData -> Transaction
+toTransaction net ctx t =
   Transaction
     { version = t.tx.version,
       locktime = t.tx.locktime,
@@ -1118,8 +1120,8 @@ toTransaction ctx t =
     outs = zipWith g [0 ..] t.tx.outputs
     outv = sum $ map (.value) outs
     ws = take (length t.tx.inputs) $ t.tx.witness <> repeat []
-    f n i = toInput ctx i (IntMap.lookup n t.prevs) (ws !! n)
-    g n o = toOutput ctx o $ IntMap.lookup n t.spenders
+    f n i = toInput net ctx i (IntMap.lookup n t.prevs) (ws !! n)
+    g n o = toOutput net ctx o $ IntMap.lookup n t.spenders
 
 fromTransaction :: Transaction -> TxData
 fromTransaction t =
