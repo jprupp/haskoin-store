@@ -9,7 +9,14 @@
 #
 # The server runs on CPUs 0-2 and wrk on CPU 3, so that they do not compete
 # for the same cores. Set REDIS_URL to run with the Redis cache; set
-# ENDPOINTS to a regular expression to run only matching endpoint names.
+# ENDPOINTS to a regular expression to run only matching endpoint names,
+# and BIN to run a given server binary.
+#
+# Compare builds by the CPU time per request. Requests per second depend on
+# how the GHC scheduler behaves on the host: on a KVM guest with -N3, a bare
+# Warp server fell from 53,000 to 8,600 requests per second when going from
+# 4 to 32 connections, with about ten context switches per request, while
+# -N1 served 84,000. Hence the default of 8 connections.
 set -euo pipefail
 
 BLOCKS=${1:-1000}
