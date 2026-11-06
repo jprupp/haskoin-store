@@ -142,6 +142,7 @@ test-suite spec
   other-modules:
       Haskoin.Store.BlockStoreSpec
       Haskoin.Store.CacheSpec
+      Haskoin.Store.CommonSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.WebSpec

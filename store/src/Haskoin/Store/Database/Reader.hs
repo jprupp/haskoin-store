@@ -41,9 +41,7 @@ import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (sortOn)
 import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Ord (Down (..))
 import Data.Serialize (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -628,16 +626,29 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
                   go (xs <> acc) as''
          in go [] adrs
 
+  -- The first unspent outputs of each address, at most offset plus limit
+  -- of them, sorted together. Read the addresses in step, so that each is
+  -- read only as far as the page needs, rather than decoding the whole
+  -- quota of every address to keep one page of it.
   xPubUnspents _xspec xbals limits = do
-    us <- concat <$> mapM h cs
+    db <- asks (.db)
+    net <- asks (.net)
+    ctx <- asks (.ctx)
+    let quota = case (deOffset limits).limit of
+          0 -> Nothing
+          l -> Just l
+        stream b it =
+          unspentConduit net ctx b.balance.address limits.start it
+            .| mapC (\u -> XPubUnspent {path = b.path, unspent = u})
+    us <- withManyIters db (addrOutCF db) (length cs) $ \its ->
+      runConduit $
+        mergeDescGroups (.unspent.block) quota (zipWith stream cs its)
+          .| applyLimitsC limits
+          .| sinkList
     withMetrics $ \s -> incrementCounter s.dataXPubUnspents (length us)
-    return . applyLimits limits $ sortOn Down us
+    return us
     where
-      l = deOffset limits
       cs = filter ((> 0) . (.balance.utxo)) xbals
-      i b = getAddressUnspents b.balance.address l
-      f b t = XPubUnspent {path = b.path, unspent = t}
-      h b = map (f b) <$> i b
 
   xPubTxs _xspec xbals limits = do
     let as =

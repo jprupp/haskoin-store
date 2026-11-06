@@ -36,6 +36,7 @@ module Haskoin.Store.Common
     microseconds,
     streamThings,
     joinDescStreams,
+    mergeDescGroups,
     loopForever,
   )
 where
@@ -60,7 +61,9 @@ import Data.HashMap.Strict qualified as M
 import Data.HashSet qualified as H
 import Data.Hashable (Hashable)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.List (sortOn)
+import Data.Maybe (catMaybes, mapMaybe)
+import Data.Ord (Down (..))
 import Data.Time.Clock.System
   ( getSystemTime,
     systemNanoseconds,
@@ -383,3 +386,44 @@ joinDescStreams xs = do
         let mp2 = Map.deleteMax mp
             mp' = Map.unionWith (++) mp1 mp2
         go (Just x) mp'
+
+-- | Merge streams whose keys never increase, taking at most the given number
+-- of items from each stream ('Nothing': all of them). The items come out in
+-- groups of equal key, in decreasing order of key, and each group is sorted
+-- in decreasing order of the items themselves. So the output is the same as
+-- sorting the first items of every stream in decreasing order, but a stream
+-- is read only as far as the consumer needs: a consumer that stops after
+-- the first n items makes each stream be read only a little past its first
+-- n items, instead of to the end of its quota.
+mergeDescGroups ::
+  (Monad m, Ord a, Ord k) =>
+  (a -> k) ->
+  Maybe Word32 ->
+  [ConduitT () a m ()] ->
+  ConduitT () a m ()
+mergeDescGroups key quota streams = do
+  heads <- lift $ mapM (next quota . sealConduitT) streams
+  go (insertAll (catMaybes heads) Map.empty)
+  where
+    insertAll hs mp =
+      foldr (\h@(x, _, _) -> Map.insertWith (<>) (Down (key x)) [h]) mp hs
+    -- the next item of a stream, if any is left within its quota
+    next (Just 0) _ = return Nothing
+    next q s = do
+      (s', mx) <- s $$++ await
+      return $ (\x -> (x, subtract 1 <$> q, s')) <$> mx
+    -- all the items of a stream with this key, and the first one after them
+    group k (x, q, s) = do
+      n <- next q s
+      case n of
+        Just h@(y, _, _)
+          | key y == k -> do
+              (ys, rest) <- group k h
+              return (x : ys, rest)
+        _ -> return ([x], n)
+    go mp = case Map.minViewWithKey mp of
+      Nothing -> return ()
+      Just ((Down k, hs), mp') -> do
+        gs <- lift $ mapM (group k) hs
+        mapM_ yield (sortOn Down (concatMap fst gs))
+        go (insertAll (mapMaybe snd gs) mp')
