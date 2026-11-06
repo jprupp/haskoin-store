@@ -1,5 +1,5 @@
 name: haskoin-store-data
-version: 1.6.3
+version: 1.7.0
 synopsis: Data for Haskoin Store
 description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category: Bitcoin, Finance, Network
@@ -20,7 +20,7 @@ dependencies:
   - containers >= 0.6.2.1
   - deepseq >= 1.4.4.0
   - hashable >= 1.3.0.0
-  - haskoin-core >= 1.5.1
+  - haskoin-core >= 1.6.0
   - network >= 3.1.1.1
   - scotty >= 0.20
   - string-conversions >= 0.4.0.1

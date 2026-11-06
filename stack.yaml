@@ -27,5 +27,8 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.5.0
   - rocksdb-query-0.6.0
   - nqe-0.6.7
-  - haskoin-core-1.5.1
-  - haskoin-node-2.2.0
+  # haskoin-core 1.6.0 and haskoin-node 2.3.0 from the local checkouts next
+  # to this repository. This is for testing only. Pin the released versions
+  # before opening a pull request.
+  - ../haskoin-core
+  - ../haskoin-node
