@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.8.1] - 2026-11-07
+
+### Changed
+
+- Documentation: the README explains the purpose and design of the store, with
+  installation steps, a full configuration reference, monitoring and a
+  tutorial, and the Haddock of every module and function says why it works the
+  way it does.
+- Build against nqe 0.6.9, rocksdb-haskell-jprupp 2.6.1, rocksdb-query 0.6.1,
+  statsd-rupp 0.5.0.2, haskoin-node 2.3.1 and Stackage nightly-2026-11-07.
+
 ## [1.8.0] - 2026-11-07
 
 ### Changed
