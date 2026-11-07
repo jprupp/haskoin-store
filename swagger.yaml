@@ -7,7 +7,7 @@ servers:
   - url: 'https://api.haskoin.com/btctest4/'
 
 info:
-  version: &version 1.7.0
+  version: &version 1.8.0
   title: Haskoin
   contact:
     name: JP Rupp
