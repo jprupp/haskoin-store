@@ -458,6 +458,7 @@ instance
   getBlocksAtHeight height = runInWebReader (getBlocksAtHeight height)
   getBlock bh = runInWebReader (getBlock bh)
   getTxData th = runInWebReader (getTxData th)
+  getManyTxData ths = runInWebReader (getManyTxData ths)
   getSpender op = runInWebReader (getSpender op)
   getUnspent op = runInWebReader (getUnspent op)
   getBalance a = runInWebReader (getBalance a)
@@ -488,6 +489,7 @@ instance (MonadUnliftIO m) => StoreReadBase (ActionT m) where
   getBlocksAtHeight = lift . getBlocksAtHeight
   getBlock = lift . getBlock
   getTxData = lift . getTxData
+  getManyTxData = lift . getManyTxData
   getSpender = lift . getSpender
   getUnspent = lift . getUnspent
   getBalance = lift . getBalance
@@ -972,7 +974,7 @@ getRawBlock h =
 
 toRawBlock :: (StoreReadBase m) => BlockData -> m H.Block
 toRawBlock b = do
-  txs <- map transactionData . catMaybes <$> mapM getTransaction b.txs
+  txs <- map transactionData . catMaybes <$> getTransactions b.txs
   return H.Block {header = b.header, txs}
 
 -- GET BlockBest / BlockBestRaw --
@@ -1093,7 +1095,7 @@ scottyTxs ::
   (MonadUnliftIO m) => GetTxs -> ActionT m [Transaction]
 scottyTxs (GetTxs txids) =
   withMetrics (.tx) $
-    catMaybes <$> mapM getTransaction (nub txids)
+    catMaybes <$> getTransactions (nub txids)
 
 scottyTxRaw ::
   (MonadUnliftIO m) => GetTxRaw -> ActionT m (RawResult Tx)
@@ -1111,7 +1113,7 @@ scottyTxsRaw ::
 scottyTxsRaw (GetTxsRaw txids) =
   withMetrics (.txRaw) $
     RawResultList . map transactionData . catMaybes
-      <$> mapM getTransaction (nub txids)
+      <$> getTransactions (nub txids)
 
 getTxsBlock ::
   (MonadUnliftIO m) =>
@@ -1120,7 +1122,7 @@ getTxsBlock ::
 getTxsBlock h =
   getBlock h >>= \case
     Nothing -> raise ThingNotFound
-    Just b -> catMaybes <$> mapM getTransaction b.txs
+    Just b -> catMaybes <$> getTransactions b.txs
 
 scottyTxsBlock ::
   (MonadUnliftIO m) =>
@@ -1340,7 +1342,7 @@ scottyAddrTxsFull ::
 scottyAddrTxsFull (GetAddrTxsFull addr pLimits) =
   withMetrics (.addressTxFull) $ do
     txs <- getAddressTxs addr =<< paramToLimits True pLimits
-    catMaybes <$> mapM (getTransaction . (.txid)) txs
+    catMaybes <$> getTransactions (map (.txid) txs)
 
 scottyAddrsTxsFull ::
   (MonadUnliftIO m) =>
@@ -1349,7 +1351,7 @@ scottyAddrsTxsFull ::
 scottyAddrsTxsFull (GetAddrsTxsFull addrs pLimits) =
   withMetrics (.addressTxFull) $ do
     txs <- getAddressesTxs addrs =<< paramToLimits True pLimits
-    catMaybes <$> mapM (getTransaction . (.txid)) txs
+    catMaybes <$> getTransactions (map (.txid) txs)
 
 scottyAddrBalance :: (MonadUnliftIO m) => GetAddrBalance -> ActionT m Balance
 scottyAddrBalance (GetAddrBalance addr) =
@@ -1417,7 +1419,7 @@ scottyXPubTxsFull ::
 scottyXPubTxsFull (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
   withMetrics (.xpubTxFull) $
     fmap catMaybes $
-      lift . runNoCache nocache . mapM (getTransaction . (.txid))
+      lift . runNoCache nocache . getTransactions . map (.txid)
         =<< getXPubTxs xpub deriv plimits nocache
 
 scottyXPubBalances ::
@@ -2219,7 +2221,7 @@ scottyBinfoBlockHeight =
     streamEncoding $ marshalEncoding (net, ctx) is
   where
     get_binfo_blocks numtxid ns b = do
-      txs <- catMaybes <$> mapM getTransaction b.txs
+      txs <- catMaybes <$> getTransactions b.txs
       let h x = H.headerHash x.header
           nbs = [h n | n <- ns, n.header.prev == h b]
           bts = map (toBinfoTxSimple numtxid) txs
@@ -2255,7 +2257,7 @@ scottyBinfoBlock =
   where
     go numtxid hex bh = do
       b <- maybe (raise ThingNotFound) return =<< getBlock bh
-      txs <- catMaybes <$> mapM getTransaction b.txs
+      txs <- catMaybes <$> getTransactions b.txs
       nhs <- fmap catMaybes $ getBlocksAtHeight (b.height + 1) >>= mapM getBlock
       let h x = H.headerHash x.header
           nxt = [h n | n <- nhs, n.header.prev == h b]
@@ -2377,7 +2379,7 @@ scottyBinfoMempool =
         else
           map snd
             <$> getMempoolPage (Limits (fromIntegral n) (fromIntegral offset) Nothing)
-    txs <- catMaybes <$> mapM getTransaction txids
+    txs <- catMaybes <$> getTransactions txids
     net <- askl (.config.store.net)
     setHeaders
     let mem = BinfoMempool $ map (toBinfoTxSimple numtxid) txs

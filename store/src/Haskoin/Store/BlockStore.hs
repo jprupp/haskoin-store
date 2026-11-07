@@ -399,6 +399,8 @@ instance (MonadIO m) => StoreReadBase (BlockT m) where
     runRocksDB . getBlock
   getTxData =
     runRocksDB . getTxData
+  getManyTxData =
+    runRocksDB . getManyTxData
   getSpender =
     runRocksDB . getSpender
   getUnspent =

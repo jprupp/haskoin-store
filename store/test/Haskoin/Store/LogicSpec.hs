@@ -82,7 +82,7 @@ spec = prepareContext $ \ctx -> do
     it "moves the mempool into its column family when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
         let open :: DatabaseReaderT IO () -> IO ()
-            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing
+            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
             h1 = TxHash (sha256 ("one" :: B.ByteString))
             h2 = TxHash (sha256 ("two" :: B.ByteString))
             old = [(200, h2), (100, h1)] :: [(Word64, TxHash)]
@@ -99,7 +99,7 @@ spec = prepareContext $ \ctx -> do
     it "indexes the mempool by time when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
         let open :: DatabaseReaderT IO () -> IO ()
-            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing
+            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
             old = sortOn Down (zip [300, 100, 200] (hashes 3))
         open $ ask >>= \r -> liftIO $ do
           insert r.db VersionKey (19 :: Word32)
@@ -398,7 +398,7 @@ spec = prepareContext $ \ctx -> do
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
 withDB net ctx go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing (ask >>= liftIO . go)
+    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing (ask >>= liftIO . go)
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.

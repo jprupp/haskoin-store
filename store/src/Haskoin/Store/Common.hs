@@ -19,6 +19,7 @@ module Haskoin.Store.Common
     getActiveTxData,
     getDefaultBalance,
     getTransaction,
+    getTransactions,
     getNumTransaction,
     blockAtOrAfter,
     blockAtOrBefore,
@@ -36,6 +37,7 @@ module Haskoin.Store.Common
     microseconds,
     streamThings,
     joinDescStreams,
+    mergeDescGroups,
     loopForever,
   )
 where
@@ -60,7 +62,9 @@ import Data.HashMap.Strict qualified as M
 import Data.HashSet qualified as H
 import Data.Hashable (Hashable)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.List (sortOn)
+import Data.Maybe (catMaybes, mapMaybe)
+import Data.Ord (Down (..))
 import Data.Time.Clock.System
   ( getSystemTime,
     systemNanoseconds,
@@ -120,6 +124,12 @@ class (Monad m) => StoreReadBase m where
   getBlocksAtHeight :: BlockHeight -> m [BlockHash]
   getBlock :: BlockHash -> m (Maybe BlockData)
   getTxData :: TxHash -> m (Maybe TxData)
+
+  -- | Data of many transactions, in the order of their hashes. Stores that
+  -- can read many keys at once read them together.
+  getManyTxData :: [TxHash] -> m [Maybe TxData]
+  getManyTxData = mapM getTxData
+
   getSpender :: OutPoint -> m (Maybe Spender)
   getBalance :: Address -> m (Maybe Balance)
   getUnspent :: OutPoint -> m (Maybe Unspent)
@@ -211,6 +221,14 @@ getTransaction h = do
   net <- getNetwork
   ctx <- getCtx
   fmap (toTransaction net ctx) <$> getTxData h
+
+-- | Many transactions, in the order of their hashes, read together.
+getTransactions ::
+  (StoreReadBase m) => [TxHash] -> m [Maybe Transaction]
+getTransactions hs = do
+  net <- getNetwork
+  ctx <- getCtx
+  map (fmap (toTransaction net ctx)) <$> getManyTxData hs
 
 getNumTransaction ::
   (StoreReadExtra m) => Word64 -> m [Transaction]
@@ -347,11 +365,17 @@ streamThings getit gettx limits =
     [] -> return ()
     ls -> mapM_ yield ls >> go limits (last ls)
   where
+    -- Without a transaction to start the next page from, the next page
+    -- starts at an offset, which the store reads and drops. Double the
+    -- page each time, up to 'maxPage', so that the rows read and dropped
+    -- stay in proportion to the rows streamed, instead of growing with
+    -- their square.
     h l x = case gettx of
       Just g -> Just l {offset = 1, start = Just (AtTx (g x))}
       Nothing -> case l.limit of
         0 -> Nothing
-        _ -> Just l {offset = l.offset + l.limit}
+        _ -> Just l {offset = l.offset + l.limit, limit = max l.limit (min maxPage (2 * l.limit))}
+    maxPage = 1024
     go l x = case h l x of
       Nothing -> return ()
       Just l' ->
@@ -383,3 +407,44 @@ joinDescStreams xs = do
         let mp2 = Map.deleteMax mp
             mp' = Map.unionWith (++) mp1 mp2
         go (Just x) mp'
+
+-- | Merge streams whose keys never increase, taking at most the given number
+-- of items from each stream ('Nothing': all of them). The items come out in
+-- groups of equal key, in decreasing order of key, and each group is sorted
+-- in decreasing order of the items themselves. So the output is the same as
+-- sorting the first items of every stream in decreasing order, but a stream
+-- is read only as far as the consumer needs: a consumer that stops after
+-- the first n items makes each stream be read only a little past its first
+-- n items, instead of to the end of its quota.
+mergeDescGroups ::
+  (Monad m, Ord a, Ord k) =>
+  (a -> k) ->
+  Maybe Word32 ->
+  [ConduitT () a m ()] ->
+  ConduitT () a m ()
+mergeDescGroups key quota streams = do
+  heads <- lift $ mapM (next quota . sealConduitT) streams
+  go (insertAll (catMaybes heads) Map.empty)
+  where
+    insertAll hs mp =
+      foldr (\h@(x, _, _) -> Map.insertWith (<>) (Down (key x)) [h]) mp hs
+    -- the next item of a stream, if any is left within its quota
+    next (Just 0) _ = return Nothing
+    next q s = do
+      (s', mx) <- s $$++ await
+      return $ (\x -> (x, subtract 1 <$> q, s')) <$> mx
+    -- all the items of a stream with this key, and the first one after them
+    group k (x, q, s) = do
+      n <- next q s
+      case n of
+        Just h@(y, _, _)
+          | key y == k -> do
+              (ys, rest) <- group k h
+              return (x : ys, rest)
+        _ -> return ([x], n)
+    go mp = case Map.minViewWithKey mp of
+      Nothing -> return ()
+      Just ((Down k, hs), mp') -> do
+        gs <- lift $ mapM (group k) hs
+        mapM_ yield (sortOn Down (concatMap fst gs))
+        go (insertAll (mapMaybe snd gs) mp')

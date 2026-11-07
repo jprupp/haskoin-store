@@ -1,5 +1,5 @@
 name: haskoin-store
-version: 1.7.0
+version: 1.8.0
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-store#readme>
 category: Bitcoin, Finance, Network
@@ -24,10 +24,10 @@ dependencies:
   - deepseq >= 1.4.4.0
   - hashable >= 1.3.0.0
   - hashtables >= 1.2.4.2
-  - haskoin-store-data == 1.7.0
+  - haskoin-store-data == 1.8.0
   - monad-control >= 1.0.2.3
   - mtl >= 2.2.2
-  - haskoin-core >= 1.6.0
+  - haskoin-core >= 1.6.1
   - haskoin-node >= 2.3.0
   - nqe >= 0.6.5
   - random >= 1.1
@@ -40,7 +40,7 @@ dependencies:
   - hedis >= 0.16.1
   - http-types >= 0.12.3
   - network >= 3.1.1.1
-  - rocksdb-haskell-jprupp >= 2.5.0
+  - rocksdb-haskell-jprupp >= 2.6.0
   - rocksdb-query >= 0.6.0
   - scotty >= 0.22
   - statsd-rupp >= 0.4
@@ -71,7 +71,7 @@ executables:
     ghc-options:
       - -threaded
       - -rtsopts
-      - -with-rtsopts=-N4
+      - -with-rtsopts=-N
     dependencies:
       - haskoin-store
       - filepath
@@ -87,10 +87,24 @@ tests:
       - -threaded
       - -rtsopts
       # -T lets the memory test read the heap size
-      - '"-with-rtsopts=-N4 -T"'
+      - '"-with-rtsopts=-N -T"'
     dependencies:
       - haskoin-store
       - hspec >= 2.7.1
       - QuickCheck >= 2.13.2
       - base64 >= 0.4.1
       - fast-logger >= 3.0
+benchmarks:
+  # Load-test server: syncs a synthetic chain and serves the web API on it.
+  # Build with `stack build --bench --no-run-benchmarks` and run it with
+  # scripts/bench-web.sh.
+  haskoin-store-bench:
+    main: Main.hs
+    source-dirs: bench
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - haskoin-store
+      - vector

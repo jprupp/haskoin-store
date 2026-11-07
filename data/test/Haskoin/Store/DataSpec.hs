@@ -161,6 +161,19 @@ spec = do
         p2wpkh = "0014751e76e8199196d454941c45d1b3a323f1433bd6"
         -- OP_HASH256, a push of 32 bytes, OP_EQUAL.
         hashLock = "aa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb87"
+    it "computes the id, size, weight and witnesses of the transaction" $
+      forAll (arbitraryTxData ctx) $ \td ->
+        let t = toTransaction btc ctx td
+            len :: Tx -> Int
+            len = B.length . runPutS . serialize
+            witless = let Tx {..} = td.tx in Tx {witness = [], ..}
+            ws = take (length td.tx.inputs) (td.tx.witness <> repeat [])
+         in (t.txid, t.size, t.weight, map (.witness) t.inputs)
+              `shouldBe` ( txHash td.tx,
+                           fromIntegral (len td.tx),
+                           fromIntegral (len witless * 3 + len td.tx),
+                           ws
+                         )
     it "gives a SegWit output its address on Bitcoin" $
       outputJson btc p2wpkh
         `shouldBe` [ json

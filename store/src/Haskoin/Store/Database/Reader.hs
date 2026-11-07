@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -31,18 +32,20 @@ module Haskoin.Store.Database.Reader
 where
 
 import Conduit
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, replicateM, (>=>))
 import Control.Monad.Reader
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (sortOn)
-import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Ord (Down (..))
-import Data.Serialize (decode, encode)
+import Data.Functor ((<&>))
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Serialize (Serialize, decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
@@ -64,8 +67,51 @@ data DatabaseReader = DatabaseReader
     initGap :: !Word32,
     net :: !Network,
     metrics :: !(Maybe DataMetrics),
-    ctx :: !Ctx
+    ctx :: !Ctx,
+    -- | addresses derived from recently queried xpubs
+    derived :: !(IORef DerivedCache)
   }
+
+-- | Addresses of an xpub, external then change, in order of index. Each
+-- list is infinite and lazy: it is derived as far as queries have needed,
+-- and shared by later queries of the same xpub. Deriving an address costs
+-- an elliptic curve operation and two hashes, which made up most of the
+-- time of an xpub query.
+data Derived = Derived ![(Word32, Address)] ![(Word32, Address)]
+
+-- | Recently used xpubs and their addresses. When the newer generation is
+-- full it becomes the older one, so the cache holds at most twice
+-- 'derivedCacheSize' xpubs, and an xpub stays while it is in use.
+data DerivedCache = DerivedCache
+  { newer :: !(HashMap XPubSpec Derived),
+    older :: !(HashMap XPubSpec Derived)
+  }
+
+derivedCacheSize :: Int
+derivedCacheSize = 512
+
+-- | Addresses of an xpub, from the cache or a new lazy derivation.
+derivedAddrs :: (MonadIO m) => XPubSpec -> DatabaseReaderT m Derived
+derivedAddrs xpub = do
+  ref <- asks (.derived)
+  ctx <- asks (.ctx)
+  let fresh =
+        let addrs m =
+              deriveAddresses
+                (deriveFunction ctx xpub.deriv)
+                (pubSubKey ctx xpub.key m)
+                0
+         in Derived (addrs 0) (addrs 1)
+  liftIO . atomicModifyIORef' ref $ \c ->
+    case HashMap.lookup xpub c.newer of
+      Just d -> (c, d)
+      Nothing ->
+        let d = fromMaybe fresh (HashMap.lookup xpub c.older)
+            c'
+              | HashMap.size c.newer >= derivedCacheSize =
+                  DerivedCache {newer = HashMap.singleton xpub d, older = c.newer}
+              | otherwise = c {newer = HashMap.insert xpub d c.newer}
+         in (c', d)
 
 data DataMetrics = DataMetrics
   { dataBestCount :: !StatCounter,
@@ -120,12 +166,14 @@ withDatabaseReader ::
   Maybe Int ->
   Maybe Int ->
   Maybe Int ->
+  Maybe Int ->
   Maybe DataMetrics ->
   DatabaseReaderT m a ->
   m a
-withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal stats m =
+withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal blockCache stats m =
   withRunInIO $ \run ->
-    withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
+    withDBCF dir cfg (columnFamilyConfig bloom (isJust blockCache)) $ \db -> do
+      derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
       let bdb =
             DatabaseReader
               { db = db,
@@ -133,7 +181,8 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal s
                 net = net,
                 initGap = igap,
                 metrics = stats,
-                ctx = ctx
+                ctx = ctx,
+                derived = derived
               }
       initRocksDB bdb
       run $ runReaderT m bdb
@@ -144,7 +193,9 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal s
           createMissingColumnFamilies = True,
           maxFiles = maxOpenFiles,
           dbWriteBufferSize = writeBuffers,
-          maxTotalWalSize = maxWal
+          maxTotalWalSize = maxWal,
+          blockCacheSize = blockCache,
+          cacheIndexAndFilterBlocks = isJust blockCache
         }
 
 -- | Memory that RocksDB uses outside the GHC heap, per column family:
@@ -172,25 +223,29 @@ memoryReport db = do
   where
     cfs =
       ("default", Nothing)
-        : zip (map (T.pack . fst) (columnFamilyConfig False)) (map Just (columnFamilies db))
+        : zip (map (T.pack . fst) (columnFamilyConfig False False)) (map Just (columnFamilies db))
     prop cf p = do
       v <- maybe (getProperty db p) (\c -> getPropertyCF db c p) cf
       return (v >>= readMaybe . BS8.unpack)
     num :: Maybe Integer -> Text
     num = maybe "?" (T.pack . show)
 
-columnFamilyConfig :: Bool -> [(String, Config)]
-columnFamilyConfig bloom =
-  [ ("addr-tx", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("addr-out", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("tx", def {prefixLength = Just 33, bloomFilter = bloom}),
-    ("spender", def {prefixLength = Just 33, bloomFilter = bloom}), -- unused
-    ("unspent", def {prefixLength = Just 37, bloomFilter = bloom}),
-    ("block", def {prefixLength = Just 33, bloomFilter = bloom}),
-    ("height", def {prefixLength = Nothing, bloomFilter = bloom}),
-    ("balance", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("mempool", def {prefixLength = Nothing, bloomFilter = bloom})
+-- | Column families, with Bloom filters or not, and with their index and
+-- filter blocks in the block cache or not.
+columnFamilyConfig :: Bool -> Bool -> [(String, Config)]
+columnFamilyConfig bloom cached =
+  [ ("addr-tx", c (Just 22)),
+    ("addr-out", c (Just 22)),
+    ("tx", c (Just 33)),
+    ("spender", c (Just 33)), -- unused
+    ("unspent", c (Just 37)),
+    ("block", c (Just 33)),
+    ("height", c Nothing),
+    ("balance", c (Just 22)),
+    ("mempool", c Nothing)
   ]
+  where
+    c p = def {prefixLength = p, bloomFilter = bloom, cacheIndexAndFilterBlocks = cached}
 
 addrTxCF :: DB -> ColumnFamily
 addrTxCF db = columnFamilies db !! 0
@@ -394,6 +449,11 @@ withIterCFStat db cf f = do
     go = withRunInIO $ \run ->
       withIterCF db cf $ \it -> run (f it)
 
+-- | Run an action with this many iterators on a column family. They are
+-- opened and closed in a single bracket rather than one bracket each: each
+-- bracket leaves a frame on the stack, and every call into RocksDB through
+-- an iterator walks the stack, so with one bracket per address an xpub of a
+-- hundred addresses made each step of each iterator a hundred times slower.
 withManyIters ::
   (MonadUnliftIO m) =>
   DB ->
@@ -401,10 +461,30 @@ withManyIters ::
   Int ->
   ([Iterator] -> DatabaseReaderT m a) ->
   DatabaseReaderT m a
-withManyIters db cf i f = go [] i
+withManyIters db cf i f = do
+  m <- asks (.metrics)
+  bracket_ (gauge m i) (gauge m (negate i)) $
+    withRunInIO $ \run ->
+      bracket (newIORef []) (readIORef >=> mapM_ destroyIterator) $ \ref -> do
+        its <- replicateM i . mask_ $ do
+          it <- createIterator db (Just cf)
+          modifyIORef' ref (it :)
+          return it
+        run (f its)
   where
-    go acc 0 = f acc
-    go acc n = withIterCFStat db cf $ \it -> go (it : acc) (n - 1)
+    gauge (Just m) n = incrementGauge m.dataIters n
+    gauge Nothing _ = return ()
+
+-- | Values of many keys of a column family, read with one multi-get, in
+-- the order of the keys.
+retrieveManyCF ::
+  (KeyValue key value, Serialize key, Serialize value) =>
+  DB ->
+  ColumnFamily ->
+  [key] ->
+  IO [Maybe value]
+retrieveManyCF db cf keys =
+  map (fmap (either error id . decode)) <$> multiGetCF db cf (map encode keys)
 
 joinConduits ::
   (Monad m, Ord o) =>
@@ -425,6 +505,12 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
       Just t -> do
         withMetrics $ \s -> incrementCounter s.dataTxCount 1
         return (Just t)
+
+  getManyTxData ths = do
+    db <- asks (.db)
+    tds <- liftIO (retrieveManyCF db (txCF db) (map TxKey ths))
+    withMetrics $ \s -> incrementCounter s.dataTxCount (length (catMaybes tds))
+    return tds
 
   getSpender op = runMaybeT $ do
     td <- MaybeT $ getTxData op.hash
@@ -539,33 +625,33 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     forM_ r.metrics $ \s -> incrementCounter s.dataTxCount (length txs)
     return txs
 
+  getBalances [] = return []
   getBalances as = do
-    zipWith f as <$> mapM getBalance as
+    db <- asks (.db)
+    withMetrics $ \s -> incrementCounter s.dataBalanceCount (length as)
+    vals <- liftIO (retrieveManyCF db (balanceCF db) (map BalKey as))
+    return (zipWith f as vals)
     where
       f a Nothing = zeroBalance a
-      f _ (Just b) = b
+      f a (Just v) = valToBalance a v
 
   xPubBals xpub = do
-    ctx <- asks (.ctx)
     igap <- asks (.initGap)
     gap <- asks (.maxGap)
-    ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) (aderiv ctx 0 0))
+    Derived ext chg <- derivedAddrs xpub
+    ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) ext)
     if all nullxb ext1
       then do
         withMetrics $ \s -> incrementCounter s.dataXPubBals (length ext1)
         return ext1
       else do
-        ext2 <- derive_until_gap gap 0 (aderiv ctx 0 igap)
-        chg <- derive_until_gap gap 1 (aderiv ctx 1 0)
-        let bals = ext1 <> ext2 <> chg
+        ext2 <- derive_until_gap gap 0 (drop (fromIntegral igap) ext)
+        chg' <- derive_until_gap gap 1 chg
+        let bals = ext1 <> ext2 <> chg'
         withMetrics $ \s -> incrementCounter s.dataXPubBals (length bals)
         return bals
     where
       nullxb b = nullBalance b.balance
-      aderiv ctx m =
-        deriveAddresses
-          (deriveFunction ctx xpub.deriv)
-          (pubSubKey ctx xpub.key m)
       derive_until_gap gap m adrs =
         let xb b n = XPubBal {path = [m, n], balance = b}
             ig = fromIntegral gap
@@ -585,16 +671,29 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
                   go (xs <> acc) as''
          in go [] adrs
 
+  -- The first unspent outputs of each address, at most offset plus limit
+  -- of them, sorted together. Read the addresses in step, so that each is
+  -- read only as far as the page needs, rather than decoding the whole
+  -- quota of every address to keep one page of it.
   xPubUnspents _xspec xbals limits = do
-    us <- concat <$> mapM h cs
+    db <- asks (.db)
+    net <- asks (.net)
+    ctx <- asks (.ctx)
+    let quota = case (deOffset limits).limit of
+          0 -> Nothing
+          l -> Just l
+        stream b it =
+          unspentConduit net ctx b.balance.address limits.start it
+            .| mapC (\u -> XPubUnspent {path = b.path, unspent = u})
+    us <- withManyIters db (addrOutCF db) (length cs) $ \its ->
+      runConduit $
+        mergeDescGroups (.unspent.block) quota (zipWith stream cs its)
+          .| applyLimitsC limits
+          .| sinkList
     withMetrics $ \s -> incrementCounter s.dataXPubUnspents (length us)
-    return . applyLimits limits $ sortOn Down us
+    return us
     where
-      l = deOffset limits
       cs = filter ((> 0) . (.balance.utxo)) xbals
-      i b = getAddressUnspents b.balance.address l
-      f b t = XPubUnspent {path = b.path, unspent = t}
-      h b = map (f b) <$> i b
 
   xPubTxs _xspec xbals limits = do
     let as =
@@ -605,8 +704,11 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     withMetrics $ \s -> incrementCounter s.dataXPubTxs (length txs)
     return txs
 
-  -- Count the merged streams instead of building the list of every
-  -- transaction of the xpub only to take its length.
+  -- Count the transactions of all the addresses, each once even when it
+  -- touches several of them. The entries of an address are sorted, and the
+  -- same transaction has the same key after the address prefix in every
+  -- address, so merge the addresses by those raw key bytes and count the
+  -- distinct ones, without decoding any key or reading any value.
   xPubTxCount _xspec xbals = do
     withMetrics $ \s -> incrementCounter s.dataXPubTxCount 1
     db <- asks (.db)
@@ -615,5 +717,23 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
             filter (not . nullBalance) $
               map (.balance) xbals
     withManyIters db (addrTxCF db) (length as) $ \its ->
-      runConduit (joinDescStreams (zipWith (`addressConduit` Nothing) as its) .| lengthC)
-        >>= \n -> return (fromIntegral (n :: Int))
+      liftIO $ fromIntegral <$> countDistinctSuffixes (zip (map (encode . AddrTxKeyA) as) its)
+
+-- | Number of distinct keys, after their prefix, in a set of iterators that
+-- each walk the keys with one prefix, in order.
+countDistinctSuffixes :: [(BS.ByteString, Iterator)] -> IO Int
+countDistinctSuffixes streams = do
+  heads <- mapM start streams
+  go 0 (Map.fromListWith (<>) [(k, [x]) | (k, x) <- catMaybes heads])
+  where
+    start x@(pfx, it) = iterSeek it pfx >> current x
+    current x@(pfx, it) =
+      iterKey it <&> \case
+        Just k | pfx `BS.isPrefixOf` k -> Just (BS.drop (BS.length pfx) k, x)
+        _ -> Nothing
+    advance x@(_, it) = iterNext it >> current x
+    go !n m = case Map.minViewWithKey m of
+      Nothing -> return n
+      Just ((_, xs), m') -> do
+        nexts <- catMaybes <$> mapM advance xs
+        go (n + 1) (foldr (\(k, x) -> Map.insertWith (<>) k [x]) m' nexts)

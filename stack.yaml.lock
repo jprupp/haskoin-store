@@ -33,12 +33,12 @@ packages:
   original:
     hackage: secp256k1-haskell-2.0.0
 - completed:
-    hackage: rocksdb-haskell-jprupp-2.5.0@sha256:bb37d94f20ba83330016d5e03b84db0127c6ce906b7c4ae382a36a7d97386dda,1589
+    hackage: rocksdb-haskell-jprupp-2.6.0@sha256:4208f9d91d30f60f77d84e6b601f196ec518e5fcfa1516985e318e43e45c3c1d,1589
     pantry-tree:
-      sha256: b498eb44ff16681d0bfb572025852fa00edcef24959f8807c9261c4096814a43
+      sha256: 77319b04a71431ae3327c6cd6b4be45b285134af4fb26d3150cd5d4fb55605db
       size: 712
   original:
-    hackage: rocksdb-haskell-jprupp-2.5.0
+    hackage: rocksdb-haskell-jprupp-2.6.0
 - completed:
     hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
     pantry-tree:
@@ -54,12 +54,12 @@ packages:
   original:
     hackage: nqe-0.6.7
 - completed:
-    hackage: haskoin-core-1.6.0@sha256:f7bc0fe84aefa0dd92502f5b6fd541c6bde8ba280b036bc363a32aad9c081a4b,6180
+    hackage: haskoin-core-1.6.1@sha256:9cb562c94482bbad41cce33679850d49ed9ec355377a0f6573b07a0f880d48c4,6180
     pantry-tree:
-      sha256: 9f406929a19a54629ab398afe128ddd87f56d05c2e3f10550ca309e1d4412e98
+      sha256: 8cbf855aa0a330905ef0fe42f52251b4aad3901d967a21dea5d526ee7260c220
       size: 7848
   original:
-    hackage: haskoin-core-1.6.0
+    hackage: haskoin-core-1.6.1
 - completed:
     hackage: haskoin-node-2.3.0@sha256:a2aec5f122f67e5b0b706910530d2ef506b703d8dc5c04755cbb14ffb0b5ee72,2261
     pantry-tree:

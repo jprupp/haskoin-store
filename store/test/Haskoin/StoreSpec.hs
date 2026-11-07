@@ -168,6 +168,7 @@ withTestStoreBlocks blocks net ctx t f =
               maxOpenFiles = Nothing,
               writeBufferSize = Nothing,
               maxWalSize = Nothing,
+              blockCache = Nothing,
               logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
             }
     withStore cfg $ \store ->
