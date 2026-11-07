@@ -12,6 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Building against sibling checkouts of haskoin-core or haskoin-node
+      # (e.g. "- ../haskoin-core" in extra-deps) works locally but cannot
+      # work here: only this repository is checked out. Fail early with a
+      # clear message instead of a Stack S-395 error after the cache restore.
+      - name: Reject local path dependencies
+        run: |
+          if grep -nE '^[[:space:]]*-[[:space:]]*(\.\.?/|/|~)' stack.yaml; then
+            echo "::error file=stack.yaml::stack.yaml refers to local paths outside the repository. Pin released versions (or a git commit) in extra-deps before pushing."
+            exit 1
+          fi
+
       - name: Install system libraries
         run: |
           sudo apt-get update
