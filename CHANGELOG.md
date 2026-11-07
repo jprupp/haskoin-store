@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   outputs that does not start at a transaction.
 - Serialize a transaction at most twice to compute its id, size and weight,
   and stop looking up its witnesses with a quadratic list index.
+- Build on haskoin-core 1.6.1, which encodes CashAddr and Base58 addresses
+  faster: about 10% less CPU per request on endpoints that return many
+  addresses.
+- The executable uses every core of the host by default (`-N` instead of
+  `-N4`). Set `+RTS -N<n> -RTS` on the command line to choose a number.
 
 ### Added
 
