@@ -8,6 +8,49 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+{- |
+Module      : Haskoin.Store.Database.Types
+Copyright   : (c) Haskoin Developers
+License     : MIT
+Maintainer  : jprupp@protonmail.ch
+Stability   : experimental
+Portability : POSIX
+
+Keys and values stored in RocksDB.
+
+Every key type serializes to a distinct first byte, so that keys of different
+types never collide even when they share a column family. Many key types
+have short variants (suffixed @A@, @B@ or @S@) that serialize to a prefix of
+the full key, for use with the prefix queries of "Database.RocksDB.Query".
+
++-----------+--------------+----------------------------------------+
+| Prefix    | Key          | Value                                  |
++===========+==============+========================================+
+| 32 x 0x00 | 'BestKey'    | hash of the best block                 |
++-----------+--------------+----------------------------------------+
+| 0x01      | 'BlockKey'   | 'BlockData'                            |
++-----------+--------------+----------------------------------------+
+| 0x02      | 'TxKey'      | 'TxData'                               |
++-----------+--------------+----------------------------------------+
+| 0x03      | 'HeightKey'  | hashes of the blocks at a height       |
++-----------+--------------+----------------------------------------+
+| 0x04      | 'BalKey'     | 'BalVal'                               |
++-----------+--------------+----------------------------------------+
+| 0x05      | 'AddrTxKey'  | nothing                                |
++-----------+--------------+----------------------------------------+
+| 0x06      | 'AddrOutKey' | 'OutVal'                               |
++-----------+--------------+----------------------------------------+
+| 0x07      | 'MemKey'     | whole mempool (legacy)                 |
++-----------+--------------+----------------------------------------+
+| 0x08      | 'MemTxKey'   | time a transaction entered the mempool |
++-----------+--------------+----------------------------------------+
+| 0x09      | 'UnspentKey' | 'UnspentVal'                           |
++-----------+--------------+----------------------------------------+
+| 0x0a      | 'VersionKey' | database version                       |
++-----------+--------------+----------------------------------------+
+| 0x0b      | 'MemTimeKey' | nothing                                |
++-----------+--------------+----------------------------------------+
+-}
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),
@@ -85,8 +128,11 @@ data AddrTxKey
     AddrTxKey !Address !TxRef
   | -- | short key that matches all entries
     AddrTxKeyA !Address
-  | AddrTxKeyB !Address !BlockRef
-  | AddrTxKeyS
+  | -- | short key that matches the entries of an address at a position in
+    -- the chain
+    AddrTxKeyB !Address !BlockRef
+  | -- | short key that matches the entries of every address
+    AddrTxKeyS
   deriving (Show, Eq, Ord, Generic, Hashable)
 
 instance Serialize AddrTxKey where
@@ -122,8 +168,10 @@ data AddrOutKey
     AddrOutKey !Address !BlockRef !OutPoint
   | -- | short key for all spent or unspent outputs
     AddrOutKeyA !Address
-  | AddrOutKeyB !Address !BlockRef
-  | AddrOutKeyS
+  | -- | short key for the outputs of an address at a position in the chain
+    AddrOutKeyB !Address !BlockRef
+  | -- | short key for the outputs of every address
+    AddrOutKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize AddrOutKey where
@@ -148,6 +196,8 @@ instance Serialize AddrOutKey where
 
 instance Key AddrOutKey
 
+-- | Value of an unspent output of an address: amount in satoshi and output
+-- script.
 data OutVal = OutVal !Word64 !ByteString
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize)
 
@@ -155,8 +205,11 @@ instance KeyValue AddrOutKey OutVal
 
 -- | Transaction database key.
 data TxKey
-  = TxKey !TxHash
-  | TxKeyS !(Word32, Word16)
+  = -- | key of a transaction
+    TxKey !TxHash
+  | -- | short key that matches transactions whose hash starts with these six
+    -- bytes; see 'decodeTxKey'
+    TxKeyS !(Word32, Word16)
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize TxKey where
@@ -171,6 +224,10 @@ instance Serialize TxKey where
     guard . (== 0x02) =<< getWord8
     TxKey <$> get
 
+-- | Split a short numeric transaction identifier, as used by the Blockchain.info
+-- compatibility API, into the first six bytes of the transaction hash and the
+-- five high bits of the seventh byte. Only the low 53 bits of the identifier
+-- are used.
 decodeTxKey :: Word64 -> ((Word32, Word16), Word8)
 decodeTxKey i =
   let masked = i .&. 0x001fffffffffffff
@@ -193,9 +250,12 @@ instance KeyValue TxKey TxData
 
 -- | Unspent output database key.
 data UnspentKey
-  = UnspentKey !OutPoint
-  | UnspentKeyS !TxHash
-  | UnspentKeyB
+  = -- | key of an unspent output
+    UnspentKey !OutPoint
+  | -- | short key that matches the unspent outputs of a transaction
+    UnspentKeyS !TxHash
+  | -- | short key that matches every unspent output
+    UnspentKeyB
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize UnspentKey where
@@ -220,6 +280,7 @@ instance Key UnspentKey
 
 instance KeyValue UnspentKey UnspentVal
 
+-- | Build an 'Unspent' from an address output entry. Returns 'Nothing' for a short key.
 toUnspent :: Network -> Ctx -> AddrOutKey -> OutVal -> Maybe Unspent
 toUnspent net ctx (AddrOutKey _address block outpoint) (OutVal value script) =
   Just
@@ -232,7 +293,8 @@ toUnspent net ctx (AddrOutKey _address block outpoint) (OutVal value script) =
       }
 toUnspent _ _ _ _ = Nothing
 
--- | Mempool transaction database key.
+-- | Mempool transaction database key. Legacy: databases of version 18 kept the
+-- whole mempool under this key. It is only read to migrate them.
 data MemKey
   = MemKey
   deriving (Show, Read)
@@ -252,8 +314,10 @@ instance KeyValue MemKey [(UnixTime, TxHash)]
 -- time it entered the mempool as its value. Replaces 'MemKey', which kept
 -- the whole mempool in a single value.
 data MemTxKey
-  = MemTxKey !TxHash
-  | MemTxKeyS
+  = -- | key of a mempool transaction
+    MemTxKey !TxHash
+  | -- | short key that matches every mempool transaction
+    MemTxKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize MemTxKey where
@@ -276,8 +340,10 @@ instance KeyValue MemTxKey UnixTime
 -- hash, as the pairs in 'getMempool' do, so a page of the mempool is read
 -- with a short scan instead of loading and sorting every entry.
 data MemTimeKey
-  = MemTimeKey !UnixTime !TxHash
-  | MemTimeKeyS
+  = -- | entry of a mempool transaction, by time and hash
+    MemTimeKey !UnixTime !TxHash
+  | -- | short key that matches every entry
+    MemTimeKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize MemTimeKey where
@@ -332,8 +398,10 @@ instance KeyValue HeightKey [BlockHash]
 
 -- | Address balance database key.
 data BalKey
-  = BalKey !Address
-  | BalKeyS
+  = -- | key of the balance of an address
+    BalKey !Address
+  | -- | short key that matches every balance
+    BalKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 
 instance Serialize BalKey where
@@ -381,19 +449,28 @@ instance Key VersionKey
 
 instance KeyValue VersionKey Word32
 
+-- | Balance of an address as stored in the database. The address itself is in
+-- the key.
 data BalVal = BalVal
-  { confirmed :: !Word64,
+  { -- | confirmed balance in satoshi
+    confirmed :: !Word64,
+    -- | unconfirmed balance in satoshi
     unconfirmed :: !Word64,
+    -- | number of unspent outputs
     utxo :: !Word64,
+    -- | number of transactions
     txs :: !Word64,
+    -- | total amount received in satoshi, including unconfirmed
     received :: !Word64
   }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
 
+-- | Build a 'Balance' from an address and its stored value.
 valToBalance :: Address -> BalVal -> Balance
 valToBalance address BalVal {..} =
   Balance {..}
 
+-- | Stored value of a 'Balance'.
 balanceToVal :: Balance -> BalVal
 balanceToVal Balance {..} =
   BalVal {..}
@@ -409,16 +486,22 @@ instance Default BalVal where
         received = 0
       }
 
+-- | Unspent output as stored in the database. The outpoint is in the key.
 data UnspentVal = UnspentVal
-  { block :: !BlockRef,
+  { -- | block or mempool position of the transaction
+    block :: !BlockRef,
+    -- | amount in satoshi
     value :: !Word64,
+    -- | output script
     script :: !ByteString
   }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
 
+-- | Split an 'Unspent' into its key and its stored value.
 unspentToVal :: Unspent -> (OutPoint, UnspentVal)
 unspentToVal Unspent {..} = (outpoint, UnspentVal {..})
 
+-- | Build an 'Unspent' from its outpoint and stored value, decoding the address from the script.
 valToUnspent :: Network -> Ctx -> OutPoint -> UnspentVal -> Unspent
 valToUnspent net ctx outpoint UnspentVal {..} =
   Unspent {..}
