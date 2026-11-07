@@ -14,6 +14,39 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.Cache
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Redis cache for extended public keys (xpubs).
+--
+-- Answering a query about an xpub from the database means deriving its
+-- addresses and reading the index of every one of them, which is slow for
+-- wallets with many used addresses. When such an xpub is queried, its balances,
+-- transactions and unspent outputs are copied to Redis, and later queries are
+-- answered from there. Only xpubs with at least 'minAddrs' used addresses are
+-- cached, and only while the store is in sync.
+--
+-- A cache writer process ('cacheWriter') keeps cached xpubs up to date as new
+-- blocks and mempool transactions arrive. When Redis holds more than 'maxKeys'
+-- keys, the xpubs used least recently are evicted.
+--
+-- = Redis keys
+--
+-- * @b\<xpub\>@: hash of derivation path to balance of each address.
+-- * @t\<xpub\>@: sorted set of transactions, scored by 'blockRefScore'.
+-- * @u\<xpub\>@: sorted set of unspent outputs, scored by 'blockRefScore'.
+-- * @a\<address\>@: xpub and derivation path of a cached address.
+-- * @max@: sorted set of cached xpubs, scored by time of last use.
+-- * @mempool@: sorted set of mempool transactions.
+-- * @head@: last block that the cache has processed.
+-- * @xlock-\<xpub\>@, @lock@, @i\<xpub\>@: locks.
+--
+-- Here @\<xpub\>@ and @\<address\>@ stand for their binary serialization.
 module Haskoin.Store.Cache
   ( CacheConfig (..),
     CacheMetrics,
@@ -140,12 +173,14 @@ import UnliftIO
   )
 import UnliftIO.Concurrent (threadDelay)
 
+-- | Run a Redis command. Throws 'RedisError' if Redis returns an error.
 runRedis :: (MonadIO m) => Redis (Either Reply a) -> CacheX m a
 runRedis action = do
   conn <- asks (.redis)
   logger <- asks (.logger)
   withRedis logger conn action
 
+-- | Run a Redis command on a connection. Logs and throws 'RedisError' if Redis returns an error.
 withRedis ::
   (MonadIO m) => Logger -> Connection -> Redis (Either Reply a) -> m a
 withRedis logger conn action =
@@ -155,29 +190,49 @@ withRedis logger conn action =
       logAt LevelError logger $ "Got error from Redis: " <> cs (show e)
       throwIO (RedisError e)
 
+-- | Cache configuration.
 data CacheConfig = CacheConfig
-  { redis :: !Connection,
+  { -- | connection to Redis
+    redis :: !Connection,
+    -- | cache xpubs with at least this many used addresses
     minAddrs :: !Int,
+    -- | evict xpubs when Redis holds more keys than this
     maxKeys :: !Integer,
+    -- | header chain, used to know whether the store is in sync
     chain :: !Chain,
+    -- | StatsD metrics, if enabled
     metrics :: !(Maybe CacheMetrics),
+    -- | log messages here
     logger :: !Logger
   }
 
+-- | StatsD metrics of the cache.
 data CacheMetrics = CacheMetrics
-  { hits :: !StatCounter,
+  { -- | xpub balance queries answered from the cache (@cache.hits@)
+    hits :: !StatCounter,
+    -- | xpub balance queries not in the cache (@cache.misses@)
     misses :: !StatCounter,
+    -- | locks acquired (@cache.lock_acquired@)
     lockAcquired :: !StatCounter,
+    -- | locks released (@cache.lock_released@)
     lockReleased :: !StatCounter,
+    -- | locks that could not be acquired (@cache.lock_failed@)
     lockFailed :: !StatCounter,
+    -- | xpub balances served (@cache.xpub_balances@)
     xBalances :: !StatCounter,
+    -- | xpub unspent outputs served (@cache.xpub_unspents@)
     xUnspents :: !StatCounter,
+    -- | xpub transactions served (@cache.xpub_txs@)
     xTxs :: !StatCounter,
+    -- | xpub transaction counts served (@cache.xpub_tx_count@)
     xTxCount :: !StatCounter,
+    -- | milliseconds to cache an xpub (@cache.index@)
     indexTime :: !StatTiming,
+    -- | height of the last block processed by the cache (@cache.height@)
     height :: !StatGauge
   }
 
+-- | Register the cache metrics with a StatsD client.
 newCacheMetrics ::
   (MonadIO m) =>
   Logger ->
@@ -209,6 +264,7 @@ newCacheMetrics logger s r db = do
     c x = newStatCounter s x 10
     d x = newStatTiming s x 10
 
+-- | Record how long an action takes in a timing metric.
 withTiming ::
   (MonadUnliftIO m) =>
   (CacheMetrics -> StatTiming) ->
@@ -226,29 +282,41 @@ withTiming df go =
     time = round . (* 1000) <$> liftIO getPOSIXTime
     end m t1 = time >>= addTiming (df m) . subtract t1
 
+-- | Run an action with the metrics, if they are enabled.
 withMetrics ::
   (MonadIO m) => (CacheMetrics -> CacheX m a) -> CacheX m ()
 withMetrics go = asks (.metrics) >>= mapM_ go
 
+-- | Monad transformer that may use the cache. With 'Nothing', every query goes
+-- to the underlying store. Run it with 'withCache'.
 type CacheT = ReaderT (Maybe CacheConfig)
 
+-- | Monad transformer that uses the cache.
 type CacheX = ReaderT CacheConfig
 
+-- | Log a message with the logger of the cache.
 logDebug, logInfo, logWarn, logError :: (MonadIO m) => Text -> CacheX m ()
 logDebug = cacheLog LevelDebug
 logInfo = cacheLog LevelInfo
 logWarn = cacheLog LevelWarn
 logError = cacheLog LevelError
 
+-- | Log a message at a level with the logger of the cache.
 cacheLog :: (MonadIO m) => LogLevel -> Text -> CacheX m ()
 cacheLog l msg = asks (.logger) >>= \lg -> logAt l lg msg
 
+-- | Errors of the cache.
 data CacheError
-  = RedisError Reply
-  | RedisTxError !String
-  | LogicError !String
+  = -- | Redis returned an error
+    RedisError Reply
+  | -- | a Redis transaction failed
+    RedisTxError !String
+  | -- | the cache is inconsistent with the database
+    LogicError !String
   deriving (Show, Eq, Generic, NFData, Exception)
 
+-- | Connect to Redis at a URL such as @redis:\/\/localhost:6379@, or with the
+-- default settings if the URL is empty. Calls 'error' if the URL is invalid.
 connectRedis :: (MonadIO m) => String -> m Connection
 connectRedis redisurl = do
   conninfo <-
@@ -333,21 +401,27 @@ instance
       Nothing -> xPubTxCount xpub xbals
       Just cfg -> runReaderT (xPubTxCount xpub xbals) cfg
 
+-- | Run queries with the cache, or without it if 'Nothing'.
 withCache :: Maybe CacheConfig -> CacheT m a -> m a
 withCache s f = runReaderT f s
 
+-- | Prefix of the keys of xpub balances.
 balancesPfx :: ByteString
 balancesPfx = "b"
 
+-- | Prefix of the keys of xpub transactions.
 txSetPfx :: ByteString
 txSetPfx = "t"
 
+-- | Prefix of the keys of xpub unspent outputs.
 utxoPfx :: ByteString
 utxoPfx = "u"
 
+-- | Prefix of the keys that mark an xpub as being cached.
 idxPfx :: ByteString
 idxPfx = "i"
 
+-- | Key of the lock held while caching an xpub.
 xpubLock :: XPubSpec -> ByteString
 xpubLock xpub = "xlock-" <> encode xpub
 
@@ -375,6 +449,7 @@ startScore Nothing = Just Nothing
 startScore (Just (AtBlock h)) = Just (Just (blockRefScore (BlockRef h maxBound)))
 startScore (Just AtTx {}) = Nothing
 
+-- | Transactions of an xpub, from the cache if it is cached, or from the store otherwise.
 getXPubTxs ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
@@ -406,6 +481,7 @@ getXPubTxs xpub xbals limits =
         incrementCounter s.xTxs (length txs)
       return txs
 
+-- | Number of transactions of an xpub, from the cache if it is cached, or from the store otherwise.
 getXPubTxCount ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
@@ -420,6 +496,7 @@ getXPubTxCount xpub xbals =
       return (fromInteger count)
     Nothing -> lift $ xPubTxCount xpub xbals
 
+-- | Unspent outputs of an xpub, from the cache if it is cached, or from the store otherwise.
 getXPubUnspents ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
@@ -470,6 +547,8 @@ getXPubUnspents xpub xbals limits =
       withMetrics $ \s -> incrementCounter s.xUnspents (length us)
       return $ mapMaybe (uncurry i) us
 
+-- | Balances of an xpub, from the cache if it is cached. Otherwise read them from
+-- the store and cache the xpub if it has enough used addresses.
 getXPubBalances ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
@@ -497,21 +576,26 @@ getXPubBalances xpub =
       newXPubC x bals
       return bals
 
+-- | Whether an xpub is cached. Always 'False' without a cache.
 isInCache :: (MonadIO m) => XPubSpec -> CacheT m Bool
 isInCache xpub =
   ReaderT $ \case
     Nothing -> return False
     Just cfg -> runReaderT (isXPubCached xpub) cfg
 
+-- | Whether an xpub is cached.
 isXPubCached :: (MonadIO m) => XPubSpec -> CacheX m Bool
 isXPubCached xpub = runRedis (redisIsXPubCached xpub)
 
+-- | Redis command to check whether an xpub is cached.
 redisIsXPubCached :: (RedisCtx m f) => XPubSpec -> m (f Bool)
 redisIsXPubCached xpub = Redis.exists (balancesPfx <> encode xpub)
 
+-- | Redis command to count the transactions of an xpub.
 redisGetXPubTxCount :: (RedisCtx m f) => XPubSpec -> m (f Integer)
 redisGetXPubTxCount xpub = Redis.zcard (txSetPfx <> encode xpub)
 
+-- | Page of the cached transactions of an xpub.
 cacheGetXPubTxs ::
   (StoreReadBase m, MonadIO m) =>
   XPubSpec ->
@@ -563,6 +647,7 @@ cacheGetXPubTxs xpub limits =
         else id
     f t s = TxRef {txid = t, block = scoreBlockRef s}
 
+-- | Page of the cached unspent outputs of an xpub, with their positions.
 cacheGetXPubUnspents ::
   (StoreReadBase m, MonadIO m) =>
   XPubSpec ->
@@ -614,12 +699,17 @@ cacheGetXPubUnspents xpub limits =
         else id
     f o s = (scoreBlockRef s, o)
 
+-- | Redis command to read the cached balances of an xpub, sorted by path.
 redisGetXPubBalances :: (Functor f, RedisCtx m f) => XPubSpec -> m (f [XPubBal])
 redisGetXPubBalances xpub =
   fmap (sort . map (uncurry f)) <$> getAllFromMap (balancesPfx <> encode xpub)
   where
     f p b = XPubBal {path = p, balance = b}
 
+-- | Score of a position in a Redis sorted set, such that sorting by score
+-- ascending sorts from newest to oldest. Mempool transactions get negative
+-- scores from their time, so they come first; confirmed ones get positive
+-- scores that decrease with height and position.
 blockRefScore :: BlockRef -> Double
 blockRefScore BlockRef {height = h, position = p} =
   fromIntegral (0x001fffffffffffff - (h' .|. p'))
@@ -630,6 +720,7 @@ blockRefScore MemRef {timestamp = t} = negate t'
   where
     t' = fromIntegral (t .&. 0x001fffffffffffff)
 
+-- | Inverse of 'blockRefScore'.
 scoreBlockRef :: Double -> BlockRef
 scoreBlockRef s
   | s < 0 = MemRef {timestamp = n}
@@ -640,6 +731,9 @@ scoreBlockRef s
     h = fromIntegral (m `shift` (-26))
     p = fromIntegral (m .&. 0x03ffffff)
 
+-- | Redis command to read members of a sorted set, decoded, with their scores,
+-- from a minimum score if given, skipping an offset, up to a count (@0@ for
+-- all).
 getFromSortedSet ::
   (Applicative f, RedisCtx m f, Serialize a) =>
   ByteString ->
@@ -684,6 +778,7 @@ getFromSortedSet key (Just score) off count = do
     ys <- map (\(x, s) -> (,s) <$> decode x) <$> xs
     return (rights ys)
 
+-- | Redis command to read all fields of a hash, decoded.
 getAllFromMap ::
   (Functor f, RedisCtx m f, Serialize k, Serialize v) =>
   ByteString ->
@@ -699,40 +794,57 @@ getAllFromMap n = do
         let v = fromRight undefined $ decode v'
       ]
 
+-- | Messages handled by the cache writer.
 data CacheWriterMessage
-  = CacheNewBlock
-  | CacheNewTx !TxHash
+  = -- | a new block was imported
+    CacheNewBlock
+  | -- | a mempool transaction was added or removed
+    CacheNewTx !TxHash
   | -- | internal: a batch of coalesced 'CacheNewTx' events
     CacheNewTxs ![TxHash]
-  | CacheSyncMempool !(Listen ())
+  | -- | sync the mempool with the database, then reply
+    CacheSyncMempool !(Listen ())
 
+-- | Inbox of the cache writer process.
 type CacheWriterInbox = Inbox CacheWriterMessage
 
+-- | Mailbox to send messages to the cache writer.
 type CacheWriter = Mailbox CacheWriterMessage
 
+-- | Xpub that a cached address belongs to.
 data AddressXPub = AddressXPub
-  { spec :: !XPubSpec,
+  { -- | the xpub
+    spec :: !XPubSpec,
+    -- | derivation path of the address below the xpub
     path :: ![KeyIndex]
   }
   deriving (Show, Eq, Generic, NFData, Serialize)
 
+-- | Key of the sorted set of mempool transactions.
 mempoolSetKey :: ByteString
 mempoolSetKey = "mempool"
 
+-- | Prefix of the keys of cached addresses.
 addrPfx :: ByteString
 addrPfx = "a"
 
+-- | Key of the last block processed by the cache.
 bestBlockKey :: ByteString
 bestBlockKey = "head"
 
+-- | Key of the sorted set of cached xpubs by time of last use.
 maxKey :: ByteString
 maxKey = "max"
 
+-- | Address of an extended public key for a type of address.
 xPubAddrFunction :: Ctx -> DeriveType -> XPubKey -> Address
 xPubAddrFunction ctx DeriveNormal = xPubAddr ctx
 xPubAddrFunction ctx DeriveP2SH = xPubCompatWitnessAddr ctx
 xPubAddrFunction ctx DeriveP2WPKH = xPubWitnessAddr ctx
 
+-- | Run the cache writer process: bring the cache up to date with the database,
+-- then handle messages forever. Notifications of new mempool transactions that
+-- pile up are handled together, up to 1000 at a time.
 cacheWriter ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   CacheConfig ->
@@ -768,6 +880,7 @@ cacheWriter cfg inbox =
                   requeueSTM other inbox
                   return (reverse acc)
 
+-- | Try to take a lock that expires after five minutes. Returns 'True' if taken.
 lockIt :: (MonadIO m) => ByteString -> CacheX m Bool
 lockIt l = do
   go >>= \case
@@ -807,6 +920,7 @@ lockIt l = do
                 }
         Redis.setOpts l "locked" opts
 
+-- | Extend a lock for another five minutes.
 refreshLock :: (MonadIO m) => ByteString -> CacheX m ()
 refreshLock l = void . runRedis $ do
   let opts =
@@ -820,9 +934,11 @@ refreshLock l = void . runRedis $ do
           }
   Redis.setOpts l "locked" opts
 
+-- | Release a lock.
 unlockIt :: (MonadIO m) => ByteString -> CacheX m ()
 unlockIt l = void . runRedis . Redis.del $ NonEmpty.singleton l
 
+-- | Run an action holding a lock, refreshing it every two and a half minutes. Returns 'Nothing' if the lock is taken.
 withLock ::
   (MonadUnliftIO m) =>
   ByteString ->
@@ -861,6 +977,7 @@ withRetryLock l f =
               threadDelay n
               go (waited + n) (min max_delay (n * 2))
 
+-- | Evict the least recently used xpubs while Redis holds more than the maximum number of keys.
 pruneDB ::
   (MonadUnliftIO m, StoreReadBase m) => CacheX m ()
 pruneDB = void . withLock "lock" $ do
@@ -871,16 +988,19 @@ pruneDB = void . withLock "lock" $ do
     void . delXPubKeys . map fst
       =<< runRedis (getFromSortedSet maxKey Nothing 0 (fromIntegral (s - x)))
 
+-- | Record that xpubs were just used.
 touchKeys :: (MonadIO m) => [XPubSpec] -> CacheX m ()
 touchKeys xpubs = do
   now <- round <$> liftIO getPOSIXTime :: (MonadIO m) => m Int
   runRedis $ redisTouchKeys now xpubs
 
+-- | Redis command to record that xpubs were used at a time.
 redisTouchKeys :: (Monad f, RedisCtx m f, Real a) => a -> [XPubSpec] -> m (f ())
 redisTouchKeys _ [] = return $ return ()
 redisTouchKeys now xpubs =
   void <$> Redis.zadd maxKey (map ((realToFrac now,) . encode) xpubs)
 
+-- | Handle a message sent to the cache writer.
 cacheWriterReact ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   CacheWriterMessage ->
@@ -904,9 +1024,12 @@ cacheWriterReact (CacheSyncMempool l) = do
   syncMempoolC
   atomically $ l ()
 
+-- | Number of used addresses in a list of xpub balances.
 lenNotNull :: [XPubBal] -> Int
 lenNotNull = length . filter (not . nullBalance . (.balance))
 
+-- | Cache an xpub, if it has enough used addresses, the store is in sync, and no
+-- other thread is caching it already.
 newXPubC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   XPubSpec ->
@@ -971,6 +1094,7 @@ newXPubC xpub xbals =
       conn <- asks (.redis)
       liftIO (Redis.runRedis conn red) <&> isRight
 
+-- | Whether the best block of the store is the best header of the node.
 inSync ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   CacheX m Bool
@@ -982,6 +1106,8 @@ inSync =
       cb <- liftIO $ chainGetBest ch
       return $ cb.height > 0 && headerHash cb.header == bb
 
+-- | Bring the cache up to date with the best block of the store, processing every
+-- block since the last one it processed, across reorganisations.
 newBlockC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   CacheX m ()
@@ -1025,6 +1151,7 @@ newBlockC =
           let blocks = reverse left_parents <> right_parents <> pure right_node
           return $ map (headerHash . (.header)) blocks
 
+-- | Update cached xpubs with the transactions of a block.
 importBlockC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   BlockHash ->
@@ -1054,6 +1181,9 @@ importBlockC bh =
         "Could not get block: "
           <> blockHashToHex bh
 
+-- | Update cached xpubs with transactions: their transaction sets, unspent
+-- outputs, balances and the mempool. Addresses past the gap are derived and
+-- added when new addresses get used.
 importMultiTxC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   [TxData] ->
@@ -1139,6 +1269,7 @@ importMultiTxC txs = do
     allxpubs =
       HashSet.fromList . map (.spec) . HashMap.elems
 
+-- | Redis commands to add or remove transactions and unspent outputs of cached xpubs.
 redisImportMultiTx ::
   (Monad f, RedisCtx m f) =>
   Network ->
@@ -1203,6 +1334,7 @@ redisImportMultiTx net ctx addrmap unspentmap tds = do
           return $ a >> b >> return ()
     txaddrops td = txInputs net ctx td <> txOutputs net ctx td
 
+-- | Redis commands to update the balances of cached addresses.
 redisUpdateBalances ::
   (Monad f, RedisCtx m f) =>
   HashMap Address AddressXPub ->
@@ -1218,6 +1350,8 @@ redisUpdateBalances addrmap balmap =
     xpubbal ainfo bal =
       XPubBal {path = ainfo.path, balance = bal}
 
+-- | Add newly derived addresses to their cached xpubs, with their balances,
+-- transactions and unspent outputs, and keep deriving while they are used.
 cacheAddAddresses ::
   (StoreReadExtra m, MonadUnliftIO m) =>
   [(Address, AddressXPub)] ->
@@ -1285,6 +1419,7 @@ cacheAddAddresses addrs = do
       let f ts = (i.spec, ts)
        in f <$> lift (getAddressTxs a def)
 
+-- | Addresses to derive and add to cached xpubs to keep the gap after the used ones.
 getNewAddrs ::
   Ctx ->
   KeyIndex ->
@@ -1297,6 +1432,7 @@ getNewAddrs ctx gap xpubs =
       Nothing -> []
       Just bals -> addrsToAdd ctx gap bals a
 
+-- | Update cached xpubs with new or deleted transactions, if in sync.
 syncNewTxC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   [TxHash] ->
@@ -1310,6 +1446,7 @@ syncNewTxC ths =
           "Synchronizing transaction: " <> txHashToHex (txHash tx.tx)
       importMultiTxC txs
 
+-- | Update cached xpubs with every mempool difference between the cache and the store, if in sync.
 syncMempoolC ::
   (MonadUnliftIO m, StoreReadExtra m) =>
   CacheX m ()
@@ -1327,12 +1464,15 @@ syncMempoolC =
         "Synchronizing " <> cs (show (length txs)) <> " mempool transactions"
       importMultiTxC txs
 
+-- | Mempool as seen by the cache, newest first.
 cacheGetMempool :: (MonadIO m) => CacheX m [(UnixTime, TxHash)]
 cacheGetMempool = runRedis redisGetMempool
 
+-- | Last block processed by the cache.
 cacheGetHead :: (MonadIO m) => CacheX m (Maybe BlockHash)
 cacheGetHead = runRedis redisGetHead
 
+-- | Set the last block processed by the cache.
 cacheSetHead :: (MonadIO m) => BlockData -> CacheX m ()
 cacheSetHead bd = do
   logDebug $ "Cache head set to: " <> blockHashToHex bh
@@ -1341,10 +1481,12 @@ cacheSetHead bd = do
   where
     bh = headerHash bd.header
 
+-- | Xpub and path of each address, or 'Nothing' if the address is not cached.
 cacheGetAddrsInfo ::
   (MonadIO m) => [Address] -> CacheX m [Maybe AddressXPub]
 cacheGetAddrsInfo as = runRedis (redisGetAddrsInfo as)
 
+-- | Redis command to add transactions to the mempool set.
 redisAddToMempool :: (Applicative f, RedisCtx m f) => [TxRef] -> m (f Integer)
 redisAddToMempool [] = return (pure 0)
 redisAddToMempool btxs =
@@ -1353,6 +1495,7 @@ redisAddToMempool btxs =
       (\btx -> (blockRefScore btx.block, encode btx.txid))
       btxs
 
+-- | Redis command to remove transactions from the mempool set.
 redisRemFromMempool ::
   (Applicative f, RedisCtx m f) => [TxHash] -> m (f Integer)
 redisRemFromMempool xs =
@@ -1360,10 +1503,12 @@ redisRemFromMempool xs =
     Nothing -> return (pure 0)
     Just xs' -> zrem mempoolSetKey $ NonEmpty.map encode xs'
 
+-- | Redis command to record the xpub and path of an address.
 redisSetAddrInfo ::
   (Functor f, RedisCtx m f) => Address -> AddressXPub -> m (f ())
 redisSetAddrInfo a i = void <$> Redis.set (addrPfx <> encode a) (encode i)
 
+-- | Remove xpubs from the cache. Returns the number of keys deleted.
 cacheDelXPubs ::
   (MonadIO m, StoreReadBase m) =>
   [XPubSpec] ->
@@ -1372,6 +1517,7 @@ cacheDelXPubs xpubs = ReaderT $ \case
   Just cache -> runReaderT (delXPubKeys xpubs) cache
   Nothing -> return 0
 
+-- | Remove xpubs from the cache. Returns the number of keys deleted.
 delXPubKeys ::
   (MonadIO m, StoreReadBase m) =>
   [XPubSpec] ->
@@ -1387,6 +1533,7 @@ delXPubKeys xpubs = do
       return $ (xpub,) <$> bs
   runRedis $ fmap sum . sequence <$> forM xbals (uncurry redisDelXPubKeys)
 
+-- | Redis commands to remove an xpub and its addresses from the cache.
 redisDelXPubKeys ::
   (Monad f, RedisCtx m f) => XPubSpec -> [XPubBal] -> m (f Integer)
 redisDelXPubKeys xpub bals = go $ map (.balance.address) bals
@@ -1408,6 +1555,7 @@ redisDelXPubKeys xpub bals = go $ map (.balance.address) bals
         bal' <- balcount
         return $ addrs' + txset' + utxo' + bal'
 
+-- | Redis command to add transactions to an xpub.
 redisAddXPubTxs ::
   (Applicative f, RedisCtx m f) => XPubSpec -> [TxRef] -> m (f Integer)
 redisAddXPubTxs _ [] = return (pure 0)
@@ -1415,6 +1563,7 @@ redisAddXPubTxs xpub btxs =
   zadd (txSetPfx <> encode xpub) $
     map (\t -> (blockRefScore t.block, encode t.txid)) btxs
 
+-- | Redis command to remove transactions from an xpub.
 redisRemXPubTxs ::
   (Applicative f, RedisCtx m f) => XPubSpec -> [TxHash] -> m (f Integer)
 redisRemXPubTxs xpub txhs =
@@ -1422,6 +1571,7 @@ redisRemXPubTxs xpub txhs =
     Nothing -> return (pure 0)
     Just txhs' -> zrem (txSetPfx <> encode xpub) (NonEmpty.map encode txhs')
 
+-- | Redis command to add unspent outputs to an xpub.
 redisAddXPubUnspents ::
   (Applicative f, RedisCtx m f) =>
   XPubSpec ->
@@ -1433,6 +1583,7 @@ redisAddXPubUnspents xpub utxo =
   zadd (utxoPfx <> encode xpub) $
     map (\(p, r) -> (blockRefScore r, encode p)) utxo
 
+-- | Redis command to remove unspent outputs from an xpub.
 redisRemXPubUnspents ::
   (Applicative f, RedisCtx m f) => XPubSpec -> [OutPoint] -> m (f Integer)
 redisRemXPubUnspents _ [] =
@@ -1442,6 +1593,7 @@ redisRemXPubUnspents xpub ops =
     Nothing -> return (pure 0)
     Just ops' -> zrem (utxoPfx <> encode xpub) (NonEmpty.map encode ops')
 
+-- | Redis commands to set balances of an xpub and record its addresses.
 redisAddXPubBalances ::
   (Monad f, RedisCtx m f) => XPubSpec -> [XPubBal] -> m (f ())
 redisAddXPubBalances xpub bals =
@@ -1459,9 +1611,11 @@ redisAddXPubBalances xpub bals =
             }
       return $ sequence_ ys
 
+-- | Redis command to set the last block processed by the cache.
 redisSetHead :: (RedisCtx m f) => BlockHash -> m (f Redis.Status)
 redisSetHead bh = Redis.set bestBlockKey (encode bh)
 
+-- | Redis commands to read the xpub and path of addresses.
 redisGetAddrsInfo ::
   (Monad f, RedisCtx m f) => [Address] -> m (f [Maybe AddressXPub])
 redisGetAddrsInfo [] = return (pure [])
@@ -1471,6 +1625,8 @@ redisGetAddrsInfo as = do
     is' <- sequence is
     return $ map (eitherToMaybe . decode =<<) is'
 
+-- | Addresses to derive after a newly used address, so that the gap of unused
+-- addresses after the last used one on its chain is kept.
 addrsToAdd ::
   Ctx ->
   KeyIndex ->
@@ -1506,12 +1662,14 @@ addrsToAdd ctx gap xbals addrinfo
     changeaddrs = map xpubf (keys changepaths)
     changelist = map pathToList changepaths
 
+-- | Sort transactions so that each comes after those it spends.
 sortTxData :: [TxData] -> [TxData]
 sortTxData tds =
   let txm = Map.fromList (map (\d -> (txHash d.tx, d)) tds)
       ths = map (txHash . snd) (sortTxs (map (.tx) tds))
    in mapMaybe (`Map.lookup` txm) ths
 
+-- | Addresses and outpoints of the outputs spent by a transaction.
 txInputs :: Network -> Ctx -> TxData -> [(Address, OutPoint)]
 txInputs net ctx td =
   let is = td.tx.inputs
@@ -1521,6 +1679,7 @@ txInputs net ctx td =
       f (Left _) _ = Nothing
    in catMaybes (zipWith f as is)
 
+-- | Addresses and outpoints of the outputs of a transaction.
 txOutputs :: Network -> Ctx -> TxData -> [(Address, OutPoint)]
 txOutputs net ctx td =
   let ps =
@@ -1538,11 +1697,13 @@ txOutputs net ctx td =
       f (Left _) _ = Nothing
    in catMaybes (zipWith f as ps)
 
+-- | Redis command to read the last block processed by the cache.
 redisGetHead :: (Functor f, RedisCtx m f) => m (f (Maybe BlockHash))
 redisGetHead = do
   x <- Redis.get bestBlockKey
   return $ (eitherToMaybe . decode =<<) <$> x
 
+-- | Redis command to read the mempool set, newest first.
 redisGetMempool :: (Applicative f, RedisCtx m f) => m (f [(UnixTime, TxHash)])
 redisGetMempool = do
   xs <- getFromSortedSet mempoolSetKey Nothing 0 0
@@ -1550,6 +1711,7 @@ redisGetMempool = do
   where
     f t s = ((scoreBlockRef s).timestamp, t)
 
+-- | Text form of an xpub for logs, with a suffix for its address type.
 xpubText ::
   (StoreReadBase m) =>
   XPubSpec ->
@@ -1563,11 +1725,14 @@ xpubText xpub = do
   ctx <- lift getCtx
   return . cs $ suffix <> xPubExport net ctx xpub.key
 
+-- | Tell the cache writer that a new block was imported.
 cacheNewBlock :: (MonadIO m) => CacheWriter -> m ()
 cacheNewBlock = send CacheNewBlock
 
+-- | Tell the cache writer that a mempool transaction was added or removed.
 cacheNewTx :: (MonadIO m) => TxHash -> CacheWriter -> m ()
 cacheNewTx = send . CacheNewTx
 
+-- | Ask the cache writer to sync the mempool, and wait until it is done.
 cacheSyncMempool :: (MonadIO m) => CacheWriter -> m ()
 cacheSyncMempool = query CacheSyncMempool

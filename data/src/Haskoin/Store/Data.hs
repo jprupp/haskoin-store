@@ -13,6 +13,28 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.Data
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Data types of Haskoin Store: what it stores in its database and what its API
+-- returns.
+--
+-- Most types have three encodings:
+--
+-- * binary ('Serial' and 'Binary'/'Serialize' instances), used in the database
+--   and in binary API responses;
+-- * JSON ('ToJSON' and 'FromJSON' instances), used in JSON API responses;
+-- * for types that contain addresses, JSON functions that take the 'Network'
+--   (the @marshal@ functions of 'MarshalJSON'), since the text form of an
+--   address depends on the network.
+--
+-- Types whose names start with @Binfo@ belong to the API compatible with
+-- Blockchain.info.
 module Haskoin.Store.Data
   ( -- * Address Balances
     Balance (..),
@@ -185,18 +207,25 @@ import GHC.Generics (Generic)
 import Haskoin
 import Web.Scotty.Trans (Parsable (..))
 
+-- | Type of the addresses derived from an extended public key.
 data DeriveType
-  = DeriveNormal
-  | DeriveP2SH
-  | DeriveP2WPKH
+  = -- | legacy pay-to-public-key-hash addresses (@normal@)
+    DeriveNormal
+  | -- | pay-to-witness-public-key-hash nested in pay-to-script-hash
+    -- (@compat@)
+    DeriveP2SH
+  | -- | native pay-to-witness-public-key-hash (@segwit@)
+    DeriveP2WPKH
   deriving (Show, Eq, Generic, NFData)
 
+-- | Parse a derivation type from @normal@, @compat@ or @segwit@.
 textToDeriveType :: Text -> Maybe DeriveType
 textToDeriveType "normal" = Just DeriveNormal
 textToDeriveType "compat" = Just DeriveP2SH
 textToDeriveType "segwit" = Just DeriveP2WPKH
 textToDeriveType _ = Nothing
 
+-- | Text form of a derivation type: @normal@, @compat@ or @segwit@.
 deriveTypeToText :: DeriveType -> Text
 deriveTypeToText DeriveNormal = "normal"
 deriveTypeToText DeriveP2SH = "compat"
@@ -231,8 +260,11 @@ instance Parsable DeriveType where
       Nothing -> Left "invalid derivation type"
       Just x -> Right x
 
+-- | Extended public key with the type of the addresses to derive from it.
 data XPubSpec = XPubSpec
-  { key :: !XPubKey,
+  { -- | the extended public key
+    key :: !XPubKey,
+    -- | type of addresses to derive
     deriv :: !DeriveType
   }
   deriving (Show, Eq, Generic, NFData)
@@ -268,14 +300,17 @@ instance Binary XPubSpec where
   put = serialize
   get = deserialize
 
+-- | Seconds since the Unix epoch.
 type UnixTime = Word64
 
+-- | Position of a transaction in a block.
 type BlockPos = Word32
 
 -- | Binary such that ordering is inverted.
 putUnixTime :: (MonadPut m) => Word64 -> m ()
 putUnixTime w = putWord64be $ maxBound - w
 
+-- | Inverse of 'putUnixTime'.
 getUnixTime :: (MonadGet m) => m Word64
 getUnixTime = (maxBound -) <$> getWord64be
 
@@ -287,8 +322,10 @@ data BlockRef
         -- | position of transaction within the block
         position :: !Word32
       }
-  | MemRef
-      { timestamp :: !UnixTime
+  | -- | the transaction is in the mempool
+    MemRef
+      { -- | time it entered the mempool
+        timestamp :: !UnixTime
       }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
 
@@ -322,6 +359,7 @@ instance Binary BlockRef where
   put = serialize
   get = deserialize
 
+-- | Whether a position is in a block rather than in the mempool.
 confirmed :: BlockRef -> Bool
 confirmed BlockRef {} = True
 confirmed MemRef {} = False
@@ -411,7 +449,8 @@ data Balance = Balance
     utxo :: !Word64,
     -- | number of transactions
     txs :: !Word64,
-    -- | total amount from all outputs in this address
+    -- | total amount from all outputs in this address, including unconfirmed
+    -- and spent ones
     received :: !Word64
   }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
@@ -442,6 +481,7 @@ instance Serialize Balance where
   put = serialize
   get = deserialize
 
+-- | Balance of an address that was never used.
 zeroBalance :: Address -> Balance
 zeroBalance a =
   Balance
@@ -453,6 +493,7 @@ zeroBalance a =
       received = 0
     }
 
+-- | Whether a balance is that of an address that was never used.
 nullBalance :: Balance -> Bool
 nullBalance
   Balance
@@ -498,10 +539,15 @@ instance MarshalJSON Network Balance where
 
 -- | Unspent output.
 data Unspent = Unspent
-  { block :: !BlockRef,
+  { -- | position of the transaction that created it
+    block :: !BlockRef,
+    -- | the output
     outpoint :: !OutPoint,
+    -- | amount in satoshi
     value :: !Word64,
+    -- | output script
     script :: !ByteString,
+    -- | address of the output script, if it has one
     address :: !(Maybe Address)
   }
   deriving (Show, Eq, Ord, Generic, Hashable, NFData)
@@ -739,20 +785,34 @@ instance MarshalJSON Network BlockData where
 
   unmarshalValue net = parseJSON
 
+-- | Transaction input with information about the output it spends.
 data StoreInput
-  = StoreCoinbase
-      { outpoint :: !OutPoint,
+  = -- | input of a coinbase transaction
+    StoreCoinbase
+      { -- | null outpoint
+        outpoint :: !OutPoint,
+        -- | sequence number
         sequence :: !Word32,
+        -- | coinbase data
         script :: !ByteString,
+        -- | witness stack
         witness :: !WitnessStack
       }
-  | StoreInput
-      { outpoint :: !OutPoint,
+  | -- | input that spends an output
+    StoreInput
+      { -- | output spent
+        outpoint :: !OutPoint,
+        -- | sequence number
         sequence :: !Word32,
+        -- | input script
         script :: !ByteString,
+        -- | script of the output spent
         pkscript :: !ByteString,
+        -- | amount of the output spent, in satoshi
         value :: !Word64,
+        -- | witness stack
         witness :: !WitnessStack,
+        -- | address of the output spent, if it has one
         address :: !(Maybe Address)
       }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
@@ -801,9 +861,11 @@ instance Binary StoreInput where
   put = serialize
   get = deserialize
 
+-- | Whether a transaction is a coinbase: it has one input, which spends the null outpoint.
 isCoinbaseTx :: Tx -> Bool
 isCoinbaseTx = all ((== nullOutPoint) . (.outpoint)) . (.inputs)
 
+-- | Whether an input is that of a coinbase transaction.
 isCoinbase :: StoreInput -> Bool
 isCoinbase StoreCoinbase {} = True
 isCoinbase StoreInput {} = False
@@ -878,6 +940,7 @@ instance MarshalJSON Network StoreInput where
               >>= maybe (return Nothing) (optional . unmarshalValue net)
           return StoreInput {..}
 
+-- | Parse a hex string in JSON.
 jsonHex :: Text -> Parser ByteString
 jsonHex s =
   case decodeHex s of
@@ -927,9 +990,13 @@ instance FromJSON Spender where
 
 -- | Output information.
 data StoreOutput = StoreOutput
-  { value :: !Word64,
+  { -- | amount in satoshi
+    value :: !Word64,
+    -- | output script
     script :: !ByteString,
+    -- | input that spends it, if spent
     spender :: !(Maybe Spender),
+    -- | address of the output script, if it has one
     address :: !(Maybe Address)
   }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
@@ -985,8 +1052,11 @@ instance MarshalJSON Network StoreOutput where
           >>= maybe (return Nothing) (optional . unmarshalValue net)
       return StoreOutput {..}
 
+-- | Output spent by an input, as stored with the transaction.
 data Prev = Prev
-  { script :: !ByteString,
+  { -- | output script
+    script :: !ByteString,
+    -- | amount in satoshi
     value :: !Word64
   }
   deriving (Show, Eq, Ord, Generic, Hashable, NFData)
@@ -1008,6 +1078,7 @@ instance Serialize Prev where
   put = serialize
   get = deserialize
 
+-- | Input with information about the output it spends, which is missing for a coinbase.
 toInput :: Network -> Ctx -> TxIn -> Maybe Prev -> WitnessStack -> StoreInput
 toInput _ _ i Nothing w =
   StoreCoinbase
@@ -1027,6 +1098,7 @@ toInput net ctx i (Just p) w =
       address = eitherToMaybe (scriptToAddressBS net ctx p.script)
     }
 
+-- | Output with its address and spender.
 toOutput :: Network -> Ctx -> TxOut -> Maybe Spender -> StoreOutput
 toOutput net ctx o s =
   StoreOutput
@@ -1036,13 +1108,21 @@ toOutput net ctx o s =
       address = eitherToMaybe (scriptToAddressBS net ctx o.script)
     }
 
+-- | Transaction as stored in the database.
 data TxData = TxData
-  { block :: !BlockRef,
+  { -- | position in the chain or mempool
+    block :: !BlockRef,
+    -- | the transaction
     tx :: !Tx,
+    -- | outputs spent by each input, by input index
     prevs :: !(IntMap Prev),
+    -- | the transaction was removed, for example by a double spend
     deleted :: !Bool,
+    -- | the transaction can be replaced by fee
     rbf :: !Bool,
+    -- | time it was first seen, or time of its block
     timestamp :: !Word64,
+    -- | inputs that spend each output, by output index
     spenders :: !(IntMap Spender)
   }
   deriving (Show, Eq, Ord, Generic, NFData)
@@ -1074,6 +1154,7 @@ instance Binary TxData where
   put = serialize
   get = deserialize
 
+-- | Fee of a transaction: inputs minus outputs, or zero for a coinbase.
 txDataFee :: TxData -> Word64
 txDataFee t =
   if isCoinbaseTx t.tx
@@ -1124,6 +1205,7 @@ toTransaction net ctx t =
     f n i w = toInput net ctx i (IntMap.lookup n t.prevs) w
     g n o = toOutput net ctx o $ IntMap.lookup n t.spenders
 
+-- | Inverse of 'toTransaction'.
 fromTransaction :: Transaction -> TxData
 fromTransaction t =
   TxData
@@ -1215,6 +1297,7 @@ instance Binary Transaction where
   put = serialize
   get = deserialize
 
+-- | The transaction without the information added by the store.
 transactionData :: Transaction -> Tx
 transactionData t =
   Tx
@@ -1358,7 +1441,10 @@ instance FromJSON PeerInfo where
 
 -- | Address balances for an extended public key.
 data XPubBal = XPubBal
-  { path :: ![KeyIndex],
+  { -- | derivation path below the xpub: chain (@0@ external, @1@ change) and
+    -- index
+    path :: ![KeyIndex],
+    -- | balance of the address
     balance :: !Balance
   }
   deriving (Show, Ord, Eq, Generic, NFData)
@@ -1402,7 +1488,9 @@ instance MarshalJSON Network XPubBal where
 
 -- | Unspent transaction for extended public key.
 data XPubUnspent = XPubUnspent
-  { unspent :: !Unspent,
+  { -- | the unspent output
+    unspent :: !Unspent,
+    -- | derivation path of its address below the xpub
     path :: ![KeyIndex]
   }
   deriving (Show, Eq, Ord, Generic, NFData)
@@ -1444,12 +1532,19 @@ instance MarshalJSON Network XPubUnspent where
       path <- o .: "path"
       return XPubUnspent {..}
 
+-- | Summary of the balances of an extended public key.
 data XPubSummary = XPubSummary
-  { confirmed :: !Word64,
+  { -- | confirmed balance in satoshi
+    confirmed :: !Word64,
+    -- | unconfirmed balance in satoshi
     unconfirmed :: !Word64,
+    -- | total received by external addresses, in satoshi
     received :: !Word64,
+    -- | number of unspent outputs
     utxo :: !Word64,
+    -- | index of the last used external address
     external :: !Word32,
+    -- | index of the last used change address
     change :: !Word32
   }
   deriving (Eq, Show, Generic, NFData)
@@ -1527,12 +1622,18 @@ instance FromJSON XPubSummary where
       external <- i .: "external"
       return XPubSummary {..}
 
+-- | Result of a health check.
 class Healthy a where
+  -- | Whether the check passed.
   isOK :: a -> Bool
 
+-- | Whether the database keeps up with the headers.
 data BlockHealth = BlockHealth
-  { headers :: !BlockHeight,
+  { -- | height of the best header
+    headers :: !BlockHeight,
+    -- | height of the best block in the database
     blocks :: !BlockHeight,
+    -- | blocks the database may lag behind
     max :: !Int32
   }
   deriving (Show, Eq, Generic, NFData)
@@ -1587,8 +1688,11 @@ instance FromJSON BlockHealth where
       max <- o .: "max"
       return BlockHealth {..}
 
+-- | Whether something happened recently enough.
 data TimeHealth = TimeHealth
-  { age :: !Int64,
+  { -- | seconds since it happened
+    age :: !Int64,
+    -- | maximum seconds allowed
     max :: !Int64
   }
   deriving (Show, Eq, Generic, NFData)
@@ -1633,8 +1737,11 @@ instance FromJSON TimeHealth where
       max <- o .: "max"
       return TimeHealth {..}
 
+-- | Whether there are enough of something.
 data CountHealth = CountHealth
-  { count :: !Int64,
+  { -- | how many there are
+    count :: !Int64,
+    -- | fewest allowed
     min :: !Int64
   }
   deriving (Show, Eq, Generic, NFData)
@@ -1678,8 +1785,11 @@ instance FromJSON CountHealth where
       min <- o .: "min"
       return CountHealth {..}
 
+-- | Whether there are few enough of something.
 data MaxHealth = MaxHealth
-  { count :: !Int64,
+  { -- | how many there are
+    count :: !Int64,
+    -- | most allowed
     max :: !Int64
   }
   deriving (Show, Eq, Generic, NFData)
@@ -1723,14 +1833,24 @@ instance FromJSON MaxHealth where
       max <- o .: "max"
       return MaxHealth {..}
 
+-- | Health of the store, as returned by @\/health@. It is healthy if every check
+-- passes.
 data HealthCheck = HealthCheck
-  { blocks :: !BlockHealth,
+  { -- | the database keeps up with the headers
+    blocks :: !BlockHealth,
+    -- | the best header is recent
     lastBlock :: !TimeHealth,
+    -- | a transaction or block arrived recently
     lastTx :: !TimeHealth,
+    -- | few transactions wait to be imported
     pendingTxs :: !MaxHealth,
+    -- | enough peers are connected
     peers :: !CountHealth,
+    -- | network name
     network :: !String,
+    -- | version of the software
     version :: !String,
+    -- | time of the check
     time :: !Word64
   }
   deriving (Show, Eq, Generic, NFData)
@@ -1806,9 +1926,12 @@ instance FromJSON HealthCheck where
       let time = round $ utcTimeToPOSIXSeconds utcTime
       return HealthCheck {..}
 
+-- | Event streamed by @\/events@.
 data Event
-  = EventBlock !BlockHash
-  | EventTx !TxHash
+  = -- | a new best block
+    EventBlock !BlockHash
+  | -- | a transaction entered or left the mempool
+    EventTx !TxHash
   deriving (Show, Eq, Generic, NFData)
 
 instance Serial Event where
@@ -1851,6 +1974,7 @@ instance FromJSON Event where
           return $ EventBlock i
         _ -> fail $ "Could not recognize event type: " <> t
 
+-- | Response that wraps a single value, encoded in JSON as @{\"result\": value}@.
 newtype GenericResult a = GenericResult {get :: a}
   deriving (Show, Eq, Generic, NFData)
 
@@ -1874,6 +1998,8 @@ instance (FromJSON a) => FromJSON (GenericResult a) where
   parseJSON =
     A.withObject "GenericResult" $ \o -> GenericResult <$> o .: "result"
 
+-- | Response with a value in its peer-to-peer serialization, encoded in JSON as
+-- a hex string in @{\"result\": hex}@.
 newtype RawResult a = RawResult {get :: a}
   deriving (Show, Eq, Generic, NFData)
 
@@ -1904,6 +2030,7 @@ instance (Serial a) => FromJSON (RawResult a) where
               =<< decodeHex res
       maybe mzero (return . RawResult) m
 
+-- | List response. In binary, a length followed by the items.
 newtype SerialList a = SerialList {get :: [a]}
   deriving (Show, Eq, Generic, NFData)
 
@@ -1924,6 +2051,8 @@ instance (ToJSON a) => ToJSON (SerialList a) where
 instance (FromJSON a) => FromJSON (SerialList a) where
   parseJSON = fmap SerialList . parseJSON
 
+-- | List of values in their peer-to-peer serialization, encoded in JSON as a
+-- list of hex strings.
 newtype RawResultList a = RawResultList {get :: [a]}
   deriving (Show, Eq, Generic, NFData)
 
@@ -1967,6 +2096,8 @@ instance (Serial a) => FromJSON (RawResultList a) where
         A.withText "RawResultListItem" $ \t ->
           maybe mzero return (decodeHex t >>= deser)
 
+-- | Hash of a transaction, as returned when posting one, encoded in JSON as
+-- @{\"txid\": hash}@.
 newtype TxId
   = TxId TxHash
   deriving (Show, Eq, Generic, NFData)
@@ -1990,15 +2121,24 @@ instance ToJSON TxId where
 instance FromJSON TxId where
   parseJSON = A.withObject "txid" $ \o -> TxId <$> o .: "txid"
 
+-- | Errors returned by the API.
 data Except
-  = ThingNotFound
-  | ServerError
-  | BadRequest
-  | UserError !String
-  | StringError !String
-  | TxIndexConflict ![TxHash]
-  | ServerTimeout
-  | RequestTooLarge
+  = -- | the resource does not exist (404)
+    ThingNotFound
+  | -- | internal error (500)
+    ServerError
+  | -- | the request is malformed (400)
+    BadRequest
+  | -- | the request is invalid, with a reason (400)
+    UserError !String
+  | -- | other error, with a message (400)
+    StringError !String
+  | -- | a short transaction number matches these transactions (409)
+    TxIndexConflict ![TxHash]
+  | -- | the request took too long (500)
+    ServerTimeout
+  | -- | the request asks for too much (413)
+    RequestTooLarge
   deriving (Show, Eq, Ord, Generic, NFData)
 
 instance Exception Except
@@ -2070,15 +2210,21 @@ instance FromJSON Except where
 -- Blockchain.info API Compatibility --
 ---------------------------------------
 
+-- | Short numeric identifier of a transaction, as used by Blockchain.info: the
+-- first eight bytes of its hash, read as a big-endian number, shifted right by
+-- eleven bits.
 toIntTxId :: TxHash -> Word64
 toIntTxId h =
   let bs = runPutS (serialize h)
       Right w64 = runGetS getWord64be bs
    in w64 `shift` (-11)
 
+-- | Block identified by hash or by height.
 data BinfoBlockId
-  = BinfoBlockHash !BlockHash
-  | BinfoBlockIndex !Word32
+  = -- | by hash
+    BinfoBlockHash !BlockHash
+  | -- | by height
+    BinfoBlockIndex !Word32
   deriving (Eq, Show, Read, Generic, NFData)
 
 instance Parsable BinfoBlockId where
@@ -2090,11 +2236,15 @@ instance Parsable BinfoBlockId where
         Just h -> Right $ BinfoBlockHash h
       igr = BinfoBlockIndex <$> parseParam t
 
+-- | Transaction identified by hash or by short number; see 'toIntTxId'.
 data BinfoTxId
-  = BinfoTxIdHash !TxHash
-  | BinfoTxIdIndex !Word64
+  = -- | by hash
+    BinfoTxIdHash !TxHash
+  | -- | by short number
+    BinfoTxIdIndex !Word64
   deriving (Eq, Show, Read, Generic, NFData)
 
+-- | Identify a transaction by short number if the flag is 'True', or by hash otherwise.
 encodeBinfoTxId :: Bool -> TxHash -> BinfoTxId
 encodeBinfoTxId False = BinfoTxIdHash
 encodeBinfoTxId True = BinfoTxIdIndex . toIntTxId
@@ -2120,13 +2270,20 @@ instance FromJSON BinfoTxId where
     BinfoTxIdHash <$> parseJSON v
       <|> BinfoTxIdIndex <$> parseJSON v
 
+-- | Which transactions to list in a Blockchain.info response (@filter@).
 data BinfoFilter
-  = BinfoFilterAll
-  | BinfoFilterSent
-  | BinfoFilterReceived
-  | BinfoFilterMoved
-  | BinfoFilterConfirmed
-  | BinfoFilterMempool
+  = -- | all of them (@0@ or @6@)
+    BinfoFilterAll
+  | -- | those that decrease the balance (@1@)
+    BinfoFilterSent
+  | -- | those that increase the balance (@2@)
+    BinfoFilterReceived
+  | -- | those that leave the balance unchanged except for fees (@3@)
+    BinfoFilterMoved
+  | -- | confirmed ones (@5@)
+    BinfoFilterConfirmed
+  | -- | unconfirmed ones (@7@)
+    BinfoFilterMempool
   deriving (Eq, Show, Generic, NFData)
 
 instance Parsable BinfoFilter where
@@ -2141,12 +2298,19 @@ instance Parsable BinfoFilter where
       7 -> return BinfoFilterMempool
       _ -> Left "could not parse filter parameter"
 
+-- | Response of @\/blockchain\/multiaddr@.
 data BinfoMultiAddr = BinfoMultiAddr
-  { addresses :: ![BinfoBalance],
+  { -- | balance of each address and xpub requested
+    addresses :: ![BinfoBalance],
+    -- | totals of all of them
     wallet :: !BinfoWallet,
+    -- | page of their transactions, newest first
     txs :: ![BinfoTx],
+    -- | information about the chain and prices
     info :: !BinfoInfo,
+    -- | always 'True'
     recommendFee :: !Bool,
+    -- | addresses are shown in CashAddr format
     cashAddr :: !Bool
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2187,13 +2351,21 @@ instance MarshalJSON (Network, Ctx) BinfoMultiAddr where
     where
       net = if not m.cashAddr && net' == bch then btc else net'
 
+-- | Response of @\/blockchain\/rawaddr\/:addr@.
 data BinfoRawAddr = BinfoRawAddr
-  { address :: !BinfoAddr,
+  { -- | address or xpub
+    address :: !BinfoAddr,
+    -- | balance in satoshi
     balance :: !Word64,
+    -- | number of transactions
     ntx :: !Word64,
+    -- | number of unspent outputs
     utxo :: !Word64,
+    -- | total received in satoshi
     received :: !Word64,
+    -- | total sent in satoshi
     sent :: !Int64,
+    -- | page of transactions, newest first
     txs :: ![BinfoTx]
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2256,9 +2428,13 @@ instance MarshalJSON (Network, Ctx) BinfoRawAddr where
       txs <- mapM (unmarshalValue (net, ctx)) =<< o .: "txs"
       return BinfoRawAddr {..}
 
+-- | Balance of an address or xpub in @\/blockchain\/balance@.
 data BinfoShortBal = BinfoShortBal
-  { final :: !Word64,
+  { -- | balance in satoshi
+    final :: !Word64,
+    -- | number of transactions
     ntx :: !Word64,
+    -- | total received in satoshi
     received :: !Word64
   }
   deriving (Eq, Show, Read, Generic, NFData)
@@ -2286,21 +2462,36 @@ instance FromJSON BinfoShortBal where
       received <- o .: "total_received"
       return BinfoShortBal {..}
 
+-- | Balance of an address or xpub in @\/blockchain\/multiaddr@.
 data BinfoBalance
-  = BinfoAddrBalance
-      { address :: !Address,
+  = -- | balance of an address
+    BinfoAddrBalance
+      { -- | the address
+        address :: !Address,
+        -- | number of transactions
         txs :: !Word64,
+        -- | total received in satoshi
         received :: !Word64,
+        -- | total sent in satoshi
         sent :: !Word64,
+        -- | balance in satoshi
         balance :: !Word64
       }
-  | BinfoXPubBalance
-      { xpub :: !XPubKey,
+  | -- | balance of an xpub
+    BinfoXPubBalance
+      { -- | the xpub
+        xpub :: !XPubKey,
+        -- | number of transactions
         txs :: !Word64,
+        -- | total received in satoshi
         received :: !Word64,
+        -- | total sent in satoshi
         sent :: !Word64,
+        -- | balance in satoshi
         balance :: !Word64,
+        -- | index of the last used external address
         external :: !Word32,
+        -- | index of the last used change address
         change :: !Word32
       }
   deriving (Eq, Show, Generic, NFData)
@@ -2375,11 +2566,17 @@ instance MarshalJSON (Network, Ctx) [BinfoBalance] where
     A.withArray "[BinfoBalance]" $
       fmap V.toList . mapM (unmarshalValue (net, ctx))
 
+-- | Totals of all addresses and xpubs in @\/blockchain\/multiaddr@.
 data BinfoWallet = BinfoWallet
-  { balance :: !Word64,
+  { -- | balance in satoshi
+    balance :: !Word64,
+    -- | number of transactions
     txs :: !Word64,
+    -- | number of transactions that pass the filter
     filtered :: !Word64,
+    -- | total received in satoshi
     received :: !Word64,
+    -- | total sent in satoshi
     sent :: !Word64
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2413,6 +2610,7 @@ instance FromJSON BinfoWallet where
       sent <- o .: "total_sent"
       return BinfoWallet {..}
 
+-- | Amount as a big-endian hex string without leading zeros, as Blockchain.info shows values of unspent outputs.
 binfoHexValue :: Word64 -> Text
 binfoHexValue w64 =
   encodeHex $
@@ -2425,13 +2623,21 @@ binfoHexValue w64 =
         runPutS $
           serialize w64
 
+-- | Unspent output in @\/blockchain\/unspent@.
 data BinfoUnspent = BinfoUnspent
-  { txid :: !TxHash,
+  { -- | hash of the transaction
+    txid :: !TxHash,
+    -- | index of the output
     index :: !Word32,
+    -- | output script
     script :: !ByteString,
+    -- | amount in satoshi
     value :: !Word64,
+    -- | number of confirmations; @0@ if unconfirmed
     confirmations :: !Int32,
+    -- | identifier of the transaction
     txidx :: !BinfoTxId,
+    -- | xpub and path of its address, if it belongs to an xpub requested
     xpub :: !(Maybe BinfoXPubPath)
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2477,6 +2683,7 @@ instance MarshalJSON (Network, Ctx) BinfoUnspent where
       xpub <- mapM (unmarshalValue (net, ctx)) =<< o .:? "xpub"
       return BinfoUnspent {..}
 
+-- | Response of @\/blockchain\/unspent@.
 newtype BinfoUnspents = BinfoUnspents [BinfoUnspent]
   deriving (Eq, Show, Generic, NFData)
 
@@ -2499,6 +2706,7 @@ instance MarshalJSON (Network, Ctx) BinfoUnspents where
       us <- mapM (unmarshalValue (net, ctx)) =<< o .: "unspent_outputs"
       return (BinfoUnspents us)
 
+-- | Block in the Blockchain.info format, from its data, its transactions and the hashes of its children.
 toBinfoBlock :: BlockData -> [BinfoTx] -> [BlockHash] -> BinfoBlock
 toBinfoBlock b transactions next_blocks =
   BinfoBlock
@@ -2520,22 +2728,39 @@ toBinfoBlock b transactions next_blocks =
       txs = transactions
     }
 
+-- | Block in the Blockchain.info format.
 data BinfoBlock = BinfoBlock
-  { hash :: !BlockHash,
+  { -- | block hash
+    hash :: !BlockHash,
+    -- | block version
     version :: !Word32,
+    -- | hash of the previous block
     prev :: !BlockHash,
+    -- | Merkle root of the transactions
     merkle :: !Hash256,
+    -- | block timestamp
     timestamp :: !Word32,
+    -- | difficulty target in compact form
     bits :: !Word32,
+    -- | hashes of the children of the block
     next :: ![BlockHash],
+    -- | total fees in satoshi
     fee :: !Word64,
+    -- | nonce
     nonce :: !Word32,
+    -- | number of transactions
     ntx :: !Word32,
+    -- | size in bytes
     size :: !Word32,
+    -- | block index; the height
     index :: !Word32,
+    -- | whether it is in the main chain
     main :: !Bool,
+    -- | height
     height :: !Word32,
+    -- | weight
     weight :: !Word32,
+    -- | transactions
     txs :: ![BinfoTx]
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2613,24 +2838,44 @@ instance MarshalJSON (Network, Ctx) [BinfoBlock] where
     A.withObject "blocks" $ \o ->
       mapM (unmarshalValue (net, ctx)) =<< o .: "blocks"
 
+-- | Transaction in the Blockchain.info format.
 data BinfoTx = BinfoTx
-  { txid :: !TxHash,
+  { -- | hash
+    txid :: !TxHash,
+    -- | version
     version :: !Word32,
+    -- | number of inputs
     inputCount :: !Word32,
+    -- | number of outputs
     outputCount :: !Word32,
+    -- | size in bytes
     size :: !Word32,
+    -- | weight
     weight :: !Word32,
+    -- | fee in satoshi
     fee :: !Word64,
+    -- | IP address of the peer that relayed it; always @0.0.0.0@
     relayed :: !ByteString,
+    -- | lock time
     locktime :: !Word32,
+    -- | identifier
     index :: !BinfoTxId,
+    -- | whether it was removed by a double spend
     doubleSpend :: !Bool,
+    -- | whether it can be replaced by fee
     rbf :: !Bool,
+    -- | net change to the balance of the addresses requested, and the
+    -- balance after it; only in responses about addresses
     balance :: !(Maybe (Int64, Int64)),
+    -- | time first seen, or time of its block
     timestamp :: !Word64,
+    -- | height of its block, if confirmed
     blockIndex :: !(Maybe Word32),
+    -- | height of its block, if confirmed
     blockHeight :: !(Maybe Word32),
+    -- | inputs
     inputs :: ![BinfoTxInput],
+    -- | outputs
     outputs :: ![BinfoTxOutput]
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2726,11 +2971,17 @@ instance MarshalJSON (Network, Ctx) [BinfoTx] where
     A.withArray "[BinfoTx]" $
       fmap V.toList . mapM (unmarshalValue (net, ctx))
 
+-- | Transaction input in the Blockchain.info format.
 data BinfoTxInput = BinfoTxInput
-  { sequence :: !Word32,
+  { -- | sequence number
+    sequence :: !Word32,
+    -- | serialized witness stack
     witness :: !ByteString,
+    -- | input script
     script :: !ByteString,
+    -- | index of the input
     index :: !Word32,
+    -- | output that it spends
     output :: !BinfoTxOutput
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2770,15 +3021,25 @@ instance MarshalJSON (Network, Ctx) BinfoTxInput where
           >>= unmarshalValue (net, ctx)
       return BinfoTxInput {..}
 
+-- | Transaction output in the Blockchain.info format.
 data BinfoTxOutput = BinfoTxOutput
-  { typ :: !Int,
+  { -- | type; always @0@
+    typ :: !Int,
+    -- | whether it is spent
     spent :: !Bool,
+    -- | amount in satoshi
     value :: !Word64,
+    -- | index of the output
     index :: !Word32,
+    -- | identifier of its transaction
     txidx :: !BinfoTxId,
+    -- | output script
     script :: !ByteString,
+    -- | inputs that spend it
     spenders :: ![BinfoSpender],
+    -- | address of the output script, if it has one
     address :: !(Maybe Address),
+    -- | xpub and path of its address, if it belongs to an xpub requested
     xpub :: !(Maybe BinfoXPubPath)
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2832,8 +3093,11 @@ instance MarshalJSON (Network, Ctx) BinfoTxOutput where
       xpub <- o .:? "xpub" >>= mapM (unmarshalValue (net, ctx))
       return BinfoTxOutput {..}
 
+-- | Input that spends an output, in the Blockchain.info format.
 data BinfoSpender = BinfoSpender
-  { txidx :: !BinfoTxId,
+  { -- | identifier of the spending transaction
+    txidx :: !BinfoTxId,
+    -- | index of the input
     input :: !Word32
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2858,8 +3122,11 @@ instance FromJSON BinfoSpender where
       input <- o .: "n"
       return BinfoSpender {..}
 
+-- | Xpub that an address belongs to, with its derivation path.
 data BinfoXPubPath = BinfoXPubPath
-  { key :: !XPubKey,
+  { -- | the xpub
+    key :: !XPubKey,
+    -- | derivation path of the address below the xpub
     deriv :: !SoftPath
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2892,11 +3159,17 @@ instance MarshalJSON (Network, Ctx) BinfoXPubPath where
       deriv <- fromMaybe "bad xpub path" . parseSoft <$> o .: "path"
       return BinfoXPubPath {..}
 
+-- | Information about the chain and prices in @\/blockchain\/multiaddr@.
 data BinfoInfo = BinfoInfo
-  { connected :: !Word32,
+  { -- | number of connected peers
+    connected :: !Word32,
+    -- | satoshi per unit of the fiat currency
     conversion :: !Double,
+    -- | fiat currency
     fiat :: !BinfoSymbol,
+    -- | coin of the network
     crypto :: !BinfoSymbol,
+    -- | best block
     head :: !BinfoBlockInfo
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2930,10 +3203,15 @@ instance FromJSON BinfoInfo where
       head <- o .: "latest_block"
       return BinfoInfo {..}
 
+-- | Short information about a block in the Blockchain.info format.
 data BinfoBlockInfo = BinfoBlockInfo
-  { hash :: !BlockHash,
+  { -- | block hash
+    hash :: !BlockHash,
+    -- | height
     height :: !BlockHeight,
+    -- | block timestamp
     timestamp :: !Word32,
+    -- | block index; the height
     index :: !BlockHeight
   }
   deriving (Eq, Show, Generic, NFData)
@@ -2964,6 +3242,7 @@ instance FromJSON BinfoBlockInfo where
       index <- o .: "block_index"
       return BinfoBlockInfo {..}
 
+-- | Short information about a block.
 toBinfoBlockInfo :: BlockData -> BinfoBlockInfo
 toBinfoBlockInfo d =
   BinfoBlockInfo
@@ -2973,9 +3252,13 @@ toBinfoBlockInfo d =
       index = d.height
     }
 
+-- | Historical price of the coin of the network, from the price service.
 data BinfoRate = BinfoRate
-  { timestamp :: !Word64,
+  { -- | time of the price
+    timestamp :: !Word64,
+    -- | price in the fiat currency
     price :: !Double,
+    -- | volume in the 24 hours before
     vol24 :: !Double
   }
   deriving (Eq, Show, Generic, NFData)
@@ -3003,15 +3286,25 @@ instance FromJSON BinfoRate where
       vol24 <- o .: "volume24h"
       return BinfoRate {..}
 
+-- | Entry of @\/blockchain\/export-history@.
 data BinfoHistory = BinfoHistory
-  { date :: !Text,
+  { -- | date, as @YYYY-MM-DD@
+    date :: !Text,
+    -- | time of day
     time :: !Text,
+    -- | @sent@ or @received@
     typ :: !Text,
+    -- | amount in coins
     amount :: !Double,
+    -- | value in fiat at the time
     valueThen :: !Double,
+    -- | value in fiat now
     valueNow :: !Double,
+    -- | price at the time
     rateThen :: !Double,
+    -- | transaction hash
     txid :: !TxHash,
+    -- | fee in coins
     fee :: !Double
   }
   deriving (Eq, Show, Generic, NFData)
@@ -3057,6 +3350,8 @@ instance FromJSON BinfoHistory where
       fee <- o .: "fee"
       return BinfoHistory {..}
 
+-- | History entry from a net amount in satoshi, a time, the price then and now, a
+-- fee in satoshi, and a transaction hash.
 toBinfoHistory ::
   Int64 ->
   Word64 ->
@@ -3086,6 +3381,8 @@ toBinfoHistory satoshi timestamp rateThen rateNow fee txid =
     v1 = v * r1
     v2 = v * r2
 
+-- | Date given as @DD-MM-YYYY@ or @DD\/MM\/YYYY@ in a request, as seconds
+-- since the Unix epoch.
 newtype BinfoDate = BinfoDate Word64
   deriving (Eq, Show, Read, Generic, NFData)
 
@@ -3098,11 +3395,18 @@ instance Parsable BinfoDate where
       s = LazyText.unpack t
       p fmt = parseTimeM False defaultTimeLocale fmt s
 
+-- | Price of the coin of the network in a fiat currency, from the ticker
+-- service.
 data BinfoTicker = BinfoTicker
-  { fifteen :: !Double,
+  { -- | price delayed by fifteen minutes
+    fifteen :: !Double,
+    -- | last price
     last :: !Double,
+    -- | buy price
     buy :: !Double,
+    -- | sell price
     sell :: !Double,
+    -- | currency symbol
     symbol :: !Text
   }
   deriving (Eq, Show, Generic, NFData)
@@ -3146,12 +3450,19 @@ instance FromJSON BinfoTicker where
       last <- o .: "last"
       return BinfoTicker {..}
 
+-- | Currency in the Blockchain.info format.
 data BinfoSymbol = BinfoSymbol
-  { code :: !Text,
+  { -- | currency code, such as @USD@
+    code :: !Text,
+    -- | symbol, such as @$@
     symbol :: !Text,
+    -- | name
     name :: !Text,
+    -- | satoshi per unit
     conversion :: !Double,
+    -- | whether the symbol goes after the amount
     after :: !Bool,
+    -- | whether it is a fiat currency
     local :: !Bool
   }
   deriving (Eq, Show, Generic, NFData)
@@ -3199,6 +3510,8 @@ instance FromJSON BinfoSymbol where
       local <- o .: "local"
       return BinfoSymbol {..}
 
+-- | Transactions to fetch to show a transaction: those it spends, and, if outputs
+-- are pruned, those that spend its outputs to other addresses.
 relevantTxs ::
   HashSet Address ->
   Bool ->
@@ -3221,6 +3534,7 @@ relevantTxs addrs prune t =
     g StoreInput {outpoint = OutPoint h i} = Just h
     ins = mapMaybe g t.inputs
 
+-- | Balances of addresses and xpubs in the Blockchain.info format.
 toBinfoAddrs ::
   HashMap Address Balance ->
   HashMap XPubSpec [XPubBal] ->
@@ -3262,6 +3576,7 @@ toBinfoAddrs onlyAddrs onlyXpubs xpubTxs =
              in BinfoAddrBalance {..}
        in map f $ HashMap.elems onlyAddrs
 
+-- | Transaction in the Blockchain.info format, without balance information.
 toBinfoTxSimple ::
   Bool ->
   Transaction ->
@@ -3269,6 +3584,7 @@ toBinfoTxSimple ::
 toBinfoTxSimple numtxid =
   toBinfoTx numtxid HashMap.empty False 0
 
+-- | Inputs of a transaction in the Blockchain.info format.
 toBinfoTxInputs ::
   Bool ->
   HashMap Address (Maybe BinfoXPubPath) ->
@@ -3297,11 +3613,16 @@ toBinfoTxInputs numtxid abook t =
       putVarInt (B.length bs)
       putByteString bs
 
+-- | Height of the block of a transaction, or 'Nothing' if unconfirmed.
 transactionHeight :: Transaction -> Maybe BlockHeight
 transactionHeight Transaction {deleted = True} = Nothing
 transactionHeight Transaction {block = MemRef _} = Nothing
 transactionHeight Transaction {block = BlockRef h _} = Just h
 
+-- | Transaction in the Blockchain.info format. Arguments: identify transactions
+-- by short number; address book of the addresses requested and their xpubs;
+-- prune outputs to other addresses of a transaction that increases the balance;
+-- balance after the transaction.
 toBinfoTx ::
   Bool ->
   HashMap Address (Maybe BinfoXPubPath) ->
@@ -3341,6 +3662,7 @@ toBinfoTx numtxid abook prune bal t =
     aset = HashMap.keysSet abook
     simple = HashMap.null abook && bal == 0
 
+-- | Net change that a transaction makes to the balance of a set of addresses.
 getTxResult :: HashSet Address -> Transaction -> Int64
 getTxResult aset t =
   inputSum + outputSum
@@ -3364,6 +3686,7 @@ getTxResult aset t =
             then fromIntegral value
             else 0
 
+-- | Output in the Blockchain.info format, or 'Nothing' if it is pruned.
 toBinfoTxOutput ::
   Bool ->
   HashMap Address (Maybe BinfoXPubPath) ->
@@ -3391,6 +3714,7 @@ toBinfoTxOutput numtxid abook prune t index o =
   where
     notInBook = isNothing $ o.address >>= flip HashMap.lookup abook
 
+-- | Spender in the Blockchain.info format.
 toBinfoSpender :: Bool -> Spender -> BinfoSpender
 toBinfoSpender numtxid s =
   BinfoSpender
@@ -3398,6 +3722,7 @@ toBinfoSpender numtxid s =
       input = s.index
     }
 
+-- | Output spent by an input, in the Blockchain.info format.
 inputToBinfoTxOutput ::
   Bool ->
   HashMap Address (Maybe BinfoXPubPath) ->
@@ -3434,11 +3759,15 @@ inputToBinfoTxOutput numtxid abook t n i =
           StoreInput {address} -> address >>= join . flip HashMap.lookup abook
     }
 
+-- | Address or xpub in a Blockchain.info request.
 data BinfoAddr
-  = BinfoAddr !Address
-  | BinfoXpub !XPubKey
+  = -- | an address
+    BinfoAddr !Address
+  | -- | an xpub
+    BinfoXpub !XPubKey
   deriving (Eq, Show, Generic, Hashable, NFData)
 
+-- | Parse addresses and xpubs separated by pipes or commas. Returns 'Nothing' if any is invalid.
 parseBinfoAddr :: Network -> Ctx -> Text -> Maybe [BinfoAddr]
 parseBinfoAddr net ctx "" = Just []
 parseBinfoAddr net ctx s =
@@ -3449,11 +3778,17 @@ parseBinfoAddr net ctx s =
       BinfoAddr <$> textToAddr net x
         <|> BinfoXpub <$> xPubImport net ctx x
 
+-- | Block header with its transactions in the Blockchain.info format.
 data BinfoHeader = BinfoHeader
-  { hash :: !BlockHash,
+  { -- | block hash
+    hash :: !BlockHash,
+    -- | block timestamp
     timestamp :: !Timestamp,
+    -- | block index; the height
     index :: !Word32,
+    -- | height
     height :: !BlockHeight,
+    -- | identifiers of its transactions
     txids :: ![BinfoTxId]
   }
   deriving (Eq, Show, Generic, NFData)
@@ -3487,6 +3822,7 @@ instance FromJSON BinfoHeader where
       txids <- o .: "txIndexes"
       return BinfoHeader {..}
 
+-- | Response of @\/blockchain\/unconfirmed-transactions@.
 newtype BinfoMempool = BinfoMempool {get :: [BinfoTx]}
   deriving (Eq, Show, Generic, NFData)
 
@@ -3501,6 +3837,7 @@ instance MarshalJSON (Network, Ctx) BinfoMempool where
     A.withObject "BinfoMempool" $ \o ->
       BinfoMempool <$> (mapM (unmarshalValue (net, ctx)) =<< o .: "txs")
 
+-- | List of short block information.
 newtype BinfoBlockInfos = BinfoBlockInfos {get :: [BinfoBlockInfo]}
   deriving (Eq, Show, Generic, NFData)
 

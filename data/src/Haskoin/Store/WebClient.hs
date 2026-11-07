@@ -8,11 +8,37 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.WebClient
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Client for the REST API of Haskoin Store.
+--
+-- Build a request value, such as 'GetAddrBalance', and pass it to 'apiCall'.
+-- The response type follows from the request type. Requests and responses use
+-- the compact binary encoding of the API. Errors returned by the server are
+-- thrown as 'Store.Except' in 'MonadError'.
+--
+-- @
+-- import Control.Monad.Except (runExceptT)
+-- import Data.Default (def)
+--
+-- balance :: Ctx -> Address -> IO (Either Except Balance)
+-- balance ctx addr = runExceptT $ 'apiCall' ctx def ('GetAddrBalance' addr)
+-- @
+--
+-- Requests that take long lists of addresses, transactions or blocks can be
+-- split into several calls with 'apiBatch'.
 module Haskoin.Store.WebClient
-  ( ApiConfig (..),
+  ( -- * Calls
+    ApiConfig (..),
     apiCall,
     apiBatch,
-    -- Blocks
+    -- * Blocks
     GetBlock (..),
     GetBlocks (..),
     GetBlockRaw (..),
@@ -24,7 +50,7 @@ module Haskoin.Store.WebClient
     GetBlockHeightRaw (..),
     GetBlockTime (..),
     GetBlockTimeRaw (..),
-    -- Transactions
+    -- * Transactions
     GetTx (..),
     GetTxs (..),
     GetTxRaw (..),
@@ -35,7 +61,7 @@ module Haskoin.Store.WebClient
     PostTx (..),
     GetMempool (..),
     GetEvents (..),
-    -- Address
+    -- * Addresses
     GetAddrTxs (..),
     GetAddrsTxs (..),
     GetAddrTxsFull (..),
@@ -44,17 +70,17 @@ module Haskoin.Store.WebClient
     GetAddrsBalance (..),
     GetAddrUnspent (..),
     GetAddrsUnspent (..),
-    -- XPubs
+    -- * Extended public keys
     GetXPub (..),
     GetXPubTxs (..),
     GetXPubTxsFull (..),
     GetXPubBalances (..),
     GetXPubUnspent (..),
     DelCachedXPub (..),
-    -- Network
+    -- * Network
     GetPeers (..),
     GetHealth (..),
-    -- Params
+    -- * Parameters
     StartParam (..),
     OffsetParam (..),
     LimitParam (..),
@@ -105,7 +131,9 @@ import Numeric.Natural (Natural)
 -- }
 -- @
 data ApiConfig = ApiConfig
-  { net :: !Network,
+  { -- | network to query; its name is appended to the host
+    net :: !Network,
+    -- | base URL of the API, ending in a slash
     host :: !String
   }
   deriving (Eq, Show)
@@ -125,7 +153,9 @@ instance Default ApiConfig where
 --
 -- With options:
 --
--- > apiCall ctx def $ GetAddrsUnspent addrs def{ paramLimit = Just 10 }
+-- > apiCall ctx def $ GetAddrsUnspent addrs def {limit = Just 10}
+--
+-- Only @GET@ and @POST@ endpoints are supported.
 apiCall ::
   (ApiResource a b, MonadIO m, MonadError Store.Except m) =>
   Ctx ->
@@ -146,7 +176,10 @@ apiCall ctx (ApiConfig net apiHost) res = do
 
 -- | Batch commands that have a large list of arguments:
 --
--- > apiBatch 20 def (GetAddrsTxs addrs def)
+-- > apiBatch ctx 20 def (GetAddrsTxs addrs def)
+--
+-- The list is split into chunks of the given size, one call is made per chunk,
+-- and the results are concatenated.
 apiBatch ::
   (Batchable a b, MonadIO m, MonadError Store.Except m) =>
   Ctx ->
@@ -157,7 +190,10 @@ apiBatch ::
 apiBatch ctx i conf res =
   mconcat <$> mapM (apiCall ctx conf) (resourceBatch i res)
 
+-- | Requests that can be split into several smaller ones whose results are
+-- concatenated.
 class (ApiResource a b, Monoid b) => Batchable a b where
+  -- | Split a request into requests with lists of at most this size.
   resourceBatch :: Natural -> a -> [a]
 
 instance Batchable GetBlocks (Store.SerialList Store.BlockData) where
@@ -197,6 +233,7 @@ instance Batchable GetAddrsUnspent (Store.SerialList Store.Unspent) where
 -- API Internal --
 ------------------
 
+-- | HTTP options carrying the query string parameters of a request.
 toOptions ::
   (ApiResource a b) =>
   Network ->
@@ -208,6 +245,7 @@ toOptions net ctx res =
   where
     f (ParamBox p) = toOption net ctx p
 
+-- | HTTP option for one query string parameter.
 toOption ::
   (Param a) =>
   Network ->
@@ -220,9 +258,11 @@ toOption net ctx a = do
       encodeParam net ctx a
   return $ applyOpt (paramLabel a) res
 
+-- | Set a query string parameter to comma-separated values.
 applyOpt :: Text -> [Text] -> Endo HTTP.Options
 applyOpt p t = Endo $ HTTP.param p .~ [Text.intercalate "," t]
 
+-- | Make a @GET@ request and decode the binary response.
 getBinary ::
   (Serial a) =>
   Endo HTTP.Options ->
@@ -234,6 +274,7 @@ getBinary opts url = do
     res <- resE
     return . runGetL deserialize $ res ^. HTTP.responseBody
 
+-- | Make a @POST@ request with a binary body and decode the binary response.
 postBinary ::
   (Serial a, Serial r) =>
   Endo HTTP.Options ->
@@ -246,6 +287,7 @@ postBinary opts url body = do
     res <- resE
     return . runGetL deserialize $ res ^. HTTP.responseBody
 
+-- | Request binary responses, and turn error responses into exceptions.
 binaryOpts :: Endo HTTP.Options -> HTTP.Options
 binaryOpts opts =
   appEndo (opts <> accept <> stat) HTTP.defaults
@@ -253,6 +295,9 @@ binaryOpts opts =
     accept = Endo $ HTTP.header "Accept" .~ ["application/octet-stream"]
     stat = Endo $ HTTP.checkResponse ?~ checkStatus
 
+-- | Throw the error in the body of an unsuccessful response as 'Store.Except'.
+-- A health check that answers 503 is not an error: its body says what is
+-- wrong.
 checkStatus :: ResponseChecker
 checkStatus req res
   | statusIsSuccessful status = return ()
@@ -273,6 +318,7 @@ checkStatus req res
 -- Utilities --
 ---------------
 
+-- | Split a list into chunks of at most this size.
 chunksOf :: Natural -> [a] -> [[a]]
 chunksOf n xs
   | null xs = []

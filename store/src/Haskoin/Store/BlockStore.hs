@@ -12,6 +12,41 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
 
+-- |
+-- Module      : Haskoin.Store.BlockStore
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- The block store process downloads blocks and transactions from peers and
+-- imports them into the database.
+--
+-- = Blocks
+--
+-- When the best header of the node is ahead of the best block in the database,
+-- the block store picks one online peer as its syncing peer and asks it for
+-- blocks in batches of 'blockWindow'. Each block is imported as soon as it
+-- arrives. If the best block of the database is no longer in the main chain of
+-- headers, blocks are reverted until it is. A syncing peer that sends a block
+-- that was not requested, cannot find a block, or stays silent for longer than
+-- 'peerTimeout' is disconnected.
+--
+-- = Mempool
+--
+-- Once the database is in sync, the block store asks each peer for its mempool
+-- (if 'syncMempool' is set) and requests every transaction that peers
+-- announce. Received transactions are queued and imported in batches on every
+-- clock tick, in dependency order. Transactions that spend unknown outputs are
+-- kept for up to an hour, waiting for their parents. Mempool transactions older
+-- than 'mempoolTimeout' days are deleted.
+--
+-- = Feeding the block store
+--
+-- The block store does not listen to the node by itself.
+-- "Haskoin.Store.Manager" forwards node events to it with the
+-- @blockStore*@ functions of this module.
 module Haskoin.Store.BlockStore
   ( -- * Block Store
     BlockStore,
@@ -178,57 +213,95 @@ import UnliftIO
   )
 import UnliftIO.Concurrent (threadDelay)
 
+-- | Messages handled by the block store process.
 data BlockStoreMessage
-  = BlockNewBest !BlockNode
-  | BlockPeerConnect !Peer
-  | BlockPeerDisconnect !Peer
-  | BlockReceived !Peer !Block
-  | BlockNotFound !Peer ![BlockHash]
-  | TxRefReceived !Peer !Tx
-  | TxRefAvailable !Peer ![TxHash]
-  | BlockPing !(Listen ())
+  = -- | the node has a new best header
+    BlockNewBest !BlockNode
+  | -- | a peer connected
+    BlockPeerConnect !Peer
+  | -- | a peer disconnected
+    BlockPeerDisconnect !Peer
+  | -- | a peer sent a block
+    BlockReceived !Peer !Block
+  | -- | a peer could not find blocks
+    BlockNotFound !Peer ![BlockHash]
+  | -- | a peer sent a transaction
+    TxRefReceived !Peer !Tx
+  | -- | a peer announced transactions
+    TxRefAvailable !Peer ![TxHash]
+  | -- | clock tick for housekeeping; reply when done
+    BlockPing !(Listen ())
 
+-- | Fatal errors of the block store.
 data BlockException
-  = BlockNotInChain !BlockHash
-  | Uninitialized
-  | CorruptDatabase
-  | AncestorNotInChain !BlockHeight !BlockHash
-  | MempoolImportFailed
+  = -- | the header of a block in the database is not known to the node
+    BlockNotInChain !BlockHash
+  | -- | the database has no best block
+    Uninitialized
+  | -- | the database is inconsistent
+    CorruptDatabase
+  | -- | the node has no header at this height below this block
+    AncestorNotInChain !BlockHeight !BlockHash
+  | -- | importing mempool transactions failed
+    MempoolImportFailed
   deriving (Show, Eq, Ord, Exception)
 
+-- | State of the sync against the syncing peer.
 data Syncing = Syncing
-  { peer :: !Peer,
+  { -- | peer that blocks are downloaded from
+    peer :: !Peer,
+    -- | when it last delivered a block, or when syncing started
     time :: !UTCTime,
+    -- | blocks requested and not yet imported, in chain order
     blocks :: ![BlockHash]
   }
 
+-- | Transaction received from a peer and waiting to be imported.
 data PendingTx = PendingTx
-  { time :: !UTCTime,
+  { -- | when it was received
+    time :: !UTCTime,
+    -- | the transaction
     tx :: !Tx,
+    -- | parent transactions that are missing; empty if it can be imported
     deps :: !(HashSet TxHash)
   }
   deriving (Show, Eq, Ord)
 
 -- | Block store process state.
 data BlockStore = BlockStore
-  { mailbox :: !(Mailbox BlockStoreMessage),
+  { -- | mailbox of the process
+    mailbox :: !(Mailbox BlockStoreMessage),
+    -- | configuration
     config :: !BlockStoreConfig,
+    -- | syncing peer, if any
     peer :: !(TVar (Maybe Syncing)),
+    -- | transactions received and waiting to be imported
     txs :: !(TVar (HashMap TxHash PendingTx)),
+    -- | transactions requested from peers in the last twenty seconds
     requested :: !(TVar (HashSet TxHash)),
+    -- | StatsD metrics, if enabled
     metrics :: !(Maybe StoreMetrics),
+    -- | labels of the peers whose mempool was already requested
     syncedMempool :: !(TVar (HashSet Text))
   }
 
+-- | StatsD metrics of the block store.
 data StoreMetrics = StoreMetrics
-  { blocks :: !StatGauge,
+  { -- | height of the best block (@store.blocks@)
+    blocks :: !StatGauge,
+    -- | height of the best header (@store.headers@)
     headers :: !StatGauge,
+    -- | transactions waiting to be imported (@store.queued_txs@)
     queuedTxs :: !StatGauge,
+    -- | online peers (@store.peers@)
     peers :: !StatGauge,
+    -- | transactions in the mempool (@store.mempool@)
     mempool :: !StatGauge,
+    -- | milliseconds to import a block (@store.block@)
     block :: !StatTiming
   }
 
+-- | Register the block store metrics, if StatsD is configured, with their current values.
 newStoreMetrics :: (MonadIO m) => BlockStoreConfig -> m (Maybe StoreMetrics)
 newStoreMetrics cfg =
   forM cfg.stats $ \s -> liftIO $ do
@@ -251,6 +324,7 @@ newStoreMetrics cfg =
     g s x = newStatGauge s ("store." <> x)
     t s x = newStatTiming s ("store." <> x)
 
+-- | Update the gauge of the best block height.
 setStoreHeight :: (MonadIO m) => BlockT m ()
 setStoreHeight = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
@@ -258,24 +332,28 @@ setStoreHeight = void $ runMaybeT $ do
   b <- MaybeT (getBlock h)
   setGauge m.blocks (fromIntegral b.height)
 
+-- | Update the gauge of the best header height.
 setHeadersHeight :: (MonadIO m) => BlockT m ()
 setHeadersHeight = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
   n <- liftIO . chainGetBest =<< asks (.config.chain)
   setGauge m.headers (fromIntegral n.height)
 
+-- | Update the gauge of transactions waiting to be imported.
 setPendingTxs :: (MonadIO m) => BlockT m ()
 setPendingTxs = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
   p <- readTVarIO =<< asks (.txs)
   setGauge m.queuedTxs (HashMap.size p)
 
+-- | Update the gauge of online peers.
 setPeersConnected :: (MonadIO m) => BlockT m ()
 setPeersConnected = void $ runMaybeT $ do
   m <- MaybeT (asks (.metrics))
   p <- liftIO . getPeers =<< asks (.config.peerMgr)
   setGauge m.peers (length p)
 
+-- | Record how long a successful block import took.
 withBlockTiming :: (MonadIO m) => BlockT m (Either l r) -> BlockT m (Either l r)
 withBlockTiming go = do
   asks (.metrics) >>= \case
@@ -291,7 +369,8 @@ withBlockTiming go = do
 
 -- | Configuration for a block store.
 data BlockStoreConfig = BlockStoreConfig
-  { ctx :: !Ctx,
+  { -- | secp256k1 context
+    ctx :: !Ctx,
     -- | peer manager from running node
     peerMgr :: !PeerMgr,
     -- | chain from a running node
@@ -314,13 +393,16 @@ data BlockStoreConfig = BlockStoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
+    -- | StatsD client, if metrics are enabled
     stats :: !(Maybe Stats),
     -- | log messages here
     logger :: !Logger
   }
 
+-- | Monad transformer of the block store process.
 type BlockT m = ReaderT BlockStore m
 
+-- | Log a message with the logger of the block store.
 logDebug, logInfo, logWarn, logError ::
   (MonadIO m, MonadReader BlockStore m) => Text -> m ()
 logDebug = blockLog LevelDebug
@@ -328,9 +410,11 @@ logInfo = blockLog LevelInfo
 logWarn = blockLog LevelWarn
 logError = blockLog LevelError
 
+-- | Log a message at a level with the logger of the block store.
 blockLog :: (MonadIO m, MonadReader BlockStore m) => LogLevel -> Text -> m ()
 blockLog l msg = asks (.config.logger) >>= \lg -> logAt l lg msg
 
+-- | Run an import against the database, returning the import error if it fails.
 runImport ::
   (MonadIO m) =>
   Network ->
@@ -382,6 +466,7 @@ runImportNotify block f = do
     inBlock = maybe HashSet.empty (HashSet.fromList . map txHash . (.txs)) block
     notInBlock = not . (`HashSet.member` inBlock)
 
+-- | Run a database query from the block store.
 runRocksDB :: ReaderT DatabaseReader m a -> BlockT m a
 runRocksDB f =
   ReaderT $ runReaderT f . (.config.db)
@@ -502,6 +587,7 @@ withBlockStore cfg action = do
       withAsync (pingMe (inboxToMailbox inbox)) $ \a ->
         link a >> runBlockStoreLoop inbox
 
+-- | Handle messages forever.
 runBlockStoreLoop ::
   (InChan mbox, MonadUnliftIO m) =>
   mbox BlockStoreMessage ->
@@ -512,6 +598,8 @@ runBlockStoreLoop inbox =
     msg <- receive inbox
     ReaderT $ runReaderT $ processBlockStoreMessage msg
 
+-- | Whether the best block in the database is the best header of the node. If
+-- so, release the syncing peer.
 isInSync :: (MonadIO m) => BlockT m Bool
 isInSync =
   getBestBlock >>= \case
@@ -524,12 +612,15 @@ isInSync =
         then clearSyncingState >> return True
         else return False
 
+-- | Run an action only if the database is in sync.
 guardSync :: (MonadIO m) => BlockT m () -> BlockT m ()
 guardSync f = isInSync >>= \s -> when s f
 
+-- | Run an action only if the mempool is indexed.
 guardMempool :: (Monad m) => BlockT m () -> BlockT m ()
 guardMempool f = asks (.config.noMempool) >>= \n -> unless n f
 
+-- | Ask a peer for its mempool, once per peer, if in sync and mempool sync is enabled.
 syncMempool :: (MonadUnliftIO m) => Peer -> BlockT m ()
 syncMempool p =
   guardMempool . guardSync $ do
@@ -542,6 +633,9 @@ syncMempool p =
       atomically . modifyTVar m $ HashSet.insert p.label
       liftIO $ MMempool `sendMessage` p
 
+-- | Import a block from the syncing peer, then ask for more blocks or, if now in
+-- sync, sync the mempool. Disconnects the peer if it is not the syncing peer, if
+-- the block is unknown to the node, or if the block cannot be imported.
 processBlock ::
   (MonadUnliftIO m) =>
   Peer ->
@@ -603,6 +697,7 @@ processBlock peer block = void . runMaybeT $ do
           <> cs (show e)
       killPeer peer
 
+-- | Set the blocks requested from the syncing peer.
 setSyncingBlocks ::
   (MonadReader BlockStore m, MonadIO m) =>
   [BlockHash] ->
@@ -614,12 +709,14 @@ setSyncingBlocks hs =
         Nothing -> Nothing
         Just x -> Just (x :: Syncing) {blocks = hs}
 
+-- | Blocks requested from the syncing peer and not yet imported.
 getSyncingBlocks :: (MonadReader BlockStore m, MonadIO m) => m [BlockHash]
 getSyncingBlocks =
   asks (.peer) >>= readTVarIO >>= \case
     Nothing -> return []
     Just x -> return x.blocks
 
+-- | Add blocks to those requested from the syncing peer.
 addSyncingBlocks ::
   (MonadReader BlockStore m, MonadIO m) =>
   [BlockHash] ->
@@ -631,6 +728,7 @@ addSyncingBlocks hs =
         Nothing -> Nothing
         Just x -> Just (x :: Syncing) {blocks = x.blocks <> hs}
 
+-- | Remove a block from those requested from the syncing peer.
 removeSyncingBlock ::
   (MonadReader BlockStore m, MonadIO m) =>
   BlockHash ->
@@ -642,11 +740,13 @@ removeSyncingBlock h = do
       Nothing -> Nothing
       Just x -> Just (x :: Syncing) {blocks = delete h x.blocks}
 
+-- | Whether a peer is the syncing peer.
 checkPeer :: (MonadIO m, MonadReader BlockStore m) => Peer -> m Bool
 checkPeer p = fmap (fromMaybe False) <$> runMaybeT $ do
   Syncing {peer} <- MaybeT getSyncingState
   return $ peer == p
 
+-- | Header of a block from the node.
 getBlockNode ::
   (MonadIO m, MonadReader BlockStore m) =>
   BlockHash ->
@@ -655,6 +755,7 @@ getBlockNode blockhash = do
   ch <- asks (.config.chain)
   liftIO $ chainGetBlock ch blockhash
 
+-- | Disconnect a peer that could not find requested blocks.
 processNoBlocks ::
   (MonadIO m) =>
   Peer ->
@@ -673,6 +774,7 @@ processNoBlocks p hs = do
         <> p.label
   killPeer p
 
+-- | Queue a transaction received from a peer for import.
 processTx :: (MonadIO m) => Peer -> Tx -> BlockT m ()
 processTx p tx = guardMempool $ do
   t <- liftIO getCurrentTime
@@ -683,6 +785,7 @@ processTx p tx = guardMempool $ do
       <> p.label
   addPendingTx $ PendingTx t tx HashSet.empty
 
+-- | Drop queued transactions received more than an hour ago.
 pruneOrphans :: (MonadIO m) => BlockT m ()
 pruneOrphans = guardMempool $ do
   ts <- asks (.txs)
@@ -691,6 +794,7 @@ pruneOrphans = guardMempool $ do
   atomically . modifyTVar' ts . HashMap.filter $ \p ->
     now `diffUTCTime` p.time <= 3600
 
+-- | Queue a transaction for import.
 addPendingTx :: (MonadIO m) => PendingTx -> BlockT m ()
 addPendingTx p = do
   ts <- asks (.txs)
@@ -702,6 +806,7 @@ addPendingTx p = do
   where
     th = txHash p.tx
 
+-- | Remember for twenty seconds that a transaction was requested, so that it is not requested again.
 addRequestedTx :: (MonadIO m) => TxHash -> BlockT m ()
 addRequestedTx th = do
   qbox <- asks (.requested)
@@ -710,6 +815,7 @@ addRequestedTx th = do
     threadDelay 20000000
     atomically $ modifyTVar qbox $ HashSet.delete th
 
+-- | Whether a transaction is queued or was requested recently.
 isPending :: (MonadIO m) => TxHash -> BlockT m Bool
 isPending th = do
   tbox <- asks (.txs)
@@ -721,6 +827,8 @@ isPending th = do
       th `HashMap.member` ts
         || th `HashSet.member` rs
 
+-- | Take up to this many queued transactions that have no missing parents, in
+-- dependency order, out of the queue.
 pendingTxs :: (MonadIO m) => Int -> BlockT m [PendingTx]
 pendingTxs i = do
   selected <-
@@ -743,6 +851,7 @@ pendingTxs i = do
           txids = map (txHash . snd) sorted
        in mapMaybe (`HashMap.lookup` m) txids
 
+-- | Mark a transaction as no longer missing for the queued transactions that spend it.
 fulfillOrphans :: (MonadIO m) => BlockStore -> TxHash -> m ()
 fulfillOrphans block_read th =
   atomically $ modifyTVar box (HashMap.map fulfill)
@@ -750,6 +859,8 @@ fulfillOrphans block_read th =
     box = block_read.txs
     fulfill p = p {deps = HashSet.delete th p.deps}
 
+-- | Drop queued transactions that are already in the database, and recompute the
+-- missing parents of the others.
 updateOrphans ::
   ( StoreReadBase m,
     MonadIO m,
@@ -783,6 +894,7 @@ updateOrphans = do
       unspents <- prev_utxos tx
       return $ foldl fulfill p unspents
 
+-- | Queue a transaction that spends unknown outputs, recording which parents are missing.
 newOrphanTx ::
   (MonadIO m) =>
   BlockStore ->
@@ -811,6 +923,9 @@ newOrphanTx block_read time tx = do
     prev_set = HashSet.fromList prevs
     prevs = map (.outpoint) tx.inputs
 
+-- | Import a transaction into the mempool. Returns 'True' if imported. A
+-- transaction that spends unknown outputs is queued as an orphan; other errors
+-- are ignored.
 importMempoolTx :: BlockStore -> UTCTime -> Tx -> ImportM Bool
 importMempoolTx block_read time tx =
   catch new_mempool_tx handle_error
@@ -831,6 +946,7 @@ importMempoolTx block_read time tx =
       when t $ fulfillOrphans block_read tx_hash
       return t
 
+-- | Import up to 2000 queued transactions.
 processMempool :: (MonadIO m) => BlockT m ()
 processMempool = guardMempool $ do
   txs <- pendingTxs 2000
@@ -848,6 +964,7 @@ processMempool = guardMempool $ do
         "Error processing mempool: " <> cs (show e)
       throwIO e
 
+-- | Delete up to 1000 mempool transactions older than the configured number of days.
 pruneMempool :: (MonadIO m) => BlockT m ()
 pruneMempool =
   guardMempool $ do
@@ -867,6 +984,8 @@ pruneMempool =
               "Error pruning mempool: " <> cs (show e)
           Right () -> return ()
 
+-- | Request from a peer the announced transactions that are neither queued,
+-- recently requested nor in the database. Only while in sync.
 processTxs ::
   (MonadIO m) =>
   Peer ->
@@ -928,6 +1047,7 @@ processTxs p hs = guardMempool . guardSync $ do
           msg = MGetData (GetData vec)
       liftIO $ msg `sendMessage` p
 
+-- | Record that the syncing peer just delivered something.
 touchPeer ::
   ( MonadIO m,
     MonadReader BlockStore m
@@ -944,6 +1064,7 @@ touchPeer =
           fmap $
             \x -> (x :: Syncing) {time = now}
 
+-- | Disconnect the syncing peer if it has been silent for too long.
 checkTime :: (MonadIO m) => BlockT m ()
 checkTime =
   asks (.peer) >>= readTVarIO >>= \case
@@ -960,6 +1081,7 @@ checkTime =
             "Syncing peer timeout: " <> p.label
           killPeer p
 
+-- | Revert blocks until the best block in the database is in the main chain of headers.
 revertToMainChain :: (MonadIO m) => BlockT m ()
 revertToMainChain = do
   h <- headerHash . (.header) <$> getBest
@@ -981,6 +1103,7 @@ revertToMainChain = do
       Right () -> setSyncingBlocks []
     revertToMainChain
 
+-- | Header of the best block in the database.
 getBest :: (MonadIO m) => BlockT m BlockNode
 getBest = do
   bb <-
@@ -998,6 +1121,7 @@ getBest = do
           <> blockHashToHex bb
       throwIO (BlockNotInChain bb)
 
+-- | Header of the last block requested from the syncing peer, or of the best block if none.
 getSyncBest :: (MonadIO m) => BlockT m BlockNode
 getSyncBest = do
   bb <-
@@ -1083,6 +1207,7 @@ syncMe = do
       ps <- liftIO $ chainGetParents ch (bb.height + 1) top
       return $ ps <> [top]
 
+-- | Ancestor of a header at a height. Throws 'AncestorNotInChain' if missing.
 findAncestor ::
   (MonadIO m, MonadReader BlockStore m) =>
   BlockHeight ->
@@ -1101,6 +1226,7 @@ findAncestor height target = do
           <> cs (show target.height)
       throwIO $ AncestorNotInChain height h
 
+-- | Forget a peer: release it if it was the syncing peer, and forget that its mempool was requested.
 finishPeer ::
   (MonadIO m, MonadReader BlockStore m) =>
   Peer ->
@@ -1118,6 +1244,7 @@ finishPeer p = do
       logDebug $ "Releasing peer: " <> p.label
       liftIO $ setFree p
 
+-- | Make a peer the syncing peer if there is none and the peer is not busy.
 trySetPeer :: (MonadIO m) => Peer -> BlockT m Bool
 trySetPeer p =
   getSyncingState >>= \case
@@ -1141,6 +1268,7 @@ trySetPeer p =
                 }
           return True
 
+-- | If not in sync and there is no syncing peer, pick the fastest free peer and start syncing.
 trySyncing :: (MonadIO m) => BlockT m ()
 trySyncing =
   isInSync >>= \case
@@ -1160,6 +1288,7 @@ trySyncing =
       let ps = map (.mailbox) ops
       recurse ps
 
+-- | Start syncing against a newly connected peer if needed, or request its mempool if in sync.
 trySyncingPeer :: (MonadUnliftIO m) => Peer -> BlockT m ()
 trySyncingPeer p =
   isInSync >>= \case
@@ -1169,11 +1298,13 @@ trySyncingPeer p =
         False -> return ()
         True -> syncMe
 
+-- | State of the sync against the syncing peer, if any.
 getSyncingState ::
   (MonadIO m, MonadReader BlockStore m) => m (Maybe Syncing)
 getSyncingState =
   readTVarIO =<< asks (.peer)
 
+-- | Release the syncing peer, if any.
 clearSyncingState ::
   (MonadIO m, MonadReader BlockStore m) => m ()
 clearSyncingState =
@@ -1181,6 +1312,7 @@ clearSyncingState =
     Nothing -> return ()
     Just Syncing {peer = p} -> finishPeer p
 
+-- | Handle a message sent to the block store.
 processBlockStoreMessage ::
   (MonadUnliftIO m) =>
   BlockStoreMessage ->
@@ -1239,6 +1371,7 @@ processBlockStoreMessage (BlockPing r) = do
   checkTime
   atomically (r ())
 
+-- | Send a clock tick to the block store every 0.1 to 1 second, waiting for each to be handled.
 pingMe :: (MonadIO m) => Mailbox BlockStoreMessage -> m ()
 pingMe mbox =
   loopForever $ do
@@ -1246,80 +1379,96 @@ pingMe mbox =
     delay <- liftIO $ randomRIO (100 * 1000, 1000 * 1000)
     threadDelay delay
 
+-- | Tell the block store that a peer connected.
 blockStorePeerConnect :: (MonadIO m) => Peer -> BlockStore -> m ()
 blockStorePeerConnect peer store =
   BlockPeerConnect peer `send` store.mailbox
 
+-- | Tell the block store that a peer disconnected.
 blockStorePeerDisconnect ::
   (MonadIO m) => Peer -> BlockStore -> m ()
 blockStorePeerDisconnect peer store =
   BlockPeerDisconnect peer `send` store.mailbox
 
+-- | Tell the block store that the node has a new best header.
 blockStoreHead ::
   (MonadIO m) => BlockNode -> BlockStore -> m ()
 blockStoreHead node store =
   BlockNewBest node `send` store.mailbox
 
+-- | Give the block store a block received from a peer.
 blockStoreBlock ::
   (MonadIO m) => Peer -> Block -> BlockStore -> m ()
 blockStoreBlock peer block store =
   BlockReceived peer block `send` store.mailbox
 
+-- | Tell the block store that a peer could not find blocks.
 blockStoreNotFound ::
   (MonadIO m) => Peer -> [BlockHash] -> BlockStore -> m ()
 blockStoreNotFound peer blocks store =
   BlockNotFound peer blocks `send` store.mailbox
 
+-- | Give the block store a transaction received from a peer.
 blockStoreTx ::
   (MonadIO m) => Peer -> Tx -> BlockStore -> m ()
 blockStoreTx peer tx store =
   TxRefReceived peer tx `send` store.mailbox
 
+-- | Tell the block store that a peer announced transactions.
 blockStoreTxHash ::
   (MonadIO m) => Peer -> [TxHash] -> BlockStore -> m ()
 blockStoreTxHash peer txhashes store =
   TxRefAvailable peer txhashes `send` store.mailbox
 
+-- | 'STM' version of 'blockStorePeerConnect'.
 blockStorePeerConnectSTM ::
   Peer -> BlockStore -> STM ()
 blockStorePeerConnectSTM peer store =
   BlockPeerConnect peer `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStorePeerDisconnect'.
 blockStorePeerDisconnectSTM ::
   Peer -> BlockStore -> STM ()
 blockStorePeerDisconnectSTM peer store =
   BlockPeerDisconnect peer `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStoreHead'.
 blockStoreHeadSTM ::
   BlockNode -> BlockStore -> STM ()
 blockStoreHeadSTM node store =
   BlockNewBest node `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStoreBlock'.
 blockStoreBlockSTM ::
   Peer -> Block -> BlockStore -> STM ()
 blockStoreBlockSTM peer block store =
   BlockReceived peer block `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStoreNotFound'.
 blockStoreNotFoundSTM ::
   Peer -> [BlockHash] -> BlockStore -> STM ()
 blockStoreNotFoundSTM peer blocks store =
   BlockNotFound peer blocks `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStoreTx'.
 blockStoreTxSTM ::
   Peer -> Tx -> BlockStore -> STM ()
 blockStoreTxSTM peer tx store =
   TxRefReceived peer tx `sendSTM` store.mailbox
 
+-- | 'STM' version of 'blockStoreTxHash'.
 blockStoreTxHashSTM ::
   Peer -> [TxHash] -> BlockStore -> STM ()
 blockStoreTxHashSTM peer txhashes store =
   TxRefAvailable peer txhashes `sendSTM` store.mailbox
 
+-- | Number of transactions queued or requested by the block store.
 blockStorePendingTxs ::
   (MonadIO m) => BlockStore -> m Int
 blockStorePendingTxs =
   atomically . blockStorePendingTxsSTM
 
+-- | 'STM' version of 'blockStorePendingTxs'.
 blockStorePendingTxsSTM ::
   BlockStore -> STM Int
 blockStorePendingTxsSTM BlockStore {..} = do
@@ -1327,6 +1476,7 @@ blockStorePendingTxsSTM BlockStore {..} = do
   y <- readTVar requested
   return $ HashSet.size $ x `HashSet.union` y
 
+-- | Describe a block for logs: height, time, hash and, if the block is given, size.
 blockText :: BlockNode -> Maybe Block -> Text
 blockText bn mblock = case mblock of
   Nothing ->

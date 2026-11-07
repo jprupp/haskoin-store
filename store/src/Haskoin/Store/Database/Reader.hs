@@ -9,6 +9,23 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.Database.Reader
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Queries against the RocksDB database of the store.
+--
+-- 'DatabaseReaderT' implements 'StoreReadBase' and 'StoreReadExtra' by reading
+-- the indices directly from RocksDB. The database is opened with
+-- 'withDatabaseReader', which also creates or migrates it.
+--
+-- Data is split across column families by kind; see 'addrTxCF' and the other
+-- column family accessors. The keys stored in each are described in
+-- "Haskoin.Store.Database.Types".
 module Haskoin.Store.Database.Reader
   ( -- * RocksDB Database Access
     DatabaseReader (..),
@@ -59,14 +76,22 @@ import System.Metrics.StatsD
 import Text.Read (readMaybe)
 import UnliftIO
 
+-- | Monad transformer to query the database.
 type DatabaseReaderT = ReaderT DatabaseReader
 
+-- | Open database and its settings.
 data DatabaseReader = DatabaseReader
-  { db :: !DB,
+  { -- | RocksDB handle, with the column families of the store
+    db :: !DB,
+    -- | consecutive unused addresses after which xpub derivation stops
     maxGap :: !Word32,
+    -- | unused addresses to look at for an xpub with no transactions
     initGap :: !Word32,
+    -- | network constants
     net :: !Network,
+    -- | StatsD metrics, if enabled
     metrics :: !(Maybe DataMetrics),
+    -- | secp256k1 context
     ctx :: !Ctx,
     -- | addresses derived from recently queried xpubs
     derived :: !(IORef DerivedCache)
@@ -87,6 +112,7 @@ data DerivedCache = DerivedCache
     older :: !(HashMap XPubSpec Derived)
   }
 
+-- | Number of xpubs in each generation of the cache of derived addresses.
 derivedCacheSize :: Int
 derivedCacheSize = 512
 
@@ -113,21 +139,35 @@ derivedAddrs xpub = do
               | otherwise = c {newer = HashMap.insert xpub d c.newer}
          in (c', d)
 
+-- | StatsD metrics of database reads. Counters count the items read.
 data DataMetrics = DataMetrics
-  { dataBestCount :: !StatCounter,
+  { -- | best block reads (@db.best_block@)
+    dataBestCount :: !StatCounter,
+    -- | blocks read (@db.blocks@)
     dataBlockCount :: !StatCounter,
+    -- | transactions read (@db.txs@)
     dataTxCount :: !StatCounter,
+    -- | mempool entries read (@db.mempool@)
     dataMempoolCount :: !StatCounter,
+    -- | balances read (@db.balances@)
     dataBalanceCount :: !StatCounter,
+    -- | unspent outputs read (@db.unspents@)
     dataUnspentCount :: !StatCounter,
+    -- | address transactions read (@db.address_txs@)
     dataAddrTxCount :: !StatCounter,
+    -- | xpub balances read (@db.xpub_balances@)
     dataXPubBals :: !StatCounter,
+    -- | xpub unspent outputs read (@db.xpub_unspents@)
     dataXPubUnspents :: !StatCounter,
+    -- | xpub transactions read (@db.xpub_txs@)
     dataXPubTxs :: !StatCounter,
+    -- | xpub transaction counts (@db.xpub_tx_count@)
     dataXPubTxCount :: !StatCounter,
+    -- | open iterators (@db.iterators@)
     dataIters :: !StatGauge
   }
 
+-- | Register the database metrics with a StatsD client. Samples are sent at a rate of one in ten.
 createDataMetrics :: Stats -> IO DataMetrics
 createDataMetrics s = do
   dataBestCount <- newStatCounter s "db.best_block" n
@@ -146,15 +186,27 @@ createDataMetrics s = do
   where
     n = 10
 
+-- | Run an action with the metrics, if they are enabled.
 withMetrics :: (MonadReader DatabaseReader m) => (DataMetrics -> m a) -> m ()
 withMetrics go = asks (.metrics) >>= mapM_ go
 
+-- | Version of the database layout. Databases of versions 18 and 19 are
+-- migrated when opened; other versions are refused.
 dataVersion :: Word32
 dataVersion = 20
 
+-- | Run a query against a database.
 withDB :: DatabaseReader -> DatabaseReaderT m a -> m a
 withDB = flip runReaderT
 
+-- | Open the database and run a query against it. Creates the database and its
+-- column families if missing, and migrates it from older versions.
+--
+-- Arguments, in order: network, secp256k1 context, initial xpub gap, maximum
+-- xpub gap, directory, whether to use Bloom filters, maximum open files, total
+-- memtable size in bytes, write-ahead log size in bytes after which column
+-- families are flushed, block cache size in bytes, and metrics. 'Nothing' leaves
+-- a setting to RocksDB.
 withDatabaseReader ::
   (MonadUnliftIO m) =>
   Network ->
@@ -247,30 +299,39 @@ columnFamilyConfig bloom cached =
   where
     c p = def {prefixLength = p, bloomFilter = bloom, cacheIndexAndFilterBlocks = cached}
 
+-- | Column family for transactions by address ('AddrTxKey').
 addrTxCF :: DB -> ColumnFamily
 addrTxCF db = columnFamilies db !! 0
 
+-- | Column family for unspent outputs by address ('AddrOutKey').
 addrOutCF :: DB -> ColumnFamily
 addrOutCF db = columnFamilies db !! 1
 
+-- | Column family for transactions ('TxKey').
 txCF :: DB -> ColumnFamily
 txCF db = columnFamilies db !! 2
 
+-- | Column family for unspent outputs ('UnspentKey').
 unspentCF :: DB -> ColumnFamily
 unspentCF db = columnFamilies db !! 4
 
+-- | Column family for blocks ('BlockKey').
 blockCF :: DB -> ColumnFamily
 blockCF db = columnFamilies db !! 5
 
+-- | Column family for block hashes by height ('HeightKey').
 heightCF :: DB -> ColumnFamily
 heightCF db = columnFamilies db !! 6
 
+-- | Column family for address balances ('BalKey').
 balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
+-- | Column family for mempool transactions ('MemTxKey' and 'MemTimeKey').
 mempoolCF :: DB -> ColumnFamily
 mempoolCF db = columnFamilies db !! 8
 
+-- | Set the version of a new database, migrate an old one, or call 'error' if the version is not supported.
 initRocksDB :: DatabaseReader -> IO ()
 initRocksDB DatabaseReader {db = db} =
   retrieve db VersionKey >>= \case
@@ -350,9 +411,12 @@ getMempoolBefore time n = do
     entry (MemTimeKey t h, ()) = Just (t, h)
     entry (MemTimeKeyS, ()) = Nothing
 
+-- | Set the version of a new database.
 setInitRocksDB :: DB -> IO ()
 setInitRocksDB db = insert db VersionKey dataVersion
 
+-- | Stream the transactions of an address, newest first, from a starting point.
+-- If the start is a transaction that is not found, nothing is streamed.
 addressConduit ::
   (MonadIO m) =>
   Address ->
@@ -395,6 +459,8 @@ addressConduit a s it = do
                       .| (dropWhileC (cond . fst) >> mapC id)
           Nothing -> return ()
 
+-- | Stream the unspent outputs of an address, newest first, from a starting
+-- point. If the start is a transaction that is not found, nothing is streamed.
 unspentConduit ::
   (MonadIO m) =>
   Network ->
@@ -432,6 +498,7 @@ unspentConduit net ctx a s it =
                       .| (dropWhileC (cond . fst) >> mapC id)
           Nothing -> return ()
 
+-- | Run an action with an iterator on a column family, counting it in the metrics.
 withIterCFStat ::
   (MonadUnliftIO m) =>
   DB ->
@@ -486,6 +553,8 @@ retrieveManyCF ::
 retrieveManyCF db cf keys =
   map (fmap (either error id . decode)) <$> multiGetCF db cf (map encode keys)
 
+-- | Merge streams sorted newest first, drop duplicates, and apply the offset and
+-- limit.
 joinConduits ::
   (Monad m, Ord o) =>
   [ConduitT () o m ()] ->

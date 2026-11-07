@@ -111,7 +111,79 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 - Add `?pretty=true` for indented JSON.
 - Send `Accept: application/octet-stream` for the binary encoding, which
   the Haskell client in `haskoin-store-data` decodes.
-- Lists are paged with `limit` and `offset`.
+- Lists are paged with `limit` and `offset`, newest first. `start` begins
+  a page at a transaction hash, a block height or a Unix time instead.
+- Errors come back as JSON with an HTTP status: 400 for bad input, 404 for
+  unknown things, 409 when a short transaction number is ambiguous, 413 for
+  requests that ask for too much.
+
+### Endpoints at a glance
+
+| Area | Endpoints |
+| --- | --- |
+| Blocks | `/block/best`, `/block/latest`, `/block/:hash`, `/blocks`, `/block/height/:h`, `/block/heights`, `/block/time/:t`, `/block/mtp/:t`, each with a `/raw` variant where it makes sense |
+| Transactions | `/transaction/:txid`, `/transactions`, `/transactions/block/:hash`, `/transaction/:txid/after/:height`, `POST /transactions`, `/raw` variants |
+| Mempool | `/mempool` |
+| Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
+| Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=normal\|compat\|segwit` picks the address type |
+| Network | `/peers`, `/health` (503 when unhealthy), `/dbstats` |
+| Events | `/events`, as JSON lines over HTTP or as a WebSocket |
+| Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |
+
+Turn off the xpub endpoints with `--no-xpub` and the Blockchain.info ones
+with `--no-blockchain-info`.
+
+## How it works
+
+```
+peers ──► haskoin-node ──► block store ──► RocksDB ──► web server ──► clients
+                │               │             ▲
+                └─ headers      └─ events ──► cache writer ──► Redis
+```
+
+- **haskoin-node** keeps a pool of peers and syncs block headers.
+- The **block store** (`Haskoin.Store.BlockStore`) downloads blocks from one
+  peer at a time and mempool transactions from all of them, and imports them
+  with the rules in `Haskoin.Store.Logic`. Each import is one atomic RocksDB
+  batch, so a crash never leaves a half-written block.
+- Reorganisations are handled by reverting blocks until the best block is
+  back on the main chain of headers.
+- The **cache writer** (`Haskoin.Store.Cache`) copies xpubs with many used
+  addresses to Redis and keeps them current as blocks and transactions
+  arrive. Without Redis, xpub queries read RocksDB directly.
+- The **web server** (`Haskoin.Store.Web`) answers from RocksDB, through the
+  cache when there is one.
+
+The database layout is described in `Haskoin.Store.Database.Types`.
+
+## Using it from Haskell
+
+Query a running server with `haskoin-store-data`:
+
+```haskell
+import Control.Monad.Except (runExceptT)
+import Data.Default (def)
+import Haskoin (btc, textToAddr, withContext)
+import Haskoin.Store.WebClient
+
+main :: IO ()
+main = withContext $ \ctx -> do
+  let cfg = def {net = btc} -- https://api.haskoin.com/btc/...
+      Just addr = textToAddr btc "bc1q…"
+  r <- runExceptT $ apiCall ctx cfg (GetAddrBalance addr)
+  print r
+```
+
+The client appends the network name to `host`, as in the layout of
+api.haskoin.com. To reach your own server, put it behind a proxy that maps
+`/btc/` (or the name of your network) to it.
+
+Or embed the indexer in your own program with `haskoin-store`: `withStore`
+starts the node, the block store and the cache from a `StoreConfig`, and
+`withDB store.db` runs queries such as `getBalance` or `xPubTxs` against
+it. Subscribe to `Store.pub` to receive `StoreEvent`s.
+
+Every module has Haddock documentation; build it with `stack haddock`.
 
 ## Packages
 

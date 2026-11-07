@@ -14,6 +14,25 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
+-- |
+-- Module      : Haskoin.Store.Web
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- REST API server of Haskoin Store, built with Scotty.
+--
+-- 'runWeb' serves the endpoints described in "Haskoin.Store.WebCommon" and a
+-- set of endpoints compatible with the Blockchain.info API under
+-- @\/blockchain\/@. Responses are JSON by default, pretty-printed with
+-- @?pretty=true@, or binary if the request has the header
+-- @Accept: application\/octet-stream@. New blocks and mempool transactions are
+-- streamed at @\/events@, as lines of JSON or over a WebSocket.
+--
+-- Limits on the size of responses are set with 'WebLimits'. Errors are
+-- returned as JSON with an HTTP status that depends on the 'Except'.
 module Haskoin.Store.Web
   ( -- * Web
     WebConfig (..),
@@ -222,22 +241,37 @@ import UnliftIO
 import UnliftIO.Concurrent (threadDelay)
 import Web.Scotty.Trans qualified as S
 
+-- | Scotty application with access to the web state.
 type ScottyT m = S.ScottyT (ReaderT WebState m)
 
+-- | Scotty request handler with access to the web state.
 type ActionT m = S.ActionT (ReaderT WebState m)
 
+-- | Limits of the API. A value of @0@ means no limit.
 data WebLimits = WebLimits
-  { maxItemCount :: !Word32,
+  { -- | maximum number of items in a list response
+    maxItemCount :: !Word32,
+    -- | maximum number of full transactions in a list response
     maxFullItemCount :: !Word32,
+    -- | maximum offset of a paged query
     maxOffset :: !Word32,
+    -- | number of items in a list response when no limit is given
     defItemCount :: !Word32,
+    -- | consecutive unused addresses after which xpub derivation stops
     xpubGap :: !Word32,
+    -- | unused addresses to look at for an xpub with no transactions
     xpubGapInit :: !Word32,
+    -- | seconds without a new transaction before the store is reported
+    -- unhealthy
     txTimeout :: !Word64,
+    -- | seconds without a new block before the store is reported unhealthy
     blockTimeout :: !Word64
   }
   deriving (Eq, Show)
 
+-- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
+-- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes and
+-- block timeout of four hours.
 instance Default WebLimits where
   def =
     WebLimits
@@ -251,34 +285,63 @@ instance Default WebLimits where
         blockTimeout = 4 * 3600
       }
 
+-- | Configuration of the web server.
 data WebConfig = WebConfig
-  { host :: !String,
+  { -- | address to listen on, such as @*@ for all
+    host :: !String,
+    -- | port to listen on
     port :: !Int,
+    -- | running store to serve
     store :: !Store,
+    -- | blocks that the database may lag behind the headers before the store
+    -- is reported unhealthy
     maxLaggingBlocks :: !Int,
+    -- | transactions that may be waiting to be imported before the store is
+    -- reported unhealthy
     maxPendingTxs :: !Int,
+    -- | fewest peers before the store is reported unhealthy
     minPeers :: !Int,
+    -- | limits of the API
     limits :: !WebLimits,
+    -- | version reported by the health check
     version :: !String,
+    -- | the mempool is not indexed, so do not report it in health checks
     noMempool :: !Bool,
+    -- | StatsD client, if metrics are enabled
     stats :: !(Maybe Stats),
+    -- | microseconds between updates of the price ticker
     tickerRefresh :: !Int,
+    -- | URL of the price ticker service
     tickerURL :: !String,
+    -- | URL of the historical price service
     priceHistoryURL :: !String,
+    -- | disable the xpub endpoints
     noXPub :: !Bool,
+    -- | disable the Blockchain.info compatible endpoints
     noBlockchainInfo :: !Bool,
+    -- | seconds between health checks
     healthCheckInterval :: !Int,
+    -- | log messages here
     logger :: !Logger
   }
 
+-- | State shared by all request handlers.
 data WebState = WebState
-  { config :: !WebConfig,
+  { -- | configuration
+    config :: !WebConfig,
+    -- | latest prices by currency code
     ticker :: !(TVar (HashMap Text BinfoTicker)),
+    -- | StatsD metrics, if enabled
     metrics :: !(Maybe WebMetrics),
+    -- | HTTP session for price requests
     session :: !Wreq.Session,
+    -- | result of the latest health check
     health :: !(TVar HealthCheck)
   }
 
+-- | StatsD metrics of the web server: a timing for each kind of request,
+-- under @web.\<name\>@, error counters and a gauge of connected event
+-- clients.
 data WebMetrics = WebMetrics
   { -- Addresses
     addressTx :: !StatTiming,
@@ -341,6 +404,7 @@ data WebMetrics = WebMetrics
     events :: !StatGauge
   }
 
+-- | Register the web server metrics with a StatsD client.
 createMetrics :: (MonadIO m) => Stats -> m WebMetrics
 createMetrics s = liftIO $ do
   -- Addresses
@@ -415,9 +479,11 @@ createMetrics s = liftIO $ do
     g x = newStatGauge s ("web." <> x) 0
     c x = newStatCounter s ("web." <> x) 10
 
+-- | Increase a gauge while an action runs.
 withGaugeIO :: (MonadUnliftIO m) => StatGauge -> m a -> m a
 withGaugeIO g = bracket_ (incrementGauge g 1) (decrementGauge g 1)
 
+-- | Increase a gauge of the web metrics while a handler runs.
 withGaugeIncrease ::
   (MonadUnliftIO m) =>
   (WebMetrics -> StatGauge) ->
@@ -430,6 +496,7 @@ withGaugeIncrease gf go =
       s <- liftWith $ \run -> withGaugeIO (gf m) (run go)
       restoreT $ return s
 
+-- | Record how long a handler takes in a timing of the web metrics.
 withMetrics ::
   (MonadUnliftIO m) => (WebMetrics -> StatTiming) -> ActionT m a -> ActionT m a
 withMetrics df go =
@@ -445,7 +512,14 @@ withMetrics df go =
       let ms = t2 - t1
       liftIO $ addTiming (df m) ms
 
-data SerialAs = SerialAsBinary | SerialAsJSON | SerialAsPrettyJSON
+-- | Encoding of a response.
+data SerialAs
+  = -- | binary, for @Accept: application\/octet-stream@
+    SerialAsBinary
+  | -- | compact JSON
+    SerialAsJSON
+  | -- | indented JSON, for @?pretty=true@
+    SerialAsPrettyJSON
   deriving (Eq, Show)
 
 instance
@@ -514,6 +588,9 @@ instance (MonadUnliftIO m) => StoreReadExtra (ActionT m) where
 -- Path Handlers --
 -------------------
 
+-- | Run the web server forever. Also starts a thread that updates prices, unless
+-- the Blockchain.info endpoints are disabled, and a thread that runs health
+-- checks.
 runWeb :: (MonadUnliftIO m) => WebConfig -> m ()
 runWeb config = do
   ticker <- newTVarIO HashMap.empty
@@ -545,6 +622,7 @@ runWeb config = do
     opts = S.defaultOptions {S.settings = settings defaultSettings}
     settings = setPort config.port . setHost (fromString config.host)
 
+-- | Historical prices of the coin of the network in a currency at several times. Returns an empty list on failure.
 getRates ::
   (MonadUnliftIO m) =>
   Logger ->
@@ -571,6 +649,7 @@ getRates logger net session url currency times = do
         & Wreq.param "base" .~ [T.toUpper $ T.pack net.name]
     opts = base & Wreq.param "quote" .~ [currency]
 
+-- | Update the prices of the coin of the network periodically, for BTC and BCH only.
 price ::
   (MonadUnliftIO m) =>
   Logger ->
@@ -596,6 +675,7 @@ price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
           | net == bch = Just "bch"
           | otherwise = Nothing
 
+-- | Respond with an error and stop handling the request.
 raise :: (MonadIO m) => Except -> ActionT m a
 raise e = do
   askl (.metrics) >>= mapM_ \m -> do
@@ -610,6 +690,7 @@ raise e = do
   S.json e
   S.finish
 
+-- | HTTP status of an error.
 errStatus :: Except -> Status
 errStatus ThingNotFound = status404
 errStatus BadRequest = status400
@@ -620,6 +701,7 @@ errStatus TxIndexConflict {} = status409
 errStatus ServerTimeout = status500
 errStatus RequestTooLarge = status413
 
+-- | Register the handlers of every endpoint, except those disabled in the configuration.
 handlePaths ::
   (MonadUnliftIO m) =>
   WebConfig ->
@@ -857,6 +939,7 @@ handlePaths cfg = do
     json_list f = toJSONList . map f
     net = cfg.store.net
 
+-- | Register a handler for an API resource, with compact JSON by default.
 pathCompact ::
   (ApiResource a b, MonadUnliftIO m) =>
   ActionT m a ->
@@ -867,6 +950,8 @@ pathCompact ::
 pathCompact parser action encJson encValue =
   pathCommon parser action encJson encValue False
 
+-- | Register a handler for an API resource: parse the request, run the handler,
+-- and encode the response as JSON or binary, as the client asked.
 pathCommon ::
   (ApiResource a b, MonadUnliftIO m) =>
   ActionT m a ->
@@ -887,11 +972,13 @@ pathCommon parser action encJson encValue pretty =
     toProxy = const Proxy
     proxy = toProxy parser
 
+-- | Respond with JSON.
 streamEncoding :: (MonadIO m) => Encoding -> ActionT m ()
 streamEncoding e = do
   S.setHeader "Content-Type" "application/json; charset=utf-8"
   S.raw (encodingToLazyByteString e)
 
+-- | Encode a response in binary, JSON or pretty JSON.
 protoSerial ::
   (Serial a) =>
   SerialAs ->
@@ -904,20 +991,24 @@ protoSerial SerialAsJSON f _ = encodingToLazyByteString . f
 protoSerial SerialAsPrettyJSON _ g =
   encodePretty' defConfig {confTrailingNewline = True} . g
 
+-- | Allow requests from any origin.
 setHeaders :: (MonadIO m) => S.ActionT m ()
 setHeaders = S.setHeader "Access-Control-Allow-Origin" "*"
 
+-- | Respond with JSON, pretty if the @pretty@ parameter or the default says so.
 setupJSON :: (MonadUnliftIO m) => Bool -> S.ActionT m SerialAs
 setupJSON pretty = do
   S.setHeader "Content-Type" "application/json"
   p <- param "pretty" `rescue` return pretty
   return $ if p then SerialAsPrettyJSON else SerialAsJSON
 
+-- | Respond with binary.
 setupBinary :: (MonadIO m) => S.ActionT m SerialAs
 setupBinary = do
   S.setHeader "Content-Type" "application/octet-stream"
   return SerialAsBinary
 
+-- | Choose the encoding of the response from the @Accept@ header of the request.
 setupContentType :: (MonadUnliftIO m) => Bool -> S.ActionT m SerialAs
 setupContentType pretty = do
   accept <- S.header "accept"
@@ -928,6 +1019,7 @@ setupContentType pretty = do
 
 -- GET Block / GET Blocks --
 
+-- | Handler for @GET \/block\/:block@: a block by hash.
 scottyBlock ::
   (MonadUnliftIO m) => GetBlock -> ActionT m BlockData
 scottyBlock (GetBlock h (NoTx noTx)) = withMetrics (.block) $ do
@@ -937,6 +1029,7 @@ scottyBlock (GetBlock h (NoTx noTx)) = withMetrics (.block) $ do
     Just b -> do
       return $ pruneTx noTx b
 
+-- | Blocks by hash, without duplicates, leaving out unknown ones.
 getBlocks ::
   (MonadUnliftIO m) =>
   [H.BlockHash] ->
@@ -945,18 +1038,21 @@ getBlocks ::
 getBlocks hs notx =
   (pruneTx notx <$>) . catMaybes <$> mapM getBlock (nub hs)
 
+-- | Handler for @GET \/blocks?blocks=…@: several blocks by hash.
 scottyBlocks ::
   (MonadUnliftIO m) => GetBlocks -> ActionT m [BlockData]
 scottyBlocks (GetBlocks hs (NoTx notx)) =
   withMetrics (.block) $
     getBlocks hs notx
 
+-- | Keep only the coinbase in the list of transactions of a block, if the flag is 'True'.
 pruneTx :: Bool -> BlockData -> BlockData
 pruneTx False b = b
 pruneTx True BlockData {..} = BlockData {txs = take 1 txs, ..}
 
 -- GET BlockRaw --
 
+-- | Handler for @GET \/block\/:block\/raw@: a block by hash, serialized as in the peer-to-peer protocol.
 scottyBlockRaw ::
   (MonadUnliftIO m) =>
   GetBlockRaw ->
@@ -965,6 +1061,7 @@ scottyBlockRaw (GetBlockRaw h) =
   withMetrics (.blockRaw) $
     RawResult <$> getRawBlock h
 
+-- | Block by hash with all its transactions. Responds with an error if not found.
 getRawBlock ::
   (MonadUnliftIO m) =>
   H.BlockHash ->
@@ -972,6 +1069,7 @@ getRawBlock ::
 getRawBlock h =
   getBlock h >>= maybe (raise ThingNotFound) return >>= lift . toRawBlock
 
+-- | Rebuild a block from its data and its transactions.
 toRawBlock :: (StoreReadBase m) => BlockData -> m H.Block
 toRawBlock b = do
   txs <- map transactionData . catMaybes <$> getTransactions b.txs
@@ -979,6 +1077,7 @@ toRawBlock b = do
 
 -- GET BlockBest / BlockBestRaw --
 
+-- | Handler for @GET \/block\/best@: the best block.
 scottyBlockBest ::
   (MonadUnliftIO m) => GetBlockBest -> ActionT m BlockData
 scottyBlockBest (GetBlockBest (NoTx notx)) =
@@ -986,6 +1085,7 @@ scottyBlockBest (GetBlockBest (NoTx notx)) =
     maybe (raise ThingNotFound) (return . pruneTx notx) <=< runMaybeT $
       MaybeT getBestBlock >>= MaybeT . getBlock
 
+-- | Handler for @GET \/block\/best\/raw@: the best block, serialized.
 scottyBlockBestRaw ::
   (MonadUnliftIO m) =>
   GetBlockBestRaw ->
@@ -997,6 +1097,7 @@ scottyBlockBestRaw _ =
 
 -- GET BlockLatest --
 
+-- | Handler for @GET \/block\/latest@: the best block and its ancestors, up to 100 blocks.
 scottyBlockLatest ::
   (MonadUnliftIO m) =>
   GetBlockLatest ->
@@ -1013,6 +1114,7 @@ scottyBlockLatest (GetBlockLatest (NoTx noTx)) =
 
 -- GET BlockHeight / BlockHeights / BlockHeightRaw --
 
+-- | Handler for @GET \/block\/height\/:height@: the blocks at a height.
 scottyBlockHeight ::
   (MonadUnliftIO m) => GetBlockHeight -> ActionT m [BlockData]
 scottyBlockHeight (GetBlockHeight h (NoTx notx)) =
@@ -1020,6 +1122,7 @@ scottyBlockHeight (GetBlockHeight h (NoTx notx)) =
     getBlocksAtHeight (fromIntegral h)
       >>= (`getBlocks` notx)
 
+-- | Handler for @GET \/block\/heights?heights=…@: the blocks at several heights.
 scottyBlockHeights ::
   (MonadUnliftIO m) =>
   GetBlockHeights ->
@@ -1029,6 +1132,7 @@ scottyBlockHeights (GetBlockHeights (HeightsParam heights) (NoTx notx)) =
     mapM (getBlocksAtHeight . fromIntegral) heights
       >>= (`getBlocks` notx) . concat
 
+-- | Handler for @GET \/block\/height\/:height\/raw@: the blocks at a height, serialized.
 scottyBlockHeightRaw ::
   (MonadUnliftIO m) =>
   GetBlockHeightRaw ->
@@ -1040,6 +1144,7 @@ scottyBlockHeightRaw (GetBlockHeightRaw h) =
 
 -- GET BlockTime / BlockTimeRaw --
 
+-- | Handler for @GET \/block\/time\/:time@: the last block with a timestamp at or before a time.
 scottyBlockTime ::
   (MonadUnliftIO m) =>
   GetBlockTime ->
@@ -1051,6 +1156,7 @@ scottyBlockTime (GetBlockTime (TimeParam t) (NoTx notx)) =
       Nothing -> raise ThingNotFound
       Just b -> return $ pruneTx notx b
 
+-- | Handler for @GET \/block\/mtp\/:time@: the first block with a median time past at or after a time.
 scottyBlockMTP ::
   (MonadUnliftIO m) =>
   GetBlockMTP ->
@@ -1062,6 +1168,7 @@ scottyBlockMTP (GetBlockMTP (TimeParam t) (NoTx notx)) =
       Nothing -> raise ThingNotFound
       Just b -> return $ pruneTx notx b
 
+-- | Handler for @GET \/block\/time\/:time\/raw@: the last block with a timestamp at or before a time, serialized.
 scottyBlockTimeRaw ::
   (MonadUnliftIO m) =>
   GetBlockTimeRaw ->
@@ -1073,6 +1180,7 @@ scottyBlockTimeRaw (GetBlockTimeRaw (TimeParam t)) =
       Nothing -> raise ThingNotFound
       Just b -> RawResult <$> lift (toRawBlock b)
 
+-- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time past at or after a time, serialized.
 scottyBlockMTPRaw ::
   (MonadUnliftIO m) =>
   GetBlockMTPRaw ->
@@ -1086,17 +1194,20 @@ scottyBlockMTPRaw (GetBlockMTPRaw (TimeParam t)) =
 
 -- GET Transactions --
 
+-- | Handler for @GET \/transaction\/:txid@: a transaction.
 scottyTx :: (MonadUnliftIO m) => GetTx -> ActionT m Transaction
 scottyTx (GetTx txid) =
   withMetrics (.tx) $
     getTransaction txid >>= maybe (raise ThingNotFound) return
 
+-- | Handler for @GET \/transactions?txids=…@: several transactions.
 scottyTxs ::
   (MonadUnliftIO m) => GetTxs -> ActionT m [Transaction]
 scottyTxs (GetTxs txids) =
   withMetrics (.tx) $
     catMaybes <$> getTransactions (nub txids)
 
+-- | Handler for @GET \/transaction\/:txid\/raw@: a transaction, serialized.
 scottyTxRaw ::
   (MonadUnliftIO m) => GetTxRaw -> ActionT m (RawResult Tx)
 scottyTxRaw (GetTxRaw txid) =
@@ -1106,6 +1217,7 @@ scottyTxRaw (GetTxRaw txid) =
         Nothing -> raise ThingNotFound
         Just tx -> return $ RawResult (transactionData tx)
 
+-- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized.
 scottyTxsRaw ::
   (MonadUnliftIO m) =>
   GetTxsRaw ->
@@ -1115,6 +1227,7 @@ scottyTxsRaw (GetTxsRaw txids) =
     RawResultList . map transactionData . catMaybes
       <$> getTransactions (nub txids)
 
+-- | Transactions of a block. Responds with an error if not found.
 getTxsBlock ::
   (MonadUnliftIO m) =>
   H.BlockHash ->
@@ -1124,6 +1237,7 @@ getTxsBlock h =
     Nothing -> raise ThingNotFound
     Just b -> catMaybes <$> getTransactions b.txs
 
+-- | Handler for @GET \/transactions\/block\/:block@: the transactions of a block.
 scottyTxsBlock ::
   (MonadUnliftIO m) =>
   GetTxsBlock ->
@@ -1131,6 +1245,7 @@ scottyTxsBlock ::
 scottyTxsBlock (GetTxsBlock h) =
   withMetrics (.txBlock) $ getTxsBlock h
 
+-- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized.
 scottyTxsBlockRaw ::
   (MonadUnliftIO m) =>
   GetTxsBlockRaw ->
@@ -1141,6 +1256,7 @@ scottyTxsBlockRaw (GetTxsBlockRaw h) =
 
 -- GET TransactionAfterHeight --
 
+-- | Handler for @GET \/transaction\/:txid\/after\/:height@: whether any ancestor of a transaction is a coinbase confirmed after a height.
 scottyTxAfter ::
   (MonadUnliftIO m) =>
   GetTxAfter ->
@@ -1189,6 +1305,7 @@ cbAfterHeight height txid =
 
 -- POST Transaction --
 
+-- | Handler for @POST \/transactions@: broadcast a transaction to half of the peers and return its hash.
 scottyPostTx :: (MonadUnliftIO m) => PostTx -> ActionT m TxId
 scottyPostTx (PostTx tx) =
   withMetrics (.txPost) $ do
@@ -1215,6 +1332,7 @@ publishTx cfg tx = do
 
 -- GET Mempool / Events --
 
+-- | Handler for @GET \/mempool@: hashes of mempool transactions, newest first.
 scottyMempool ::
   (MonadUnliftIO m) => GetMempool -> ActionT m [TxHash]
 scottyMempool (GetMempool limitM (OffsetParam o)) =
@@ -1224,6 +1342,9 @@ scottyMempool (GetMempool limitM (OffsetParam o)) =
         l = Limits (validateLimit wl' False limitM) (fromIntegral o) Nothing
     map snd <$> getMempoolPage l
 
+-- | Middleware that serves @\/events@ over a WebSocket: each new block or mempool
+-- transaction is sent as a JSON message. Clients that do not answer pings, or
+-- that fall more than 10000 events behind, are disconnected.
 webSocketEvents :: WebState -> Middleware
 webSocketEvents s =
   websocketsOr defaultConnectionOptions (wrap . events)
@@ -1267,6 +1388,7 @@ webSocketEvents s =
                   [("Content-Type", "application/json")]
               }
 
+-- | Handler for @GET \/events@: stream of new blocks and mempool transactions, one per line in JSON, until the client falls more than 10000 events behind.
 scottyEvents :: (MonadUnliftIO m) => ActionT m ()
 scottyEvents =
   withGaugeIncrease (.events) $ do
@@ -1323,18 +1445,21 @@ withEventSubscription pub f = do
 
 -- GET Address Transactions --
 
+-- | Handler for @GET \/address\/:address\/transactions@: transactions of an address.
 scottyAddrTxs ::
   (MonadUnliftIO m) => GetAddrTxs -> ActionT m [TxRef]
 scottyAddrTxs (GetAddrTxs addr pLimits) =
   withMetrics (.addressTx) $
     getAddressTxs addr =<< paramToLimits False pLimits
 
+-- | Handler for @GET \/address\/transactions?addresses=…@: transactions of several addresses.
 scottyAddrsTxs ::
   (MonadUnliftIO m) => GetAddrsTxs -> ActionT m [TxRef]
 scottyAddrsTxs (GetAddrsTxs addrs pLimits) =
   withMetrics (.addressTx) $
     getAddressesTxs addrs =<< paramToLimits False pLimits
 
+-- | Handler for @GET \/address\/:address\/transactions\/full@: full transactions of an address.
 scottyAddrTxsFull ::
   (MonadUnliftIO m) =>
   GetAddrTxsFull ->
@@ -1344,6 +1469,7 @@ scottyAddrTxsFull (GetAddrTxsFull addr pLimits) =
     txs <- getAddressTxs addr =<< paramToLimits True pLimits
     catMaybes <$> getTransactions (map (.txid) txs)
 
+-- | Handler for @GET \/address\/transactions\/full?addresses=…@: full transactions of several addresses.
 scottyAddrsTxsFull ::
   (MonadUnliftIO m) =>
   GetAddrsTxsFull ->
@@ -1353,21 +1479,25 @@ scottyAddrsTxsFull (GetAddrsTxsFull addrs pLimits) =
     txs <- getAddressesTxs addrs =<< paramToLimits True pLimits
     catMaybes <$> getTransactions (map (.txid) txs)
 
+-- | Handler for @GET \/address\/:address\/balance@: balance of an address.
 scottyAddrBalance :: (MonadUnliftIO m) => GetAddrBalance -> ActionT m Balance
 scottyAddrBalance (GetAddrBalance addr) =
   withMetrics (.addressBalance) $ getDefaultBalance addr
 
+-- | Handler for @GET \/address\/balances?addresses=…@: balances of several addresses.
 scottyAddrsBalance ::
   (MonadUnliftIO m) => GetAddrsBalance -> ActionT m [Balance]
 scottyAddrsBalance (GetAddrsBalance addrs) =
   withMetrics (.addressBalance) $ getBalances addrs
 
+-- | Handler for @GET \/address\/:address\/unspent@: unspent outputs of an address.
 scottyAddrUnspent ::
   (MonadUnliftIO m) => GetAddrUnspent -> ActionT m [Unspent]
 scottyAddrUnspent (GetAddrUnspent addr pLimits) =
   withMetrics (.addressUnspent) $
     getAddressUnspents addr =<< paramToLimits False pLimits
 
+-- | Handler for @GET \/address\/unspent?addresses=…@: unspent outputs of several addresses.
 scottyAddrsUnspent ::
   (MonadUnliftIO m) => GetAddrsUnspent -> ActionT m [Unspent]
 scottyAddrsUnspent (GetAddrsUnspent addrs pLimits) =
@@ -1376,6 +1506,7 @@ scottyAddrsUnspent (GetAddrsUnspent addrs pLimits) =
 
 -- GET XPubs --
 
+-- | Handler for @GET \/xpub\/:xpub@: summary of an extended public key.
 scottyXPub ::
   (MonadUnliftIO m) => GetXPub -> ActionT m XPubSummary
 scottyXPub (GetXPub xpub deriv (NoCache noCache)) =
@@ -1383,6 +1514,7 @@ scottyXPub (GetXPub xpub deriv (NoCache noCache)) =
     let xs = XPubSpec xpub deriv
      in xPubSummary xs <$> lift (runNoCache noCache $ xPubBals xs)
 
+-- | Handler for @DELETE \/xpub\/:xpub@: remove an extended public key from the cache. Returns 'True' if it was cached.
 scottyDelXPub ::
   (MonadUnliftIO m) =>
   DelCachedXPub ->
@@ -1393,6 +1525,7 @@ scottyDelXPub (DelCachedXPub xpub deriv) =
     n <- lift (withCache c $ cacheDelXPubs [XPubSpec xpub deriv])
     return $ GenericResult (n > 0)
 
+-- | Transactions of an extended public key, optionally without the cache.
 getXPubTxs ::
   (MonadUnliftIO m) =>
   XPubKey ->
@@ -1406,12 +1539,14 @@ getXPubTxs xpub deriv plimits nocache = do
   xbals <- xPubBals xs
   lift $ runNoCache nocache $ xPubTxs xs xbals limits
 
+-- | Handler for @GET \/xpub\/:xpub\/transactions@: transactions of an extended public key.
 scottyXPubTxs ::
   (MonadUnliftIO m) => GetXPubTxs -> ActionT m [TxRef]
 scottyXPubTxs (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
   withMetrics (.xpubTx) $
     getXPubTxs xpub deriv plimits nocache
 
+-- | Handler for @GET \/xpub\/:xpub\/transactions\/full@: full transactions of an extended public key.
 scottyXPubTxsFull ::
   (MonadUnliftIO m) =>
   GetXPubTxsFull ->
@@ -1422,6 +1557,7 @@ scottyXPubTxsFull (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
       lift . runNoCache nocache . getTransactions . map (.txid)
         =<< getXPubTxs xpub deriv plimits nocache
 
+-- | Handler for @GET \/xpub\/:xpub\/balances@: balances of the used addresses of an extended public key.
 scottyXPubBalances ::
   (MonadUnliftIO m) => GetXPubBalances -> ActionT m [XPubBal]
 scottyXPubBalances (GetXPubBalances xpub deriv (NoCache noCache)) =
@@ -1430,6 +1566,7 @@ scottyXPubBalances (GetXPubBalances xpub deriv (NoCache noCache)) =
       runNoCache noCache $
         xPubBals (XPubSpec xpub deriv)
 
+-- | Handler for @GET \/xpub\/:xpub\/unspent@: unspent outputs of an extended public key.
 scottyXPubUnspent ::
   (MonadUnliftIO m) =>
   GetXPubUnspent ->
@@ -1445,6 +1582,7 @@ scottyXPubUnspent (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
 -- Blockchain.info API Compatibility --
 ---------------------------------------
 
+-- | Currency symbol of the coin of a network, in the Blockchain.info format.
 netBinfoSymbol :: Network -> BinfoSymbol
 netBinfoSymbol net
   | net == btc =
@@ -1475,6 +1613,7 @@ netBinfoSymbol net
           local = False
         }
 
+-- | Currency symbol of a fiat currency from its price ticker.
 binfoTickerToSymbol :: Text -> BinfoTicker -> BinfoSymbol
 binfoTickerToSymbol code t =
   BinfoSymbol
@@ -1492,6 +1631,7 @@ binfoTickerToSymbol code t =
       "GBP" -> "British pound"
       x -> x
 
+-- | Addresses and xpubs in a request parameter, separated by pipes or commas.
 getBinfoAddrsParam ::
   (MonadUnliftIO m) =>
   Text ->
@@ -1506,6 +1646,9 @@ getBinfoAddrsParam name = do
       Nothing -> raise (UserError "invalid address")
       Just xs -> return $ HashSet.fromList xs
 
+-- | Xpubs and addresses in the @active@, @activeP2SH@ and @activeBech32@
+-- parameters. Xpubs in each parameter derive legacy, nested SegWit and native
+-- SegWit addresses.
 getBinfoActive ::
   (MonadUnliftIO m) =>
   ActionT m (HashSet XPubSpec, HashSet Address)
@@ -1529,13 +1672,16 @@ getBinfoActive = do
     xpub (BinfoXpub x) = Just x
     xpub (BinfoAddr _) = Nothing
 
+-- | Whether to identify transactions by short number, unless @txidindex@ is false.
 getNumTxId :: (MonadUnliftIO m) => ActionT m Bool
 getNumTxId = fmap not $ param "txidindex" `rescue` return False
 
+-- | Height of the best header.
 getChainHeight :: (MonadUnliftIO m) => ActionT m H.BlockHeight
 getChainHeight =
   fmap (.height) $ liftIO . chainGetBest =<< askl (.config.store.chain)
 
+-- | Handler for @GET\/POST \/blockchain\/unspent@: unspent outputs of addresses and xpubs, as Blockchain.info.
 scottyBinfoUnspent :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoUnspent =
   withMetrics (.binfoUnspent) $ do
@@ -1558,6 +1704,8 @@ scottyBinfoUnspent =
     get_limit = fmap (min 1000) $ param "limit" `rescue` return 250
     get_min_conf = param "confirmations" `rescue` return 0
 
+-- | Stream the unspent outputs of xpubs and addresses, newest first, in the
+-- Blockchain.info format.
 getBinfoUnspents ::
   (StoreReadExtra m, MonadIO m) =>
   Bool ->
@@ -1601,6 +1749,7 @@ getBinfoUnspents numtxid height xbals xspecs addrs = do
           g a = streamThings (h a) Nothing l .| mapC f
        in map g (HashSet.toList addrs)
 
+-- | Balances of the used addresses of each xpub.
 getXBals ::
   (StoreReadExtra m) =>
   HashSet XPubSpec ->
@@ -1610,9 +1759,13 @@ getXBals =
   where
     f x = (x,) . filter (not . nullBalance . (.balance)) <$> xPubBals x
 
+-- | Balances of an xpub, or none if missing.
 xBals :: XPubSpec -> HashMap XPubSpec [XPubBal] -> [XPubBal]
 xBals = HashMap.findWithDefault []
 
+-- | Stream the transactions of xpubs and addresses, newest first, in the
+-- Blockchain.info format, with the running balance of the given addresses after
+-- each, keeping only those that pass the filter.
 getBinfoTxs ::
   (StoreReadExtra m, MonadIO m) =>
   HashMap XPubSpec [XPubBal] -> -- xpub balances
@@ -1696,9 +1849,11 @@ getBinfoTxs
                     | c -> return ()
                     | otherwise -> yield a >> go b'
 
+-- | Whether to show addresses in CashAddr format (@cashaddr@).
 getCashAddr :: (MonadUnliftIO m) => ActionT m Bool
 getCashAddr = param "cashaddr" `rescue` return False
 
+-- | Parse an address. Responds with not found if invalid.
 getAddress :: (MonadUnliftIO m) => Text -> ActionT m Address
 getAddress txt = do
   net <- askl (.config.store.net)
@@ -1706,6 +1861,7 @@ getAddress txt = do
     Nothing -> raise ThingNotFound
     Just a -> return a
 
+-- | Address or xpub in a path parameter. Passes to the next route if invalid.
 getBinfoAddr :: (MonadUnliftIO m) => Text -> ActionT m BinfoAddr
 getBinfoAddr param' = do
   txt <- S.captureParam param'
@@ -1715,6 +1871,7 @@ getBinfoAddr param' = do
       xpub = BinfoXpub <$> xPubImport net ctx txt
   maybe S.next return (addr <|> xpub)
 
+-- | Handler for @GET\/POST \/blockchain\/export-history@: daily history of the balance of addresses and xpubs with prices, as Blockchain.info.
 scottyBinfoHistory :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHistory =
   withMetrics (.binfoExportHistory) $ do
@@ -1792,6 +1949,7 @@ scottyBinfoHistory =
     xpub_c endM x bs =
       streamThings (xPubTxs x bs) (Just (.txid)) (lim endM)
 
+-- | Currency code in the @currency@ parameter, USD by default, and its latest price.
 getPrice :: (MonadUnliftIO m) => ActionT m (Text, BinfoTicker)
 getPrice = do
   code <- T.toUpper <$> param "currency" `rescue` return "USD"
@@ -1801,9 +1959,11 @@ getPrice = do
     Nothing -> return (code, def)
     Just p -> return (code, p)
 
+-- | Symbol of the currency in the @currency@ parameter.
 getSymbol :: (MonadUnliftIO m) => ActionT m BinfoSymbol
 getSymbol = uncurry binfoTickerToSymbol <$> getPrice
 
+-- | Handler for @GET \/blockchain\/blocks\/:milliseconds@: the blocks of the day before a time in milliseconds, as Blockchain.info.
 scottyBinfoBlocksDay :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoBlocksDay =
   withMetrics (.binfoBlock) $ do
@@ -1823,6 +1983,7 @@ scottyBinfoBlocksDay =
           b' <- getBlock b.header.prev
           (b :) <$> go t b'
 
+-- | Handler for @GET\/POST \/blockchain\/multiaddr@: balances and transactions of addresses and xpubs, as Blockchain.info.
 scottyMultiAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyMultiAddr =
   withMetrics (.binfoMultiaddr) $ do
@@ -1983,6 +2144,7 @@ scottyMultiAddr =
       let f = map (.balance.address)
        in HashSet.fromList . concatMap f . HashMap.elems
 
+-- | Number of items requested in a parameter, within the limits.
 getBinfoCount :: (MonadUnliftIO m) => Text -> ActionT m Int
 getBinfoCount str = do
   d <- askl (.config.limits.defItemCount)
@@ -1990,6 +2152,7 @@ getBinfoCount str = do
   i <- min x <$> (param str `rescue` return d)
   return (fromIntegral i :: Int)
 
+-- | Offset requested in the @offset@ parameter. Responds with an error if above the maximum.
 getBinfoOffset ::
   (MonadUnliftIO m) =>
   ActionT m Int
@@ -2002,6 +2165,7 @@ getBinfoOffset = do
         "offset exceeded: " <> show o <> " > " <> show x
   return (fromIntegral o :: Int)
 
+-- | Handler for @GET \/blockchain\/rawaddr\/:addr@: balance and transactions of an address or xpub, as Blockchain.info; also at @\/blockchain\/address\/:addr@ and @\/blockchain\/xpub\/:addr@.
 scottyRawAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyRawAddr =
   withMetrics (.binfoAddressRaw) $
@@ -2097,6 +2261,7 @@ scottyRawAddr =
       ctx <- askl (.config.store.ctx)
       streamEncoding $ marshalEncoding (net, ctx) ra
 
+-- | Handler for @GET \/blockchain\/q\/getreceivedbyaddress\/:addr@: total received by an address.
 scottyBinfoReceived :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoReceived =
   withMetrics (.binfoQgetreceivedbyaddress) $ do
@@ -2105,6 +2270,7 @@ scottyBinfoReceived =
     setHeaders
     S.text $ cs $ show b.received
 
+-- | Handler for @GET \/blockchain\/q\/getsentbyaddress\/:addr@: total sent by an address.
 scottyBinfoSent :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoSent =
   withMetrics (.binfoQgetsentbyaddress) $ do
@@ -2113,6 +2279,7 @@ scottyBinfoSent =
     setHeaders
     S.text $ cs $ show $ b.received - b.confirmed - b.unconfirmed
 
+-- | Handler for @GET \/blockchain\/q\/addressbalance\/:addr@: balance of an address.
 scottyBinfoAddrBalance :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoAddrBalance =
   withMetrics (.binfoQaddressbalance) $ do
@@ -2121,6 +2288,7 @@ scottyBinfoAddrBalance =
     setHeaders
     S.text $ cs $ show $ b.confirmed + b.unconfirmed
 
+-- | Handler for @GET \/blockchain\/q\/addressfirstseen\/:addr@: time of the first block with a transaction of an address.
 scottyFirstSeen :: (MonadUnliftIO m) => ActionT m ()
 scottyFirstSeen =
   withMetrics (.binfoQaddressfirstseen) $ do
@@ -2160,6 +2328,7 @@ scottyFirstSeen =
       let l = Limits 1 0 (Just (AtBlock h))
       not . null <$> getAddressTxs a l
 
+-- | Handler for @GET\/POST \/blockchain\/balance@: short balances of addresses and xpubs, as Blockchain.info.
 scottyShortBal :: (MonadUnliftIO m) => ActionT m ()
 scottyShortBal =
   withMetrics (.binfoBalance) $ do
@@ -2204,9 +2373,11 @@ scottyShortBal =
       ctx <- askl (.config.store.ctx)
       return (xPubExport net ctx xpub.key, sbl)
 
+-- | Whether to respond with hex (@format=hex@).
 getBinfoHex :: (MonadUnliftIO m) => ActionT m Bool
 getBinfoHex = (== ("hex" :: Text)) <$> param "format" `rescue` return "json"
 
+-- | Handler for @GET \/blockchain\/block-height\/:height@: the blocks at a height, as Blockchain.info.
 scottyBinfoBlockHeight :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoBlockHeight =
   withMetrics (.binfoBlockHeight) $ do
@@ -2227,6 +2398,7 @@ scottyBinfoBlockHeight =
           bts = map (toBinfoTxSimple numtxid) txs
       return $ toBinfoBlock b bts nbs
 
+-- | Handler for @GET \/blockchain\/latestblock@: the best block, as Blockchain.info.
 scottyBinfoLatest :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoLatest =
   withMetrics (.binfoBlockLatest) $ do
@@ -2243,6 +2415,7 @@ scottyBinfoLatest =
             txids = map (encodeBinfoTxId numtxid) b.txs
           }
 
+-- | Handler for @GET \/blockchain\/rawblock\/:block@: a block with its transactions, as Blockchain.info.
 scottyBinfoBlock :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoBlock =
   withMetrics (.binfoBlockRaw) $ do
@@ -2274,6 +2447,7 @@ scottyBinfoBlock =
           ctx <- askl (.config.store.ctx)
           streamEncoding $ marshalEncoding (net, ctx) y
 
+-- | Transaction by hash or short number. Fails with 'TxIndexConflict' if a short number matches several.
 getBinfoTx ::
   (MonadUnliftIO m) =>
   BinfoTxId ->
@@ -2289,6 +2463,7 @@ getBinfoTx txid = do
       let tids = map (txHash . transactionData) ts
        in return $ Left (TxIndexConflict tids)
 
+-- | Handler for @GET \/blockchain\/rawtx\/:txid@: a transaction, as Blockchain.info.
 scottyBinfoTx :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTx =
   withMetrics (.binfoTxRaw) $ do
@@ -2310,6 +2485,7 @@ scottyBinfoTx =
       setHeaders
       S.text . encodeHexLazy . runPutL . serialize $ transactionData t
 
+-- | Handler for @GET \/blockchain\/q\/txtotalbtcoutput\/:txid@: total value of the outputs of a transaction.
 scottyBinfoTotalOut :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTotalOut =
   withMetrics (.binfoQtxtotalbtcoutput) $ do
@@ -2320,6 +2496,7 @@ scottyBinfoTotalOut =
         Left e -> raise e
     S.text $ cs $ show $ sum $ map (.value) tx.outputs
 
+-- | Handler for @GET \/blockchain\/q\/txfee\/:txid@: fee of a transaction.
 scottyBinfoTxFees :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTxFees =
   withMetrics (.binfoQtxfee) $ do
@@ -2335,6 +2512,7 @@ scottyBinfoTxFees =
     f StoreInput {} = True
     f StoreCoinbase {} = False
 
+-- | Handler for @GET \/blockchain\/q\/txresult\/:txid\/:addr@: net amount that a transaction sends to an address.
 scottyBinfoTxResult :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTxResult =
   withMetrics (.binfoQtxresult) $ do
@@ -2353,6 +2531,7 @@ scottyBinfoTxResult =
     g addr StoreOutput {address = Just a} = a == addr
     g _ _ = False
 
+-- | Handler for @GET \/blockchain\/q\/txtotalbtcinput\/:txid@: total value of the inputs of a transaction.
 scottyBinfoTotalInput :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoTotalInput =
   withMetrics (.binfoQtxtotalbtcinput) $ do
@@ -2366,6 +2545,7 @@ scottyBinfoTotalInput =
     f StoreInput {} = True
     f StoreCoinbase {} = False
 
+-- | Handler for @GET \/blockchain\/unconfirmed-transactions@: mempool transactions, as Blockchain.info.
 scottyBinfoMempool :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoMempool =
   withMetrics (.binfoMempool) $ do
@@ -2386,6 +2566,7 @@ scottyBinfoMempool =
     ctx <- askl (.config.store.ctx)
     streamEncoding $ marshalEncoding (net, ctx) mem
 
+-- | Handler for @GET \/blockchain\/q\/getblockcount@: height of the best header.
 scottyBinfoGetBlockCount :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoGetBlockCount =
   withMetrics (.binfoQgetblockcount) $ do
@@ -2394,6 +2575,7 @@ scottyBinfoGetBlockCount =
     setHeaders
     S.text $ TL.pack $ show bn.height
 
+-- | Handler for @GET \/blockchain\/q\/latesthash@: hash of the best header.
 scottyBinfoLatestHash :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoLatestHash =
   withMetrics (.binfoQlatesthash) $ do
@@ -2402,6 +2584,7 @@ scottyBinfoLatestHash =
     setHeaders
     S.text $ TL.fromStrict $ H.blockHashToHex $ H.headerHash bn.header
 
+-- | Handler for @GET \/blockchain\/q\/bcperblock@: block subsidy at the next height.
 scottyBinfoSubsidy :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoSubsidy =
   withMetrics (.binfoQbcperblock) $ do
@@ -2416,6 +2599,7 @@ scottyBinfoSubsidy =
             fromIntegral $
               H.computeSubsidy net (bn.height + 1)
 
+-- | Handler for @GET \/blockchain\/q\/addresstohash\/:addr@: hash160 of an address in hex.
 scottyBinfoAddrToHash :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoAddrToHash =
   withMetrics (.binfoQaddresstohash) $ do
@@ -2429,6 +2613,7 @@ scottyBinfoAddrToHash =
       | otherwise ->
           return ()
 
+-- | Handler for @GET \/blockchain\/q\/hashtoaddress\/:hash@: pay-to-public-key-hash address of a hash160.
 scottyBinfoHashToAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHashToAddr =
   withMetrics (.binfoQhashtoaddress) $ do
@@ -2439,6 +2624,7 @@ scottyBinfoHashToAddr =
     setHeaders
     S.text $ TL.fromStrict addr
 
+-- | Handler for @GET \/blockchain\/q\/addrpubkey\/:pubkey@: address of a public key.
 scottyBinfoAddrPubkey :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoAddrPubkey =
   withMetrics (.binfoQaddrpubkey) $ do
@@ -2453,6 +2639,7 @@ scottyBinfoAddrPubkey =
       Nothing -> raise ThingNotFound
       Just a -> S.text $ TL.fromStrict a
 
+-- | Handler for @GET \/blockchain\/q\/pubkeyaddr\/:addr@: public key of an address, found in a transaction input that spends from it.
 scottyBinfoPubKeyAddr :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoPubKeyAddr =
   withMetrics (.binfoQpubkeyaddr) $ do
@@ -2497,6 +2684,7 @@ scottyBinfoPubKeyAddr =
         _ -> Left "Address does not have public key"
     extr _ _ = Left "Incorrect input type"
 
+-- | Handler for @GET \/blockchain\/q\/hashpubkey\/:pubkey@: hash160 of a public key in hex.
 scottyBinfoHashPubkey :: (MonadUnliftIO m) => ActionT m ()
 scottyBinfoHashPubkey =
   withMetrics (.binfoQhashpubkey) $ do
@@ -2519,6 +2707,7 @@ scottyBinfoHashPubkey =
 
 -- GET Network Information --
 
+-- | Handler for @GET \/peers@: connected peers.
 scottyPeers ::
   (MonadUnliftIO m) =>
   GetPeers ->
@@ -2545,6 +2734,7 @@ getPeersInformation mgr =
             relay = ver.relay
           }
 
+-- | Handler for @GET \/health@: health of the store.
 scottyHealth ::
   (MonadUnliftIO m) => GetHealth -> ActionT m HealthCheck
 scottyHealth _ =
@@ -2553,6 +2743,7 @@ scottyHealth _ =
     unless (isOK h) $ S.status status503
     return h
 
+-- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck ::
   (MonadUnliftIO m, StoreReadBase m) =>
   WebConfig ->
@@ -2570,6 +2761,7 @@ blockHealthCheck cfg = do
         max = fromIntegral cfg.maxLaggingBlocks
       }
 
+-- | Age of the best header and the maximum allowed.
 lastBlockHealthCheck ::
   (MonadUnliftIO m, StoreReadBase m) =>
   Chain ->
@@ -2584,6 +2776,7 @@ lastBlockHealthCheck ch WebLimits {blockTimeout} = do
         max = fromIntegral blockTimeout
       }
 
+-- | Age of the newest mempool transaction or best header, and the maximum allowed.
 lastTxHealthCheck ::
   (MonadUnliftIO m, StoreReadBase m) =>
   WebConfig ->
@@ -2609,6 +2802,7 @@ lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
         then limits.blockTimeout
         else limits.txTimeout
 
+-- | Transactions waiting to be imported and the maximum allowed.
 pendingTxsHealthCheck ::
   (MonadUnliftIO m, StoreReadBase m) =>
   WebConfig ->
@@ -2621,6 +2815,7 @@ pendingTxsHealthCheck cfg = do
         count = fromIntegral n
       }
 
+-- | Online peers and the minimum required.
 peerHealthCheck ::
   (MonadUnliftIO m, StoreReadBase m) =>
   WebConfig ->
@@ -2629,6 +2824,7 @@ peerHealthCheck cfg = do
   count <- fromIntegral . length <$> liftIO (getPeers cfg.store.peerMgr)
   return CountHealth {min = fromIntegral cfg.minPeers, count}
 
+-- | Run every health check.
 healthCheck ::
   (MonadUnliftIO m, StoreReadBase m) => WebConfig -> m HealthCheck
 healthCheck cfg = do
@@ -2645,6 +2841,7 @@ healthCheck cfg = do
         ..
       }
 
+-- | Handler for @GET \/dbstats@: RocksDB memory use and statistics, as text.
 scottyDbStats :: (MonadUnliftIO m) => ActionT m ()
 scottyDbStats =
   withMetrics (.db) $ do
@@ -2726,6 +2923,7 @@ decodeTxBody net body = fromHex <> fromBytes body
         Right b16 -> fromBytes (decodeBase16 b16)
         Left e -> Left (cs e)
 
+-- | Offset in the @offset@ parameter. Responds with an error if above the maximum.
 parseOffset :: (MonadUnliftIO m) => ActionT m OffsetParam
 parseOffset = do
   res@(OffsetParam o) <- paramDef
@@ -2735,6 +2933,8 @@ parseOffset = do
       "offset exceeded: " <> show o <> " > " <> show limits.maxOffset
   return res
 
+-- | Turn a start parameter into a position: a transaction, the block of a block
+-- hash, a height, or the last block at or before a time.
 parseStart ::
   (MonadUnliftIO m) =>
   Maybe StartParam ->
@@ -2759,9 +2959,11 @@ parseStart (Just s) =
       b <- MaybeT $ blockAtOrBefore ch q
       return $ AtBlock b.height
 
+-- | Limit, offset and start in the parameters of a request.
 parseLimits :: (MonadUnliftIO m) => ActionT m LimitsParam
 parseLimits = LimitsParam <$> paramOptional <*> parseOffset <*> paramOptional
 
+-- | Pagination of a query from request parameters, within the limits for full or short items.
 paramToLimits ::
   (MonadUnliftIO m) =>
   Bool ->
@@ -2771,6 +2973,7 @@ paramToLimits full (LimitsParam limitM o startM) = do
   wl <- askl (.config.limits)
   Limits (validateLimit wl full limitM) (fromIntegral o) <$> parseStart startM
 
+-- | Limit of a query: the requested one or the default, but no more than the maximum.
 validateLimit :: WebLimits -> Bool -> Maybe LimitParam -> Word32
 validateLimit wl full limitM =
   f m $ maybe d (fromIntegral . (.get)) limitM
@@ -2787,6 +2990,7 @@ validateLimit wl full limitM =
 -- Utilities --
 ---------------
 
+-- | Run a query against the database, through the cache if there is one.
 runInWebReader ::
   (MonadIO m) =>
   CacheT (DatabaseReaderT m) a ->
@@ -2796,6 +3000,7 @@ runInWebReader f = do
   mc <- asks (.config.store.cache)
   lift $ runReaderT (withCache mc f) bdb
 
+-- | Run queries without the cache if the flag is 'True'.
 runNoCache ::
   (MonadIO m) =>
   Bool ->
@@ -2805,6 +3010,7 @@ runNoCache False = id
 runNoCache True = local $ \s ->
   s {config = s.config {store = s.config.store {cache = Nothing}}}
 
+-- | Middleware that logs every request with its response status: errors at error level, others at debug level.
 logIt :: Logger -> Middleware
 logIt logger app req respond =
   app req $ \res -> do
@@ -2815,6 +3021,7 @@ logIt logger app req respond =
       else logError logger msg
     respond res
 
+-- | Describe a request for logs.
 fmtReq :: Request -> Text
 fmtReq req =
   let m = requestMethod req
@@ -2823,9 +3030,11 @@ fmtReq req =
       q = rawQueryString req
    in T.decodeUtf8 (m <> " " <> p <> q <> " " <> cs (show v))
 
+-- | Describe a response status for logs.
 fmtStatus :: Status -> Text
 fmtStatus s = cs (show (statusCode s)) <> " " <> cs (statusMessage s)
 
+-- | Run a handler, or another if the first one fails.
 rescue ::
   (MonadUnliftIO m) =>
   S.ActionT m a ->
@@ -2833,11 +3042,13 @@ rescue ::
   S.ActionT m a
 x `rescue` y = x `S.catch` \(_ :: S.ScottyException) -> y
 
+-- | Read a request parameter from the path, query string or form.
 param ::
   (MonadUnliftIO m, S.Parsable a) =>
   Text ->
   S.ActionT m a
 param t = S.queryParam t `rescue` S.formParam t
 
+-- | Read a field of the environment from a monad transformer.
 askl :: (MonadTrans t, MonadReader r m) => (r -> a) -> t m a
 askl f = lift (asks f)
