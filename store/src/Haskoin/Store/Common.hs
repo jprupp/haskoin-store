@@ -19,6 +19,7 @@ module Haskoin.Store.Common
     getActiveTxData,
     getDefaultBalance,
     getTransaction,
+    getTransactions,
     getNumTransaction,
     blockAtOrAfter,
     blockAtOrBefore,
@@ -123,6 +124,12 @@ class (Monad m) => StoreReadBase m where
   getBlocksAtHeight :: BlockHeight -> m [BlockHash]
   getBlock :: BlockHash -> m (Maybe BlockData)
   getTxData :: TxHash -> m (Maybe TxData)
+
+  -- | Data of many transactions, in the order of their hashes. Stores that
+  -- can read many keys at once read them together.
+  getManyTxData :: [TxHash] -> m [Maybe TxData]
+  getManyTxData = mapM getTxData
+
   getSpender :: OutPoint -> m (Maybe Spender)
   getBalance :: Address -> m (Maybe Balance)
   getUnspent :: OutPoint -> m (Maybe Unspent)
@@ -214,6 +221,14 @@ getTransaction h = do
   net <- getNetwork
   ctx <- getCtx
   fmap (toTransaction net ctx) <$> getTxData h
+
+-- | Many transactions, in the order of their hashes, read together.
+getTransactions ::
+  (StoreReadBase m) => [TxHash] -> m [Maybe Transaction]
+getTransactions hs = do
+  net <- getNetwork
+  ctx <- getCtx
+  map (fmap (toTransaction net ctx)) <$> getManyTxData hs
 
 getNumTransaction ::
   (StoreReadExtra m) => Word64 -> m [Transaction]

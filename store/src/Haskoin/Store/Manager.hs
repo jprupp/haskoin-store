@@ -173,6 +173,10 @@ data StoreConfig = StoreConfig
     -- | bytes of write-ahead log after which the column families holding the
     -- oldest log file are flushed ('Nothing' = RocksDB default)
     maxWalSize :: !(Maybe Int),
+    -- | bytes of RocksDB block cache shared by all column families, which
+    -- also holds their index and filter blocks ('Nothing' = RocksDB default:
+    -- 32 MiB per column family, index and filter blocks outside it)
+    blockCache :: !(Maybe Int),
     -- | log messages here
     logger :: !Logger
   }
@@ -223,6 +227,7 @@ connectDB cfg f = do
     cfg.maxOpenFiles
     cfg.writeBufferSize
     cfg.maxWalSize
+    cfg.blockCache
     stats
     f
 

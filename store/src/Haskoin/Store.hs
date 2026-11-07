@@ -27,6 +27,7 @@ module Haskoin.Store
 
     -- * Useful Fuctions
     getTransaction,
+    getTransactions,
     getDefaultBalance,
     getActiveTxData,
     blockAtOrBefore,

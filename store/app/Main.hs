@@ -136,7 +136,8 @@ data Config = Config
     noWeb :: !Bool,
     maxOpenFiles :: !Int,
     writeBufferMB :: !Int,
-    maxWalMB :: !Int
+    maxWalMB :: !Int,
+    blockCacheMB :: !Int
   }
 
 env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
@@ -228,6 +229,8 @@ defConfig = do
     env "WRITE_BUFFER_MB" 256 readMaybe
   maxWalMB <-
     env "MAX_WAL_MB" 1024 readMaybe
+  blockCacheMB <-
+    env "BLOCK_CACHE_MB" 1024 readMaybe
   return Config {version = False, ..}
   where
     tickerString =
@@ -580,6 +583,13 @@ config c = do
         <> help "RocksDB write-ahead log size in MiB that forces flushes so old log files can be deleted (0 = RocksDB default)"
         <> showDefault
         <> value c.maxWalMB
+  blockCacheMB <-
+    option auto $
+      metavar "MB"
+        <> long "block-cache-mb"
+        <> help "RocksDB block cache in MiB, shared by all column families, holding index and filter blocks too (0 = RocksDB default of 32 MiB per column family)"
+        <> showDefault
+        <> value c.blockCacheMB
   pure Config {..}
 
 networkReader :: String -> Either String Network
@@ -655,6 +665,10 @@ run cfg =
             maxWalSize =
               if cfg.maxWalMB > 0
                 then Just (cfg.maxWalMB * 1024 * 1024)
+                else Nothing,
+            blockCache =
+              if cfg.blockCacheMB > 0
+                then Just (cfg.blockCacheMB * 1024 * 1024)
                 else Nothing,
             logger = logger
           }

@@ -33,12 +33,16 @@ packages:
   original:
     hackage: secp256k1-haskell-2.0.0
 - completed:
-    hackage: rocksdb-haskell-jprupp-2.5.0@sha256:bb37d94f20ba83330016d5e03b84db0127c6ce906b7c4ae382a36a7d97386dda,1589
+    commit: 0a345cd86f5470caed5e419a7c7f0d5ef358e5c5
+    git: https://github.com/jprupp/rocksdb-haskell.git
+    name: rocksdb-haskell-jprupp
     pantry-tree:
-      sha256: b498eb44ff16681d0bfb572025852fa00edcef24959f8807c9261c4096814a43
-      size: 712
+      sha256: 2eeaabb9fdf3b9579fc749ef10a3f45681dab1ff5310f4a964e0c928553f0681
+      size: 1074
+    version: 2.6.0
   original:
-    hackage: rocksdb-haskell-jprupp-2.5.0
+    commit: 0a345cd86f5470caed5e419a7c7f0d5ef358e5c5
+    git: https://github.com/jprupp/rocksdb-haskell.git
 - completed:
     hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
     pantry-tree:

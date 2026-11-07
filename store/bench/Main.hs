@@ -119,6 +119,7 @@ storeConfig ctx net dir redis blocks requests =
       maxOpenFiles = Nothing,
       writeBufferSize = Nothing,
       maxWalSize = Nothing,
+      blockCache = Just (1024 * 1024 * 1024),
       logger = quiet
     }
   where

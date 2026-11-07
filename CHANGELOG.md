@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   addresses.
 - The executable uses every core of the host by default (`-N` instead of
   `-N4`). Set `+RTS -N<n> -RTS` on the command line to choose a number.
+- Read the balances of many addresses, and lists of transactions, with one
+  RocksDB multi-get instead of one read per key. `StoreReadBase` has a new
+  method, `getManyTxData`, which defaults to reading the transactions one by
+  one; `getTransactions` reads many transactions with it.
+- Give RocksDB a block cache of 1 GiB by default, shared by all column
+  families, and keep their index and filter blocks in it at high priority,
+  with those of level 0 pinned. Before, each column family had RocksDB's
+  default cache of 32 MiB, and index and filter blocks stayed in memory
+  outside any cache for every open file. Set the size with `--block-cache-mb`
+  or `BLOCK_CACHE_MB`; 0 restores the RocksDB defaults. `StoreConfig` and
+  `withDatabaseReader` take the size in bytes. Requires rocksdb-haskell-jprupp
+  2.6.0.
 
 ### Added
 

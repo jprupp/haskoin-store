@@ -44,8 +44,8 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
 import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
-import Data.Serialize (decode, encode)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Serialize (Serialize, decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
@@ -166,12 +166,13 @@ withDatabaseReader ::
   Maybe Int ->
   Maybe Int ->
   Maybe Int ->
+  Maybe Int ->
   Maybe DataMetrics ->
   DatabaseReaderT m a ->
   m a
-withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal stats m =
+withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal blockCache stats m =
   withRunInIO $ \run ->
-    withDBCF dir cfg (columnFamilyConfig bloom) $ \db -> do
+    withDBCF dir cfg (columnFamilyConfig bloom (isJust blockCache)) $ \db -> do
       derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
       let bdb =
             DatabaseReader
@@ -192,7 +193,9 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal s
           createMissingColumnFamilies = True,
           maxFiles = maxOpenFiles,
           dbWriteBufferSize = writeBuffers,
-          maxTotalWalSize = maxWal
+          maxTotalWalSize = maxWal,
+          blockCacheSize = blockCache,
+          cacheIndexAndFilterBlocks = isJust blockCache
         }
 
 -- | Memory that RocksDB uses outside the GHC heap, per column family:
@@ -220,25 +223,29 @@ memoryReport db = do
   where
     cfs =
       ("default", Nothing)
-        : zip (map (T.pack . fst) (columnFamilyConfig False)) (map Just (columnFamilies db))
+        : zip (map (T.pack . fst) (columnFamilyConfig False False)) (map Just (columnFamilies db))
     prop cf p = do
       v <- maybe (getProperty db p) (\c -> getPropertyCF db c p) cf
       return (v >>= readMaybe . BS8.unpack)
     num :: Maybe Integer -> Text
     num = maybe "?" (T.pack . show)
 
-columnFamilyConfig :: Bool -> [(String, Config)]
-columnFamilyConfig bloom =
-  [ ("addr-tx", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("addr-out", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("tx", def {prefixLength = Just 33, bloomFilter = bloom}),
-    ("spender", def {prefixLength = Just 33, bloomFilter = bloom}), -- unused
-    ("unspent", def {prefixLength = Just 37, bloomFilter = bloom}),
-    ("block", def {prefixLength = Just 33, bloomFilter = bloom}),
-    ("height", def {prefixLength = Nothing, bloomFilter = bloom}),
-    ("balance", def {prefixLength = Just 22, bloomFilter = bloom}),
-    ("mempool", def {prefixLength = Nothing, bloomFilter = bloom})
+-- | Column families, with Bloom filters or not, and with their index and
+-- filter blocks in the block cache or not.
+columnFamilyConfig :: Bool -> Bool -> [(String, Config)]
+columnFamilyConfig bloom cached =
+  [ ("addr-tx", c (Just 22)),
+    ("addr-out", c (Just 22)),
+    ("tx", c (Just 33)),
+    ("spender", c (Just 33)), -- unused
+    ("unspent", c (Just 37)),
+    ("block", c (Just 33)),
+    ("height", c Nothing),
+    ("balance", c (Just 22)),
+    ("mempool", c Nothing)
   ]
+  where
+    c p = def {prefixLength = p, bloomFilter = bloom, cacheIndexAndFilterBlocks = cached}
 
 addrTxCF :: DB -> ColumnFamily
 addrTxCF db = columnFamilies db !! 0
@@ -468,6 +475,17 @@ withManyIters db cf i f = do
     gauge (Just m) n = incrementGauge m.dataIters n
     gauge Nothing _ = return ()
 
+-- | Values of many keys of a column family, read with one multi-get, in
+-- the order of the keys.
+retrieveManyCF ::
+  (KeyValue key value, Serialize key, Serialize value) =>
+  DB ->
+  ColumnFamily ->
+  [key] ->
+  IO [Maybe value]
+retrieveManyCF db cf keys =
+  map (fmap (either error id . decode)) <$> multiGetCF db cf (map encode keys)
+
 joinConduits ::
   (Monad m, Ord o) =>
   [ConduitT () o m ()] ->
@@ -487,6 +505,12 @@ instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
       Just t -> do
         withMetrics $ \s -> incrementCounter s.dataTxCount 1
         return (Just t)
+
+  getManyTxData ths = do
+    db <- asks (.db)
+    tds <- liftIO (retrieveManyCF db (txCF db) (map TxKey ths))
+    withMetrics $ \s -> incrementCounter s.dataTxCount (length (catMaybes tds))
+    return tds
 
   getSpender op = runMaybeT $ do
     td <- MaybeT $ getTxData op.hash
@@ -601,11 +625,15 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     forM_ r.metrics $ \s -> incrementCounter s.dataTxCount (length txs)
     return txs
 
+  getBalances [] = return []
   getBalances as = do
-    zipWith f as <$> mapM getBalance as
+    db <- asks (.db)
+    withMetrics $ \s -> incrementCounter s.dataBalanceCount (length as)
+    vals <- liftIO (retrieveManyCF db (balanceCF db) (map BalKey as))
+    return (zipWith f as vals)
     where
       f a Nothing = zeroBalance a
-      f _ (Just b) = b
+      f a (Just v) = valToBalance a v
 
   xPubBals xpub = do
     igap <- asks (.initGap)
