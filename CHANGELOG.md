@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   tutorial, and the Haddock of every module and function says why it works the
   way it does.
 - Build against nqe 0.6.9, rocksdb-haskell-jprupp 2.6.1, rocksdb-query 0.6.1,
-  statsd-rupp 0.5.0.2, haskoin-node 2.3.1 and Stackage nightly-2026-11-07.
+  statsd-rupp 0.5.0.2, secp256k1-haskell 2.0.1, haskoin-node 2.3.1 and
+  Stackage nightly-2026-11-07.
 
 ## [1.8.0] - 2026-11-07
 
