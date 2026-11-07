@@ -9,6 +9,9 @@ RUN apt install -y curl
 RUN curl -sSL https://get.haskellstack.org/ | sh
 RUN useradd -rm haskoin
 USER haskoin:haskoin
+# Create the data directory as haskoin, so a volume mounted on it is
+# writable (Docker copies the ownership of an existing directory).
+RUN mkdir -p /home/haskoin/.haskoin-store
 COPY . /home/haskoin/haskoin-store
 WORKDIR /home/haskoin/haskoin-store
 RUN stack clean --no-terminal --full
