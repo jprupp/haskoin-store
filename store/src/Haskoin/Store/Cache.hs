@@ -47,6 +47,24 @@
 -- * @xlock-\<xpub\>@, @lock@, @i\<xpub\>@: locks.
 --
 -- Here @\<xpub\>@ and @\<address\>@ stand for their binary serialization.
+-- = Why a cache, and why Redis
+--
+-- Most xpubs are small and fast to answer from RocksDB. A few, such as the
+-- wallets of exchanges and payment processors, have thousands of used addresses
+-- and are queried constantly. Answering them from the database means deriving and
+-- reading every address each time. Keeping their balances, transactions and
+-- unspent outputs ready in sorted sets turns those queries into a single range
+-- read.
+--
+-- Redis fits because sorted sets are exactly the shape of these queries, and
+-- because several store instances can share one cache. Only large xpubs are
+-- cached ('minAddrs'), because small ones gain nothing, and xpubs not used for a
+-- while are evicted, so the cache holds the working set rather than everything
+-- ever queried.
+--
+-- Locks keep two store instances, or two requests, from building the cache of
+-- the same xpub at the same time. A request that cannot get a lock in time is
+-- answered from the database rather than made to wait.
 module Haskoin.Store.Cache
   ( CacheConfig (..),
     CacheMetrics,
@@ -710,6 +728,11 @@ redisGetXPubBalances xpub =
 -- ascending sorts from newest to oldest. Mempool transactions get negative
 -- scores from their time, so they come first; confirmed ones get positive
 -- scores that decrease with height and position.
+--
+-- One number has to order mempool and confirmed transactions in a single sorted
+-- set, newest first, exactly as the database does. Floating point is what Redis
+-- offers, so the height and position are packed into the 53 bits a double holds
+-- exactly.
 blockRefScore :: BlockRef -> Double
 blockRefScore BlockRef {height = h, position = p} =
   fromIntegral (0x001fffffffffffff - (h' .|. p'))

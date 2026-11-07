@@ -23,6 +23,13 @@
 -- the database. When the action given to 'runWriter' finishes, all the changes
 -- are written to RocksDB in a single atomic batch. A block or a set of
 -- transactions is thus either fully imported or not at all.
+-- = Why buffer writes
+--
+-- Importing a block touches thousands of keys, and many of them several times:
+-- an output is created and spent in the same block, a balance changes with every
+-- transaction of its address. Buffering collapses those into one final value per
+-- key, and a single atomic batch makes the whole import all-or-nothing. A crash
+-- or an invalid block leaves the database exactly as it was.
 module Haskoin.Store.Database.Writer
   ( WriterT,
     MempoolChanges (..),

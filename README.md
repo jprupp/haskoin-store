@@ -17,10 +17,13 @@ does not need a full node next to it, and keeps its indices in RocksDB.
 
 ## Contents
 
+- [Why Haskoin Store](#why-haskoin-store)
+- [Design principles](#design-principles)
 - [Features](#features)
 - [Quick start](#quick-start)
 - [Building from source](#building-from-source)
 - [Running](#running)
+- [Tutorial: following a wallet](#tutorial-following-a-wallet)
 - [Configuration](#configuration)
 - [API](#api)
 - [How it works](#how-it-works)
@@ -30,6 +33,45 @@ does not need a full node next to it, and keeps its indices in RocksDB.
 - [Development](#development)
 - [Related projects](#related-projects)
 - [License](#license)
+
+## Why Haskoin Store
+
+A Bitcoin node can tell you what is in block 800000, but not what the balance
+of an address is, which transactions belong to a wallet, or which outputs it
+can spend. Wallets, block explorers, payment processors and accounting tools
+all need exactly those answers, for many users at once, in milliseconds.
+
+The usual way to get them is to run a full node and an indexer next to it, and
+operate both. Haskoin Store is one program instead. It connects to the
+peer-to-peer network itself, downloads blocks and unconfirmed transactions,
+keeps indices by address, transaction and extended public key in RocksDB, and
+serves them over a REST API. It has been used to serve public Bitcoin and
+Bitcoin Cash APIs such as api.haskoin.com.
+
+## Design principles
+
+- **Index for the questions people ask.** Every index is laid out so that an
+  API query is one seek and a short scan in RocksDB, newest first, which keeps
+  response times flat as the chain grows.
+- **Never half-write.** Each block, and each batch of mempool transactions, is
+  one atomic database write. A crash leaves the store at the previous block,
+  with no repair step on restart.
+- **Unconfirmed transactions matter.** The mempool is indexed and persisted like
+  the chain, ordered before confirmed history, and handles replace-by-fee on
+  Bitcoin. A wallet sees a payment the moment the network does.
+- **Extended public keys are first class.** Wallets are mostly xpubs, so the
+  store derives their addresses, remembers the derivations, and can keep large
+  wallets ready in Redis.
+- **Bounded resources.** API limits stop one request from monopolising the
+  server, slow event clients are dropped, and RocksDB memory has a budget.
+- **Operable.** A health endpoint that tells a load balancer when an instance is
+  behind, StatsD metrics for everything, configuration through flags or
+  environment variables, and a Docker image.
+- **Follow the work, not a node.** The store trusts the chain with the most
+  proof of work, as reported by [haskoin-node](https://github.com/jprupp/haskoin-node),
+  and checks what it needs to keep its indices consistent. It does not
+  re-validate scripts; run it against the network you trust, or next to your
+  own node with `--peer`.
 
 ## Features
 
@@ -119,6 +161,86 @@ discovery on by itself. Data goes in a directory named after the network inside
 
 For a big public deployment, also set `MALLOC_ARENA_MAX=2` (the Docker image
 does) to keep glibc from fragmenting RocksDB's memory.
+
+## Tutorial: following a wallet
+
+This walks through what a wallet back end typically does with the API, on a
+store that is already running on `localhost:3000`.
+
+### 1. Wait for the store to be ready
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/health
+```
+
+`200` means the index is caught up with the network. While it syncs you get
+`503`, and the body says which check fails.
+
+### 2. Get the balance of a wallet
+
+Most wallets are an extended public key. Ask for its summary, and say which
+kind of addresses it derives (`normal`, `compat` for nested SegWit, `segwit`
+for native SegWit):
+
+```sh
+curl 'localhost:3000/xpub/xpub6C...?derive=segwit&pretty=true'
+```
+
+The answer has confirmed and unconfirmed balances, and the index of the last
+used receiving and change address, so the wallet knows where to derive the
+next address.
+
+### 3. List its transactions, page by page
+
+```sh
+curl 'localhost:3000/xpub/xpub6C.../transactions?derive=segwit&limit=50'
+```
+
+Results are newest first, unconfirmed ones on top. To get the next page, start
+from the last transaction you received instead of using an offset:
+
+```sh
+curl 'localhost:3000/xpub/xpub6C.../transactions?derive=segwit&limit=50&offset=1&start=<last txid>'
+```
+
+`offset=1` skips the transaction you already have. Paging by starting point
+stays fast however deep you go, and does not shift when new transactions
+arrive.
+
+### 4. Find spendable outputs
+
+```sh
+curl 'localhost:3000/xpub/xpub6C.../unspent?derive=segwit'
+```
+
+Each output comes with its derivation path, so the wallet knows which key signs
+it.
+
+### 5. Broadcast a payment
+
+```sh
+curl -X POST --data-binary @tx.hex localhost:3000/transactions
+```
+
+The body is the signed transaction in hex. The store sends it to its peers and
+returns the transaction id. It appears in the mempool, and in the wallet's
+history, as soon as a peer relays it back.
+
+### 6. Stay up to date without polling
+
+```sh
+curl -N localhost:3000/events
+```
+
+Each line is a new block or a mempool change. A wallet back end keeps this open
+and refreshes the affected wallets when an event arrives, instead of asking
+every few seconds.
+
+### 7. Make big wallets fast
+
+Start the store with `--redis` and a Redis server. Xpubs with more than
+`--redis-min-addrs` used addresses are then answered from Redis after their
+first query.
 
 ## Configuration
 

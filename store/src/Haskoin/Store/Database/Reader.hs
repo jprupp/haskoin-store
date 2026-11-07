@@ -26,6 +26,20 @@
 -- Data is split across column families by kind; see 'addrTxCF' and the other
 -- column family accessors. The keys stored in each are described in
 -- "Haskoin.Store.Database.Types".
+-- = Why column families
+--
+-- Each kind of record lives in its own column family. Their keys and access
+-- patterns differ: balances are small point lookups, address transactions are
+-- scans, transactions are large values. Separate column families let each have
+-- its own key prefix length for filters and seeks, and keep scans over one kind
+-- of data from wading through another.
+--
+-- = Why addresses of xpubs are cached
+--
+-- Deriving an address from an extended public key costs an elliptic curve
+-- operation and two hashes, and an xpub query may need hundreds of them before it
+-- reads a single balance. Addresses depend only on the xpub, so the derivations
+-- of recently queried xpubs are kept and shared. The cache never goes stale.
 module Haskoin.Store.Database.Reader
   ( -- * RocksDB Database Access
     DatabaseReader (..),
@@ -192,6 +206,10 @@ withMetrics go = asks (.metrics) >>= mapM_ go
 
 -- | Version of the database layout. Databases of versions 18 and 19 are
 -- migrated when opened; other versions are refused.
+--
+-- Bumping the version is how a change to the database layout is made safe: an
+-- old database is either migrated in place when it is opened or refused, never
+-- read with the wrong layout.
 dataVersion :: Word32
 dataVersion = 20
 

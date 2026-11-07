@@ -47,6 +47,28 @@
 -- The block store does not listen to the node by itself.
 -- "Haskoin.Store.Manager" forwards node events to it with the
 -- @blockStore*@ functions of this module.
+-- = Why it works this way
+--
+-- * __Blocks come from one peer at a time.__ Blocks must be imported in order,
+--   so downloading from several peers at once would only buffer blocks that cannot
+--   be imported yet. One syncing peer, kept busy with a sliding window of
+--   requests, uses the network well without unbounded buffering.
+--
+-- * __The window refills early.__ The next batch is requested when fewer than a
+--   quarter of the window are still outstanding, so the peer never sits idle
+--   while the store imports, and the backlog never grows much beyond one window.
+--
+-- * __Mempool sync waits for the tip.__ Unconfirmed transactions only make sense
+--   against the current chain, so they are requested once the database is in
+--   sync.
+--
+-- * __Orphans get a grace period.__ A transaction can arrive before its parent.
+--   It is held for up to an hour, waiting for the parent, instead of being
+--   dropped and requested again.
+--
+-- * __Imports are batched.__ Mempool transactions are imported up to 2000 at a
+--   time on each clock tick, which amortises the cost of a database write over
+--   many transactions during bursts.
 module Haskoin.Store.BlockStore
   ( -- * Block Store
     BlockStore,

@@ -35,6 +35,13 @@
 --
 -- Types whose names start with @Binfo@ belong to the API compatible with
 -- Blockchain.info.
+-- These types live in their own package, @haskoin-store-data@, so that clients of
+-- the API can use them without depending on RocksDB, Redis or the server.
+--
+-- Values that refer to positions in the chain sort newest first: the binary
+-- encoding of 'BlockRef' stores inverted heights and times, and mempool positions
+-- sort before confirmed ones. That is the order in which wallets and explorers
+-- want history, so database scans return it directly.
 module Haskoin.Store.Data
   ( -- * Address Balances
     Balance (..),

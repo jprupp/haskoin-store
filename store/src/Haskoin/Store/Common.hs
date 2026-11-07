@@ -26,6 +26,21 @@
 --
 -- This module also has helpers for pagination ('Limits'), for deriving
 -- addresses from extended public keys, and for merging sorted streams.
+-- = Why the store is a set of type classes
+--
+-- The same questions are asked in three places: by the web server against the
+-- database, by the import logic against a buffer of uncommitted changes, and by
+-- the cache, which answers some questions itself and passes others on. Writing
+-- the queries once against a class, and providing instances for each place, keeps
+-- those three in agreement and lets the cache sit transparently in front of the
+-- database.
+--
+-- = Why pages start at a transaction
+--
+-- Paging by offset alone gets slower the deeper you go, because the store must
+-- read and drop every result before the page, and it shifts when new
+-- transactions arrive. 'Start' lets a client continue from the last transaction
+-- it saw: the store seeks straight to it, and new arrivals do not move the page.
 module Haskoin.Store.Common
   ( Limits (..),
     Start (..),
@@ -418,6 +433,10 @@ applyLimit l = take (fromIntegral l)
 -- | Fold the offset into the limit, so that a query returns enough results to
 -- apply the offset afterwards, for example when merging results from several
 -- sources.
+--
+-- When results from several sources are merged, the offset can only be applied
+-- to the merged stream. Each source must therefore return the first
+-- @offset + limit@ results.
 deOffset :: Limits -> Limits
 deOffset l = case l.limit of
   0 -> l {offset = 0}
@@ -484,6 +503,10 @@ microseconds =
 -- If a function to get the transaction of a result is given, each page starts
 -- at the last transaction of the previous one. Otherwise pages are fetched by
 -- offset, doubling their size each time up to 1024 results.
+--
+-- This is how endpoints that combine many sources, such as the transactions of
+-- every address of an xpub, avoid loading everything: each source is read page by
+-- page, only as far as the merged output needs.
 streamThings ::
   (Monad m) =>
   (Limits -> m [a]) ->

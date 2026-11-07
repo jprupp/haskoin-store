@@ -33,6 +33,29 @@
 --
 -- Limits on the size of responses are set with 'WebLimits'. Errors are
 -- returned as JSON with an HTTP status that depends on the 'Except'.
+-- = Design of the API
+--
+-- * __Two encodings of the same data.__ JSON is easy to use from anywhere. The
+--   binary encoding is several times smaller and faster to produce and parse, and
+--   is what the Haskell client uses.
+--
+-- * __Limits protect the server.__ A single request for every transaction of a
+--   busy address could take minutes and gigabytes. 'WebLimits' caps list sizes
+--   and offsets, and lower caps apply to full transactions, which are much larger
+--   than references.
+--
+-- * __Health is measured, not assumed.__ The store reports itself unhealthy when
+--   it lags behind the network, stops receiving blocks or transactions, has too
+--   few peers or a backlog of transactions. Load balancers can route around an
+--   instance that is still syncing or has lost its peers.
+--
+-- * __Slow event clients are dropped.__ Each @\/events@ client gets a bounded
+--   queue. A client that falls too far behind is disconnected rather than allowed
+--   to make the server buffer events without limit.
+--
+-- * __Compatibility endpoints ease migration.__ The @\/blockchain\/@ endpoints
+--   follow the Blockchain.info API so that existing wallets can switch to a
+--   self-hosted server with few changes.
 module Haskoin.Store.Web
   ( -- * Web
     WebConfig (..),

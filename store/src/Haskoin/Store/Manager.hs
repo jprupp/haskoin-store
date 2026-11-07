@@ -17,6 +17,10 @@
 -- peer-to-peer node, the block store that imports data, and the optional Redis
 -- cache with its writer process. Node events are forwarded to the block store
 -- and turned into 'StoreEvent's.
+-- Keeping the wiring in one place means each component only knows about the
+-- interfaces it uses: the block store does not know about the cache, and the
+-- node does not know about either. 'withStore' starts them in dependency order
+-- and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
     Store (..),

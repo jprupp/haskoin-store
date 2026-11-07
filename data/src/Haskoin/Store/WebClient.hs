@@ -33,6 +33,8 @@
 --
 -- Requests that take long lists of addresses, transactions or blocks can be
 -- split into several calls with 'apiBatch'.
+-- The client always uses the binary encoding, which is smaller and faster than
+-- JSON and decodes straight into the types of "Haskoin.Store.Data".
 module Haskoin.Store.WebClient
   ( -- * Calls
     ApiConfig (..),

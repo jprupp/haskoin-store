@@ -33,6 +33,24 @@
 -- On networks with replace-by-fee, a new mempool transaction may replace the
 -- unconfirmed transactions it conflicts with. Elsewhere a conflicting mempool
 -- transaction is rejected as a double spend.
+-- = Why these rules
+--
+-- The indices are only useful if they always agree with each other: a balance
+-- must equal the sum of the unspent outputs of its address, a spent output must
+-- name its spender, and a transaction must appear in the index of every address
+-- it touches. Every function here changes all of them together, inside one
+-- atomic batch, so the database moves from one consistent state to the next.
+--
+-- The store does not validate scripts or consensus rules. It follows the chain
+-- with the most work, as reported by haskoin-node, and checks only what it needs
+-- to keep the indices consistent: that inputs exist and are unspent, and that a
+-- transaction does not spend more than it has. A block that fails these checks
+-- is not imported, and the block store disconnects the peer that sent it.
+--
+-- The mempool is treated as provisional. A confirmed block always wins: mempool
+-- transactions that conflict with it are deleted together with everything that
+-- spends them. Between mempool transactions, replace-by-fee decides on networks
+-- that support it; elsewhere the first one seen stays.
 module Haskoin.Store.Logic
   ( ImportException (..),
     ImportM,

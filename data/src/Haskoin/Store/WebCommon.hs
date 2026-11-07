@@ -28,6 +28,9 @@
 --
 -- Endpoints that return lists take a limit, an offset and a start
 -- ('LimitsParam'). Results are ordered from newest to oldest.
+-- Describing each endpoint once, as a type, keeps the server and the client from
+-- drifting apart: the path, parameters and response type that the server routes
+-- are the same ones the client builds requests from.
 module Haskoin.Store.WebCommon where
 
 import Control.Applicative ((<|>))
