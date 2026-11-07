@@ -1,21 +1,30 @@
 name: CI
 
+# Every change is built and tested twice with Stack:
+#
+# - os-libraries: against the C libraries that Ubuntu packages, as most users
+#   build it, with --no-nix;
+# - nix: with --nix, so that GHC and the C libraries listed under "nix:" in
+#   stack.yaml come from nixpkgs, as on NixOS or with "stack --nix" locally.
+#
+# Both jobs also build the Haddock documentation, so broken markup fails CI.
+
 on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  build:
+  os-libraries:
+    name: Stack with OS libraries
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      # Building against sibling checkouts of haskoin-core or haskoin-node
-      # (e.g. "- ../haskoin-core" in extra-deps) works locally but cannot
-      # work here: only this repository is checked out. Fail early with a
-      # clear message instead of a Stack S-395 error after the cache restore.
+      # Only this repository is checked out, so extra-deps that point at
+      # sibling checkouts (such as ../haskoin-core) cannot build here.
       - name: Reject local path dependencies
         run: |
           if grep -nE '^[[:space:]]*-[[:space:]]*(\.\.?/|/|~)' stack.yaml; then
@@ -26,7 +35,14 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecp256k1-dev librocksdb-dev pkg-config zlib1g-dev
+          sudo apt-get install -y librocksdb-dev libsecp256k1-dev pkg-config zlib1g-dev
+
+      - name: Set up Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+          stack-no-global: true
 
       - name: Cache Stack
         uses: actions/cache@v4
@@ -36,18 +52,72 @@ jobs:
             .stack-work
             data/.stack-work
             store/.stack-work
-          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
-          restore-keys: stack-${{ runner.os }}-
+          key: stack-os-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
+          restore-keys: stack-os-${{ runner.os }}-
 
       - name: Build
-        run: stack build --install-ghc --test --no-run-tests
+        run: stack --no-nix build --install-ghc --test --no-run-tests --haddock --no-haddock-deps
 
       - name: Test haskoin-store-data
-        run: stack test haskoin-store-data
+        run: stack --no-nix test haskoin-store-data
 
       # Includes "keeps the heap flat while syncing": it syncs 6000 regtest
       # blocks from a mock peer and fails if the live heap grows by 1 MB or
       # more between blocks 1000 and 6000, which catches a message loop that
       # retains memory per message. The test suite runs with +RTS -T for it.
       - name: Test haskoin-store
-        run: stack test haskoin-store
+        run: stack --no-nix test haskoin-store
+
+  nix:
+    name: Stack with Nix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only this repository is checked out, so extra-deps that point at
+      # sibling checkouts (such as ../haskoin-core) cannot build here.
+      - name: Reject local path dependencies
+        run: |
+          if grep -nE '^[[:space:]]*-[[:space:]]*(\.\.?/|/|~)' stack.yaml; then
+            echo "::error file=stack.yaml::stack.yaml refers to local paths outside the repository. Pin released versions (or a git commit) in extra-deps before pushing."
+            exit 1
+          fi
+
+      # Stack runs the build inside nix-shell, which takes GHC and the
+      # libraries from <nixpkgs>; nix_path points that at nixos-unstable.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Set up Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+          stack-no-global: true
+
+      - name: Cache Stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+            data/.stack-work
+            store/.stack-work
+          key: stack-nix-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
+          restore-keys: stack-nix-${{ runner.os }}-
+
+      - name: Build
+        run: stack --nix build --test --no-run-tests --haddock --no-haddock-deps
+
+      - name: Test haskoin-store-data
+        run: stack --nix test haskoin-store-data
+
+      # Includes "keeps the heap flat while syncing": it syncs 6000 regtest
+      # blocks from a mock peer and fails if the live heap grows by 1 MB or
+      # more between blocks 1000 and 6000, which catches a message loop that
+      # retains memory per message. The test suite runs with +RTS -T for it.
+      - name: Test haskoin-store
+        run: stack --nix test haskoin-store

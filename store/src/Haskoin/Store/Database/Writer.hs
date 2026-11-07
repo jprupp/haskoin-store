@@ -8,6 +8,28 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.Database.Writer
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Buffered writes to the database.
+--
+-- 'WriterT' implements 'StoreWrite' by recording every change in in-memory hash
+-- tables, and 'StoreReadBase' by reading those tables first and falling back to
+-- the database. When the action given to 'runWriter' finishes, all the changes
+-- are written to RocksDB in a single atomic batch. A block or a set of
+-- transactions is thus either fully imported or not at all.
+-- = Why buffer writes
+--
+-- Importing a block touches thousands of keys, and many of them several times:
+-- an output is created and spent in the same block, a balance changes with every
+-- transaction of its address. Buffering collapses those into one final value per
+-- key, and a single atomic batch makes the whole import all-or-nothing. A crash
+-- or an invalid block leaves the database exactly as it was.
 module Haskoin.Store.Database.Writer
   ( WriterT,
     MempoolChanges (..),
@@ -59,12 +81,17 @@ import UnliftIO
     writeIORef,
   )
 
+-- | Environment of a batch of writes.
 data Writer = Writer
-  { reader :: !DatabaseReader,
+  { -- | database to read from and write to
+    reader :: !DatabaseReader,
+    -- | changes made so far
     memory :: !Memory,
+    -- | log messages here
     logger :: !Logger
   }
 
+-- | Monad transformer for a batch of writes. Run it with 'runWriter'.
 type WriterT = ReaderT Writer
 
 -- | Logger passed to 'runWriter'.
@@ -83,36 +110,56 @@ instance (MonadIO m) => StoreReadBase (WriterT m) where
   getBalance = getBalanceI
   getMempool = getMempoolI
 
+-- | Change to the best block: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 type BestRef = IORef (Maybe (Maybe BlockHash))
 
+-- | Changed blocks: 'Nothing' for a deletion.
 type BlockTable = H.BasicHashTable BlockHash (Maybe BlockData)
 
+-- | Changed lists of blocks at a height.
 type HeightTable = H.BasicHashTable BlockHeight [BlockHash]
 
+-- | Changed transactions: 'Nothing' for a deletion.
 type TxTable = H.BasicHashTable TxHash (Maybe TxData)
 
+-- | Changed unspent outputs: 'Nothing' for a deletion.
 type UnspentTable = H.BasicHashTable OutPoint (Maybe Unspent)
 
+-- | Changed balances: 'Nothing' for a deletion.
 type BalanceTable = H.BasicHashTable Address (Maybe Balance)
 
+-- | Changed address transactions: 'Nothing' for a deletion.
 type AddrTxTable = H.BasicHashTable (Address, TxRef) (Maybe ())
 
+-- | Changed address unspent outputs: 'Nothing' for a deletion.
 type AddrOutTable = H.BasicHashTable (Address, BlockRef, OutPoint) (Maybe OutVal)
 
 -- | Mempool changes in this batch: 'Nothing' for a deletion.
 type MempoolTable = H.BasicHashTable TxHash (Maybe UnixTime)
 
+-- | Changes made in a batch, not yet written to the database.
 data Memory = Memory
-  { net :: !Network,
+  { -- | network constants
+    net :: !Network,
+    -- | secp256k1 context
     ctx :: !Ctx,
+    -- | best block
     best :: !BestRef,
+    -- | blocks
     blockTable :: !BlockTable,
+    -- | blocks at each height
     heightTable :: !HeightTable,
+    -- | transactions
     txTable :: !TxTable,
+    -- | unspent outputs
     unspentTable :: !UnspentTable,
+    -- | address balances
     balanceTable :: !BalanceTable,
+    -- | address transactions
     addressTable :: !AddrTxTable,
+    -- | address unspent outputs
     outputTable :: !AddrOutTable,
+    -- | mempool
     mempoolTable :: !MempoolTable
   }
 
@@ -162,6 +209,7 @@ instance (MonadIO m) => StoreWrite (WriterT m) where
     ReaderT $ \Writer {memory = Memory {..}} ->
       liftIO $ H.insert unspentTable p Nothing
 
+-- | Read a value from the changes of the batch, or from the database if the batch did not change it.
 getLayered ::
   (MonadIO m) =>
   (Memory -> IO (Maybe a)) ->
@@ -173,6 +221,8 @@ getLayered f g =
       Just x -> return x
       Nothing -> runReaderT g db
 
+-- | Run a batch of writes and commit all its changes to the database in one
+-- atomic write. Reads within the batch see its own changes.
 runWriter ::
   (MonadIO m) =>
   Network ->
@@ -187,7 +237,9 @@ runWriter net ctx bdb logger f =
 -- | Transactions that a batch added to the mempool or removed from it,
 -- compared to what the database held before the batch was written.
 data MempoolChanges = MempoolChanges
-  { added :: ![TxHash],
+  { -- | transactions that entered the mempool
+    added :: ![TxHash],
+    -- | transactions that left the mempool
     removed :: ![TxHash]
   }
   deriving (Eq, Show)
@@ -210,6 +262,7 @@ runWriterMempool net ctx bdb@DatabaseReader {db} logger f = do
   liftIO $ writeBatch db (ops <> mops)
   return (x, changes)
 
+-- | Database operations for all changes of a batch except the mempool.
 hashMapOps :: (MonadIO m) => DB -> Memory -> m [BatchOp]
 hashMapOps db Memory {..} =
   mconcat
@@ -224,6 +277,7 @@ hashMapOps db Memory {..} =
         unspentOps db unspentTable
       ]
 
+-- | Operation for the change of the best block, if any.
 bestBlockOp :: (MonadIO m) => BestRef -> m [BatchOp]
 bestBlockOp r =
   readIORef r >>= \case
@@ -231,35 +285,41 @@ bestBlockOp r =
     Just Nothing -> return [deleteOp BestKey]
     Just (Just b) -> return [insertOp BestKey b]
 
+-- | Operations for changed blocks.
 blockHashOps :: (MonadIO m) => DB -> BlockTable -> m [BatchOp]
 blockHashOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
     f k (Just d) = insertOpCF (blockCF db) (BlockKey k) d
     f k Nothing = deleteOpCF (blockCF db) (BlockKey k)
 
+-- | Operations for changed block heights.
 blockHeightOps :: (MonadIO m) => DB -> HeightTable -> m [BatchOp]
 blockHeightOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
     f = insertOpCF (heightCF db) . HeightKey
 
+-- | Operations for changed transactions.
 txOps :: (MonadIO m) => DB -> TxTable -> m [BatchOp]
 txOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
     f k (Just t') = insertOpCF (txCF db) (TxKey k) t'
     f k Nothing = deleteOpCF (txCF db) (TxKey k)
 
+-- | Operations for changed balances.
 balOps :: (MonadIO m) => DB -> BalanceTable -> m [BatchOp]
 balOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
     f a (Just b) = insertOpCF (balanceCF db) (BalKey a) (balanceToVal b)
     f a Nothing = deleteOpCF (balanceCF db) (BalKey a)
 
+-- | Operations for changed address transactions.
 addrTxOps :: (MonadIO m) => DB -> AddrTxTable -> m [BatchOp]
 addrTxOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
     f (a, t') (Just ()) = insertOpCF (addrTxCF db) (AddrTxKey a t') ()
     f (a, t') Nothing = deleteOpCF (addrTxCF db) (AddrTxKey a t')
 
+-- | Operations for changed address unspent outputs.
 addrOutOps :: (MonadIO m) => DB -> AddrOutTable -> m [BatchOp]
 addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
@@ -300,6 +360,7 @@ mempoolOps db t = liftIO $ do
       | o == n = []
       | otherwise = deleteOpCF cf (MemTimeKey o h) : mempoolInsertOps db h n
 
+-- | Operations for changed unspent outputs.
 unspentOps :: (MonadIO m) => DB -> UnspentTable -> m [BatchOp]
 unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)
   where
@@ -308,25 +369,32 @@ unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)
     f p Nothing =
       deleteOpCF (unspentCF db) (UnspentKey p)
 
+-- | Read the best block, with the changes of the batch applied.
 getBestBlockI :: (MonadIO m) => WriterT m (Maybe BlockHash)
 getBestBlockI = getLayered getBestBlockH getBestBlock
 
+-- | Read the blocks at a height, with the changes of the batch applied.
 getBlocksAtHeightI :: (MonadIO m) => BlockHeight -> WriterT m [BlockHash]
 getBlocksAtHeightI bh =
   getLayered (getBlocksAtHeightH bh) (getBlocksAtHeight bh)
 
+-- | Read a block, with the changes of the batch applied.
 getBlockI :: (MonadIO m) => BlockHash -> WriterT m (Maybe BlockData)
 getBlockI bh = getLayered (getBlockH bh) (getBlock bh)
 
+-- | Read a transaction, with the changes of the batch applied.
 getTxDataI :: (MonadIO m) => TxHash -> WriterT m (Maybe TxData)
 getTxDataI th = getLayered (getTxDataH th) (getTxData th)
 
+-- | Read the spender of an output, with the changes of the batch applied.
 getSpenderI :: (MonadIO m) => OutPoint -> WriterT m (Maybe Spender)
 getSpenderI op = getLayered (getSpenderH op) (getSpender op)
 
+-- | Read the balance of an address, with the changes of the batch applied.
 getBalanceI :: (MonadIO m) => Address -> WriterT m (Maybe Balance)
 getBalanceI a = getLayered (getBalanceH a) (getBalance a)
 
+-- | Read an unspent output, with the changes of the batch applied.
 getUnspentI :: (MonadIO m) => OutPoint -> WriterT m (Maybe Unspent)
 getUnspentI op = getLayered (getUnspentH op) (getUnspent op)
 
@@ -342,6 +410,7 @@ getMempoolI =
         added = [(t, h) | (h, Just t) <- changes]
     return $ sortOn Down (kept <> added)
 
+-- | Empty set of changes.
 newMemory ::
   (MonadIO m) =>
   Network ->
@@ -359,26 +428,35 @@ newMemory net ctx = do
   mempoolTable <- liftIO H.new
   return Memory {..}
 
+-- | Read the best block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getBestBlockH :: Memory -> IO (Maybe (Maybe BlockHash))
 getBestBlockH = readIORef . (.best)
 
+-- | Read the blocks at a height from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getBlocksAtHeightH :: BlockHeight -> Memory -> IO (Maybe [BlockHash])
 getBlocksAtHeightH h s = H.lookup s.heightTable h
 
+-- | Read a block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getBlockH :: BlockHash -> Memory -> IO (Maybe (Maybe BlockData))
 getBlockH h s = H.lookup s.blockTable h
 
+-- | Read a transaction from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getTxDataH :: TxHash -> Memory -> IO (Maybe (Maybe TxData))
 getTxDataH t s = H.lookup s.txTable t
 
+-- | Read the spender of an output from the transaction changed in the batch:
+-- 'Nothing' if the transaction did not change, @Just Nothing@ if the output is
+-- not spent.
 getSpenderH :: OutPoint -> Memory -> IO (Maybe (Maybe Spender))
 getSpenderH op s = do
   fmap (f =<<) <$> getTxDataH op.hash s
   where
     f = IntMap.lookup (fromIntegral op.index) . (.spenders)
 
+-- | Read the balance of an address from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getBalanceH :: Address -> Memory -> IO (Maybe (Maybe Balance))
 getBalanceH a s = H.lookup s.balanceTable a
 
+-- | Read an unspent output from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 getUnspentH :: OutPoint -> Memory -> IO (Maybe (Maybe Unspent))
 getUnspentH p Memory {..} = H.lookup unspentTable p

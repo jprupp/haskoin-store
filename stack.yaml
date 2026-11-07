@@ -1,4 +1,4 @@
-resolver: nightly-2026-10-28
+resolver: nightly-2026-11-07
 ghc-options:
   "$everything": -O2
   # Specialise the polymorphic message loops to their concrete monads. The
@@ -22,10 +22,10 @@ packages:
 extra-deps:
   - base16-2.0
   - hashtables-1.4.2
-  - statsd-rupp-0.5.0.0
-  - secp256k1-haskell-2.0.0
-  - rocksdb-haskell-jprupp-2.6.0
-  - rocksdb-query-0.6.0
-  - nqe-0.6.7
+  - statsd-rupp-0.5.0.2
+  - secp256k1-haskell-2.0.1
+  - rocksdb-haskell-jprupp-2.6.1
+  - rocksdb-query-0.6.1
+  - nqe-0.6.9
   - haskoin-core-1.6.1
-  - haskoin-node-2.3.0
+  - haskoin-node-2.3.1

@@ -5,6 +5,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.Manager
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Wires the components of a store together: the RocksDB database, the
+-- peer-to-peer node, the block store that imports data, and the optional Redis
+-- cache with its writer process. Node events are forwarded to the block store
+-- and turned into 'StoreEvent's.
+-- Keeping the wiring in one place means each component only knows about the
+-- interfaces it uses: the block store does not know about the cache, and the
+-- node does not know about either. 'withStore' starts them in dependency order
+-- and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
     Store (..),
@@ -106,15 +122,24 @@ import UnliftIO
   )
 import UnliftIO.Concurrent (threadDelay)
 
--- | Store mailboxes.
+-- | Store mailboxes. Handles to the running components of a store, given by
+-- 'withStore'.
 data Store = Store
-  { peerMgr :: !PeerMgr,
+  { -- | peer manager of the node
+    peerMgr :: !PeerMgr,
+    -- | block header chain of the node
     chain :: !Chain,
+    -- | process that imports blocks and transactions
     block :: !BlockStore,
+    -- | database reader
     db :: !DatabaseReader,
+    -- | cache configuration, if Redis is configured
     cache :: !(Maybe CacheConfig),
+    -- | store events are published here
     pub :: !(Publisher StoreEvent),
+    -- | network constants
     net :: !Network,
+    -- | secp256k1 context
     ctx :: !Ctx
   }
 
@@ -181,6 +206,12 @@ data StoreConfig = StoreConfig
     logger :: !Logger
   }
 
+-- | Run a store and pass its handles to the given action. Everything is stopped
+-- when the action returns, and an exception in any component is re-thrown in
+-- the calling thread.
+--
+-- The database is opened first, then the node, the cache (if 'redis' is set)
+-- and the block store.
 withStore ::
   (MonadUnliftIO m) =>
   StoreConfig ->
@@ -210,6 +241,7 @@ withStore cfg action =
               ctx = cfg.ctx
             }
 
+-- | Open the database described by the configuration and run an action with its reader.
 connectDB ::
   (MonadUnliftIO m) =>
   StoreConfig ->
@@ -231,6 +263,7 @@ connectDB cfg f = do
     stats
     f
 
+-- | Configuration of the block store, from the store configuration.
 blockStoreCfg ::
   StoreConfig ->
   Node ->
@@ -255,6 +288,8 @@ blockStoreCfg cfg node pub db =
       logger = withSource "BlockStore" cfg.logger
     }
 
+-- | Configuration of the node, from the store configuration. The node keeps its
+-- headers in the default column family of the store database.
 nodeCfg ::
   StoreConfig ->
   DatabaseReader ->
@@ -279,6 +314,8 @@ nodeCfg cfg db pub =
       logger = cfg.logger
     }
 
+-- | If Redis is configured, connect to it, start the cache writer, and pass the
+-- cache configuration to the action. Otherwise pass 'Nothing'.
 withCache ::
   (MonadUnliftIO m) =>
   StoreConfig ->
@@ -315,6 +352,7 @@ withCache cfg chain db pub action =
           logger = logger
         }
 
+-- | Run the loop that feeds store events to the cache writer while the action runs.
 cacheWriterProcesses ::
   (MonadUnliftIO m) =>
   Int ->
@@ -325,6 +363,8 @@ cacheWriterProcesses ::
 cacheWriterProcesses interval evts cwm action =
   withAsync (cacheWriterEvents interval evts cwm) $ \a1 -> link a1 >> action
 
+-- | Forward store events to the cache writer, and ask it to sync the mempool
+-- every given number of seconds.
 cacheWriterEvents :: (MonadUnliftIO m) => Int -> Inbox StoreEvent -> CacheWriter -> m ()
 cacheWriterEvents interval evts cwm =
   withAsync mempool . const $
@@ -336,12 +376,14 @@ cacheWriterEvents interval evts cwm =
       threadDelay (interval * 1000 * 1000)
       cacheSyncMempool cwm
 
+-- | Tell the cache writer about new blocks and mempool changes.
 cacheWriterDispatch :: (MonadIO m) => StoreEvent -> CacheWriter -> m ()
 cacheWriterDispatch (StoreBestBlock _) = cacheNewBlock
 cacheWriterDispatch (StoreMempoolNew t) = cacheNewTx t
 cacheWriterDispatch (StoreMempoolDelete t) = cacheNewTx t
 cacheWriterDispatch _ = const (return ())
 
+-- | Forward every node event to the block store and the store publisher, forever.
 nodeForwarder ::
   (MonadIO m) =>
   BlockStore ->
@@ -351,7 +393,10 @@ nodeForwarder ::
 nodeForwarder b pub sub =
   loopForever $ receive sub >>= atomically . storeDispatch b pub
 
--- | Dispatcher of node events.
+-- | Dispatcher of node events. Peer connections, blocks, transactions,
+-- inventories and not-found messages go to the block store; peer events,
+-- pongs, transaction announcements and rejections are published as store
+-- events; new best headers go to the block store.
 storeDispatch ::
   BlockStore ->
   Publisher StoreEvent ->

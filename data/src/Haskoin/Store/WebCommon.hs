@@ -10,6 +10,27 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Store.WebCommon
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Description of the REST API, shared by the server ("Haskoin.Store.Web") and
+-- the client ("Haskoin.Store.WebClient").
+--
+-- Each endpoint is a type, such as 'GetBlock', with an 'ApiResource' instance
+-- that gives its HTTP method, path, parameters and response type. Parameters
+-- are types with a 'Param' instance, which knows how to encode them in a URL
+-- and parse them back.
+--
+-- Endpoints that return lists take a limit, an offset and a start
+-- ('LimitsParam'). Results are ordered from newest to oldest.
+-- Describing each endpoint once, as a type, keeps the server and the client from
+-- drifting apart: the path, parameters and response type that the server routes
+-- are the same ones the client builds requests from.
 module Haskoin.Store.WebCommon where
 
 import Control.Applicative ((<|>))
@@ -42,21 +63,34 @@ import Web.Scotty.Trans qualified as Scotty
 -- API Resources --
 -------------------
 
+-- | An endpoint of the API. The request type @a@ determines the response type
+-- @b@.
 class (Serial b) => ApiResource a b | a -> b where
+  -- | HTTP method; 'GET' by default.
   resourceMethod :: Proxy a -> StdMethod
   resourceMethod _ = GET
+  -- | Path of the endpoint, given the encoded values of the parameters that
+  -- are part of the path.
   resourcePath :: Proxy a -> ([Text] -> Text)
+  -- | Parameters of a request: those that go in the path, and those that go in
+  -- the query string.
   queryParams :: a -> ([ParamBox], [ParamBox]) -- (resource, querystring)
   queryParams _ = ([], [])
+  -- | Types of the parameters that go in the path, used to build the route
+  -- pattern of the server.
   captureParams :: Proxy a -> [ProxyBox]
   captureParams _ = []
+  -- | Body of the request, if any.
   resourceBody :: a -> Maybe PostBox
   resourceBody = const Nothing
 
+-- | Request body of any serializable type.
 data PostBox = forall s. (Serial s) => PostBox !s
 
+-- | Parameter value of any type.
 data ParamBox = forall p. (Eq p, Param p) => ParamBox !p
 
+-- | Parameter type, without a value.
 data ProxyBox = forall p. (Param p) => ProxyBox !(Proxy p)
 
 --------------------
@@ -64,86 +98,125 @@ data ProxyBox = forall p. (Param p) => ProxyBox !(Proxy p)
 --------------------
 
 -- Blocks
+-- | Request for a block by hash: @GET \/block\/:block@.
 data GetBlock = GetBlock !BlockHash !NoTx
 
+-- | Request for several blocks by hash: @GET \/blocks?blocks=…@.
 data GetBlocks = GetBlocks ![BlockHash] !NoTx
 
+-- | Request for a block by hash, serialized as in the peer-to-peer protocol: @GET \/block\/:block\/raw@.
 newtype GetBlockRaw = GetBlockRaw BlockHash
 
+-- | Request for the best block: @GET \/block\/best@.
 newtype GetBlockBest = GetBlockBest NoTx
 
+-- | Request for the best block, serialized: @GET \/block\/best\/raw@.
 data GetBlockBestRaw = GetBlockBestRaw
 
+-- | Request for the best block and its ancestors, up to 100 blocks: @GET \/block\/latest@.
 newtype GetBlockLatest = GetBlockLatest NoTx
 
+-- | Request for the blocks at a height: @GET \/block\/height\/:height@.
 data GetBlockHeight = GetBlockHeight !HeightParam !NoTx
 
+-- | Request for the blocks at several heights: @GET \/block\/heights?heights=…@.
 data GetBlockHeights = GetBlockHeights !HeightsParam !NoTx
 
+-- | Request for the blocks at a height, serialized: @GET \/block\/height\/:height\/raw@.
 newtype GetBlockHeightRaw = GetBlockHeightRaw HeightParam
 
+-- | Request for the last block with a timestamp at or before a time: @GET \/block\/time\/:time@.
 data GetBlockTime = GetBlockTime !TimeParam !NoTx
 
+-- | Request for the last block with a timestamp at or before a time, serialized: @GET \/block\/time\/:time\/raw@.
 newtype GetBlockTimeRaw = GetBlockTimeRaw TimeParam
 
+-- | Request for the first block with a median time past at or after a time: @GET \/block\/mtp\/:time@.
 data GetBlockMTP = GetBlockMTP !TimeParam !NoTx
 
+-- | Request for the first block with a median time past at or after a time, serialized: @GET \/block\/mtp\/:time\/raw@.
 newtype GetBlockMTPRaw = GetBlockMTPRaw TimeParam
 
 -- Transactions
+-- | Request for a transaction: @GET \/transaction\/:txid@.
 newtype GetTx = GetTx TxHash
 
+-- | Request for several transactions: @GET \/transactions?txids=…@.
 newtype GetTxs = GetTxs [TxHash]
 
+-- | Request for a transaction, serialized: @GET \/transaction\/:txid\/raw@.
 newtype GetTxRaw = GetTxRaw TxHash
 
+-- | Request for several transactions, serialized: @GET \/transactions\/raw?txids=…@.
 newtype GetTxsRaw = GetTxsRaw [TxHash]
 
+-- | Request for the transactions of a block: @GET \/transactions\/block\/:block@.
 newtype GetTxsBlock = GetTxsBlock BlockHash
 
+-- | Request for the transactions of a block, serialized: @GET \/transactions\/block\/:block\/raw@.
 newtype GetTxsBlockRaw = GetTxsBlockRaw BlockHash
 
+-- | Request for whether any ancestor of a transaction is a coinbase confirmed after a height, or null if it cannot be computed within limits: @GET \/transaction\/:txid\/after\/:height@.
 data GetTxAfter = GetTxAfter !TxHash !HeightParam
 
+-- | Request to broadcast a transaction: @POST \/transactions@.
 newtype PostTx = PostTx Tx
 
+-- | Request for hashes of mempool transactions, newest first: @GET \/mempool@.
 data GetMempool = GetMempool !(Maybe LimitParam) !OffsetParam
 
+-- | Request for stream of new blocks and mempool transactions: @GET \/events@.
 data GetEvents = GetEvents
 
 -- Address
+-- | Request for transactions of an address: @GET \/address\/:address\/transactions@.
 data GetAddrTxs = GetAddrTxs !Address !LimitsParam
 
+-- | Request for transactions of several addresses: @GET \/address\/transactions?addresses=…@.
 data GetAddrsTxs = GetAddrsTxs ![Address] !LimitsParam
 
+-- | Request for full transactions of an address: @GET \/address\/:address\/transactions\/full@.
 data GetAddrTxsFull = GetAddrTxsFull !Address !LimitsParam
 
+-- | Request for full transactions of several addresses: @GET \/address\/transactions\/full?addresses=…@.
 data GetAddrsTxsFull = GetAddrsTxsFull ![Address] !LimitsParam
 
+-- | Request for balance of an address: @GET \/address\/:address\/balance@.
 newtype GetAddrBalance = GetAddrBalance Address
 
+-- | Request for balances of several addresses: @GET \/address\/balances?addresses=…@.
 newtype GetAddrsBalance = GetAddrsBalance [Address]
 
+-- | Request for unspent outputs of an address: @GET \/address\/:address\/unspent@.
 data GetAddrUnspent = GetAddrUnspent !Address !LimitsParam
 
+-- | Request for unspent outputs of several addresses: @GET \/address\/unspent?addresses=…@.
 data GetAddrsUnspent = GetAddrsUnspent ![Address] !LimitsParam
 
 -- XPubs
+-- | Request for summary of an extended public key: @GET \/xpub\/:xpub@.
 data GetXPub = GetXPub !XPubKey !Store.DeriveType !NoCache
 
+-- | Request for transactions of an extended public key: @GET \/xpub\/:xpub\/transactions@.
 data GetXPubTxs = GetXPubTxs !XPubKey !Store.DeriveType !LimitsParam !NoCache
 
+-- | Request for full transactions of an extended public key: @GET \/xpub\/:xpub\/transactions\/full@.
 data GetXPubTxsFull = GetXPubTxsFull !XPubKey !Store.DeriveType !LimitsParam !NoCache
 
+-- | Request for balances of the used addresses of an extended public key: @GET \/xpub\/:xpub\/balances@.
 data GetXPubBalances = GetXPubBalances !XPubKey !Store.DeriveType !NoCache
 
+-- | Request for unspent outputs of an extended public key: @GET \/xpub\/:xpub\/unspent@.
 data GetXPubUnspent = GetXPubUnspent !XPubKey !Store.DeriveType !LimitsParam !NoCache
 
+-- | Request to remove an extended public key from the cache: @DELETE \/xpub\/:xpub@.
 data DelCachedXPub = DelCachedXPub !XPubKey !Store.DeriveType
 
 -- Network
+-- | Request for connected peers: @GET \/peers@.
 data GetPeers = GetPeers
 
+-- | Request for health of the store: @GET \/health@.
 data GetHealth = GetHealth
 
 ------------
@@ -365,30 +438,38 @@ instance ApiResource GetHealth Store.HealthCheck where
 -- Helpers --
 -------------
 
+-- | Path made of a prefix followed by one parameter.
 (<:>) :: Text -> [Text] -> Text
 (<:>) = (<+> "")
 
+-- | Path made of a prefix, one parameter and a suffix.
 (<+>) :: Text -> Text -> [Text] -> Text
 a <+> b = fill 1 [a, b]
 
+-- | Path made of a prefix, a parameter, an infix and another parameter.
 (<++>) :: Text -> Text -> [Text] -> Text
 a <++> b = fill 2 [a, b]
 
+-- | Interleave path fragments with this many parameters. Calls 'error' if the number of parameters is wrong.
 fill :: Int -> [Text] -> [Text] -> Text
 fill i a b
   | length b /= i = error "Invalid query parameters"
   | otherwise = mconcat $ uncurry (<>) <$> zip a (b <> repeat "")
 
+-- | Parameter to send, unless it has its default value.
 noDefBox :: (Default p, Param p, Eq p) => p -> [ParamBox]
 noDefBox p = [ParamBox p | p /= def]
 
+-- | Parameter to send, if any.
 noMaybeBox :: (Param p, Eq p) => Maybe p -> [ParamBox]
 noMaybeBox (Just p) = [ParamBox p]
 noMaybeBox _ = []
 
+-- | Proxy for the type of a value.
 asProxy :: a -> Proxy a
 asProxy = const Proxy
 
+-- | Path of a request, with its path parameters filled in.
 queryPath :: (ApiResource a b) => Network -> Ctx -> a -> Text
 queryPath net ctx a = f $ encParam <$> fst (queryParams a)
   where
@@ -398,6 +479,7 @@ queryPath net ctx a = f $ encParam <$> fst (queryParams a)
         Just [res] -> res
         _ -> error "Invalid query param"
 
+-- | Route pattern of an endpoint for the server, with a named capture for each path parameter.
 capturePath :: (ApiResource a b) => Proxy a -> Scotty.RoutePattern
 capturePath proxy =
   fromString $ cs $ f $ toLabel <$> captureParams proxy
@@ -405,6 +487,7 @@ capturePath proxy =
     f = resourcePath proxy
     toLabel (ProxyBox p) = ":" <> proxyLabel p
 
+-- | Name of a parameter in URLs.
 paramLabel :: (Param p) => p -> Text
 paramLabel = proxyLabel . asProxy
 
@@ -412,9 +495,14 @@ paramLabel = proxyLabel . asProxy
 -- Options --
 -------------
 
+-- | Type that can be a parameter of a request.
 class Param a where
+  -- | Name of the parameter in URLs.
   proxyLabel :: Proxy a -> Text
+  -- | Encode a value as one or more strings. A list parameter is sent as
+  -- comma-separated values.
   encodeParam :: Network -> Ctx -> a -> Maybe [Text]
+  -- | Parse a value from one or more strings.
   parseParam :: Network -> Ctx -> [Text] -> Maybe a
 
 instance Param Address where
@@ -428,10 +516,16 @@ instance Param [Address] where
   encodeParam net ctx = mapM (addrToText net)
   parseParam net ctx = mapM (textToAddr net)
 
+-- | Where a page of results starts. In URLs it is a transaction hash, a block
+-- height, or a Unix timestamp. Numbers up to 1230768000 are heights and larger
+-- ones are timestamps.
 data StartParam
-  = StartParamHash {hash :: Hash256}
-  | StartParamHeight {height :: Natural}
-  | StartParamTime {time :: Store.UnixTime}
+  = -- | start at a transaction
+    StartParamHash {hash :: Hash256}
+  | -- | start at a block height
+    StartParamHeight {height :: Natural}
+  | -- | start at the last block at or before a time
+    StartParamTime {time :: Store.UnixTime}
   deriving (Eq, Show)
 
 instance Param StartParam where
@@ -462,6 +556,7 @@ instance Param StartParam where
         return $ StartParamTime x
   parseParam net ctx _ = Nothing
 
+-- | Number of results to skip (@offset@).
 newtype OffsetParam = OffsetParam {get :: Natural}
   deriving (Eq, Show, Read, Enum, Ord, Num, Real, Integral)
 
@@ -474,6 +569,7 @@ instance Param OffsetParam where
   parseParam net ctx [s] = OffsetParam <$> readMaybe (cs s)
   parseParam net ctx _ = Nothing
 
+-- | Maximum number of results (@limit@).
 newtype LimitParam = LimitParam {get :: Natural}
   deriving (Eq, Show, Read, Enum, Ord, Num, Real, Integral)
 
@@ -483,9 +579,14 @@ instance Param LimitParam where
   parseParam net ctx [s] = LimitParam <$> readMaybe (cs s)
   parseParam net ctx _ = Nothing
 
+-- | Pagination of a list of results.
 data LimitsParam = LimitsParam
-  { limit :: Maybe LimitParam, -- 0 means maximum
+  { -- | maximum number of results; @0@ means the maximum the server allows,
+    -- and 'Nothing' the server default
+    limit :: Maybe LimitParam,
+    -- | number of results to skip after the start
     offset :: OffsetParam,
+    -- | where to start, or from the newest result
     start :: Maybe StartParam
   }
   deriving (Eq, Show)
@@ -493,6 +594,7 @@ data LimitsParam = LimitsParam
 instance Default LimitsParam where
   def = LimitsParam Nothing def Nothing
 
+-- | Block height (@height@).
 newtype HeightParam = HeightParam {get :: Natural}
   deriving (Eq, Show, Read, Enum, Ord, Num, Real, Integral)
 
@@ -502,6 +604,7 @@ instance Param HeightParam where
   parseParam net ctx [s] = HeightParam <$> readMaybe (cs s)
   parseParam net ctx _ = Nothing
 
+-- | List of block heights (@heights@).
 newtype HeightsParam = HeightsParam {get :: [Natural]}
   deriving (Eq, Show, Read)
 
@@ -510,6 +613,7 @@ instance Param HeightsParam where
   encodeParam net ctx (HeightsParam hs) = Just $ cs . show <$> hs
   parseParam net ctx xs = HeightsParam <$> mapM (readMaybe . cs) xs
 
+-- | Unix timestamp in seconds (@time@).
 newtype TimeParam = TimeParam {get :: Store.UnixTime}
   deriving (Eq, Show, Read, Enum, Ord, Num, Real, Integral)
 
@@ -537,6 +641,7 @@ instance Param Store.DeriveType where
     guard (net.segWit || res == Store.DeriveNormal)
     return res
 
+-- | Do not use the cache to answer an xpub query (@nocache@).
 newtype NoCache = NoCache {get :: Bool}
   deriving (Eq, Show, Read)
 
@@ -552,6 +657,8 @@ instance Param NoCache where
     ["false"] -> Just $ NoCache False
     _ -> Nothing
 
+-- | Leave out the transaction hashes of a block, except that of the coinbase
+-- (@notx@).
 newtype NoTx = NoTx {get :: Bool}
   deriving (Eq, Show, Read)
 

@@ -86,6 +86,7 @@ import UnliftIO.Directory
   )
 import UnliftIO.Environment (lookupEnv)
 
+-- | Version of the package, set at build time.
 haskoinStoreVersion :: String
 
 #ifdef CURRENT_PACKAGE_VERSION
@@ -94,6 +95,9 @@ haskoinStoreVersion = CURRENT_PACKAGE_VERSION
 haskoinStoreVersion = "Unavailable"
 #endif
 
+-- | Command line configuration. Each field has a command line option and an
+-- environment variable that sets its default; run @haskoin-store --help@ for
+-- the list.
 data Config = Config
   { dir :: !FilePath,
     host :: !String,
@@ -140,11 +144,13 @@ data Config = Config
     blockCacheMB :: !Int
   }
 
+-- | Read an environment variable with a parser, or return the default if it is unset or invalid.
 env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
 env e d p = do
   ms <- lookupEnv e
   return $ fromMaybe d $ p =<< ms
 
+-- | Default configuration, taken from environment variables where set.
 defConfig :: (MonadIO m) => m Config
 defConfig = do
   dir <-
@@ -260,9 +266,11 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       return WebLimits {..}
 
+-- | Names of the supported networks, separated by pipes.
 netNames :: String
 netNames = intercalate "|" $ map (.name) allNets
 
+-- | Parse a boolean from @yes@, @true@, @on@, @1@ or their opposites, ignoring case.
 parseBool :: String -> Maybe Bool
 parseBool str = case map toLower str of
   "yes" -> Just True
@@ -275,6 +283,7 @@ parseBool str = case map toLower str of
   "0" -> Just False
   _ -> Nothing
 
+-- | Command line parser, with defaults from the given configuration.
 config :: Config -> Parser Config
 config c = do
   dir <-
@@ -592,12 +601,15 @@ config c = do
         <> value c.blockCacheMB
   pure Config {..}
 
+-- | Network by name.
 networkReader :: String -> Either String Network
 networkReader s =
   case netByName s of
     Just net -> Right net
     Nothing -> Left "Network name invalid"
 
+-- | Parse the command line and run the store. If no peers are given and discovery
+-- is off, discovery is turned on.
 main :: IO ()
 main = do
   c <- execParser . opts =<< defConfig
@@ -615,6 +627,8 @@ main = do
           <> Options.Applicative.header
             ("haskoin-store version " <> haskoinStoreVersion)
 
+-- | Run the store with the web server, or without it if disabled, until killed.
+-- Data goes in a directory named after the network inside the data directory.
 run :: Config -> IO ()
 run cfg =
   withContext $ \ctx ->
