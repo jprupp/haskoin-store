@@ -92,7 +92,6 @@ import Conduit
     ($$++),
   )
 import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.Reader (runReaderT)
 import Data.ByteString (ByteString)
 import Data.Serialize (encode)
@@ -404,10 +403,12 @@ blockAtOrAfter ::
   Chain ->
   UnixTime ->
   m (Maybe BlockData)
-blockAtOrAfter ch q = runMaybeT $ do
-  net <- lift getNetwork
-  x <- MaybeT $ liftIO $ runReaderT (firstGreaterOrEqual net f) ch
-  MaybeT $ getBlock $ headerHash x.header
+blockAtOrAfter ch q = do
+  net <- getNetwork
+  -- the header search of haskoin-node is a ReaderT action over the chain
+  liftIO (runReaderT (firstGreaterOrEqual net f) ch) >>= \case
+    Nothing -> return Nothing
+    Just x -> getBlock (headerHash x.header)
   where
     f x =
       let t = fromIntegral x.header.timestamp
@@ -420,10 +421,12 @@ blockAtOrBefore ::
   Chain ->
   UnixTime ->
   m (Maybe BlockData)
-blockAtOrBefore ch q = runMaybeT $ do
-  net <- lift getNetwork
-  x <- MaybeT $ liftIO $ runReaderT (lastSmallerOrEqual net f) ch
-  MaybeT $ getBlock $ headerHash x.header
+blockAtOrBefore ch q = do
+  net <- getNetwork
+  -- the header search of haskoin-node is a ReaderT action over the chain
+  liftIO (runReaderT (lastSmallerOrEqual net f) ch) >>= \case
+    Nothing -> return Nothing
+    Just x -> getBlock (headerHash x.header)
   where
     f x =
       let t = fromIntegral x.header.timestamp
@@ -436,10 +439,12 @@ blockAtOrAfterMTP ::
   Chain ->
   UnixTime ->
   m (Maybe BlockData)
-blockAtOrAfterMTP ch q = runMaybeT $ do
-  net <- lift getNetwork
-  x <- MaybeT $ liftIO $ runReaderT (firstGreaterOrEqual net f) ch
-  MaybeT $ getBlock $ headerHash x.header
+blockAtOrAfterMTP ch q = do
+  net <- getNetwork
+  -- the header search of haskoin-node is a ReaderT action over the chain
+  liftIO (runReaderT (firstGreaterOrEqual net f) ch) >>= \case
+    Nothing -> return Nothing
+    Just x -> getBlock (headerHash x.header)
   where
     f x = do
       t <- fromIntegral <$> mtp x

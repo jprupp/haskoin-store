@@ -21,7 +21,6 @@ module Main (main) where
 
 import Conduit
 import Control.Monad (forever, unless)
-import Control.Monad.Reader (runReaderT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.HashMap.Strict qualified as HashMap
@@ -43,6 +42,7 @@ import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store
+import Haskoin.Store.Database.Query qualified as Q
 import NQE
 import Network.Socket (SockAddr (..))
 import System.Environment (getArgs)
@@ -72,7 +72,7 @@ server args = do
         T.putStrLn $ "hot address: " <> addrText net (hotAddr ctx)
         T.putStrLn $ "xpub: " <> xPubExport net ctx (benchXPub ctx)
         T.putStrLn $ "xpub address: " <> addrText net (xpubAddr ctx 0 0)
-        bh <- runReaderT getBestBlock store.db
+        bh <- Q.getBestBlock store.db
         T.putStrLn $ "best block: " <> maybe "" blockHashToHex bh
         putStrLn $ "serving on port " <> show port
         hFlush stdout
@@ -83,7 +83,10 @@ addrText net = fromMaybe (error "address") . addrToText net
 
 waitHeight :: Store -> Inbox StoreEvent -> Int -> IO ()
 waitHeight store sub n = do
-  h <- maybe 0 (.height) <$> runReaderT (getBestBlock >>= maybe (return Nothing) getBlock) store.db
+  h <-
+    Q.getBestBlock store.db >>= \case
+      Nothing -> return 0
+      Just bh -> maybe 0 (.height) <$> Q.getBlock store.db bh
   unless (fromIntegral h >= n) $ do
     _ <- receiveMatch sub $ \case
       StoreBestBlock b -> Just b

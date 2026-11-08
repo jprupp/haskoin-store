@@ -29,11 +29,6 @@ module Haskoin.Store.Manager
 where
 
 import Control.Monad (unless)
-import Control.Monad.Cont
-  ( ContT (..),
-    runContT,
-  )
-import Control.Monad.Trans (lift)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32)
 import Haskoin
@@ -201,26 +196,24 @@ withStore ::
   (Store -> m a) ->
   m a
 withStore cfg action =
-  connectDB cfg $
-    \db -> flip runContT return $ do
-      pub <- ContT withPublisher
-      node_pub <- ContT withPublisher
-      node_sub <- ContT $ withSubscription node_pub
-      node <- ContT $ withNode $ nodeCfg cfg db node_pub
-      block_store <- ContT $ withBlockStore $ blockStoreCfg cfg node pub db
-      fwd <- ContT $ withAsync $ nodeForwarder block_store pub node_sub
-      link fwd
-      lift $
-        action
-          Store
-            { peerMgr = node.peerMgr,
-              chain = node.chain,
-              block = block_store,
-              db = db,
-              pub = pub,
-              net = cfg.net,
-              ctx = cfg.ctx
-            }
+  connectDB cfg $ \db ->
+    withPublisher $ \pub ->
+      withPublisher $ \node_pub ->
+        withSubscription node_pub $ \node_sub ->
+          withNode (nodeCfg cfg db node_pub) $ \node ->
+            withBlockStore (blockStoreCfg cfg node pub db) $ \block_store ->
+              withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
+                link fwd
+                action
+                  Store
+                    { peerMgr = node.peerMgr,
+                      chain = node.chain,
+                      block = block_store,
+                      db = db,
+                      pub = pub,
+                      net = cfg.net,
+                      ctx = cfg.ctx
+                    }
 
 -- | Open the database described by the configuration and run an action with its reader.
 connectDB ::

@@ -13,8 +13,6 @@
 module Main (main) where
 
 import Control.Monad (when)
-import Control.Monad.Cont (ContT (ContT), runContT)
-import Control.Monad.Trans (lift)
 import Data.Char (toLower)
 import Data.Default (Default (..))
 import Data.List (intercalate)
@@ -632,19 +630,18 @@ main = do
 run :: Config -> IO ()
 run cfg =
   withContext $ \ctx ->
-    withLogger level $ \logger -> flip runContT return $ do
+    withLogger level $ \logger -> do
       net <- either error return $ networkReader cfg.net
-      stats <- ContT $ with_stats logger net
-      let dir = cfg.dir </> net.name
-      logInfo (withSource "haskoin-store" logger) $
-        "Creating working directory (if not found): " <> cs dir
-      createDirectoryIfMissing True dir
-      store <- ContT $ run_store logger net ctx stats dir
-      if cfg.noWeb
-        then lift . withSubscription store.pub $ \sub ->
-          loopForever (receive sub)
-        else do
-          lift $ run_web logger stats store
+      with_stats logger net $ \stats -> do
+        let dir = cfg.dir </> net.name
+        logInfo (withSource "haskoin-store" logger) $
+          "Creating working directory (if not found): " <> cs dir
+        createDirectoryIfMissing True dir
+        run_store logger net ctx stats dir $ \store ->
+          if cfg.noWeb
+            then withSubscription store.pub $ \sub ->
+              loopForever (receive sub)
+            else run_web logger stats store
   where
     run_store logger net ctx stats dir =
       withStore

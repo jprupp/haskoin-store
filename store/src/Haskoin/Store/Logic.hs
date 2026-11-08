@@ -22,8 +22,9 @@
 --
 -- These functions keep every index consistent: transactions, unspent outputs,
 -- spenders, address transactions, address unspent outputs, balances and the
--- mempool. They run in 'ImportM', which buffers all changes and commits them in
--- one atomic batch, so a failure leaves the database untouched.
+-- mempool. Each takes the 'Writer' of a batch as its first argument and runs
+-- in 'IO'; the writer buffers all changes and 'runWriter' commits them in one
+-- atomic batch, so a failure leaves the database untouched.
 --
 -- When a block is imported, transactions already in the mempool are confirmed,
 -- new ones are imported, and mempool transactions that conflict with the block
