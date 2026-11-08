@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
@@ -11,7 +13,7 @@ import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
 import Data.Serialize (encode)
 import Data.Word (Word32)
-import Haskoin (Address (..), TxHash (..), ripemd160, sha256)
+import Haskoin (Address (..), OutPoint (..), TxHash (..), ripemd160, sha256)
 import Haskoin.Store.Common
   ( Limits (..),
     applyLimit,
@@ -23,11 +25,13 @@ import Haskoin.Store.Common
     scanXPubBals,
     streamThings,
     txRefKey,
+    unspentKey,
   )
 import Haskoin.Store.Data
   ( Balance (..),
     BlockRef (..),
     TxRef (..),
+    Unspent (..),
     XPubBal (..),
     zeroBalance,
   )
@@ -89,6 +93,19 @@ spec = do
           seen g = [n | XPubBal {path = [0, n], balance = b} <- scan 20 g ext [], b.txs > 0]
       maximum (seen 32) `shouldBe` 35
       maximum (seen 34) `shouldBe` 69
+  describe "order of ties" $ do
+    -- RocksDB and Redis both order entries of the same block position by
+    -- their serialized bytes; the merges must agree with them
+    it "puts transactions of one position in the order of their bytes" $
+      property $ \(NonNegative t) (Positive n) ->
+        let refs = [TxRef {block = MemRef t, txid = TxHash (sha256 (encode i))} | i <- [1 .. n `mod` 20 :: Int]]
+         in map (.txid) (sortOn (Down . txRefKey) refs) === map (.txid) (sortOn (encode . (.txid)) refs)
+    it "puts outputs of one position in the order of their bytes" $
+      property $ \(Positive n) ->
+        forAll (vectorOf (n `mod` 20) (choose (0, 70000))) $ \is ->
+          let h = TxHash (sha256 ("tx" :: C8.ByteString))
+              us = [Unspent {block = BlockRef 7 1, outpoint = OutPoint h i, value = 1, script = "", address = Nothing} | i <- nub is]
+           in map (.outpoint) (sortOn (Down . unspentKey) us) === map (.outpoint) (sortOn (encode . (.outpoint)) us)
   describe "joinDescStreams with txRefKey" $ do
     it "merges without duplicates mempool transactions of the same second" $
       property $ \(TxStreams all' ss) ->

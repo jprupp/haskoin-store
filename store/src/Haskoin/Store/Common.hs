@@ -637,8 +637,8 @@ txRefKey t = (t.block, Down t.txid)
 -- | Order of unspent outputs, newest first when sorted in decreasing order:
 -- by block position, then by the serialized output point in increasing
 -- order. See 'txRefKey' for why the ties are broken by serialized bytes.
-unspentKey :: Unspent -> (BlockRef, ByteString)
-unspentKey u = (u.block, encode u.outpoint)
+unspentKey :: Unspent -> (BlockRef, Down ByteString)
+unspentKey u = (u.block, Down (encode u.outpoint))
 
 -- | Merge streams whose keys never increase, taking at most the given number
 -- of items from each stream ('Nothing': all of them). The items come out in
