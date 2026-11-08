@@ -14,12 +14,11 @@
 -- Portability : POSIX
 --
 -- Wires the components of a store together: the RocksDB database, the
--- peer-to-peer node, the block store that imports data, and the optional Redis
--- cache with its writer process. Node events are forwarded to the block store
--- and turned into 'StoreEvent's.
+-- peer-to-peer node and the block store that imports data. Node events are
+-- forwarded to the block store and turned into 'StoreEvent's.
+--
 -- Keeping the wiring in one place means each component only knows about the
--- interfaces it uses: the block store does not know about the cache, and the
--- node does not know about either. 'withStore' starts them in dependency order
+-- interfaces it uses: the node does not know about the block store. 'withStore' starts them in dependency order
 -- and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
@@ -133,7 +132,8 @@ data StoreConfig = StoreConfig
     db :: !FilePath,
     -- | network constants
     net :: !Network,
-    -- | Redis cache configuration
+    -- | Redis URL for the cache of extended public keys; not used while the
+    -- cache is being rewritten
     redis :: !(Maybe String),
     -- | Secp256k1 context
     ctx :: !Ctx,
@@ -141,9 +141,11 @@ data StoreConfig = StoreConfig
     initGap :: !Word32,
     -- | gap for extended public keys
     gap :: !Word32,
-    -- | cache xpubs with more than this many used addresses
+    -- | cache xpubs with at least this many used addresses; not used while
+    -- the cache is being rewritten
     redisMinAddrs :: !Int,
-    -- | maximum number of keys in Redis cache
+    -- | most keys in the Redis cache; not used while the cache is being
+    -- rewritten
     redisMaxKeys :: !Integer,
     -- | do not index new mempool transactions
     noMempool :: !Bool,
@@ -159,11 +161,12 @@ data StoreConfig = StoreConfig
     peerTimeout :: !NominalDiffTime,
     -- | disconnect peer if it has been connected this long
     maxPeerLife :: !NominalDiffTime,
-    -- | connect to peers using the function 'withConnection'
+    -- | connect to peers using the function 'Haskoin.Node.withConnection'
     connect :: !(SockAddr -> WithConnection),
     -- | StatsD
     stats :: !(Maybe Stats),
-    -- | sync mempool against cache every this many seconds
+    -- | seconds between syncs of the mempool to the cache; not used while the
+    -- cache is being rewritten
     redisSyncInterval :: !Int,
     -- | database Bloom filters
     bloom :: !Bool,
@@ -188,8 +191,7 @@ data StoreConfig = StoreConfig
 -- when the action returns, and an exception in any component is re-thrown in
 -- the calling thread.
 --
--- The database is opened first, then the node, the cache (if 'redis' is set)
--- and the block store.
+-- The database is opened first, then the node and the block store.
 withStore ::
   (MonadUnliftIO m) =>
   StoreConfig ->

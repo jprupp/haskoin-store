@@ -14,33 +14,35 @@
 -- <https://hackage.haskell.org/package/haskoin-node haskoin-node>, downloads
 -- blocks and mempool transactions, and indexes them in RocksDB. The indices
 -- answer questions about blocks, transactions, address balances, unspent
--- outputs and extended public keys. An optional Redis cache speeds up queries
--- about extended public keys with many addresses. A REST API built on these
--- indices is in "Haskoin.Store.Web".
+-- outputs and extended public keys. A REST API built on these indices is in
+-- "Haskoin.Store.Web". (The Redis cache of extended public keys is being
+-- rewritten; until it is back, every query reads the database.)
 --
 -- = Running a store
 --
--- 'withStore' starts everything from a 'StoreConfig': the database, the node,
--- the block store that imports data, and the cache if configured. The 'Store'
--- it returns has a 'DatabaseReader' and, if the cache is on, a 'CacheConfig'.
--- Run queries with 'withDB', or inside 'withCache' to use the cache.
+-- 'withStore' starts everything from a 'StoreConfig': the database, the node
+-- and the block store that imports data. The 'Store' it returns has a
+-- 'DatabaseReader'; query it with the functions of
+-- "Haskoin.Store.Database.Query", which take the reader and run in 'IO'.
 --
 -- @
 -- 'withStore' cfg $ \\store ->
---   'withSubscription' store.pub $ \\events -> do
---     best <- 'withDB' store.db 'getBestBlock'
+--   withSubscription store.pub $ \\events -> do
+--     best <- Haskoin.Store.Database.Query.getBestBlock store.db
 --     ...
 -- @
 --
 -- = Modules
 --
 -- * "Haskoin.Store.Data": types of the data returned by the store and the API.
--- * "Haskoin.Store.Common": the 'StoreReadBase' and 'StoreReadExtra' query
---   interfaces.
--- * "Haskoin.Store.Database.Reader": queries against RocksDB.
+-- * "Haskoin.Store.Common": helpers for paging, ordering and deriving
+--   addresses, and the 'StoreReadBase' and 'StoreReadExtra' classes that the
+--   web server still uses.
+-- * "Haskoin.Store.Database.Reader": opening the RocksDB database.
+-- * "Haskoin.Store.Database.Query": queries against RocksDB, as plain
+--   functions.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
--- * "Haskoin.Store.Cache": the Redis cache for extended public keys.
 -- * "Haskoin.Store.Web": the REST API server.
 -- = Purpose
 --

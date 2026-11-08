@@ -337,7 +337,7 @@ instance KeyValue MemTxKey UnixTime
 
 -- | Index of the mempool by the time each transaction entered it, in the
 -- mempool column family next to 'MemTxKey'. Keys sort by time, then by
--- hash, as the pairs in 'getMempool' do, so a page of the mempool is read
+-- hash, as the pairs in @getMempool@ do, so a page of the mempool is read
 -- with a short scan instead of loading and sorting every entry.
 data MemTimeKey
   = -- | entry of a mempool transaction, by time and hash

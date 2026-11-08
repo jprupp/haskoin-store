@@ -24,8 +24,8 @@
 --
 -- = Why plain functions
 --
--- The queries used to be the methods of the classes 'StoreReadBase' and
--- 'StoreReadExtra', run in @ReaderT DatabaseReader@, and reached the web
+-- The queries used to be the methods of the classes 'Haskoin.Store.Common.StoreReadBase' and
+-- 'Haskoin.Store.Common.StoreReadExtra', run in @ReaderT DatabaseReader@, and reached the web
 -- server through more layers of @ReaderT@ for the cache. Every caller then
 -- had to live in a stack of monad transformers to ask the database anything,
 -- and every layer had to lift or re-implement every method. A function that

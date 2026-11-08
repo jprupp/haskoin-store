@@ -19,7 +19,7 @@
 --
 -- Queries against the RocksDB database of the store.
 --
--- 'DatabaseReaderT' implements 'StoreReadBase' and 'StoreReadExtra' by reading
+-- 'DatabaseReaderT' implements 'Haskoin.Store.Common.StoreReadBase' and 'Haskoin.Store.Common.StoreReadExtra' by reading
 -- the indices directly from RocksDB. The database is opened with
 -- 'withDatabaseReader', which also creates or migrates it.
 --
