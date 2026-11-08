@@ -397,10 +397,12 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   their transactions. It never patches an entry: when a block, a mempool
   transaction or a reorganisation touches a cached xpub, the store reads the
   whole xpub again from RocksDB, with the same queries that answer uncached
-  requests, and replaces the entry in one Lua script. Entries carry the height
-  of the database they came from, so a store that is behind cannot replace
-  newer data written by another store. Without Redis, xpub queries read
-  RocksDB directly.
+  requests, and replaces the entry in one Lua script, together with every
+  transaction body it needs. Stores sharing a Redis claim each change, so it
+  is applied once, by the first store to see it; a store never replaces an
+  entry that knows more than its database (a higher block, or a transaction
+  it has not seen), and a store that is catching up does no cache work.
+  Without Redis, xpub queries read RocksDB directly.
 - The **web server** (`Haskoin.Store.Web`) answers from RocksDB, and from the
   cache for cached xpubs and for transaction bodies that Redis has.
 

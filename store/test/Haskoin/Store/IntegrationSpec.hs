@@ -70,8 +70,11 @@ import Haskoin
     addrToText,
     addressToScriptBS,
     deriveXPubKey,
+    TxHash (..),
+    blockHashToHex,
     encodeHex,
     hexToTxHash,
+    sha256,
     makeXPrvKey,
     prepareContext,
     prvSubKey,
@@ -94,6 +97,9 @@ import Haskoin.Store
   )
 import Haskoin.Store.Cache
   ( Cache,
+    CacheCounters (..),
+    Reload (..),
+    cacheCounters,
     cacheEvict,
     cacheIsCached,
     cachePrefix,
@@ -144,6 +150,8 @@ chainSpec kind = do
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
+  it "applies each change once with two stores sharing Redis" onceTest
+  it "does not replace what it does not know" unknownTest
   it "leaves the keys of older caches alone" oldKeysTest
 
 -------------------------------------------------------------------------------
@@ -167,7 +175,10 @@ data Env = Env
     -- | the cache of the store
     redisCache :: !Cache,
     -- | connection to Redis, to look at the keys
-    redis :: !Redis.Connection
+    redis :: !Redis.Connection,
+    -- | a second store, with its own database, syncing from the same node
+    -- and sharing the same Redis
+    other :: !Store
   }
 
 -- | Initial gap and gap of the store under test, the defaults.
@@ -201,7 +212,8 @@ withEnv kind ctx go = do
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
             cfg = storeConfig net ctx logger dir redisURL p2pPort
-        withStore cfg $ \store -> do
+        withStore cfg $ \store -> withRamDir $ \dir2 ->
+         withStore (storeConfig net ctx logger dir2 redisURL p2pPort) {maxPeers = 1} $ \other -> do
           cachedPort <- freePort
           plainPort <- freePort
           let web s p = runWeb (webConfig logger s p)
@@ -222,7 +234,8 @@ withEnv kind ctx go = do
                         plain = "http://127.0.0.1:" <> show plainPort,
                         miner = miner,
                         redisCache = cache,
-                        redis = conn
+                        redis = conn,
+                        other = other
                       }
               waitSynced env
               go env
@@ -1213,9 +1226,9 @@ damagedTest env = do
   bal <- redisRun env $ Redis.get (xpubKey env x "bal")
   (decode <$> bal :: Maybe (Either String [XPubBal])) `shouldSatisfy` maybe False isRight
   void . redisRun env $ Redis.hset (xpubKey env x "meta") (pure ("height", "999999999"))
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` False
+  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Behind
   void . redisRun env $ Redis.hset (xpubKey env x "meta") (pure ("height", "0"))
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` True
+  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
   checkXPub env x ref
 
 -- | An output of a cached transaction that pays an address outside the xpub
@@ -1299,3 +1312,58 @@ oldKeysTest :: Env -> IO ()
 oldKeysTest env =
   forM_ oldKeys $ \(k, v) ->
     redisRun env (Redis.get k) `shouldReturn` Just v
+
+-- | Wait until the second store has the best block of the node.
+waitOther :: Env -> IO ()
+waitOther env =
+  waitFor "the second store to sync" $ do
+    best <- bestBlockHash env.node
+    ours <- Q.getBestBlock env.other.db
+    return (fmap blockHashToHex ours == Just best)
+
+-- | Reloads done by both stores.
+reloads :: Env -> IO (Int, Int)
+reloads env = do
+  cache2 <- maybe (fail "The second store has no cache") return env.other.cache
+  a <- cacheCounters env.redisCache
+  b <- cacheCounters cache2
+  return (a.reloads + b.reloads, a.behind + b.behind)
+
+-- | Two stores share a Redis and see the same events. A payment to a cached
+-- xpub, then the block that confirms it, are each applied once: one store
+-- claims each change and reloads the xpub, the other finds it done.
+onceTest :: Env -> IO ()
+onceTest env = do
+  let x = newXPub env "once" DeriveNormal
+  ref <- newLedger
+  void $ pay env x ref [([0, 0], 100000)]
+  void $ mine env 1
+  waitOther env
+  checkXPub env x ref
+  threadDelay 1000000
+  (r0, b0) <- reloads env
+  void $ pay env x ref [([0, 1], 200000)]
+  waitSynced env
+  checkXPub env x ref
+  void $ mine env 1
+  waitOther env
+  checkXPub env x ref
+  threadDelay 2000000
+  (r1, b1) <- reloads env
+  (r1 - r0, b1 - b0) `shouldBe` (2, 0)
+
+-- | Redis has a transaction of a cached xpub that this store has never seen:
+-- a store that is behind must not replace the entry, which would drop it.
+unknownTest :: Env -> IO ()
+unknownTest env = do
+  let x = newXPub env "unknown" DeriveNormal
+      unknown = encode (TxHash (sha256 ("never seen" :: C8.ByteString)))
+  ref <- newLedger
+  void $ pay env x ref [([0, 0], 100000)]
+  void $ mine env 1
+  checkXPub env x ref
+  void . redisRun env $ Redis.zadd (xpubKey env x "txs") [(1, unknown)]
+  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Behind
+  void . redisRun env $ Redis.zrem (xpubKey env x "txs") (pure unknown)
+  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
+  checkXPub env x ref

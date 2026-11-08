@@ -1765,7 +1765,9 @@ getBinfoUnspents numtxid height xbals xspecs addrs = do
     binfo u xp =
       let conf = case u.block of
             MemRef _ -> 0
-            BlockRef h _ -> height - h + 1
+            -- an output from the cache may be in a block that the chain of
+            -- this store does not have yet: it is confirmed at least once
+            BlockRef h _ -> if h > height then 1 else height - h + 1
        in BinfoUnspent
             { txid = u.outpoint.hash,
               index = u.outpoint.index,

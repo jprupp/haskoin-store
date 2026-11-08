@@ -24,9 +24,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - Everything a response needs is in Redis, transaction bodies included,
     shared between xpubs, with the spenders of their outputs kept up to date.
     A store that has not imported a transaction yet still serves it.
-  - Several stores can share one Redis: entries carry the height of the
-    database they came from, so a store that is behind does not replace newer
-    data, and a lock per xpub keeps two stores from reloading it at once.
+  - Several stores can share one Redis. Each change of a cached xpub is
+    claimed and applied once, by the first store to see it; stores that catch
+    up find their changes done and do no work. A store never replaces an entry
+    that knows more than its database (a higher block, or a transaction it has
+    not seen), so stores do not undo each other's work, and every entry is
+    written together with the bodies it needs, so a store that is behind can
+    serve it in full.
   - Keys start with `hs2:<network>:`, so the cache can share a Redis with the
     cache of older versions and with stores of other networks.
   - `--redis-max-xpubs` (`REDIS_MAX_XPUBS`, default 10000) replaces
@@ -57,12 +61,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   database and the cache store them (`txRefKey`, `unspentKey`).
 - `nocache=true` on `/xpub/:xpub/transactions` and `/xpub/:xpub/unspent` no
   longer reads, or fills, the cache.
+- `confirmations` of `/blockchain/unspent` no longer wraps around for an
+  output in a block newer than the chain of the store.
 
 ### Added
 
 - Integration tests against regtest chains of Bitcoin Core and Bitcoin Cash
   Node, with Valkey, in Podman containers built from Ubuntu 26.04 and
-  release tarballs checked against pinned hashes. They are skipped when Podman
+  release tarballs checked against pinned hashes, one cached layer per
+  download, so nothing is downloaded twice. They are skipped when Podman
   cannot run containers or `HASKOIN_STORE_NO_PODMAN` is set.
 
 ## [1.8.1] - 2026-11-07

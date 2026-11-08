@@ -1,3 +1,4 @@
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE ImportQualifiedPost #-}
@@ -51,15 +52,32 @@
 --
 -- = Several stores, one Redis
 --
--- Stores index the same chain at slightly different times. To keep a store
--- that is behind from replacing newer data, every entry carries a stamp: the
--- height of the best block of the database it was read from, and the time it
--- was read. An entry is only replaced by one with a higher height, or the same
--- height and a later time. Every change that involves more than one key runs
--- as a Lua script, so readers never see half of an update, and a lock per xpub
--- keeps two stores from reloading the same xpub at once. Stores that answer
--- from Redis serve the same data; stores whose databases disagree can still
--- serve different answers for xpubs that are not cached.
+-- Stores index the same chain at slightly different times, and see mempool
+-- transactions in different orders. Three rules keep them from getting in
+-- each other's way:
+--
+-- * __Each change is applied once.__ A store claims each change it sees, per
+--   cached xpub that it touches (@ev:\<event\>:\<id\>@). The first store to
+--   claim it reloads the xpub and marks the claim done; the others skip it. A
+--   store that is catching up finds its events done and does no work, and a
+--   store whose database does not have the best header ignores events
+--   altogether.
+--
+-- * __No store writes what knows less than Redis.__ A store does not replace
+--   an entry stamped with a higher block than its own best block, nor one
+--   with a transaction that its database has never seen; it gives the change
+--   up for a store that knows more. So stores never undo each other's work.
+--
+-- * __No entry refers to what Redis does not have.__ An entry is written in
+--   one Lua script together with the bodies it needs, and the script writes
+--   nothing if a body would be missing. A store that is behind can serve a
+--   cached xpub in full, transactions it has not imported included.
+--
+-- A lock per xpub keeps two stores from reloading it at the same time, and
+-- every change of several keys is a Lua script, so readers never see half of
+-- one. Stores that answer from Redis serve the same data; stores whose
+-- databases disagree can still give different answers for xpubs that are not
+-- cached.
 --
 -- = Keys
 --
@@ -67,8 +85,8 @@
 -- the cache of older versions of the store, whose keys have no such prefix,
 -- and with stores of other networks.
 --
--- * @x:\<id\>:meta@: hash with the serialized xpub (@spec@), the stamp
---   (@height@, @time@) and the format version (@ver@). @\<id\>@ is the
+-- * @x:\<id\>:meta@: hash with the serialized xpub (@spec@), the height of
+--   the best block it was read at (@height@) and the format version (@ver@). @\<id\>@ is the
 --   hexadecimal of the first 16 bytes of the SHA-256 of the serialized xpub.
 -- * @x:\<id\>:bal@: balances of the addresses up to the gap, serialized.
 -- * @x:\<id\>:txs@: sorted set of transaction hashes, scored by 'blockRefScore'.
@@ -80,6 +98,8 @@
 -- * @txref:\<txid\>@: set of the ids of the cached xpubs with this transaction.
 -- * @lru@: sorted set of ids by time of last use, for eviction.
 -- * @lock:\<id\>@: lock held while an xpub is reloaded.
+-- * @ev:\<event\>:\<id\>@: claim of a change of a cached xpub: @busy@ while a
+--   store applies it, for two minutes at most, then @done@ for an hour.
 module Haskoin.Store.Cache
   ( -- * Running the cache
     Cache,
@@ -93,9 +113,12 @@ module Haskoin.Store.Cache
     cacheXPubUnspents,
     cacheTxData,
     cacheIsCached,
+    CacheCounters (..),
+    cacheCounters,
 
     -- * Changing
     cacheRequest,
+    Reload (..),
     cacheRefresh,
     cacheDelete,
     cacheEvict,
@@ -115,14 +138,14 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
 import Data.Either (rights)
-import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Functor ((<&>))
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -153,13 +176,19 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import NQE (Inbox, Publisher, receive, withSubscription)
+import Text.Read (readMaybe)
 import UnliftIO
-  ( TVar,
+  ( IORef,
+    atomicModifyIORef',
+    TVar,
     atomically,
     checkSTM,
     handleAny,
     link,
     modifyTVar',
+    newIORef,
+    readIORef,
+    writeIORef,
     newTVarIO,
     readTVar,
     tryAny,
@@ -176,7 +205,7 @@ import System.Metrics.StatsD
     newStatCounter,
     newStatTiming,
   )
-import UnliftIO.Concurrent (threadDelay)
+import UnliftIO.Concurrent (forkIO, threadDelay)
 
 -- | Settings of the cache.
 data CacheConfig = CacheConfig
@@ -229,9 +258,36 @@ data Cache = Cache
     maxXPubs :: !Int,
     logger :: !Logger,
     metrics :: !(Maybe CacheMetrics),
-    -- | xpubs to reload, with the transactions that made them change
-    pending :: !(TVar (HashMap XPubSpec (HashSet TxHash)))
+    -- | what this store did to the cache since it started
+    counters :: !(IORef CacheCounters),
+    -- | work for the worker, newest first
+    jobs :: !(TVar [Job])
   }
+
+-- | What a store did to the cache since it started.
+data CacheCounters = CacheCounters
+  { -- | xpubs read again from the database and written
+    reloads :: !Int,
+    -- | reloads given up because Redis knew more
+    behind :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | What this store did to the cache since it started.
+cacheCounters :: Cache -> IO CacheCounters
+cacheCounters c = readIORef c.counters
+
+-- | Work for the worker of the cache.
+data Job
+  = -- | an event of the store, which may change cached xpubs
+    JobEvent !StoreEvent
+  | -- | cache an xpub that was asked about
+    JobCache !XPubSpec
+  | -- | try again to claim changes of an xpub that another store was busy
+    -- with: the transactions that changed it, and the claims
+    JobClaim !XPubSpec !(HashSet TxHash) ![ByteString]
+  | -- | reload an xpub for changes whose claims this store holds
+    JobHeld !XPubSpec !(HashSet TxHash) ![ByteString]
 
 -- | Connect to Redis and run the process that keeps the cache up to date with
 -- the events of the store, while an action runs.
@@ -249,7 +305,8 @@ withCache cfg db chain pub logger action = do
       then return R.defaultConnectInfo
       else either fail return (R.parseConnectInfo cfg.url)
   conn <- R.checkedConnect info
-  pending <- newTVarIO HashMap.empty
+  jobs <- newTVarIO []
+  counters <- newIORef (CacheCounters 0 0)
   metrics <- mapM newCacheMetrics cfg.stats
   let cache =
         Cache
@@ -261,7 +318,8 @@ withCache cfg db chain pub logger action = do
             maxXPubs = cfg.maxXPubs,
             logger = logger,
             metrics = metrics,
-            pending = pending
+            counters = counters,
+            jobs = jobs
           }
   withSubscription pub $ \events ->
     withAsync (listener cache events) $ \a1 ->
@@ -495,13 +553,15 @@ cacheTxData c hs = do
 cacheRequest :: Cache -> XPubSpec -> [XPubBal] -> IO ()
 cacheRequest c x bals =
   when (length (filter (not . nullBalance . (.balance)) bals) >= c.minAddrs) $
-    enqueue c [(x, HashSet.empty)]
+    push c (JobCache x)
 
--- | Reload xpubs because these transactions changed them.
-enqueue :: Cache -> [(XPubSpec, HashSet TxHash)] -> IO ()
-enqueue c xs =
-  atomically . modifyTVar' c.pending $ \m ->
-    foldr (\(x, ts) -> HashMap.insertWith (<>) x ts) m xs
+-- | Give the worker something to do.
+push :: Cache -> Job -> IO ()
+push c j = atomically (modifyTVar' c.jobs (j :))
+
+-- | Give the worker something to do in two seconds.
+later :: Cache -> Job -> IO ()
+later c j = void . forkIO $ threadDelay 2000000 >> push c j
 
 -- | Remove an xpub from the cache. Returns whether it was cached.
 cacheDelete :: Cache -> XPubSpec -> IO Bool
@@ -518,50 +578,91 @@ cacheEvict c n = do
   count c (.evictions) evicted
   return evicted
 
+-- | What became of a reload.
+data Reload
+  = -- | the entry was replaced
+    Reloaded
+  | -- | Redis knows more about the xpub than this store: its entry is stamped
+    -- with a higher block, or has a transaction this store has never seen. It
+    -- is left for a store that knows more.
+    Behind
+  | -- | another store holds the lock of the xpub
+    Locked
+  deriving (Eq, Show)
+
 -- | Reload an xpub from the database and replace its entry in Redis, unless
--- another store holds its lock or has newer data. The transactions given are
--- the ones that changed it: their bodies are written again even if the xpub
--- had them already. Returns whether the entry was replaced.
-cacheRefresh :: Cache -> XPubSpec -> HashSet TxHash -> IO Bool
+-- another store holds its lock or Redis knows more than this store (see
+-- 'Reload'). The transactions given are the ones that changed it: their
+-- bodies are written again even if Redis has them.
+--
+-- A store never writes data that knows less than what is in Redis, so stores
+-- that see the chain and the mempool at slightly different times do not undo
+-- each other's work. Every body that the new entry refers to is in Redis
+-- before the entry is: the entry and the missing bodies are written in one
+-- Lua script, which writes nothing if a body is missing, so a store that is
+-- behind never finds a cached transaction that it cannot serve.
+cacheRefresh :: Cache -> XPubSpec -> HashSet TxHash -> IO Reload
 cacheRefresh c x changed =
-  withLock c x $ timed $ do
-    old <- HashMap.fromList <$> run c (R.zrangeWithscores (xkey c x "txs") 0 (-1))
-    height <- bestHeight c
-    bals <- Q.xPubBals c.db x
-    txs <- Q.xPubTxs c.db bals def'
-    utxos <- Q.xPubUnspents c.db bals def'
-    time <- nowMs
-    let wanted =
-          [ t.txid
-          | t <- txs,
-            HashMap.lookup (encode t.txid) old /= Just (blockRefScore t.block)
-              || t.txid `HashSet.member` changed
-          ]
-    bodies <- catMaybes <$> Q.getManyTxData c.db wanted
-    let args =
-          [c.prefix, xpubId x, num height, num time, num time, encode x, encode bals]
-            <> counted [encode b.balance.address | b <- bals]
-            <> counted2 [(encode t.txid, num' (blockRefScore t.block)) | t <- txs]
-            <> counted2 [(encode u.unspent, num' (blockRefScore u.unspent.block)) | u <- utxos]
-            <> bodyArgs bodies
-    r <- run c (R.eval commitScript [] args)
-    case r of
-      ("ok" : missing) -> do
-        unless (null missing) $ do
-          more <- catMaybes <$> Q.getManyTxData c.db (rights (map decode missing))
-          void (run c (R.eval fillScript [] (c.prefix : bodyArgs more) :: Redis (Either Reply Integer)))
-        void (cacheEvict c c.maxXPubs)
-        count c (.reloads) 1
-        return True
-      _ -> count c (.stale) 1 >> return False
+  fromMaybe Locked <$> withLock c x (timed (go (3 :: Int) []))
   where
+    def' = Limits {limit = 0, offset = 0, start = Nothing}
+    go tries extra = do
+      (stamp, old) <- run c $ do
+        h <- R.hget (xkey c x "meta") "height"
+        o <- R.zrangeWithscores (xkey c x "txs") 0 (-1)
+        return ((,) <$> h <*> o)
+      height <- bestHeight c
+      if maybe False (> toInteger height) (readMaybe . C8.unpack =<< stamp)
+        then behind
+        else do
+          bals <- Q.xPubBals c.db x
+          txs <- Q.xPubTxs c.db bals def'
+          let new = HashSet.fromList (map (encode . (.txid)) txs)
+              gone = [h | (bs, _) <- old, not (HashSet.member bs new), Right h <- [decode bs]]
+          -- a transaction that Redis has and this store has never seen
+          known <- Q.getManyTxData c.db gone
+          if any isNothing known
+            then behind
+            else do
+              utxos <- Q.xPubUnspents c.db bals def'
+              present <- run c (sequence <$> mapM (R.exists . txKey c . (.txid)) txs)
+              now <- nowMs
+              let scores = HashMap.fromList old
+                  wanted =
+                    nub $
+                      extra
+                        <> [ t.txid
+                           | (t, p) <- zip txs present,
+                             not p
+                               || HashMap.lookup (encode t.txid) scores /= Just (blockRefScore t.block)
+                               || t.txid `HashSet.member` changed
+                           ]
+              bodies <- catMaybes <$> Q.getManyTxData c.db wanted
+              let args =
+                    [c.prefix, xpubId x, num height, num now, encode x, encode bals]
+                      <> counted [encode b.balance.address | b <- bals]
+                      <> counted2 [(encode t.txid, num' (blockRefScore t.block)) | t <- txs]
+                      <> counted2 [(encode u.unspent, num' (blockRefScore u.unspent.block)) | u <- utxos]
+                      <> bodyArgs bodies
+              run c (R.eval commitScript [] args) >>= \case
+                ["ok"] -> do
+                  void (cacheEvict c c.maxXPubs)
+                  count c (.reloads) 1
+                  atomicModifyIORef' c.counters (\k -> (k {reloads = k.reloads + 1} :: CacheCounters, ()))
+                  return Reloaded
+                ("missing" : missing)
+                  | tries > 0 -> go (tries - 1) (rights (map decode missing))
+                _ -> behind
+    behind = do
+      count c (.stale) 1
+      atomicModifyIORef' c.counters (\k -> (k {behind = k.behind + 1} :: CacheCounters, ()))
+      return Behind
     timed f = do
       start <- nowMs
       r <- f
       end <- nowMs
       forM_ c.metrics $ \m -> addTiming m.reloadTime (fromInteger (end - start))
       return r
-    def' = Limits {limit = 0, offset = 0, start = Nothing}
 
 -- | Arguments for bodies and their spenders: the number of bodies, the hash
 -- and body of each, the number of spenders, and the transaction, output index
@@ -609,9 +710,9 @@ inSync c =
       cb <- chainGetBest c.chain
       return (cb.height > 0 && headerHash cb.header == bb)
 
--- | Run an action holding the lock of an xpub. 'False' if another store holds
--- it. The lock expires after two minutes in case its holder dies.
-withLock :: Cache -> XPubSpec -> IO Bool -> IO Bool
+-- | Run an action holding the lock of an xpub. 'Nothing' if another store
+-- holds it. The lock expires after two minutes in case its holder dies.
+withLock :: Cache -> XPubSpec -> IO a -> IO (Maybe a)
 withLock c x f = do
   token <- C8.pack . show <$> (randomIO :: IO Word64)
   let key = c.prefix <> "lock:" <> xpubId x
@@ -628,57 +729,147 @@ withLock c x f = do
     Right R.Ok -> do
       r <- f
       void (run c (R.eval unlockScript [key] [token] :: Redis (Either Reply Integer)))
-      return r
-    _ -> return False
+      return (Just r)
+    _ -> return Nothing
 
 -------------------------------------------------------------------------------
 -- Keeping up with the store
 -------------------------------------------------------------------------------
 
--- | Reload the xpubs waiting to be reloaded, forever. An xpub whose lock is
--- taken, or that cannot be reloaded because the store is not in sync, waits
--- a second and is tried again.
+-- | Do the work of the cache, forever.
+--
+-- A store that is not in sync ignores events and requests: the stores that
+-- are ahead have already done or will do the work, and this one would only
+-- find that Redis knows more. Once in sync, each event is claimed per cached
+-- xpub that it changes ('claim'): the first store to claim a change reloads
+-- the xpub and marks the claim done, and the others skip it, so a change is
+-- applied once however many stores share the Redis, and stores that catch up
+-- find their events done. A change that a store could not apply because
+-- Redis knew more is released for another store to take; one that another
+-- store is busy with is looked at again later.
 worker :: Cache -> IO ()
-worker c = loopForever $ do
-  batch <- atomically $ do
-    m <- readTVar c.pending
-    checkSTM (not (HashMap.null m))
-    writeTVar c.pending HashMap.empty
-    return m
-  synced <- inSync c
-  failed <-
-    if not synced
-      then return (HashMap.toList batch)
-      else fmap catMaybes . forM (HashMap.toList batch) $ \(x, ts) ->
-        tryAny (cacheRefresh c x ts) >>= \case
-          Right True -> return Nothing
-          Right False -> return (Just (x, ts))
-          Left e -> do
-            log' c LevelError ("Could not cache xpub: " <> cs (show e))
-            return (Just (x, ts))
-  unless (null failed) $ do
-    threadDelay 1000000
-    enqueue c failed
+worker c = do
+  lastBest <- newIORef Nothing
+  loopForever $ do
+    js <- atomically $ do
+      xs <- readTVar c.jobs
+      checkSTM (not (null xs))
+      writeTVar c.jobs []
+      return (reverse xs)
+    synced <- inSync c
+    if synced
+      then handleAny (\e -> log' c LevelError ("Cache: " <> cs (show e))) (work c lastBest js)
+      else releaseClaims c (concat [ks | JobHeld _ _ ks <- js])
 
--- | Turn the events of the store into xpubs to reload, and keep the spenders
--- of cached transactions up to date.
-listener :: Cache -> Inbox StoreEvent -> IO ()
-listener c events = do
-  lastBest <- newTVarIO Nothing
-  loopForever . handleAny (\e -> log' c LevelError ("Cache listener: " <> cs (show e))) $ do
-    e <- receive events
-    tds <- case e of
-      StoreBestBlock h -> do
-        prev <- atomically (readTVar lastBest)
-        atomically (writeTVar lastBest (Just h))
-        blockTxs c prev h
-      StoreMempoolNew t -> maybe [] pure <$> Q.getTxData c.db t
-      StoreMempoolDelete t -> maybe [] pure <$> Q.getTxData c.db t
-      _ -> return []
-    unless (null tds) $ do
+-- | Do a batch of jobs.
+work :: Cache -> IORef (Maybe BlockHash) -> [Job] -> IO ()
+work c lastBest js = do
+  fromEvents <- concat <$> mapM (eventChanges c lastBest) [e | JobEvent e <- js]
+  let toClaim = fromEvents <> [(k, x, ts) | JobClaim x ts ks <- js, k <- ks]
+  claimed <- fmap catMaybes . forM toClaim $ \(k, x, ts) ->
+    claim c k >>= \case
+      Claimed -> return (Just (x, (ts, [k])))
+      Done -> return Nothing
+      Busy -> later c (JobClaim x ts [k]) >> return Nothing
+  let held =
+        HashMap.fromListWith
+          (\(a, b) (a', b') -> (a <> a', b <> b'))
+          (claimed <> [(x, (ts, ks)) | JobHeld x ts ks <- js])
+  forM_ (HashMap.toList held) $ \(x, (ts, ks)) ->
+    reload x ts >>= \case
+      Reloaded -> finishClaims c ks
+      Behind -> releaseClaims c ks
+      Locked -> extendClaims c ks >> later c (JobHeld x ts ks)
+  forM_ (nub [x | JobCache x <- js, not (HashMap.member x held)]) $ \x ->
+    cacheIsCached c x >>= \case
+      True -> return ()
+      False ->
+        reload x HashSet.empty >>= \case
+          Locked -> later c (JobCache x)
+          _ -> return ()
+  where
+    reload x ts =
+      tryAny (cacheRefresh c x ts) >>= \case
+        Right r -> return r
+        Left e -> do
+          log' c LevelError ("Could not cache xpub: " <> cs (show e))
+          return Locked
+
+-- | Changes that an event makes to cached xpubs: for each xpub, the key of
+-- the claim for the change, and the transactions that make it. Also keeps the
+-- spenders of cached transactions up to date, which is harmless to repeat.
+eventChanges :: Cache -> IORef (Maybe BlockHash) -> StoreEvent -> IO [(ByteString, XPubSpec, HashSet TxHash)]
+eventChanges c lastBest e = do
+  (name, tds) <- case e of
+    StoreBestBlock h -> do
+      prev <- readIORef lastBest
+      writeIORef lastBest (Just h)
+      ("b:" <> encode h,) <$> blockTxs c prev h
+    StoreMempoolNew t -> ("t+:" <> encode t,) . maybeToList <$> Q.getTxData c.db t
+    StoreMempoolDelete t -> ("t-:" <> encode t,) . maybeToList <$> Q.getTxData c.db t
+    _ -> return ("", [])
+  if null tds
+    then return []
+    else do
       updateSpenders c tds
       affected <- affectedXPubs c tds
-      enqueue c affected
+      return [(c.prefix <> "ev:" <> name <> ":" <> xpubId x, x, ts) | (x, ts) <- affected]
+
+-- | Whether this store may apply a change.
+data Claim
+  = -- | it may: it holds the claim now
+    Claimed
+  | -- | another store applied it
+    Done
+  | -- | another store holds the claim
+    Busy
+
+-- | Claim a change. A claim is held for two minutes, so that a store that
+-- dies while holding it does not keep others from the change for long.
+claim :: Cache -> ByteString -> IO Claim
+claim c k = do
+  let opts =
+        R.SetOpts
+          { R.setSeconds = Nothing,
+            R.setMilliseconds = Just 120000,
+            R.setUnixSeconds = Nothing,
+            R.setUnixMilliseconds = Nothing,
+            R.setCondition = Just R.Nx,
+            R.setKeepTTL = False
+          }
+  R.runRedis c.redis (R.setOpts k "busy" opts) >>= \case
+    Right R.Ok -> return Claimed
+    _ ->
+      run c (R.get k) <&> \case
+        Just "done" -> Done
+        _ -> Busy
+
+-- | Mark changes as applied, for an hour: long enough for every store in
+-- sync to see the same events.
+finishClaims :: Cache -> [ByteString] -> IO ()
+finishClaims _ [] = return ()
+finishClaims c ks =
+  void . run c $ sequence <$> mapM (\k -> R.setex k 3600 "done") ks
+
+-- | Give up changes, for another store to apply.
+releaseClaims :: Cache -> [ByteString] -> IO ()
+releaseClaims _ [] = return ()
+releaseClaims c ks = void (run c (R.del (NonEmpty.fromList ks)))
+
+-- | Hold changes for another two minutes.
+extendClaims :: Cache -> [ByteString] -> IO ()
+extendClaims _ [] = return ()
+extendClaims c ks = void . run c $ sequence <$> mapM (`R.pexpire` 120000) ks
+
+-- | Pass the events of the store that may change cached xpubs to the worker.
+listener :: Cache -> Inbox StoreEvent -> IO ()
+listener c events =
+  loopForever $
+    receive events >>= \case
+      e@StoreBestBlock {} -> push c (JobEvent e)
+      e@StoreMempoolNew {} -> push c (JobEvent e)
+      e@StoreMempoolDelete {} -> push c (JobEvent e)
+      _ -> return ()
 
 -- | Transactions of a new best block, and of the blocks that a
 -- reorganisation took out of the chain since the previous best block.
@@ -778,62 +969,41 @@ evictScript =
     <> cleanupLua
     <> "  n = n + 1\nend\nreturn n\n"
 
--- | Lua that writes bodies and spenders from the arguments at index @i@: the
--- number of bodies, then hash and body of each, then the number of spenders,
--- then hash, output index and spender of each. Bodies are only written for
--- transactions that some cached xpub refers to, unless @force@ is true.
-bodiesLua :: ByteString
-bodiesLua =
-  "local nb = tonumber(ARGV[i]); i = i + 1\n\
-  \local written = {}\n\
-  \for j = 1, nb do\n\
-  \  local t = ARGV[i]\n\
-  \  if force or redis.call('SCARD', p .. 'txref:' .. t) > 0 then\n\
-  \    redis.call('SET', p .. 'tx:' .. t, ARGV[i + 1])\n\
-  \    redis.call('DEL', p .. 'sp:' .. t)\n\
-  \    written[t] = true\n\
-  \  end\n\
-  \  i = i + 2\n\
-  \end\n\
-  \local ns = tonumber(ARGV[i]); i = i + 1\n\
-  \for j = 1, ns do\n\
-  \  if written[ARGV[i]] then\n\
-  \    redis.call('HSET', p .. 'sp:' .. ARGV[i], ARGV[i + 1], ARGV[i + 2])\n\
-  \  end\n\
-  \  i = i + 3\n\
-  \end\n"
-
--- | Write bodies that a commit found missing. Arguments: prefix, then the
--- bodies and spenders as in 'bodiesLua'.
-fillScript :: ByteString
-fillScript =
-  "local p = ARGV[1]\nlocal i = 2\nlocal force = false\n"
-    <> bodiesLua
-    <> "return 1\n"
-
--- | Replace the entry of an xpub, unless the stored one has a newer stamp.
--- Arguments: prefix, id, height, time, time of use, serialized xpub,
+-- | Replace the entry of an xpub, unless the stored one is stamped with a
+-- higher block. Arguments: prefix, id, height, time of use, serialized xpub,
 -- balances; the number of addresses and the addresses; the number of
 -- transactions and the hash and score of each; the number of unspent outputs
--- and the output and score of each; the bodies and spenders as in
--- 'bodiesLua'. Returns @{\"stale\"}@ if the stored entry is newer, or
--- @{\"ok\", ...}@ with the hashes of transactions whose body Redis still lacks.
+-- and the output and score of each; the number of bodies and the hash and
+-- body of each; the number of spenders and the hash, output index and spender
+-- of each. Returns @{\"stale\"}@ if the stored entry has a higher block,
+-- @{\"missing\", ...}@ with the hashes of transactions that have no body in
+-- Redis nor in the arguments, without writing anything, or @{\"ok\"}@.
 commitScript :: ByteString
 commitScript =
   "local p = ARGV[1]\nlocal id = ARGV[2]\n\
-  \local h = tonumber(ARGV[3])\nlocal t = tonumber(ARGV[4])\n\
+  \local h = tonumber(ARGV[3])\n\
   \local xk = p .. 'x:' .. id .. ':'\n\
   \local meta = xk .. 'meta'\n\
   \local oh = redis.call('HGET', meta, 'height')\n\
-  \if oh then\n\
-  \  local ot = tonumber(redis.call('HGET', meta, 'time'))\n\
-  \  oh = tonumber(oh)\n\
-  \  if h < oh or (h == oh and t < ot) then return {'stale'} end\n\
+  \if oh and h < tonumber(oh) then return {'stale'} end\n\
+  \local i = 7\n\
+  \local na = tonumber(ARGV[i]); local ai = i + 1; i = ai + na\n\
+  \local nt = tonumber(ARGV[i]); local ti = i + 1; i = ti + 2 * nt\n\
+  \local nu = tonumber(ARGV[i]); local ui = i + 1; i = ui + 2 * nu\n\
+  \local nb = tonumber(ARGV[i]); local bi = i + 1; i = bi + 2 * nb\n\
+  \local ns = tonumber(ARGV[i]); local si = i + 1\n\
+  \local given = {}\n\
+  \for j = 0, nb - 1 do given[ARGV[bi + 2 * j]] = true end\n\
+  \local missing = {'missing'}\n\
+  \for j = 0, nt - 1 do\n\
+  \  local t = ARGV[ti + 2 * j]\n\
+  \  if not given[t] and redis.call('EXISTS', p .. 'tx:' .. t) == 0 then\n\
+  \    table.insert(missing, t)\n\
+  \  end\n\
   \end\n\
-  \local i = 8\n\
-  \local na = tonumber(ARGV[i]); i = i + 1\n\
+  \if #missing > 1 then return missing end\n\
   \local addrs = {}\n\
-  \for j = 1, na do addrs[ARGV[i]] = true; i = i + 1 end\n\
+  \for j = 0, na - 1 do addrs[ARGV[ai + j]] = true end\n\
   \for _, a in ipairs(redis.call('SMEMBERS', xk .. 'addrs')) do\n\
   \  if not addrs[a] then redis.call('SREM', p .. 'a:' .. a, id) end\n\
   \end\n\
@@ -842,46 +1012,42 @@ commitScript =
   \  redis.call('SADD', p .. 'a:' .. a, id)\n\
   \  redis.call('SADD', xk .. 'addrs', a)\n\
   \end\n\
-  \local nt = tonumber(ARGV[i]); i = i + 1\n\
   \local txs = {}\n\
-  \local first = i\n\
-  \for j = 1, nt do txs[ARGV[i]] = true; i = i + 2 end\n\
-  \for _, tx in ipairs(redis.call('ZRANGE', xk .. 'txs', 0, -1)) do\n\
-  \  if not txs[tx] then\n\
-  \    local rk = p .. 'txref:' .. tx\n\
+  \for j = 0, nt - 1 do txs[ARGV[ti + 2 * j]] = true end\n\
+  \for _, t in ipairs(redis.call('ZRANGE', xk .. 'txs', 0, -1)) do\n\
+  \  if not txs[t] then\n\
+  \    local rk = p .. 'txref:' .. t\n\
   \    redis.call('SREM', rk, id)\n\
   \    if redis.call('SCARD', rk) == 0 then\n\
-  \      redis.call('DEL', rk, p .. 'tx:' .. tx, p .. 'sp:' .. tx)\n\
+  \      redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)\n\
   \    end\n\
   \  end\n\
   \end\n\
   \redis.call('DEL', xk .. 'txs')\n\
-  \local k = first\n\
-  \for j = 1, nt do\n\
-  \  redis.call('ZADD', xk .. 'txs', ARGV[k + 1], ARGV[k])\n\
-  \  redis.call('SADD', p .. 'txref:' .. ARGV[k], id)\n\
-  \  k = k + 2\n\
+  \for j = 0, nt - 1 do\n\
+  \  local t = ARGV[ti + 2 * j]\n\
+  \  redis.call('ZADD', xk .. 'txs', ARGV[ti + 2 * j + 1], t)\n\
+  \  redis.call('SADD', p .. 'txref:' .. t, id)\n\
   \end\n\
-  \local nu = tonumber(ARGV[i]); i = i + 1\n\
   \redis.call('DEL', xk .. 'utxo')\n\
-  \for j = 1, nu do\n\
-  \  redis.call('ZADD', xk .. 'utxo', ARGV[i + 1], ARGV[i])\n\
-  \  i = i + 2\n\
+  \for j = 0, nu - 1 do\n\
+  \  redis.call('ZADD', xk .. 'utxo', ARGV[ui + 2 * j + 1], ARGV[ui + 2 * j])\n\
   \end\n\
-  \local force = false\n"
-    <> bodiesLua
-    <> "redis.call('SET', xk .. 'bal', ARGV[7])\n\
-       \redis.call('HSET', meta, 'spec', ARGV[6], 'height', ARGV[3], 'time', ARGV[4], 'ver', '1')\n\
-       \redis.call('ZADD', p .. 'lru', ARGV[5], id)\n\
-       \local missing = {'ok'}\n\
-       \k = first\n\
-       \for j = 1, nt do\n\
-       \  if redis.call('EXISTS', p .. 'tx:' .. ARGV[k]) == 0 then\n\
-       \    table.insert(missing, ARGV[k])\n\
-       \  end\n\
-       \  k = k + 2\n\
-       \end\n\
-       \return missing\n"
+  \for j = 0, nb - 1 do\n\
+  \  local t = ARGV[bi + 2 * j]\n\
+  \  redis.call('SET', p .. 'tx:' .. t, ARGV[bi + 2 * j + 1])\n\
+  \  redis.call('DEL', p .. 'sp:' .. t)\n\
+  \end\n\
+  \for j = 0, ns - 1 do\n\
+  \  local k = si + 3 * j\n\
+  \  if given[ARGV[k]] then\n\
+  \    redis.call('HSET', p .. 'sp:' .. ARGV[k], ARGV[k + 1], ARGV[k + 2])\n\
+  \  end\n\
+  \end\n\
+  \redis.call('SET', xk .. 'bal', ARGV[6])\n\
+  \redis.call('HSET', meta, 'spec', ARGV[5], 'height', ARGV[3], 'ver', '2')\n\
+  \redis.call('ZADD', p .. 'lru', ARGV[4], id)\n\
+  \return {'ok'}\n"
 
 -- | Record or forget spenders of outputs of cached transactions. Arguments:
 -- prefix, number of entries, then for each: hash of the transaction that

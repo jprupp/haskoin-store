@@ -88,9 +88,16 @@ valkeyBin :: String
 valkeyBin = "/usr/bin/valkey-server"
 
 -- | Recipe of the image.
+--
+-- Every download is its own layer, ordered from the one that changes least
+-- often: the packages of the snapshot, then Bitcoin Core, then Bitcoin Cash
+-- Node. Podman keeps the layers it builds and reuses each one whose
+-- instruction, and those before it, did not change, so moving one node to a
+-- new release downloads only that release. Nothing in the image depends on
+-- the time it is built.
 containerfile :: String
 containerfile =
-  unlines
+  unlines $
     [ "FROM " <> base,
       "ARG TARGETARCH",
       -- the snapshot archive is only served over HTTPS, so first get the
@@ -101,24 +108,34 @@ containerfile =
       " && apt-get install -y --no-install-recommends ca-certificates \\",
       " && apt-get update --error-on=any --snapshot " <> snapshot <> " \\",
       " && apt-get install -y --no-install-recommends --snapshot " <> snapshot <> " ca-certificates curl valkey-server \\",
-      " && rm -rf /var/lib/apt/lists/*",
-      "RUN set -eu; \\",
-      " case \"$TARGETARCH\" in \\",
-      "  amd64) a=x86_64; c=" <> coreAmd64 <> "; b=" <> bchnAmd64 <> ";; \\",
-      "  arm64) a=aarch64; c=" <> coreArm64 <> "; b=" <> bchnArm64 <> ";; \\",
-      "  *) echo \"unsupported architecture $TARGETARCH\"; exit 1;; \\",
-      " esac; \\",
-      " cd /tmp; \\",
-      " core=bitcoin-" <> coreVersion <> "-$a-linux-gnu.tar.gz; \\",
-      " curl -fsSLO https://bitcoincore.org/bin/bitcoin-core-" <> coreVersion <> "/$core; \\",
-      " echo \"$c  $core\" | sha256sum -c -; \\",
-      " mkdir -p /opt/bitcoin-core; tar -xzf $core -C /opt/bitcoin-core --strip-components=1; \\",
-      " bchn=bitcoin-cash-node-" <> bchnVersion <> "-$a-linux-gnu.tar.gz; \\",
-      " curl -fsSLO https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v" <> bchnVersion <> "/$bchn; \\",
-      " echo \"$b  $bchn\" | sha256sum -c -; \\",
-      " mkdir -p /opt/bitcoin-cash-node; tar -xzf $bchn -C /opt/bitcoin-cash-node --strip-components=1; \\",
-      " rm -f /tmp/*.tar.gz"
+      " && rm -rf /var/lib/apt/lists/*"
     ]
+      <> release
+        "/opt/bitcoin-core"
+        ("https://bitcoincore.org/bin/bitcoin-core-" <> coreVersion <> "/bitcoin-" <> coreVersion <> "-$a-linux-gnu.tar.gz")
+        coreAmd64
+        coreArm64
+      <> release
+        "/opt/bitcoin-cash-node"
+        ("https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v" <> bchnVersion <> "/bitcoin-cash-node-" <> bchnVersion <> "-$a-linux-gnu.tar.gz")
+        bchnAmd64
+        bchnArm64
+  where
+    -- download a release for the architecture of the image, check its hash,
+    -- and unpack it; @$a@ in the URL stands for the architecture
+    release dir url amd64 arm64 =
+      [ "RUN set -eu; \\",
+        " case \"$TARGETARCH\" in \\",
+        "  amd64) a=x86_64; h=" <> amd64 <> ";; \\",
+        "  arm64) a=aarch64; h=" <> arm64 <> ";; \\",
+        "  *) echo \"unsupported architecture $TARGETARCH\"; exit 1;; \\",
+        " esac; \\",
+        " curl -fsSL -o /tmp/release.tar.gz \"" <> url <> "\"; \\",
+        " echo \"$h  /tmp/release.tar.gz\" | sha256sum -c -; \\",
+        " mkdir -p " <> dir <> "; \\",
+        " tar -xzf /tmp/release.tar.gz -C " <> dir <> " --strip-components=1; \\",
+        " rm /tmp/release.tar.gz"
+      ]
 
 -- | Tag of the image: a hash of its recipe.
 tag :: String
@@ -126,9 +143,11 @@ tag =
   "localhost/haskoin-store-test:"
     <> take 16 (T.unpack (encodeHex (encode (sha256 (C8.pack containerfile)))))
 
--- | Build the image unless it exists already, and return its tag. The build
--- downloads the base image, the packages and the two releases, and may take
--- a few minutes the first time; it is limited to 1 GiB of memory.
+-- | Build the image unless it exists already, and return its tag. The first
+-- build downloads the base image, the packages and the two releases, and may
+-- take a few minutes; later builds of a changed recipe reuse the layers that
+-- did not change ('containerfile'). Images and layers are never removed by
+-- the tests. The build may use 1 GiB of memory.
 testImage :: IO String
 testImage = do
   (exists, _, _) <- readProcessWithExitCode "podman" ["image", "exists", tag] ""
@@ -138,7 +157,7 @@ testImage = do
       (code, out, err) <-
         readProcessWithExitCode
           "podman"
-          ["build", "--memory", "1g", "--tag", tag, "--file", "-", ctx]
+          ["build", "--layers", "--memory", "1g", "--tag", tag, "--file", "-", ctx]
           containerfile
       case code of
         ExitSuccess -> return tag
