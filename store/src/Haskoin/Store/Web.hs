@@ -76,6 +76,7 @@ import Conduit
     dropC,
     dropWhileC,
     headC,
+    lengthC,
     mapC,
     runConduit,
     sinkList,
@@ -97,7 +98,6 @@ import Control.Monad.Reader
   ( MonadReader,
     ReaderT,
     asks,
-    local,
     runReaderT,
   )
 import Control.Monad.Trans (lift)
@@ -182,7 +182,6 @@ import Haskoin.Node
   )
 import Haskoin.Script
 import Haskoin.Store.BlockStore
-import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader
@@ -1544,9 +1543,9 @@ scottyDelXPub ::
   ActionT m (GenericResult Bool)
 scottyDelXPub (DelCachedXPub xpub deriv) =
   withMetrics (.xpubDelete) $ do
-    c <- askl (.config.store.cache)
-    n <- lift (withCache c $ cacheDelXPubs [XPubSpec xpub deriv])
-    return $ GenericResult (n > 0)
+    -- there is no cache while it is being rewritten
+    let _ = XPubSpec xpub deriv
+    return $ GenericResult False
 
 -- | Transactions of an extended public key, optionally without the cache.
 getXPubTxs ::
@@ -1559,8 +1558,9 @@ getXPubTxs ::
 getXPubTxs xpub deriv plimits nocache = do
   limits <- paramToLimits False plimits
   let xs = XPubSpec xpub deriv
-  xbals <- xPubBals xs
-  lift $ runNoCache nocache $ xPubTxs xs xbals limits
+  lift $ runNoCache nocache $ do
+    xbals <- xPubBals xs
+    xPubTxs xs xbals limits
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions@: transactions of an extended public key.
 scottyXPubTxs ::
@@ -1598,8 +1598,9 @@ scottyXPubUnspent (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
   withMetrics (.xpubUnspent) $ do
     limits <- paramToLimits False pLimits
     let xspec = XPubSpec xpub deriv
-    xbals <- xPubBals xspec
-    lift $ runNoCache noCache $ xPubUnspents xspec xbals limits
+    lift $ runNoCache noCache $ do
+      xbals <- xPubBals xspec
+      xPubUnspents xspec xbals limits
 
 ---------------------------------------
 -- Blockchain.info API Compatibility --
@@ -1739,7 +1740,7 @@ getBinfoUnspents ::
   ConduitT () BinfoUnspent m ()
 getBinfoUnspents numtxid height xbals xspecs addrs = do
   cs' <- conduits
-  joinDescStreams cs' .| mapC (uncurry binfo)
+  joinDescStreams (unspentKey . fst) cs' .| mapC (uncurry binfo)
   where
     binfo u xp =
       let conf = case u.block of
@@ -1786,6 +1787,23 @@ getXBals =
 xBals :: XPubSpec -> HashMap XPubSpec [XPubBal] -> [XPubBal]
 xBals = HashMap.findWithDefault []
 
+-- | Stream the references to the transactions of xpubs and addresses, newest
+-- first, without duplicates. Each xpub and address is read page by page, only
+-- as far as the consumer needs.
+binfoTxRefs ::
+  (StoreReadExtra m, MonadIO m) =>
+  HashMap XPubSpec [XPubBal] ->
+  HashSet XPubSpec ->
+  HashSet Address ->
+  ConduitT () TxRef m ()
+binfoTxRefs xbals sxspecs saddrs =
+  joinDescStreams txRefKey $
+    map xpub_c (HashSet.toList sxspecs) <> map addr_c (HashSet.toList saddrs)
+  where
+    l = Limits {limit = 16, offset = 0, start = Nothing}
+    xpub_c x = streamThings (xPubTxs x (xBals x xbals)) (Just (.txid)) l
+    addr_c a = streamThings (getAddressTxs a) (Just (.txid)) l
+
 -- | Stream the transactions of xpubs and addresses, newest first, in the
 -- Blockchain.info format, with the running balance of the given addresses after
 -- each, keeping only those that pass the filter.
@@ -1810,24 +1828,9 @@ getBinfoTxs
   bfilter
   numtxid
   prune
-  bal = do
-    cs' <- conduits
-    joinDescStreams cs' .| go bal
+  bal =
+    binfoTxRefs xbals sxspecs saddrs .| go bal
     where
-      sxspecs_ls = HashSet.toList sxspecs
-      saddrs_ls = HashSet.toList saddrs
-      conduits =
-        (<>)
-          <$> mapM xpub_c sxspecs_ls
-          <*> pure (map addr_c saddrs_ls)
-      xpub_c x = do
-        let f = xPubTxs x (xBals x xbals)
-            l = Limits {limit = 16, offset = 0, start = Nothing}
-        lift . return $
-          streamThings f (Just (.txid)) l
-      addr_c a = do
-        let l = Limits {limit = 16, offset = 0, start = Nothing}
-        streamThings (getAddressTxs a) (Just (.txid)) l
       binfo_tx = toBinfoTx numtxid abook prune
       compute_bal_change t =
         let ins = map (.output) t.inputs
@@ -1909,7 +1912,7 @@ scottyBinfoHistory =
     txs <-
       lift $
         runConduit $
-          joinDescStreams cs'
+          joinDescStreams txRefKey cs'
             .| takeWhileC (is_newer startM)
             .| concatMapMC get_transaction
             .| sinkList
@@ -2048,6 +2051,24 @@ scottyMultiAddr =
           prune
           ibal
           .| (dropC offset >> takeC n .| sinkList)
+    ntx <-
+      lift . runConduit $
+        binfoTxRefs xbals sxspecs saddrs .| lengthC
+    nfiltered <- case fltr of
+      BinfoFilterAll -> return ntx
+      _ ->
+        lift . runConduit $
+          getBinfoTxs
+            xbals
+            abook
+            sxspecs
+            saddrs
+            salladdrs
+            fltr
+            numtxid
+            prune
+            ibal
+            .| lengthC
     net <- askl (.config.store.net)
     ctx <- askl (.config.store.ctx)
     best <- get_best_block
@@ -2056,12 +2077,11 @@ scottyMultiAddr =
         abaddrs = toBinfoAddrs abals xbals xtxns
         recv = sum $ map (.received) abaddrs
         sent' = sum $ map (.sent) abaddrs
-        txn = fromIntegral $ length ftxs
         wallet =
           BinfoWallet
             { balance = bal,
-              txs = txn,
-              filtered = txn,
+              txs = ntx,
+              filtered = nfiltered,
               received = recv,
               sent = sent'
             }
@@ -2225,11 +2245,14 @@ scottyRawAddr =
               False
               (fromIntegral amnt)
               .| (dropC off >> takeC n .| sinkList)
+      -- n_tx is every transaction of the xpub, as for an address, not the
+      -- number on this page
+      ntx <- xPubTxCount xspec (xBals xspec xbals)
       let ra =
             BinfoRawAddr
               { address = BinfoXpub xpub,
                 balance = amnt,
-                ntx = fromIntegral $ length txs,
+                ntx = fromIntegral ntx,
                 utxo = summary.utxo,
                 received = summary.received,
                 sent = fromIntegral summary.received - fromIntegral amnt,
@@ -3013,25 +3036,19 @@ validateLimit wl full limitM =
 -- Utilities --
 ---------------
 
--- | Run a query against the database, through the cache if there is one.
+-- | Run a query against the database.
 runInWebReader ::
   (MonadIO m) =>
-  CacheT (DatabaseReaderT m) a ->
+  DatabaseReaderT m a ->
   ReaderT WebState m a
 runInWebReader f = do
   bdb <- asks (.config.store.db)
-  mc <- asks (.config.store.cache)
-  lift $ runReaderT (withCache mc f) bdb
+  lift $ runReaderT f bdb
 
--- | Run queries without the cache if the flag is 'True'.
-runNoCache ::
-  (MonadIO m) =>
-  Bool ->
-  ReaderT WebState m a ->
-  ReaderT WebState m a
-runNoCache False = id
-runNoCache True = local $ \s ->
-  s {config = s.config {store = s.config.store {cache = Nothing}}}
+-- | Run queries without the cache if the flag is 'True'. There is no cache
+-- while it is being rewritten, so this does nothing.
+runNoCache :: Bool -> a -> a
+runNoCache _ = id
 
 -- | Middleware that logs every request with its response status: errors at error level, others at debug level.
 logIt :: Logger -> Middleware

@@ -76,6 +76,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Ord (Down (..))
 import Data.Serialize (Serialize, decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -467,14 +468,16 @@ addressConduit a s it = do
                   it
                   (AddrTxKeyA a)
                   (AddrTxKeyB a b)
-          Just TxData {block = MemRef {}} ->
-            let cond (AddrTxKey _ (TxRef MemRef {} th)) = th /= txh
-                cond (AddrTxKey _ (TxRef BlockRef {} _)) = False
-                cond _ = undefined
+          Just TxData {block = b@MemRef {}} ->
+            -- Mempool transactions that arrived in the same second are
+            -- keyed by hash, so seek to the time and drop those before it.
+            let start = txRefKey (TxRef b txh)
+                before (AddrTxKey _ t, ()) = txRefKey t > start
+                before _ = undefined
              in readerC $ \_ ->
                   transPipe liftIO $
-                    matching it (AddrTxKeyA a)
-                      .| (dropWhileC (cond . fst) >> mapC id)
+                    matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a b)
+                      .| (dropWhileC before >> mapC id)
           Nothing -> return ()
 
 -- | Stream the unspent outputs of an address, newest first, from a starting
@@ -506,14 +509,16 @@ unspentConduit net ctx a s it =
             readerC $ \_ ->
               transPipe liftIO $
                 matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
-          Just TxData {block = MemRef {}} ->
-            let cond (AddrOutKey _ MemRef {} p) = p.hash /= txh
-                cond (AddrOutKey _ BlockRef {} _) = False
-                cond _ = undefined
+          Just TxData {block = b@MemRef {}} ->
+            -- The outputs of the start transaction come first among those
+            -- of the same second whose hashes are not smaller.
+            let start = (b, Down (encode (OutPoint txh 0)))
+                before (AddrOutKey _ r p, _) = (r, Down (encode p)) > start
+                before _ = undefined
              in readerC $ \_ ->
                   transPipe liftIO $
-                    matching it (AddrOutKeyA a)
-                      .| (dropWhileC (cond . fst) >> mapC id)
+                    matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
+                      .| (dropWhileC before >> mapC id)
           Nothing -> return ()
 
 -- | Run an action with an iterator on a column family, counting it in the metrics.
@@ -574,12 +579,13 @@ retrieveManyCF db cf keys =
 -- | Merge streams sorted newest first, drop duplicates, and apply the offset and
 -- limit.
 joinConduits ::
-  (Monad m, Ord o) =>
+  (Monad m, Ord k) =>
+  (o -> k) ->
   [ConduitT () o m ()] ->
   Limits ->
   m [o]
-joinConduits cs l =
-  runConduit $ joinDescStreams cs .| applyLimitsC l .| sinkList
+joinConduits key cs l =
+  runConduit $ joinDescStreams key cs .| applyLimitsC l .| sinkList
 
 instance (MonadIO m) => StoreReadBase (DatabaseReaderT m) where
   getCtx = asks (.ctx)
@@ -655,7 +661,7 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
   getAddressesTxs addrs limits = do
     db <- asks (.db)
     withManyIters db (addrTxCF db) (length addrs) $ \its -> do
-      txs <- joinConduits (cs its) limits
+      txs <- joinConduits txRefKey (cs its) limits
       withMetrics $ \s -> incrementCounter s.dataAddrTxCount (length txs)
       return txs
     where
@@ -667,7 +673,7 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     net <- asks (.net)
     ctx <- asks (.ctx)
     withManyIters db (addrOutCF db) (length addrs) $ \its -> do
-      uns <- joinConduits (cs net ctx its) limits
+      uns <- joinConduits unspentKey (cs net ctx its) limits
       withMetrics $ \s -> incrementCounter s.dataUnspentCount (length uns)
       return uns
     where
@@ -726,37 +732,9 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
     igap <- asks (.initGap)
     gap <- asks (.maxGap)
     Derived ext chg <- derivedAddrs xpub
-    ext1 <- derive_until_gap gap 0 (take (fromIntegral igap) ext)
-    if all nullxb ext1
-      then do
-        withMetrics $ \s -> incrementCounter s.dataXPubBals (length ext1)
-        return ext1
-      else do
-        ext2 <- derive_until_gap gap 0 (drop (fromIntegral igap) ext)
-        chg' <- derive_until_gap gap 1 chg
-        let bals = ext1 <> ext2 <> chg'
-        withMetrics $ \s -> incrementCounter s.dataXPubBals (length bals)
-        return bals
-    where
-      nullxb b = nullBalance b.balance
-      derive_until_gap gap m adrs =
-        let xb b n = XPubBal {path = [m, n], balance = b}
-            ig = fromIntegral gap
-            test acc =
-              let ns = takeWhile nullxb acc
-               in length ns > ig
-            go acc [] = return $ reverse acc
-            go acc as
-              | test acc =
-                  let (ns, ys) = span nullxb acc
-                      xs = take ig $ reverse ns
-                   in return $ reverse ys <> xs
-              | otherwise = do
-                  let (as', as'') = splitAt ig as
-                  bs <- getBalances (map snd as')
-                  let xs = reverse $ zipWith xb bs (map fst as')
-                  go (xs <> acc) as''
-         in go [] adrs
+    bals <- scanXPubBals getBalances igap gap ext chg
+    withMetrics $ \s -> incrementCounter s.dataXPubBals (length bals)
+    return bals
 
   -- The first unspent outputs of each address, at most offset plus limit
   -- of them, sorted together. Read the addresses in step, so that each is
@@ -774,7 +752,7 @@ instance (MonadUnliftIO m) => StoreReadExtra (DatabaseReaderT m) where
             .| mapC (\u -> XPubUnspent {path = b.path, unspent = u})
     us <- withManyIters db (addrOutCF db) (length cs) $ \its ->
       runConduit $
-        mergeDescGroups (.unspent.block) quota (zipWith stream cs its)
+        mergeDescGroups (.unspent.block) (unspentKey . (.unspent)) quota (zipWith stream cs its)
           .| applyLimitsC limits
           .| sinkList
     withMetrics $ \s -> incrementCounter s.dataXPubUnspents (length us)

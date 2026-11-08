@@ -83,14 +83,6 @@ module Haskoin.Store
     module Haskoin.Store.Database.Types,
     module Haskoin.Store.Data,
 
-    -- * Cache
-    CacheConfig (..),
-    CacheT,
-    CacheError (..),
-    withCache,
-    connectRedis,
-    isInCache,
-
     -- * Store Reader
     StoreReadBase (..),
     StoreReadExtra (..),
@@ -107,7 +99,6 @@ module Haskoin.Store
 where
 
 import Haskoin.Store.BlockStore
-import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader

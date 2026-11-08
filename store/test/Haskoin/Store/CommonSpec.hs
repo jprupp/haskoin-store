@@ -1,20 +1,35 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
 module Haskoin.Store.CommonSpec (spec) where
 
 import Conduit (runConduit, runConduitPure, sinkList, takeC, yieldMany, (.|))
-import Control.Monad.State.Strict (State, modify', runState)
-import Data.List (sortOn)
+import Control.Monad.State.Strict (State, evalState, execState, modify', runState)
+import Data.ByteString.Char8 qualified as C8
+import Data.IntSet qualified as IntSet
+import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
+import Data.Serialize (encode)
 import Data.Word (Word32)
+import Haskoin (Address (..), TxHash (..), ripemd160, sha256)
 import Haskoin.Store.Common
   ( Limits (..),
     applyLimit,
     applyLimits,
     applyLimitsC,
     deOffset,
+    joinDescStreams,
     mergeDescGroups,
+    scanXPubBals,
     streamThings,
+    txRefKey,
+  )
+import Haskoin.Store.Data
+  ( Balance (..),
+    BlockRef (..),
+    TxRef (..),
+    XPubBal (..),
+    zeroBalance,
   )
 import Test.Hspec
 import Test.QuickCheck
@@ -45,6 +60,119 @@ spec = do
           limits = Limits 2 0 Nothing
        in merged limits ss `shouldBe` [(9, 3), (9, 1)]
 
+  describe "scanXPubBals" $ do
+    it "keeps exactly the gap after the last used address of each chain, and the initial block" $
+      property $ \(Wallet igap gap ext chg) ->
+        let paths = map (.path) (scan igap gap ext chg)
+         in paths === modelPaths igap gap ext chg
+    it "reads no address past the gap, beyond the initial block" $
+      property $ \(Wallet igap gap ext chg) ->
+        let reads = execState (scanXPubBals (countReads ext chg) igap gap (chain 0) (chain 1)) []
+            limit m used
+              | m == 0 = max (fromIntegral igap - 1) (lastReached igap gap used + fromIntegral gap)
+              | otherwise = lastReached 0 gap used + fromIntegral gap
+            ok (m, n) = n <= limit m (if m == 0 then ext else chg)
+         in counterexample (show reads) (all ok reads)
+    it "reads only the initial block of an unused xpub" $
+      property $ \(NonNegative igap) (Positive gap) ->
+        let reads = execState (scanXPubBals (countReads [] []) (igap `mod` 40) (gap `mod` 40) (chain 0) (chain 1)) []
+         in sortOn id reads === [(0, n) | n <- [0 .. fromIntegral (igap `mod` 40) - 1]]
+    it "counts the unused addresses at the end of the initial block" $
+      -- index 0 used, initial gap 20, gap 32: the store looks at indices 1 to
+      -- 32 and no further, while it used to read up to index 83
+      let paths = map (.path) (scan 20 32 [0] [])
+       in maximum [n | [0, n] <- paths] `shouldBe` 32
+    it "does not see a payment 34 addresses past the last used one" $ do
+      -- the wallet of the Blockchain.com comparison: receive indices 0 to 35
+      -- used, then a payment to index 69
+      let ext = [0 .. 35] <> [69]
+          seen g = [n | XPubBal {path = [0, n], balance = b} <- scan 20 g ext [], b.txs > 0]
+      maximum (seen 32) `shouldBe` 35
+      maximum (seen 34) `shouldBe` 69
+  describe "joinDescStreams with txRefKey" $ do
+    it "merges without duplicates mempool transactions of the same second" $
+      property $ \(TxStreams all' ss) ->
+        let merged' = runConduitPure $ joinDescStreams txRefKey (map yieldMany ss) .| sinkList
+            want = sortOn (Down . txRefKey) (nub (concat ss))
+         in counterexample (show (length all')) (merged' === want)
+
+-- | Addresses used on each chain, with the initial gap and the gap.
+data Wallet = Wallet Word32 Word32 [Int] [Int]
+  deriving (Show)
+
+instance Arbitrary Wallet where
+  arbitrary = do
+    igap <- choose (0, 30)
+    gap <- choose (1, 40)
+    let used = fmap (IntSet.toList . IntSet.fromList) . listOf $ frequency [(4, choose (0, 40)), (1, choose (0, 150))]
+    Wallet igap gap <$> used <*> used
+
+-- | A fake address for a path.
+fakeAddr :: Word32 -> Word32 -> Address
+fakeAddr m n = PubKeyAddress (ripemd160 (C8.pack (show (m, n))))
+
+chain :: Word32 -> [(Word32, Address)]
+chain m = [(n, fakeAddr m n) | n <- [0 ..]]
+
+-- | Balances of fake addresses: the used ones have one transaction.
+balancesOf :: [Int] -> [Int] -> [Address] -> [Balance]
+balancesOf ext chg = map f
+  where
+    used = [fakeAddr 0 (fromIntegral n) | n <- ext] <> [fakeAddr 1 (fromIntegral n) | n <- chg]
+    f a
+      | a `elem` used = (zeroBalance a) {txs = 1, received = 1}
+      | otherwise = zeroBalance a
+
+scan :: Word32 -> Word32 -> [Int] -> [Int] -> [XPubBal]
+scan igap gap ext chg =
+  evalState (scanXPubBals (return . balancesOf ext chg) igap gap (chain 0) (chain 1)) ()
+
+-- | Read balances, recording the paths read.
+countReads :: [Int] -> [Int] -> [Address] -> State [(Word32, Int)] [Balance]
+countReads ext chg as = do
+  let paths = [(m, fromIntegral n) | a <- as, m <- [0, 1], n <- [0 .. 400], fakeAddr m n == a]
+  modify' (paths <>)
+  return (balancesOf ext chg as)
+
+-- | Last used index that a wallet following the gap reaches, or -1.
+lastReached :: Word32 -> Word32 -> [Int] -> Int
+lastReached igap gap used = go start
+  where
+    start = maximum ((-1) : filter (< fromIntegral igap) used)
+    go l = case filter (\u -> u > l && u <= l + fromIntegral gap) used of
+      [] -> l
+      us -> go (maximum us)
+
+-- | Paths that an exact gap gives: up to the gap after the last used address
+-- of each chain, and the whole initial block of the external chain.
+modelPaths :: Word32 -> Word32 -> [Int] -> [Int] -> [[Word32]]
+modelPaths igap gap ext chg
+  | not (any (< fromIntegral igap) ext) = [[0, fromIntegral n] | n <- [0 .. fromIntegral igap - 1 :: Int]]
+  | otherwise =
+      upto 0 (max (fromIntegral igap - 1) (lastReached igap gap ext + fromIntegral gap))
+        <> upto 1 (lastReached 0 gap chg + fromIntegral gap)
+  where
+    upto m l = [[m, fromIntegral n] | n <- [0 .. l]]
+
+-- | Transaction references and streams of subsets of them, each sorted as the
+-- database sorts the transactions of an address, with many mempool
+-- transactions that arrived in the same second.
+data TxStreams = TxStreams [TxRef] [[TxRef]]
+  deriving (Show)
+
+instance Arbitrary TxStreams where
+  arbitrary = do
+    n <- choose (0, 40)
+    refs <- mapM ref [1 .. n]
+    k <- choose (1, 5)
+    ss <- vectorOf k (sublistOf refs)
+    return $ TxStreams refs (map (sortOn (Down . txRefKey)) ss)
+    where
+      ref :: Int -> Gen TxRef
+      ref i = do
+        b <- oneof [MemRef <$> choose (1, 3), BlockRef <$> choose (1, 3) <*> pure (fromIntegral i)]
+        return TxRef {block = b, txid = TxHash (sha256 (encode i))}
+
 -- | The paging of xpub unspent outputs before 'mergeDescGroups': the first
 -- offset plus limit items of each stream, all sorted, then the page.
 reference :: Limits -> [[(Int, Int)]] -> [(Int, Int)]
@@ -54,7 +182,7 @@ reference limits =
 merged :: Limits -> [[(Int, Int)]] -> [(Int, Int)]
 merged limits ss =
   runConduitPure $
-    mergeDescGroups fst quota (map yieldMany ss)
+    mergeDescGroups fst id quota (map yieldMany ss)
       .| applyLimitsC limits
       .| sinkList
   where

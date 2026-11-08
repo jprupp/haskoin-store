@@ -33,7 +33,7 @@ import Control.Monad.Cont
   ( ContT (..),
     runContT,
   )
-import Control.Monad.Reader (ReaderT (ReaderT), runReaderT)
+import Control.Monad.Reader (ReaderT (ReaderT))
 import Control.Monad.Trans (lift)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32)
@@ -79,16 +79,6 @@ import Haskoin.Store.BlockStore
     blockStoreTxSTM,
     withBlockStore,
   )
-import Haskoin.Store.Cache
-  ( CacheConfig (..),
-    CacheWriter,
-    cacheNewBlock,
-    cacheNewTx,
-    cacheSyncMempool,
-    cacheWriter,
-    connectRedis,
-    newCacheMetrics,
-  )
 import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
@@ -101,11 +91,9 @@ import Haskoin.Store.Database.Reader
   )
 import NQE
   ( Inbox,
-    Process (..),
     Publisher,
     publishSTM,
     receive,
-    withProcess,
     withPublisher,
     withSubscription,
   )
@@ -120,7 +108,6 @@ import UnliftIO
     link,
     withAsync,
   )
-import UnliftIO.Concurrent (threadDelay)
 
 -- | Store mailboxes. Handles to the running components of a store, given by
 -- 'withStore'.
@@ -133,8 +120,6 @@ data Store = Store
     block :: !BlockStore,
     -- | database reader
     db :: !DatabaseReader,
-    -- | cache configuration, if Redis is configured
-    cache :: !(Maybe CacheConfig),
     -- | store events are published here
     pub :: !(Publisher StoreEvent),
     -- | network constants
@@ -224,7 +209,6 @@ withStore cfg action =
       node_pub <- ContT withPublisher
       node_sub <- ContT $ withSubscription node_pub
       node <- ContT $ withNode $ nodeCfg cfg db node_pub
-      cache_cfg <- ContT $ withCache cfg node.chain db pub
       block_store <- ContT $ withBlockStore $ blockStoreCfg cfg node pub db
       fwd <- ContT $ withAsync $ nodeForwarder block_store pub node_sub
       link fwd
@@ -235,7 +219,6 @@ withStore cfg action =
               chain = node.chain,
               block = block_store,
               db = db,
-              cache = cache_cfg,
               pub = pub,
               net = cfg.net,
               ctx = cfg.ctx
@@ -313,75 +296,6 @@ nodeCfg cfg db pub =
       connect = cfg.connect,
       logger = cfg.logger
     }
-
--- | If Redis is configured, connect to it, start the cache writer, and pass the
--- cache configuration to the action. Otherwise pass 'Nothing'.
-withCache ::
-  (MonadUnliftIO m) =>
-  StoreConfig ->
-  Chain ->
-  DatabaseReader ->
-  Publisher StoreEvent ->
-  (Maybe CacheConfig -> m a) ->
-  m a
-withCache cfg chain db pub action =
-  case cfg.redis of
-    Nothing ->
-      action Nothing
-    Just redisurl -> do
-      conn <- connectRedis redisurl
-      metrics <- mapM (\s -> newCacheMetrics logger s conn db) cfg.stats
-      withSubscription pub $ \evts ->
-        let conf = c conn metrics
-         in withProcess (f conf) $ \p ->
-              cacheWriterProcesses
-                cfg.redisSyncInterval
-                evts
-                (getProcessMailbox p)
-                (action (Just conf))
-  where
-    f conf cwinbox = runReaderT (cacheWriter conf cwinbox) db
-    logger = withSource "Cache" cfg.logger
-    c conn metrics =
-      CacheConfig
-        { redis = conn,
-          minAddrs = cfg.redisMinAddrs,
-          chain = chain,
-          maxKeys = cfg.redisMaxKeys,
-          metrics = metrics,
-          logger = logger
-        }
-
--- | Run the loop that feeds store events to the cache writer while the action runs.
-cacheWriterProcesses ::
-  (MonadUnliftIO m) =>
-  Int ->
-  Inbox StoreEvent ->
-  CacheWriter ->
-  m a ->
-  m a
-cacheWriterProcesses interval evts cwm action =
-  withAsync (cacheWriterEvents interval evts cwm) $ \a1 -> link a1 >> action
-
--- | Forward store events to the cache writer, and ask it to sync the mempool
--- every given number of seconds.
-cacheWriterEvents :: (MonadUnliftIO m) => Int -> Inbox StoreEvent -> CacheWriter -> m ()
-cacheWriterEvents interval evts cwm =
-  withAsync mempool . const $
-    loopForever $
-      receive evts >>= \e ->
-        e `cacheWriterDispatch` cwm
-  where
-    mempool = loopForever $ do
-      threadDelay (interval * 1000 * 1000)
-      cacheSyncMempool cwm
-
--- | Tell the cache writer about new blocks and mempool changes.
-cacheWriterDispatch :: (MonadIO m) => StoreEvent -> CacheWriter -> m ()
-cacheWriterDispatch (StoreBestBlock _) = cacheNewBlock
-cacheWriterDispatch (StoreMempoolNew t) = cacheNewTx t
-cacheWriterDispatch (StoreMempoolDelete t) = cacheNewTx t
-cacheWriterDispatch _ = const (return ())
 
 -- | Forward every node event to the block store and the store publisher, forever.
 nodeForwarder ::

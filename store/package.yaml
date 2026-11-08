@@ -86,14 +86,17 @@ tests:
     ghc-options:
       - -threaded
       - -rtsopts
-      # -T lets the memory test read the heap size
-      - '"-with-rtsopts=-N -T"'
+      # -T lets the memory test read the heap size; -M4g makes a runaway
+      # test fail with heap overflow instead of exhausting the machine
+      - '"-with-rtsopts=-N4 -T -M4g"'
     dependencies:
       - haskoin-store
       - hspec >= 2.7.1
       - QuickCheck >= 2.13.2
       - base64 >= 0.4.1
       - fast-logger >= 3.0
+      # the integration tests run podman
+      - process >= 1.6.12
 benchmarks:
   # Load-test server: syncs a synthetic chain and serves the web API on it.
   # Build with `stack build --bench --no-run-benchmarks` and run it with

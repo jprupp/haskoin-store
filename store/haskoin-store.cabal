@@ -25,7 +25,6 @@ library
   exposed-modules:
       Haskoin.Store
       Haskoin.Store.BlockStore
-      Haskoin.Store.Cache
       Haskoin.Store.Common
       Haskoin.Store.Database.Reader
       Haskoin.Store.Database.Types
@@ -141,8 +140,11 @@ test-suite spec
   main-is: Spec.hs
   other-modules:
       Haskoin.Store.BlockStoreSpec
-      Haskoin.Store.CacheSpec
       Haskoin.Store.CommonSpec
+      Haskoin.Store.Integration.Image
+      Haskoin.Store.Integration.Node
+      Haskoin.Store.Integration.Podman
+      Haskoin.Store.IntegrationSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.WebSpec
@@ -150,7 +152,7 @@ test-suite spec
       Paths_haskoin_store
   hs-source-dirs:
       test
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N -T"
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N4 -T -M4g"
   build-depends:
       QuickCheck >=2.13.2
     , aeson >=1.4.7.1
@@ -180,6 +182,7 @@ test-suite spec
     , mtl >=2.2.2
     , network >=3.1.1.1
     , nqe >=0.6.5
+    , process >=1.6.12
     , random >=1.1
     , rocksdb-haskell-jprupp >=2.6.0
     , rocksdb-query >=0.6.0
