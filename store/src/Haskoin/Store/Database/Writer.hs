@@ -18,11 +18,15 @@
 --
 -- Buffered writes to the database.
 --
--- 'WriterT' implements 'StoreWrite' by recording every change in in-memory hash
--- tables, and 'StoreReadBase' by reading those tables first and falling back to
--- the database. When the action given to 'runWriter' finishes, all the changes
--- are written to RocksDB in a single atomic batch. A block or a set of
--- transactions is thus either fully imported or not at all.
+-- A 'Writer' records every change in in-memory hash tables, and its reads look
+-- in those tables first and fall back to the database. When the function given
+-- to 'runWriter' returns, all the changes are written to RocksDB in a single
+-- atomic batch. A block or a set of transactions is thus either fully imported
+-- or not at all.
+--
+-- The writer is a plain handle passed to plain functions in 'IO' ('getTxData',
+-- 'insertTx', ...), rather than a monad transformer with class instances: the
+-- import logic says which writer it uses, and needs nothing but 'IO' to run.
 -- = Why buffer writes
 --
 -- Importing a block touches thousands of keys, and many of them several times:
@@ -31,17 +35,43 @@
 -- key, and a single atomic batch makes the whole import all-or-nothing. A crash
 -- or an invalid block leaves the database exactly as it was.
 module Haskoin.Store.Database.Writer
-  ( WriterT,
+  ( -- * Batches
+    Writer,
     MempoolChanges (..),
     runWriter,
     runWriterMempool,
+    writerNet,
+    writerCtx,
     writerLogger,
+
+    -- * Reads, with the changes of the batch applied
+    getBestBlock,
+    getBlocksAtHeight,
+    getBlock,
+    getTxData,
+    getSpender,
+    getUnspent,
+    getBalance,
+    getMempool,
+
+    -- * Writes
+    setBest,
+    insertBlock,
+    setBlocksAtHeight,
+    insertTx,
+    insertAddrTx,
+    deleteAddrTx,
+    insertAddrUnspent,
+    deleteAddrUnspent,
+    addToMempool,
+    deleteFromMempool,
+    setBalance,
+    insertUnspent,
+    deleteUnspent,
   )
 where
 
 import Control.Monad (forM)
-import Control.Monad.Reader (ReaderT (..))
-import Control.Monad.Reader qualified as R
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashTable.IO qualified as H
 import Data.IntMap.Strict qualified as IntMap
@@ -68,10 +98,8 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (Logger)
-import Haskoin.Store.Common
 import Haskoin.Store.Data
--- the instances of the store classes for the database reader
-import Haskoin.Store.Database.Query ()
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import UnliftIO
@@ -83,7 +111,8 @@ import UnliftIO
     writeIORef,
   )
 
--- | Environment of a batch of writes.
+-- | A batch of writes: the database it reads from and writes to, the
+-- changes made so far, and where to log. Make one with 'runWriter'.
 data Writer = Writer
   { -- | database to read from and write to
     reader :: !DatabaseReader,
@@ -93,24 +122,17 @@ data Writer = Writer
     logger :: !Logger
   }
 
--- | Monad transformer for a batch of writes. Run it with 'runWriter'.
-type WriterT = ReaderT Writer
+-- | Network of the database of a batch.
+writerNet :: Writer -> Network
+writerNet w = w.reader.net
+
+-- | Secp256k1 context of the database of a batch.
+writerCtx :: Writer -> Ctx
+writerCtx w = w.reader.ctx
 
 -- | Logger passed to 'runWriter'.
-writerLogger :: (Monad m) => WriterT m Logger
-writerLogger = R.asks (.logger)
-
-instance (MonadIO m) => StoreReadBase (WriterT m) where
-  getNetwork = R.asks (.reader.net)
-  getCtx = R.asks (.reader.ctx)
-  getBestBlock = getBestBlockI
-  getBlocksAtHeight = getBlocksAtHeightI
-  getBlock = getBlockI
-  getTxData = getTxDataI
-  getSpender = getSpenderI
-  getUnspent = getUnspentI
-  getBalance = getBalanceI
-  getMempool = getMempoolI
+writerLogger :: Writer -> Logger
+writerLogger w = w.logger
 
 -- | Change to the best block: 'Nothing' if unchanged, @Just Nothing@ if deleted.
 type BestRef = IORef (Maybe (Maybe BlockHash))
@@ -165,74 +187,78 @@ data Memory = Memory
     mempoolTable :: !MempoolTable
   }
 
-instance (MonadIO m) => StoreWrite (WriterT m) where
-  setBest h =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ writeIORef best (Just (Just h))
-  insertBlock b =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert blockTable (headerHash b.header) (Just b)
-  setBlocksAtHeight h g =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert heightTable g h
-  insertTx t =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert txTable (txHash t.tx) (Just t)
-  insertAddrTx a t =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert addressTable (a, t) (Just ())
-  deleteAddrTx a t =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert addressTable (a, t) Nothing
-  insertAddrUnspent a u =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert outputTable k (Just v)
-    where
-      k = (a, u.block, u.outpoint)
-      v = OutVal u.value u.script
-  deleteAddrUnspent a u =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert outputTable k Nothing
-    where
-      k = (a, u.block, u.outpoint)
-  addToMempool x t =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert mempoolTable x (Just t)
-  deleteFromMempool x =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert mempoolTable x Nothing
-  setBalance b =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert balanceTable b.address (Just b)
-  insertUnspent u =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert unspentTable (fst (unspentToVal u)) (Just u)
-  deleteUnspent p =
-    ReaderT $ \Writer {memory = Memory {..}} ->
-      liftIO $ H.insert unspentTable p Nothing
+-- | Set the best block.
+setBest :: Writer -> BlockHash -> IO ()
+setBest w h = writeIORef w.memory.best (Just (Just h))
 
--- | Read a value from the changes of the batch, or from the database if the batch did not change it.
-getLayered ::
-  (MonadIO m) =>
-  (Memory -> IO (Maybe a)) ->
-  DatabaseReaderT m a ->
-  WriterT m a
-getLayered f g =
-  ReaderT $ \Writer {reader = db, memory = s} ->
-    liftIO (f s) >>= \case
-      Just x -> return x
-      Nothing -> runReaderT g db
+-- | Add or replace the data of a block.
+insertBlock :: Writer -> BlockData -> IO ()
+insertBlock w b = H.insert w.memory.blockTable (headerHash b.header) (Just b)
+
+-- | Set the hashes of the blocks at a height.
+setBlocksAtHeight :: Writer -> [BlockHash] -> BlockHeight -> IO ()
+setBlocksAtHeight w h g = H.insert w.memory.heightTable g h
+
+-- | Add or replace the data of a transaction.
+insertTx :: Writer -> TxData -> IO ()
+insertTx w t = H.insert w.memory.txTable (txHash t.tx) (Just t)
+
+-- | Add a transaction to the index of an address.
+insertAddrTx :: Writer -> Address -> TxRef -> IO ()
+insertAddrTx w a t = H.insert w.memory.addressTable (a, t) (Just ())
+
+-- | Remove a transaction from the index of an address.
+deleteAddrTx :: Writer -> Address -> TxRef -> IO ()
+deleteAddrTx w a t = H.insert w.memory.addressTable (a, t) Nothing
+
+-- | Add an unspent output to the index of an address.
+insertAddrUnspent :: Writer -> Address -> Unspent -> IO ()
+insertAddrUnspent w a u =
+  H.insert w.memory.outputTable (a, u.block, u.outpoint) (Just (OutVal u.value u.script))
+
+-- | Remove an unspent output from the index of an address.
+deleteAddrUnspent :: Writer -> Address -> Unspent -> IO ()
+deleteAddrUnspent w a u =
+  H.insert w.memory.outputTable (a, u.block, u.outpoint) Nothing
+
+-- | Add a transaction to the mempool with the time it arrived.
+addToMempool :: Writer -> TxHash -> UnixTime -> IO ()
+addToMempool w x t = H.insert w.memory.mempoolTable x (Just t)
+
+-- | Remove a transaction from the mempool.
+deleteFromMempool :: Writer -> TxHash -> IO ()
+deleteFromMempool w x = H.insert w.memory.mempoolTable x Nothing
+
+-- | Set the balance of an address.
+setBalance :: Writer -> Balance -> IO ()
+setBalance w b = H.insert w.memory.balanceTable b.address (Just b)
+
+-- | Add an unspent output.
+insertUnspent :: Writer -> Unspent -> IO ()
+insertUnspent w u = H.insert w.memory.unspentTable (fst (unspentToVal u)) (Just u)
+
+-- | Remove an unspent output.
+deleteUnspent :: Writer -> OutPoint -> IO ()
+deleteUnspent w p = H.insert w.memory.unspentTable p Nothing
+
+-- | Read a value from the changes of the batch, or from the database if the
+-- batch did not change it.
+getLayered :: Writer -> (Memory -> IO (Maybe a)) -> (DatabaseReader -> IO a) -> IO a
+getLayered w f g =
+  f w.memory >>= \case
+    Just x -> return x
+    Nothing -> g w.reader
 
 -- | Run a batch of writes and commit all its changes to the database in one
--- atomic write. Reads within the batch see its own changes.
+-- atomic write. Reads within the batch see its own changes. If the function
+-- throws, nothing is written.
 runWriter ::
-  (MonadIO m) =>
   Network ->
   Ctx ->
   DatabaseReader ->
   Logger ->
-  WriterT m a ->
-  m a
+  (Writer -> IO a) ->
+  IO a
 runWriter net ctx bdb logger f =
   fst <$> runWriterMempool net ctx bdb logger f
 
@@ -249,16 +275,15 @@ data MempoolChanges = MempoolChanges
 -- | Like 'runWriter', but also say how the batch changed the mempool, so
 -- that callers do not have to read the whole mempool before and after.
 runWriterMempool ::
-  (MonadIO m) =>
   Network ->
   Ctx ->
   DatabaseReader ->
   Logger ->
-  WriterT m a ->
-  m (a, MempoolChanges)
+  (Writer -> IO a) ->
+  IO (a, MempoolChanges)
 runWriterMempool net ctx bdb@DatabaseReader {db} logger f = do
   hm <- newMemory net ctx
-  x <- R.runReaderT f Writer {reader = bdb, memory = hm, logger}
+  x <- f Writer {reader = bdb, memory = hm, logger}
   ops <- hashMapOps db hm
   (mops, changes) <- mempoolOps db hm.mempoolTable
   liftIO $ writeBatch db (ops <> mops)
@@ -371,46 +396,45 @@ unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)
     f p Nothing =
       deleteOpCF (unspentCF db) (UnspentKey p)
 
--- | Read the best block, with the changes of the batch applied.
-getBestBlockI :: (MonadIO m) => WriterT m (Maybe BlockHash)
-getBestBlockI = getLayered getBestBlockH getBestBlock
+-- | Best block, with the changes of the batch applied.
+getBestBlock :: Writer -> IO (Maybe BlockHash)
+getBestBlock w = getLayered w getBestBlockH Q.getBestBlock
 
--- | Read the blocks at a height, with the changes of the batch applied.
-getBlocksAtHeightI :: (MonadIO m) => BlockHeight -> WriterT m [BlockHash]
-getBlocksAtHeightI bh =
-  getLayered (getBlocksAtHeightH bh) (getBlocksAtHeight bh)
+-- | Blocks at a height, with the changes of the batch applied.
+getBlocksAtHeight :: Writer -> BlockHeight -> IO [BlockHash]
+getBlocksAtHeight w bh = getLayered w (getBlocksAtHeightH bh) (`Q.getBlocksAtHeight` bh)
 
--- | Read a block, with the changes of the batch applied.
-getBlockI :: (MonadIO m) => BlockHash -> WriterT m (Maybe BlockData)
-getBlockI bh = getLayered (getBlockH bh) (getBlock bh)
+-- | Data of a block, with the changes of the batch applied.
+getBlock :: Writer -> BlockHash -> IO (Maybe BlockData)
+getBlock w bh = getLayered w (getBlockH bh) (`Q.getBlock` bh)
 
--- | Read a transaction, with the changes of the batch applied.
-getTxDataI :: (MonadIO m) => TxHash -> WriterT m (Maybe TxData)
-getTxDataI th = getLayered (getTxDataH th) (getTxData th)
+-- | Data of a transaction, deleted ones included, with the changes of the
+-- batch applied.
+getTxData :: Writer -> TxHash -> IO (Maybe TxData)
+getTxData w th = getLayered w (getTxDataH th) (`Q.getTxData` th)
 
--- | Read the spender of an output, with the changes of the batch applied.
-getSpenderI :: (MonadIO m) => OutPoint -> WriterT m (Maybe Spender)
-getSpenderI op = getLayered (getSpenderH op) (getSpender op)
+-- | Spender of an output, with the changes of the batch applied.
+getSpender :: Writer -> OutPoint -> IO (Maybe Spender)
+getSpender w op = getLayered w (getSpenderH op) (`Q.getSpender` op)
 
--- | Read the balance of an address, with the changes of the batch applied.
-getBalanceI :: (MonadIO m) => Address -> WriterT m (Maybe Balance)
-getBalanceI a = getLayered (getBalanceH a) (getBalance a)
+-- | Balance of an address, with the changes of the batch applied.
+getBalance :: Writer -> Address -> IO (Maybe Balance)
+getBalance w a = getLayered w (getBalanceH a) (`Q.getBalance` a)
 
--- | Read an unspent output, with the changes of the batch applied.
-getUnspentI :: (MonadIO m) => OutPoint -> WriterT m (Maybe Unspent)
-getUnspentI op = getLayered (getUnspentH op) (getUnspent op)
+-- | Unspent output, with the changes of the batch applied.
+getUnspent :: Writer -> OutPoint -> IO (Maybe Unspent)
+getUnspent w op = getLayered w (getUnspentH op) (`Q.getUnspent` op)
 
 -- | The mempool in the database with the changes of this batch applied,
 -- newest first.
-getMempoolI :: (MonadIO m) => WriterT m [(UnixTime, TxHash)]
-getMempoolI =
-  ReaderT $ \Writer {reader = db, memory = Memory {..}} -> do
-    stored <- runReaderT getMempool db
-    changes <- liftIO $ H.toList mempoolTable
-    let changed = HashMap.fromList changes
-        kept = filter (not . (`HashMap.member` changed) . snd) stored
-        added = [(t, h) | (h, Just t) <- changes]
-    return $ sortOn Down (kept <> added)
+getMempool :: Writer -> IO [(UnixTime, TxHash)]
+getMempool w = do
+  stored <- Q.getMempool w.reader
+  changes <- H.toList w.memory.mempoolTable
+  let changed = HashMap.fromList changes
+      kept = filter (not . (`HashMap.member` changed) . snd) stored
+      added = [(t, h) | (h, Just t) <- changes]
+  return $ sortOn Down (kept <> added)
 
 -- | Empty set of changes.
 newMemory ::

@@ -189,10 +189,10 @@ import Haskoin.Store.Data
 -- the instances of the store classes for the database reader
 import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Database.Writer
+import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool)
+import Haskoin.Store.Database.Writer qualified as W
 import Haskoin.Store.Logic
   ( ImportException (Orphan),
-    ImportM,
     deleteUnconfirmedTx,
     importBlock,
     initBest,
@@ -443,7 +443,7 @@ runImport ::
   (MonadIO m) =>
   Network ->
   Ctx ->
-  ImportM a ->
+  (Writer -> IO a) ->
   BlockT m (Either ImportException a)
 runImport net ctx f = fmap fst <$> runImportMempool net ctx f
 
@@ -454,7 +454,7 @@ runImportMempool ::
   (MonadIO m) =>
   Network ->
   Ctx ->
-  ImportM a ->
+  (Writer -> IO a) ->
   BlockT m (Either ImportException (a, MempoolChanges))
 runImportMempool net ctx f = do
   r <- ReaderT $ \r ->
@@ -470,7 +470,7 @@ runImportMempool net ctx f = do
 runImportNotify ::
   (MonadIO m) =>
   Maybe Block ->
-  ImportM a ->
+  (Writer -> IO a) ->
   BlockT m (Either ImportException a)
 runImportNotify block f = do
   net <- getNetwork
@@ -578,10 +578,10 @@ withBlockStore cfg action = do
       ini
       wipe
       run inbox
-    del txs = do
+    del txs wr = do
       logAt LevelInfo cfg.logger $
         "Deleting " <> cs (show (length txs)) <> " transactions"
-      forM_ txs $ \(_, th) -> deleteUnconfirmedTx False th
+      forM_ txs $ \(_, th) -> deleteUnconfirmedTx wr False th
     wipe_it txs = do
       net <- getNetwork
       ctx <- getCtx
@@ -693,7 +693,7 @@ processBlock peer block = void . runMaybeT $ do
       <> " from peer "
       <> peer.label
   lift $ do
-    ret <- withBlockTiming $ runImportNotify (Just block) (importBlock block node)
+    ret <- withBlockTiming $ runImportNotify (Just block) (\wr -> importBlock wr block node)
     case ret of
       Left e -> failure e
       Right _ -> success node
@@ -920,18 +920,18 @@ updateOrphans = do
 
 -- | Queue a transaction that spends unknown outputs, recording which parents are missing.
 newOrphanTx ::
-  (MonadIO m) =>
   BlockStore ->
   UTCTime ->
   Tx ->
-  WriterT m ()
-newOrphanTx block_read time tx = do
+  Writer ->
+  IO ()
+newOrphanTx block_read time tx wr = do
   logAt LevelDebug block_read.config.logger $
     "Import tx "
       <> txHashToHex (txHash tx)
       <> ": Orphan"
   let box = block_read.txs
-  unspents <- catMaybes <$> mapM getUnspent prevs
+  unspents <- catMaybes <$> mapM (W.getUnspent wr) prevs
   let unspent_set = HashSet.fromList (map (.outpoint) unspents)
       missing_set = HashSet.difference prev_set unspent_set
       missing_txs = HashSet.map (.hash) missing_set
@@ -950,19 +950,19 @@ newOrphanTx block_read time tx = do
 -- | Import a transaction into the mempool. Returns 'True' if imported. A
 -- transaction that spends unknown outputs is queued as an orphan; other errors
 -- are ignored.
-importMempoolTx :: BlockStore -> UTCTime -> Tx -> ImportM Bool
-importMempoolTx block_read time tx =
+importMempoolTx :: BlockStore -> UTCTime -> Tx -> Writer -> IO Bool
+importMempoolTx block_read time tx wr =
   catch new_mempool_tx handle_error
   where
     tx_hash = txHash tx
-    handle_error :: ImportException -> ImportM Bool
+    handle_error :: ImportException -> IO Bool
     handle_error Orphan = do
-      newOrphanTx block_read time tx
+      newOrphanTx block_read time tx wr
       return False
     handle_error _ = return False
     seconds = floor (utcTimeToPOSIXSeconds time)
     new_mempool_tx = do
-      t <- newMempoolTx tx seconds
+      t <- newMempoolTx wr tx seconds
       logAt LevelInfo block_read.config.logger $
         bool "Already have" "Imported" t
           <> " tx "
@@ -977,10 +977,10 @@ processMempool = guardMempool $ do
   block_read <- ask
   unless (null txs) $ import_txs block_read txs
   where
-    run_import block_read p =
-      importMempoolTx block_read p.time p.tx
+    run_import block_read wr p =
+      importMempoolTx block_read p.time p.tx wr
     import_txs block_read txs =
-      runImportNotify Nothing (mapM (run_import block_read) txs) >>= \case
+      runImportNotify Nothing (\wr -> mapM (run_import block_read wr) txs) >>= \case
         Left e -> report_error e
         Right _ -> return ()
     report_error e = do
@@ -1003,7 +1003,7 @@ pruneMempool =
       unless (null txs) $ do
         logInfo $
           "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
-        runImportNotify Nothing (mapM_ (deleteUnconfirmedTx False) txs) >>= \case
+        runImportNotify Nothing (\wr -> mapM_ (deleteUnconfirmedTx wr False) txs) >>= \case
           Left e ->
             logError $
               "Error pruning mempool: " <> cs (show e)
@@ -1117,7 +1117,7 @@ revertToMainChain = do
     logWarn $
       "Reverting best block: "
         <> blockHashToHex h
-    runImport net ctx (revertBlock h) >>= \case
+    runImport net ctx (`revertBlock` h) >>= \case
       Left e -> do
         logError $
           "Could not revert block "

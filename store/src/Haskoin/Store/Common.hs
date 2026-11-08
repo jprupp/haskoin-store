@@ -18,22 +18,26 @@
 --
 -- Interfaces shared by every part of the store.
 --
--- 'StoreReadBase' and 'StoreReadExtra' abstract over anything that can answer
--- queries about blocks, transactions, addresses and extended public keys: the
--- RocksDB database ("Haskoin.Store.Database.Reader"), the in-memory write
--- buffer used while importing ("Haskoin.Store.Database.Writer"), and the Redis
--- cache ("Haskoin.Store.Cache"). 'StoreWrite' is implemented by the writer.
+-- 'StoreReadBase' and 'StoreReadExtra' are the queries that the web server
+-- and the block store ask about blocks, transactions, addresses and extended
+-- public keys, with instances that read the RocksDB database (in
+-- "Haskoin.Store.Database.Query").
 --
 -- This module also has helpers for pagination ('Limits'), for deriving
--- addresses from extended public keys, and for merging sorted streams.
--- = Why the store is a set of type classes
+-- addresses from extended public keys ('scanXPubBals'), for the order of
+-- transactions and outputs ('txRefKey', 'unspentKey'), and for merging sorted
+-- streams.
 --
--- The same questions are asked in three places: by the web server against the
--- database, by the import logic against a buffer of uncommitted changes, and by
--- the cache, which answers some questions itself and passes others on. Writing
--- the queries once against a class, and providing instances for each place, keeps
--- those three in agreement and lets the cache sit transparently in front of the
--- database.
+-- = The classes are on their way out
+--
+-- The classes let the same queries be asked of the database, of the buffer of
+-- an import in progress, and of a Redis cache, each a different stack of monad
+-- transformers. The database queries are now plain functions in 'IO' that take
+-- the 'Haskoin.Store.Database.Reader.DatabaseReader'
+-- ("Haskoin.Store.Database.Query"), and the import reads its buffer through
+-- plain functions of the 'Haskoin.Store.Database.Writer.Writer'. The classes
+-- remain only for the web server and the block store, whose handlers still run
+-- in monads that carry the reader.
 --
 -- = Why pages start at a transaction
 --
@@ -46,7 +50,6 @@ module Haskoin.Store.Common
     Start (..),
     StoreReadBase (..),
     StoreReadExtra (..),
-    StoreWrite (..),
     StoreEvent (..),
     getActiveBlock,
     getActiveTxData,
@@ -244,36 +247,6 @@ class (StoreReadBase m) => StoreReadExtra m where
   -- | Number of transactions of an extended public key. The second argument
   -- is the result of 'xPubBals' for the same key.
   xPubTxCount :: XPubSpec -> [XPubBal] -> m Word32
-
--- | Changes to the index. Implemented by the writer, which buffers them in
--- memory and commits them to the database in one batch.
-class StoreWrite m where
-  -- | Set the best block.
-  setBest :: BlockHash -> m ()
-  -- | Add or replace the data of a block.
-  insertBlock :: BlockData -> m ()
-  -- | Set the hashes of the blocks at a height.
-  setBlocksAtHeight :: [BlockHash] -> BlockHeight -> m ()
-  -- | Add or replace the data of a transaction.
-  insertTx :: TxData -> m ()
-  -- | Add a transaction to the index of an address.
-  insertAddrTx :: Address -> TxRef -> m ()
-  -- | Remove a transaction from the index of an address.
-  deleteAddrTx :: Address -> TxRef -> m ()
-  -- | Add an unspent output to the index of an address.
-  insertAddrUnspent :: Address -> Unspent -> m ()
-  -- | Remove an unspent output from the index of an address.
-  deleteAddrUnspent :: Address -> Unspent -> m ()
-  -- | Add a transaction to the mempool, with the time it arrived.
-  addToMempool :: TxHash -> UnixTime -> m ()
-  -- | Remove a transaction from the mempool.
-  deleteFromMempool :: TxHash -> m ()
-  -- | Set the balance of an address.
-  setBalance :: Balance -> m ()
-  -- | Add an unspent output.
-  insertUnspent :: Unspent -> m ()
-  -- | Remove an unspent output.
-  deleteUnspent :: OutPoint -> m ()
 
 -- | Data of a block, or 'Nothing' if it is unknown or not in the main chain.
 getActiveBlock :: (StoreReadExtra m) => BlockHash -> m (Maybe BlockData)
