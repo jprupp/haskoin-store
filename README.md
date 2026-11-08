@@ -60,8 +60,8 @@ Bitcoin Cash APIs such as api.haskoin.com.
   the chain, ordered before confirmed history, and handles replace-by-fee on
   Bitcoin. A wallet sees a payment the moment the network does.
 - **Extended public keys are first class.** Wallets are mostly xpubs, so the
-  store derives their addresses, remembers the derivations, and can keep large
-  wallets ready in Redis.
+  store derives their addresses up to an exact gap, remembers the derivations,
+  and can keep large wallets ready in a Redis shared by several stores.
 - **Bounded resources.** API limits stop one request from monopolising the
   server, slow event clients are dropped, and RocksDB memory has a budget.
 - **Operable.** A health endpoint that tells a load balancer when an instance is
@@ -238,9 +238,12 @@ every few seconds.
 
 ### 7. Make big wallets fast
 
-Start the store with `--redis` and a Redis server. Xpubs with more than
-`--redis-min-addrs` used addresses are then answered from Redis after their
-first query.
+Start the store with `--redis` and a Redis (or Valkey) server. Xpubs with at
+least `--redis-min-addrs` used addresses are then cached after their first
+query and answered from Redis, transactions in full included. Several stores
+can share one Redis: they keep each other's cache up to date, and a store that
+has not imported a transaction yet still serves it from the cache. Add
+`nocache=true` to a query to read the database instead.
 
 ## Configuration
 
@@ -282,8 +285,8 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
-| `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses after which xpub derivation stops |
-| `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses to look at for an xpub with no transactions |
+| `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
+| `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
 | `--ticker-url` | `TICKER_URL` | Blockchain.info ticker | Source of current prices |
 | `--price-history-url` | `PRICE_HISTORY_URL` | Blockchain.info price index | Source of historical prices |
 | `--ticker-refresh` | `TICKER_REFRESH` | `90000000` | Microseconds between price updates |
@@ -295,8 +298,12 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--redis` | `REDIS` | off | Cache large xpubs in Redis |
 | `--redis-url` | `REDIS_URL` | local Redis | Redis URL, such as `redis://host:6379` |
 | `--redis-min-addrs` | `REDIS_MIN_ADDRS` | `100` | Cache xpubs with at least this many used addresses |
-| `--redis-max-keys` | `REDIS_MAX_KEYS` | `100000000` | Evict least recently used xpubs past this many keys |
-| `--redis-sync-interval` | `REDIS_SYNC_INTERVAL` | `30` | Seconds between mempool syncs to Redis |
+| `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Evict the least recently used xpubs past this many |
+
+Every key of the cache starts with `hs2:<network>:`, so a Redis can be shared
+by stores of several networks, and by stores of older versions, whose cache
+uses other keys. `--redis-max-keys` and `--redis-sync-interval` of older
+versions are gone.
 
 ### Health check
 
@@ -375,7 +382,7 @@ with `--no-blockchain-info`.
 ```
 peers ──► haskoin-node ──► block store ──► RocksDB ──► web server ──► clients
                 │               │             ▲
-                └─ headers      └─ events ──► cache writer ──► Redis
+                └─ headers      └─ events ──► cache ◄──► Redis ◄──► other stores
 ```
 
 - **haskoin-node** keeps a pool of peers and syncs block headers.
@@ -385,11 +392,23 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   batch, so a crash never leaves a half-written block.
 - Reorganisations are handled by reverting blocks until the best block is
   back on the main chain of headers.
-- The **cache writer** (`Haskoin.Store.Cache`) copies xpubs with many used
-  addresses to Redis and keeps them current as blocks and transactions
-  arrive. Without Redis, xpub queries read RocksDB directly.
-- The **web server** (`Haskoin.Store.Web`) answers from RocksDB, through the
-  cache when there is one.
+- The **cache** (`Haskoin.Store.Cache`) keeps xpubs with many used addresses
+  in Redis: their balances, transactions, unspent outputs and the bodies of
+  their transactions. It never patches an entry: when a block, a mempool
+  transaction or a reorganisation touches a cached xpub, the store reads the
+  whole xpub again from RocksDB, with the same queries that answer uncached
+  requests, and replaces the entry in one Lua script. Entries carry the height
+  of the database they came from, so a store that is behind cannot replace
+  newer data written by another store. Without Redis, xpub queries read
+  RocksDB directly.
+- The **web server** (`Haskoin.Store.Web`) answers from RocksDB, and from the
+  cache for cached xpubs and for transaction bodies that Redis has.
+
+Xpub addresses are derived up to an exact gap: every address up to the last
+used one of each chain, then exactly `--xpub-gap` unused ones, and always the
+first `--xpub-gap-init` addresses. A payment further away is not seen, as a
+wallet following BIP 44 with the same gap would not see it; raise the gap to
+see it.
 
 The database layout is described in `Haskoin.Store.Database.Types`.
 
@@ -431,9 +450,10 @@ api.haskoin.com. To reach your own server, put it behind a proxy that maps
 `/btc/` (or the name of your network) to it.
 
 Or embed the indexer in your own program with `haskoin-store`: `withStore`
-starts the node, the block store and the cache from a `StoreConfig`, and
-`withDB store.db` runs queries such as `getBalance` or `xPubTxs` against
-it. Subscribe to `Store.pub` to receive `StoreEvent`s.
+starts the node, the block store and the cache from a `StoreConfig`, and the
+functions of `Haskoin.Store.Database.Query`, such as `getBalance store.db
+addr` or `xPubTxs store.db bals limits`, query its database in `IO`.
+Subscribe to `Store.pub` to receive `StoreEvent`s.
 
 Every module has Haddock documentation; build it with `stack haddock`.
 
@@ -461,7 +481,26 @@ scripts/bench-web.sh           # load-test the API with wrk
 `extra-deps` at a sibling checkout such as `../haskoin-core` is fine for
 local testing, but CI rejects it.
 
-The tests use [hspec](https://hspec.github.io/) and need no network access.
+The tests use [hspec](https://hspec.github.io/). The unit tests need no network
+access. The integration tests (`Haskoin.Store.IntegrationSpec`) run regtest
+chains of Bitcoin Core and Bitcoin Cash Node, and Valkey, in
+[Podman](https://podman.io/) containers, and check the store against them: the
+exact gap, spends and change, mempool order, multiaddr counts, reorganisations,
+and that the cache answers exactly like the database on every xpub endpoint.
+
+- They are skipped if Podman cannot run containers, or if
+  `HASKOIN_STORE_NO_PODMAN` is set.
+- The first run builds the image `localhost/haskoin-store-test`, which needs
+  network access: Ubuntu 26.04 pinned by digest, Valkey from a fixed snapshot of
+  the Ubuntu archive, and the release tarballs of both nodes, checked against
+  SHA-256 hashes pinned in `store/test/Haskoin/Store/Integration/Image.hs`. No
+  third-party image is used.
+- Containers are removed when the tests end, data lives in tmpfs mounts and
+  under `/dev/shm`, and every container has a memory limit.
+- Set `HASKOIN_TEST_LOG=1` to print the log of the store under test.
+
+The test suite runs with at most four cores and a 4 GiB heap, so that a
+runaway test fails instead of exhausting the machine.
 
 `package.yaml` in `store/` and `data/` is the source of each package
 description. Change it rather than the `.cabal` files, which

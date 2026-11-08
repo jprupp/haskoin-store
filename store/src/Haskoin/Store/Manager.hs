@@ -239,7 +239,8 @@ withStoreCache cfg db chain pub action =
           CacheConfig
             { url = url,
               minAddrs = cfg.redisMinAddrs,
-              maxXPubs = cfg.redisMaxXPubs
+              maxXPubs = cfg.redisMaxXPubs,
+              stats = cfg.stats
             }
           db
           chain

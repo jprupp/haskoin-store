@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+
+- Xpub addresses are derived up to an exact gap: every address up to the last
+  used one of each chain, then exactly `--xpub-gap` unused ones, and always
+  the first `--xpub-gap-init` addresses. Addresses used to be read 32 at a
+  time with the gap checked between batches, so the store looked between 33
+  and 64 addresses past the last used one, and started counting again at index
+  20. This is why api.haskoin.com saw a payment 34 addresses past the last
+  used one, which wallets with a gap of 20 or 32 do not see. Payments that far
+  away are no longer seen; raise `--xpub-gap` to see them.
+- New Redis cache of xpubs (`Haskoin.Store.Cache`), replacing the old one:
+  - Whenever a transaction touches a cached xpub, or a reorganisation changes
+    one of its transactions, the store reads the whole xpub again from its
+    database and replaces the entry in one Lua script, so cached answers are
+    always answers of the database.
+  - Everything a response needs is in Redis, transaction bodies included,
+    shared between xpubs, with the spenders of their outputs kept up to date.
+    A store that has not imported a transaction yet still serves it.
+  - Several stores can share one Redis: entries carry the height of the
+    database they came from, so a store that is behind does not replace newer
+    data, and a lock per xpub keeps two stores from reloading it at once.
+  - Keys start with `hs2:<network>:`, so the cache can share a Redis with the
+    cache of older versions and with stores of other networks.
+  - `--redis-max-xpubs` (`REDIS_MAX_XPUBS`, default 10000) replaces
+    `--redis-max-keys`: the least recently used xpubs past this many are
+    evicted. `--redis-sync-interval` is removed.
+  - StatsD metrics: `cache.hits`, `cache.misses`, `cache.reloads`,
+    `cache.stale`, `cache.evictions` and `cache.reload` (milliseconds).
+- `n_tx` of `/blockchain/multiaddr` counts every transaction of the shown
+  addresses and xpubs, not only those on the page, and `n_tx_filtered` those
+  that pass the filter. `n_tx` of `/blockchain/rawaddr` for an xpub is its
+  number of transactions, not the size of the page.
+- No monad transformers in the store, except the `ActionT` of Scotty in the
+  web server, conduits, and the header search of haskoin-node. Database
+  queries are plain functions in `IO` that take the `DatabaseReader`
+  (`Haskoin.Store.Database.Query`); imports take a `Writer` handle
+  (`Haskoin.Store.Database.Writer`, `Haskoin.Store.Logic`); the block store
+  and the manager pass their state explicitly. `WriterT`, `ImportM`, the
+  `StoreWrite` class, `BlockT` and `CacheT` are gone, and
+  `withDatabaseReader` passes the reader to a plain function. The
+  `StoreReadBase` and `StoreReadExtra` classes remain for the web server.
+  This changes the library API.
+
+### Fixed
+
+- Mempool transactions that entered the mempool in the same second could be
+  listed twice in the transactions of an xpub or a multiaddr wallet, and
+  their order differed from page to page. Every merge now orders them as the
+  database and the cache store them (`txRefKey`, `unspentKey`).
+- `nocache=true` on `/xpub/:xpub/transactions` and `/xpub/:xpub/unspent` no
+  longer reads, or fills, the cache.
+
+### Added
+
+- Integration tests against regtest chains of Bitcoin Core and Bitcoin Cash
+  Node, with Valkey, in Podman containers built from Ubuntu 26.04 and
+  release tarballs checked against pinned hashes. They are skipped when Podman
+  cannot run containers or `HASKOIN_STORE_NO_PODMAN` is set.
+
 ## [1.8.1] - 2026-11-07
 
 ### Changed

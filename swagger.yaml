@@ -1933,6 +1933,14 @@ paths:
         - Address
       operationId: getXPubSummary
       summary: Extended Public Key Summary
+      description: |
+        Addresses of each chain of the key are derived up to an exact gap:
+        every address up to the last used one, then exactly as many unused
+        ones as the gap of the server (32 by default), and always the first
+        addresses up to the initial gap (20 by default). A payment to an
+        address further away is not seen, as a wallet using the same gap
+        would not see it. The same addresses are used by every endpoint of
+        extended public keys.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -1969,6 +1977,9 @@ paths:
         - Address
       operationId: deleteCachedXPub
       summary: Delete Cached Extended Key
+      description: |
+        Remove the key from the Redis cache, if the server has one. Answers
+        true if it was cached. A later query caches it again.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -5284,8 +5295,15 @@ components:
           type: integer
         n_tx:
           type: integer
+          description: |
+            Number of transactions of the addresses and extended public keys
+            shown (`onlyShow`, or all the active ones), each counted once, not
+            only those on this page.
         n_tx_filtered:
           type: integer
+          description: |
+            Number of those transactions that pass the `filter`, not only
+            those on this page.
         total_received:
           type: integer
         total_sent:
@@ -5425,6 +5443,9 @@ components:
           type: string
         n_tx:
           type: integer
+          description: |
+            Number of transactions of the address or extended public key, not
+            only those on this page.
         n_unredeemed:
           type: integer
         total_received:
@@ -5976,7 +5997,9 @@ components:
       required: false
       schema:
         type: boolean
-      description: Do not use the cache for this query.
+      description: |
+        Answer from the database of this server, without reading the Redis
+        cache and without caching the extended public key.
 
     notxParam:
       name: notx

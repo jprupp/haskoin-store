@@ -4,6 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
 
@@ -108,7 +109,7 @@ module Haskoin.Store.Cache
   )
 where
 
-import Control.Monad (forM, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Bits (shift, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -166,6 +167,15 @@ import UnliftIO
     writeTVar,
   )
 import System.Random (randomIO)
+import System.Metrics.StatsD
+  ( StatCounter,
+    StatTiming,
+    Stats,
+    addTiming,
+    incrementCounter,
+    newStatCounter,
+    newStatTiming,
+  )
 import UnliftIO.Concurrent (threadDelay)
 
 -- | Settings of the cache.
@@ -175,8 +185,39 @@ data CacheConfig = CacheConfig
     -- | cache xpubs with at least this many used addresses
     minAddrs :: !Int,
     -- | evict the least recently used xpubs past this many
-    maxXPubs :: !Int
+    maxXPubs :: !Int,
+    -- | StatsD client, to report the metrics of the cache
+    stats :: !(Maybe Stats)
   }
+
+-- | StatsD metrics of the cache.
+data CacheMetrics = CacheMetrics
+  { -- | xpubs answered from the cache (@cache.hits@)
+    hits :: !StatCounter,
+    -- | xpubs asked about that were not cached (@cache.misses@)
+    misses :: !StatCounter,
+    -- | xpubs read again from the database and written (@cache.reloads@)
+    reloads :: !StatCounter,
+    -- | reloads refused because the cache had newer data (@cache.stale@)
+    stale :: !StatCounter,
+    -- | xpubs evicted (@cache.evictions@)
+    evictions :: !StatCounter,
+    -- | milliseconds to reload an xpub (@cache.reload@)
+    reloadTime :: !StatTiming
+  }
+
+-- | Register the metrics of the cache.
+newCacheMetrics :: Stats -> IO CacheMetrics
+newCacheMetrics s = do
+  hits <- c "hits"
+  misses <- c "misses"
+  reloads <- c "reloads"
+  stale <- c "stale"
+  evictions <- c "evictions"
+  reloadTime <- newStatTiming s "cache.reload" 10
+  return CacheMetrics {..}
+  where
+    c x = newStatCounter s ("cache." <> x) 10
 
 -- | A running cache.
 data Cache = Cache
@@ -187,6 +228,7 @@ data Cache = Cache
     minAddrs :: !Int,
     maxXPubs :: !Int,
     logger :: !Logger,
+    metrics :: !(Maybe CacheMetrics),
     -- | xpubs to reload, with the transactions that made them change
     pending :: !(TVar (HashMap XPubSpec (HashSet TxHash)))
   }
@@ -208,6 +250,7 @@ withCache cfg db chain pub logger action = do
       else either fail return (R.parseConnectInfo cfg.url)
   conn <- R.checkedConnect info
   pending <- newTVarIO HashMap.empty
+  metrics <- mapM newCacheMetrics cfg.stats
   let cache =
         Cache
           { redis = conn,
@@ -217,6 +260,7 @@ withCache cfg db chain pub logger action = do
             minAddrs = cfg.minAddrs,
             maxXPubs = cfg.maxXPubs,
             logger = logger,
+            metrics = metrics,
             pending = pending
           }
   withSubscription pub $ \events ->
@@ -248,6 +292,10 @@ addrKey c a = c.prefix <> "a:" <> encode a
 
 lruKey :: Cache -> ByteString
 lruKey c = c.prefix <> "lru"
+
+-- | Count something in the metrics, if they are enabled.
+count :: Cache -> (CacheMetrics -> StatCounter) -> Int -> IO ()
+count c f n = mapM_ (\m -> incrementCounter (f m) n) c.metrics
 
 log' :: Cache -> LogLevel -> Text -> IO ()
 log' c l = logAt l c.logger
@@ -309,10 +357,11 @@ cacheXPubBals c x = do
     _ <- R.zadd (lruKey c) [(fromIntegral now, xpubId x)]
     return b
   case r of
-    Nothing -> return Nothing
+    Nothing -> count c (.misses) 1 >> return Nothing
     Just bs -> case decode bs of
-      Right bals -> return (Just bals)
+      Right bals -> count c (.hits) 1 >> return (Just bals)
       Left _ -> do
+        count c (.misses) 1
         log' c LevelWarn "Cached xpub balances cannot be decoded; deleting them"
         void (cacheDelete c x)
         return Nothing
@@ -464,8 +513,10 @@ cacheDelete c x = do
 -- cached. Returns how many were evicted. The cache does this by itself after
 -- caching an xpub, down to its configured maximum.
 cacheEvict :: Cache -> Int -> IO Int
-cacheEvict c n =
-  fromInteger <$> run c (R.eval evictScript [] [c.prefix, num n])
+cacheEvict c n = do
+  evicted <- fromInteger <$> run c (R.eval evictScript [] [c.prefix, num n])
+  count c (.evictions) evicted
+  return evicted
 
 -- | Reload an xpub from the database and replace its entry in Redis, unless
 -- another store holds its lock or has newer data. The transactions given are
@@ -473,7 +524,7 @@ cacheEvict c n =
 -- had them already. Returns whether the entry was replaced.
 cacheRefresh :: Cache -> XPubSpec -> HashSet TxHash -> IO Bool
 cacheRefresh c x changed =
-  withLock c x $ do
+  withLock c x $ timed $ do
     old <- HashMap.fromList <$> run c (R.zrangeWithscores (xkey c x "txs") 0 (-1))
     height <- bestHeight c
     bals <- Q.xPubBals c.db x
@@ -500,9 +551,16 @@ cacheRefresh c x changed =
           more <- catMaybes <$> Q.getManyTxData c.db (rights (map decode missing))
           void (run c (R.eval fillScript [] (c.prefix : bodyArgs more) :: Redis (Either Reply Integer)))
         void (cacheEvict c c.maxXPubs)
+        count c (.reloads) 1
         return True
-      _ -> return False
+      _ -> count c (.stale) 1 >> return False
   where
+    timed f = do
+      start <- nowMs
+      r <- f
+      end <- nowMs
+      forM_ c.metrics $ \m -> addTiming m.reloadTime (fromInteger (end - start))
+      return r
     def' = Limits {limit = 0, offset = 0, start = Nothing}
 
 -- | Arguments for bodies and their spenders: the number of bodies, the hash
