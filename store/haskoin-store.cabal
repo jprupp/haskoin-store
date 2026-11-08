@@ -25,6 +25,7 @@ library
   exposed-modules:
       Haskoin.Store
       Haskoin.Store.BlockStore
+      Haskoin.Store.Cache
       Haskoin.Store.Common
       Haskoin.Store.Database.Query
       Haskoin.Store.Database.Reader
@@ -141,6 +142,7 @@ test-suite spec
   main-is: Spec.hs
   other-modules:
       Haskoin.Store.BlockStoreSpec
+      Haskoin.Store.CacheSpec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Integration.Image
       Haskoin.Store.Integration.Node

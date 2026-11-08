@@ -85,6 +85,13 @@ module Haskoin.Store
     module Haskoin.Store.Database.Types,
     module Haskoin.Store.Data,
 
+    -- * Cache
+    Cache,
+    CacheConfig (..),
+    cacheIsCached,
+    cacheDelete,
+    cacheEvict,
+
     -- * Store Reader
     StoreReadBase (..),
     StoreReadExtra (..),
@@ -101,6 +108,7 @@ module Haskoin.Store
 where
 
 import Haskoin.Store.BlockStore
+import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 -- the instances of the store classes for the database reader

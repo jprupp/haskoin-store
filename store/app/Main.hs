@@ -112,8 +112,7 @@ data Config = Config
     redis :: !Bool,
     redisURL :: !String,
     redisMinAddrs :: !Int,
-    redisMaxKeys :: !Integer,
-    redisSyncInterval :: !Int,
+    redisMaxXPubs :: !Int,
     noMempool :: !Bool,
     wipeMempool :: !Bool,
     syncMempool :: !Bool,
@@ -179,10 +178,8 @@ defConfig = do
     env "REDIS_URL" "" pure
   redisMinAddrs <-
     env "REDIS_MIN_ADDRS" 100 readMaybe
-  redisMaxKeys <-
-    env "REDIS_MAX_KEYS" 100000000 readMaybe
-  redisSyncInterval <-
-    env "REDIS_SYNC_INTERVAL" 30 readMaybe
+  redisMaxXPubs <-
+    env "REDIS_MAX_XPUBS" 10000 readMaybe
   noMempool <-
     env "NO_MEMPOOL" False parseBool
   wipeMempool <-
@@ -430,25 +427,18 @@ config c = do
         <> value c.redisURL
   redisMinAddrs <-
     option auto $
-      metavar "GAP"
+      metavar "COUNT"
         <> long "redis-min-addrs"
-        <> help "Minimum xpub address count to cache in Redis"
+        <> help "Cache xpubs with at least this many used addresses"
         <> showDefault
         <> value c.redisMinAddrs
-  redisMaxKeys <-
+  redisMaxXPubs <-
     option auto $
       metavar "COUNT"
-        <> long "redis-max-keys"
-        <> help "Maximum number of keys in Redis"
+        <> long "redis-max-xpubs"
+        <> help "Evict the least recently used xpubs from Redis past this many"
         <> showDefault
-        <> value c.redisMaxKeys
-  redisSyncInterval <-
-    option auto $
-      metavar "SECONDS"
-        <> long "redis-sync-interval"
-        <> help "Sync mempool to Redis interval"
-        <> showDefault
-        <> value c.redisSyncInterval
+        <> value c.redisMaxXPubs
   noMempool <-
     flag c.noMempool True $
       long "no-mempool"
@@ -656,7 +646,7 @@ run cfg =
             gap = cfg.webLimits.xpubGap,
             initGap = cfg.webLimits.xpubGapInit,
             redisMinAddrs = cfg.redisMinAddrs,
-            redisMaxKeys = cfg.redisMaxKeys,
+            redisMaxXPubs = cfg.redisMaxXPubs,
             wipeMempool = cfg.wipeMempool,
             noMempool = cfg.noMempool,
             syncMempool = cfg.syncMempool,
@@ -666,7 +656,6 @@ run cfg =
             maxPeerLife = fromIntegral cfg.maxPeerLife,
             connect = withConnection,
             stats = stats,
-            redisSyncInterval = cfg.redisSyncInterval,
             bloom = cfg.bloom,
             maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing,
             writeBufferSize =

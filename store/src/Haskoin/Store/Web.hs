@@ -98,6 +98,7 @@ import Control.Monad.Reader
   ( MonadReader,
     ReaderT,
     asks,
+    local,
     runReaderT,
   )
 import Control.Monad.Trans (lift)
@@ -182,6 +183,7 @@ import Haskoin.Node
   )
 import Haskoin.Script
 import Haskoin.Store.BlockStore
+import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 -- the instances of the store classes for the database reader
@@ -555,8 +557,8 @@ instance
   getBestBlock = runInWebReader getBestBlock
   getBlocksAtHeight height = runInWebReader (getBlocksAtHeight height)
   getBlock bh = runInWebReader (getBlock bh)
-  getTxData th = runInWebReader (getTxData th)
-  getManyTxData ths = runInWebReader (getManyTxData ths)
+  getTxData th = listToMaybe' <$> webTxData [th]
+  getManyTxData = webTxData
   getSpender op = runInWebReader (getSpender op)
   getUnspent op = runInWebReader (getUnspent op)
   getBalance a = runInWebReader (getBalance a)
@@ -574,10 +576,26 @@ instance
   getAddressTxs a = runInWebReader . getAddressTxs a
   getAddressUnspents a = runInWebReader . getAddressUnspents a
   getAddressesUnspents as = runInWebReader . getAddressesUnspents as
-  xPubBals = runInWebReader . xPubBals
-  xPubUnspents xpub xbals = runInWebReader . xPubUnspents xpub xbals
-  xPubTxs xpub xbals = runInWebReader . xPubTxs xpub xbals
-  xPubTxCount xpub = runInWebReader . xPubTxCount xpub
+  xPubBals xpub =
+    withWebCache (`cacheXPubBals` xpub) (runInWebReader (xPubBals xpub)) >>= \case
+      Right bals -> return bals
+      Left (Just cache, bals) -> liftIO (cacheRequest cache xpub bals) >> return bals
+      Left (Nothing, bals) -> return bals
+  xPubUnspents xpub xbals limits =
+    either snd id
+      <$> withWebCache
+        (\c -> cacheXPubUnspents c xpub xbals limits)
+        (runInWebReader (xPubUnspents xpub xbals limits))
+  xPubTxs xpub xbals limits =
+    either snd id
+      <$> withWebCache
+        (\c -> cacheXPubTxs c xpub limits)
+        (runInWebReader (xPubTxs xpub xbals limits))
+  xPubTxCount xpub xbals =
+    either snd id
+      <$> withWebCache
+        (`cacheXPubTxCount` xpub)
+        (runInWebReader (xPubTxCount xpub xbals))
   getNumTxData = runInWebReader . getNumTxData
 
 instance (MonadUnliftIO m) => StoreReadBase (ActionT m) where
@@ -1545,9 +1563,9 @@ scottyDelXPub ::
   ActionT m (GenericResult Bool)
 scottyDelXPub (DelCachedXPub xpub deriv) =
   withMetrics (.xpubDelete) $ do
-    -- there is no cache while it is being rewritten
-    let _ = XPubSpec xpub deriv
-    return $ GenericResult False
+    c <- askl (.config.store.cache)
+    r <- liftIO $ maybe (return False) (`cacheDelete` XPubSpec xpub deriv) c
+    return $ GenericResult r
 
 -- | Transactions of an extended public key, optionally without the cache.
 getXPubTxs ::
@@ -3047,10 +3065,54 @@ runInWebReader f = do
   bdb <- asks (.config.store.db)
   lift $ runReaderT f bdb
 
--- | Run queries without the cache if the flag is 'True'. There is no cache
--- while it is being rewritten, so this does nothing.
-runNoCache :: Bool -> a -> a
-runNoCache _ = id
+-- | Ask the cache, if there is one, and the database if the cache has no
+-- answer. 'Right' is an answer of the cache; 'Left' an answer of the
+-- database, with the cache if there is one.
+withWebCache ::
+  (MonadIO m) =>
+  (Cache -> IO (Maybe a)) ->
+  ReaderT WebState m a ->
+  ReaderT WebState m (Either (Maybe Cache, a) a)
+withWebCache fromCache fromDB =
+  asks (.config.store.cache) >>= \case
+    Nothing -> Left . (Nothing,) <$> fromDB
+    Just c ->
+      liftIO (fromCache c) >>= \case
+        Just x -> return (Right x)
+        Nothing -> Left . (Just c,) <$> fromDB
+
+-- | Bodies of transactions: from Redis when the cache has them, so that the
+-- transactions of a cached xpub are served in full even before this store
+-- has imported them, and from the database otherwise.
+webTxData :: (MonadIO m) => [TxHash] -> ReaderT WebState m [Maybe TxData]
+webTxData [] = return []
+webTxData ths =
+  asks (.config.store.cache) >>= \case
+    Nothing -> runInWebReader (getManyTxData ths)
+    Just c -> do
+      cached <- liftIO (cacheTxData c ths)
+      let missing = [h | (h, Nothing) <- zip ths cached]
+      fromDB <- HashMap.fromList . zip missing <$> runInWebReader (getManyTxData missing)
+      return $
+        zipWith
+          (\h m -> maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m)
+          ths
+          cached
+
+-- | The only element of a list of one optional value.
+listToMaybe' :: [Maybe a] -> Maybe a
+listToMaybe' [x] = x
+listToMaybe' _ = Nothing
+
+-- | Run queries without the cache if the flag is 'True'.
+runNoCache ::
+  (MonadIO m) =>
+  Bool ->
+  ReaderT WebState m a ->
+  ReaderT WebState m a
+runNoCache False = id
+runNoCache True = local $ \s ->
+  s {config = s.config {store = s.config.store {cache = Nothing}}}
 
 -- | Middleware that logs every request with its response status: errors at error level, others at debug level.
 logIt :: Logger -> Middleware

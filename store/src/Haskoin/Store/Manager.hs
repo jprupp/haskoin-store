@@ -14,11 +14,13 @@
 -- Portability : POSIX
 --
 -- Wires the components of a store together: the RocksDB database, the
--- peer-to-peer node and the block store that imports data. Node events are
--- forwarded to the block store and turned into 'StoreEvent's.
+-- peer-to-peer node, the block store that imports data, and the optional Redis
+-- cache. Node events are forwarded to the block store and turned into
+-- 'StoreEvent's, which the cache follows.
 --
 -- Keeping the wiring in one place means each component only knows about the
--- interfaces it uses: the node does not know about the block store. 'withStore' starts them in dependency order
+-- interfaces it uses: the node does not know about the block store, and the
+-- block store does not know about the cache. 'withStore' starts them in dependency order
 -- and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
@@ -72,6 +74,7 @@ import Haskoin.Store.BlockStore
     blockStoreTxSTM,
     withBlockStore,
   )
+import Haskoin.Store.Cache (Cache, CacheConfig (..), withCache)
 import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
@@ -94,6 +97,7 @@ import System.Metrics.StatsD
 import UnliftIO
   ( MonadIO,
     MonadUnliftIO,
+    withRunInIO,
     STM,
     atomically,
     liftIO,
@@ -112,6 +116,8 @@ data Store = Store
     block :: !BlockStore,
     -- | database reader
     db :: !DatabaseReader,
+    -- | cache of extended public keys, if Redis is configured
+    cache :: !(Maybe Cache),
     -- | store events are published here
     pub :: !(Publisher StoreEvent),
     -- | network constants
@@ -132,8 +138,8 @@ data StoreConfig = StoreConfig
     db :: !FilePath,
     -- | network constants
     net :: !Network,
-    -- | Redis URL for the cache of extended public keys; not used while the
-    -- cache is being rewritten
+    -- | Redis URL for the cache of extended public keys ("Haskoin.Store.Cache");
+    -- 'Nothing' for no cache, an empty URL for the local Redis
     redis :: !(Maybe String),
     -- | Secp256k1 context
     ctx :: !Ctx,
@@ -141,12 +147,10 @@ data StoreConfig = StoreConfig
     initGap :: !Word32,
     -- | gap for extended public keys
     gap :: !Word32,
-    -- | cache xpubs with at least this many used addresses; not used while
-    -- the cache is being rewritten
+    -- | cache xpubs with at least this many used addresses
     redisMinAddrs :: !Int,
-    -- | most keys in the Redis cache; not used while the cache is being
-    -- rewritten
-    redisMaxKeys :: !Integer,
+    -- | evict the least recently used xpubs from the cache past this many
+    redisMaxXPubs :: !Int,
     -- | do not index new mempool transactions
     noMempool :: !Bool,
     -- | wipe mempool when starting
@@ -165,9 +169,6 @@ data StoreConfig = StoreConfig
     connect :: !(SockAddr -> WithConnection),
     -- | StatsD
     stats :: !(Maybe Stats),
-    -- | seconds between syncs of the mempool to the cache; not used while the
-    -- cache is being rewritten
-    redisSyncInterval :: !Int,
     -- | database Bloom filters
     bloom :: !Bool,
     -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
@@ -191,7 +192,8 @@ data StoreConfig = StoreConfig
 -- when the action returns, and an exception in any component is re-thrown in
 -- the calling thread.
 --
--- The database is opened first, then the node and the block store.
+-- The database is opened first, then the node, the block store and the cache
+-- (if 'redis' is set).
 withStore ::
   (MonadUnliftIO m) =>
   StoreConfig ->
@@ -206,16 +208,44 @@ withStore cfg action =
             withBlockStore (blockStoreCfg cfg node pub db) $ \block_store ->
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
-                action
-                  Store
-                    { peerMgr = node.peerMgr,
-                      chain = node.chain,
-                      block = block_store,
-                      db = db,
-                      pub = pub,
-                      net = cfg.net,
-                      ctx = cfg.ctx
-                    }
+                withStoreCache cfg db node.chain pub $ \cache ->
+                  action
+                    Store
+                      { peerMgr = node.peerMgr,
+                        chain = node.chain,
+                        block = block_store,
+                        db = db,
+                        cache = cache,
+                        pub = pub,
+                        net = cfg.net,
+                        ctx = cfg.ctx
+                      }
+
+-- | Run the cache while an action runs, if Redis is configured.
+withStoreCache ::
+  (MonadUnliftIO m) =>
+  StoreConfig ->
+  DatabaseReader ->
+  Chain ->
+  Publisher StoreEvent ->
+  (Maybe Cache -> m a) ->
+  m a
+withStoreCache cfg db chain pub action =
+  case cfg.redis of
+    Nothing -> action Nothing
+    Just url ->
+      withRunInIO $ \io ->
+        withCache
+          CacheConfig
+            { url = url,
+              minAddrs = cfg.redisMinAddrs,
+              maxXPubs = cfg.redisMaxXPubs
+            }
+          db
+          chain
+          pub
+          (withSource "Cache" cfg.logger)
+          (io . action . Just)
 
 -- | Open the database described by the configuration and run an action with its reader.
 connectDB ::
