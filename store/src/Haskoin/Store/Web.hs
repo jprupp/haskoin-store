@@ -184,6 +184,8 @@ import Haskoin.Script
 import Haskoin.Store.BlockStore
 import Haskoin.Store.Common
 import Haskoin.Store.Data
+-- the instances of the store classes for the database reader
+import Haskoin.Store.Database.Query ()
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Manager
 import Haskoin.Store.WebCommon

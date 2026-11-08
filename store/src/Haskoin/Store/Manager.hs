@@ -33,7 +33,6 @@ import Control.Monad.Cont
   ( ContT (..),
     runContT,
   )
-import Control.Monad.Reader (ReaderT (ReaderT))
 import Control.Monad.Trans (lift)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32)
@@ -85,7 +84,6 @@ import Haskoin.Store.Common
   )
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
-    DatabaseReaderT,
     createDataMetrics,
     withDatabaseReader,
   )
@@ -204,7 +202,7 @@ withStore ::
   m a
 withStore cfg action =
   connectDB cfg $
-    ReaderT $ \db -> flip runContT return $ do
+    \db -> flip runContT return $ do
       pub <- ContT withPublisher
       node_pub <- ContT withPublisher
       node_sub <- ContT $ withSubscription node_pub
@@ -228,7 +226,7 @@ withStore cfg action =
 connectDB ::
   (MonadUnliftIO m) =>
   StoreConfig ->
-  DatabaseReaderT m a ->
+  (DatabaseReader -> m a) ->
   m a
 connectDB cfg f = do
   stats <- liftIO $ mapM createDataMetrics cfg.stats

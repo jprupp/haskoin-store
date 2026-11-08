@@ -186,6 +186,8 @@ import Haskoin.Node
   )
 import Haskoin.Store.Common
 import Haskoin.Store.Data
+-- the instances of the store classes for the database reader
+import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Writer
 import Haskoin.Store.Logic
@@ -996,7 +998,8 @@ pruneMempool =
       let thresh = time - (fromIntegral days * 24 * 60 * 60)
       -- runs on every clock tick: read only the expired entries, oldest
       -- first, from the index by time
-      txs <- map snd <$> runRocksDB (getMempoolBefore thresh 1000)
+      db <- asks (.config.db)
+      txs <- map snd <$> liftIO (getMempoolBefore db thresh 1000)
       unless (null txs) $ do
         logInfo $
           "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"

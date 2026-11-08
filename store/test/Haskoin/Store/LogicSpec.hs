@@ -6,7 +6,7 @@
 module Haskoin.Store.LogicSpec (spec) where
 
 import Control.Monad (forM_, void)
-import Control.Monad.Reader (ask, liftIO, runReaderT)
+import Control.Monad.Reader (runReaderT)
 import Data.ByteString qualified as B
 import Data.List (sort, sortOn)
 import Data.Ord (Down (..))
@@ -44,7 +44,8 @@ import Haskoin.Store.Data
     TxData (..),
     Unspent (..),
   )
-import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, getMempoolBefore, memoryReport, mempoolCF, withDatabaseReader)
+import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, memoryReport, mempoolCF, withDatabaseReader)
 import Haskoin.Store.Database.Types (MemKey (..), MemTimeKey (..), MemTxKey (..), VersionKey (..))
 import Haskoin.Store.Database.Writer (MempoolChanges (..), runWriter, runWriterMempool)
 import Haskoin.Store.Logic
@@ -81,15 +82,15 @@ spec = prepareContext $ \ctx -> do
   describe "data version 18" $
     it "moves the mempool into its column family when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
-        let open :: DatabaseReaderT IO () -> IO ()
+        let open :: (DatabaseReader -> IO ()) -> IO ()
             open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
             h1 = TxHash (sha256 ("one" :: B.ByteString))
             h2 = TxHash (sha256 ("two" :: B.ByteString))
             old = [(200, h2), (100, h1)] :: [(Word64, TxHash)]
-        open $ ask >>= \r -> liftIO $ do
+        open $ \r -> do
           insert r.db VersionKey (18 :: Word32)
           insert r.db MemKey old
-        open $ ask >>= \r -> liftIO $ do
+        open $ \r -> do
           reading r getMempool `shouldReturn` old
           reading r (getMempoolPage (Limits 1 1 Nothing)) `shouldReturn` drop 1 old
           (retrieve r.db MemKey :: IO (Maybe [(Word64, TxHash)])) `shouldReturn` Nothing
@@ -98,15 +99,15 @@ spec = prepareContext $ \ctx -> do
   describe "data version 19" $
     it "indexes the mempool by time when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
-        let open :: DatabaseReaderT IO () -> IO ()
+        let open :: (DatabaseReader -> IO ()) -> IO ()
             open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
             old = sortOn Down (zip [300, 100, 200] (hashes 3))
-        open $ ask >>= \r -> liftIO $ do
+        open $ \r -> do
           insert r.db VersionKey (19 :: Word32)
           forM_ old $ \(t, h) -> insertCF r.db (mempoolCF r.db) (MemTxKey h) t
           (matchingAsListCF r.db (mempoolCF r.db) MemTimeKeyS :: IO [(MemTimeKey, ())])
             `shouldReturn` []
-        open $ ask >>= \r -> liftIO $ do
+        open $ \r -> do
           reading r getMempool `shouldReturn` old
           retrieve r.db VersionKey `shouldReturn` Just (20 :: Word32)
 
@@ -125,9 +126,9 @@ spec = prepareContext $ \ctx -> do
       withDB btcRegTest ctx $ \db -> do
         _ <- fill db
         let oldest = reverse newest
-        reading db (getMempoolBefore 4 10) `shouldReturn` takeWhile ((< 4) . fst) oldest
-        reading db (getMempoolBefore 4 2) `shouldReturn` take 2 oldest
-        reading db (getMempoolBefore 1 10) `shouldReturn` []
+        Q.getMempoolBefore db 4 10 `shouldReturn` takeWhile ((< 4) . fst) oldest
+        Q.getMempoolBefore db 4 2 `shouldReturn` take 2 oldest
+        Q.getMempoolBefore db 1 10 `shouldReturn` []
     it "reports and indexes what a batch changes" $
       withDB btcRegTest ctx $ \db -> do
         let hs = hashes 3
@@ -398,7 +399,7 @@ spec = prepareContext $ \ctx -> do
 withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
 withDB net ctx go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing (ask >>= liftIO . go)
+    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing go
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.

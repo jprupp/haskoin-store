@@ -26,6 +26,7 @@ library
       Haskoin.Store
       Haskoin.Store.BlockStore
       Haskoin.Store.Common
+      Haskoin.Store.Database.Query
       Haskoin.Store.Database.Reader
       Haskoin.Store.Database.Types
       Haskoin.Store.Database.Writer

@@ -67,16 +67,16 @@ spec = do
          in paths === modelPaths igap gap ext chg
     it "reads no address past the gap, beyond the initial block" $
       property $ \(Wallet igap gap ext chg) ->
-        let reads = execState (scanXPubBals (countReads ext chg) igap gap (chain 0) (chain 1)) []
+        let seen = execState (scanXPubBals (countReads ext chg) igap gap (chain 0) (chain 1)) []
             limit m used
               | m == 0 = max (fromIntegral igap - 1) (lastReached igap gap used + fromIntegral gap)
               | otherwise = lastReached 0 gap used + fromIntegral gap
             ok (m, n) = n <= limit m (if m == 0 then ext else chg)
-         in counterexample (show reads) (all ok reads)
+         in counterexample (show seen) (all ok seen)
     it "reads only the initial block of an unused xpub" $
       property $ \(NonNegative igap) (Positive gap) ->
-        let reads = execState (scanXPubBals (countReads [] []) (igap `mod` 40) (gap `mod` 40) (chain 0) (chain 1)) []
-         in sortOn id reads === [(0, n) | n <- [0 .. fromIntegral (igap `mod` 40) - 1]]
+        let seen = execState (scanXPubBals (countReads [] []) (igap `mod` 40) (gap `mod` 40) (chain 0) (chain 1)) []
+         in sortOn id seen === [(0, n) | n <- [0 .. fromIntegral (igap `mod` 40) - 1]]
     it "counts the unused addresses at the end of the initial block" $
       -- index 0 used, initial gap 20, gap 32: the store looks at indices 1 to
       -- 32 and no further, while it used to read up to index 83

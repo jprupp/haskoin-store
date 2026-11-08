@@ -70,6 +70,8 @@ import Haskoin
 import Haskoin.Node (Logger)
 import Haskoin.Store.Common
 import Haskoin.Store.Data
+-- the instances of the store classes for the database reader
+import Haskoin.Store.Database.Query ()
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import UnliftIO
