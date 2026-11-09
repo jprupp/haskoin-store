@@ -7108,8 +7108,9 @@ components:
         Where the page starts: a transaction id (included), a block hash, a block
         height (transactions confirmed at or below it), or a Unix time (the last
         block at or before it). Numbers up to 1,230,768,000 are heights, larger ones
-        times. Unconfirmed transactions come first in every list, so a height below
-        the best block leaves them out.
+        times. Unconfirmed transactions come first in every list, and a page that
+        starts at a height, a block or a time has none of them, even when the height
+        is above the best block.
 
         To get the next page, pass the id of the last transaction you received here,
         with `offset=1`. See *Paging* at the top for why this is better than a large

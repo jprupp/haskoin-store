@@ -153,9 +153,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     (`MemSpenderKey`, `MemAddrKey`, `MemDeletedKey`) and a marker for
     migrations that work in several writes (`MigrationKey`).
   - `Haskoin.Store.Database.Mempool` has the keys that one mempool
-    transaction contributes, and the rules that put the mempool on top of
-    the chain for transactions, spenders, unspent outputs, address
-    transactions and balances.
+    transaction contributes, and what the mempool does to the balance and
+    the unspent outputs of an address.
   - `Haskoin.Store.Database.Migrate` moves a database of version 20 to the
     layered layout without a resync: it takes every mempool transaction out
     of the chain's indices and writes it to the mempool area, in atomic
@@ -184,10 +183,34 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - One difference is on purpose: a block that spends an output of an
     unconfirmed transaction is refused by the new rules, as that output is
     not in the chain. Today it is imported.
+- `Haskoin.Store.Database.Query.Layered`: every query of the store for the
+  layered layout, with the names and arguments of
+  `Haskoin.Store.Database.Query`, and `layeredRead`, which gives them as the
+  record of queries that the web server answers with. The store does not use
+  them yet.
+  - A query takes a `View`, a RocksDB snapshot that only `withView` makes,
+    so that the chain and the mempool are read as they were at one moment.
+  - Pages are cut from the mempool's part of a list followed by the chain's
+    part, by today's rules for starts, offsets and limits, for one address,
+    for several, and for extended public keys.
+  - Mempool spenders are looked up only for the outputs of a transaction
+    that no block spends, in one multi-get for a whole page of transactions.
+  - `MemDeletedKeyP` matches deleted transactions by the start of their
+    hash, for the short transaction numbers of the Blockchain.info API.
+  - Tests ask today's queries and the new ones for pages with random
+    limits, offsets and starts, on databases migrated from today's layout,
+    on databases built by the rules of the layered layout, and on databases
+    upgraded in the middle of a history. They also check that an open view
+    goes on answering from its moment while blocks and transactions are
+    written.
+- Documentation: a page that starts at a height has no unconfirmed
+  transactions, whatever the height. The comment on `AtBlock` said that a
+  height above the best block includes them, and the API reference could be
+  read that way. The behaviour is unchanged.
 - Known issue: `--bloom` builds no Bloom filters when the store is built
   against RocksDB 6.24 or later, because of a wrong type in
-  `rocksdb-haskell-jprupp` 2.6.1, fixed in its pull request 21. The README
-  says what to expect when the fix is picked up.
+  `rocksdb-haskell-jprupp` 2.6.1, fixed in 2.6.2. `stack.yaml` still pins
+  2.6.1; the README says what to expect when the fix is picked up.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.

@@ -39,11 +39,12 @@
 -- * "Haskoin.Store.Database.Reader": opening the RocksDB database.
 -- * "Haskoin.Store.Database.Query": queries against RocksDB, as plain
 --   functions.
--- * "Haskoin.Store.Database.Mempool", "Haskoin.Store.Database.Migrate" and
---   "Haskoin.Store.Logic.Layered": a layout of the database in which the
---   mempool is kept apart from the chain, the migration to it, and the rules
---   that import blocks and transactions in it. The store does not use them
---   yet; see @docs\/layered-database.md@.
+-- * "Haskoin.Store.Database.Mempool", "Haskoin.Store.Database.Migrate",
+--   "Haskoin.Store.Logic.Layered" and
+--   "Haskoin.Store.Database.Query.Layered": a layout of the database in
+--   which the mempool is kept apart from the chain, the migration to it, the
+--   rules that import blocks and transactions in it, and its queries. The
+--   store does not use them yet; see @docs\/layered-database.md@.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.

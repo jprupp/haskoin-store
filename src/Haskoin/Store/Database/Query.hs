@@ -56,6 +56,17 @@ module Haskoin.Store.Database.Query
     xPubTxs,
     xPubTxCount,
     getAddressesTxCount,
+
+    -- * Building blocks
+
+    -- | What the queries above are made of, for the queries of the layered
+    -- layout in "Haskoin.Store.Database.Query.Layered", which read the same
+    -- column families for the part of their answers that is in the chain.
+    count,
+    withManyIters,
+    retrieveManyCF,
+    joinConduits,
+    usedAddresses,
   )
 where
 

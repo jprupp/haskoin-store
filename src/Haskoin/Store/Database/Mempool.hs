@@ -10,7 +10,8 @@
 -- applied on top of the chain. The design, and the reasons for it, are in
 -- @docs\/layered-database.md@. The store does not use this layout yet: these
 -- are its rules, checked by the tests of "Haskoin.Store.Database.Migrate"
--- against the answers of the database as it is today.
+-- against the answers of the database as it is today. The queries that apply
+-- them are in "Haskoin.Store.Database.Query.Layered".
 --
 -- = Two layers
 --
@@ -62,6 +63,7 @@ module Haskoin.Store.Database.Mempool
     -- * Reading the mempool area
     AddressMempool (..),
     getAddressMempool,
+    getAddressMempools,
     getMempoolTx,
     getMempoolSpenders,
     getDeletedTx,
@@ -70,23 +72,13 @@ module Haskoin.Store.Database.Mempool
     -- * Applying the mempool on top of the chain
     mempoolUnspents,
     hiddenOutputs,
+    applyMempool,
     mergeBalance,
-    mergeUnspents,
-    mergeTxRefs,
-
-    -- * Queries over both layers
-    getTxData,
-    getSpender,
-    getUnspent,
-    getBalance,
-    getAddressTxs,
-    getAddressUnspents,
   )
 where
 
-import Control.Applicative ((<|>))
+import Conduit (runConduit, sinkList, (.|))
 import Data.ByteString (ByteString)
-import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
@@ -99,13 +91,15 @@ import Database.RocksDB
   ( BatchOp (..),
     ColumnFamily,
     DB,
+    Iterator,
     iterFirst,
     iterKey,
     iterNext,
     withIterCF,
   )
 import Database.RocksDB.Query
-  ( matchingAsListCF,
+  ( matching,
+    matchingAsListCF,
     retrieveCF,
     writeBatch,
   )
@@ -135,7 +129,6 @@ import Haskoin.Store.Data
     Unspent (..),
     zeroBalance,
   )
-import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     mempoolAddrCF,
@@ -265,8 +258,24 @@ data AddressMempool = AddressMempool
 
 -- | What the mempool does at an address.
 getAddressMempool :: DatabaseReader -> Address -> IO AddressMempool
-getAddressMempool r a = do
-  rows <- matchingAsListCF r.db (mempoolAddrCF r.db) (MemAddrKeyA a)
+getAddressMempool r a = withIterCF r.db (mempoolAddrCF r.db) (`addressMempool` a)
+
+-- | What the mempool does at each of some addresses, in their order.
+--
+-- All of them are read through one iterator, which is moved to each address
+-- in turn. A query about an extended public key asks about hundreds of
+-- addresses, nearly all with nothing in the mempool; opening an iterator for
+-- each would cost more than the reads, each of which stops at the filter.
+getAddressMempools :: DatabaseReader -> [Address] -> IO [AddressMempool]
+getAddressMempools _ [] = return []
+getAddressMempools r as = withIterCF r.db (mempoolAddrCF r.db) $ \it -> mapM (addressMempool it) as
+
+-- | What the mempool does at an address, read with an iterator on the
+-- column family of the entries by address, which is left wherever the scan
+-- ended.
+addressMempool :: Iterator -> Address -> IO AddressMempool
+addressMempool it a = do
+  rows <- runConduit $ matching it (MemAddrKeyA a) .| sinkList
   return
     AddressMempool
       { txs = [TxRef {block = MemRef t, txid = h} | (MemAddrTxKey _ t h, _) <- rows],
@@ -333,9 +342,8 @@ hiddenOutputs m = HashMap.filterWithKey (\p _ -> not (HashSet.member p made)) m.
   where
     made = HashSet.fromList (map (.outpoint) m.created)
 
--- | Balance of an address as the API gives it, from its balance in the
--- chain, if it has one, and what the mempool does at it. 'Nothing' if the
--- address was never used in either.
+-- | The balance that the chain has for an address, with what the mempool
+-- does at the address applied: the balance as the API gives it.
 --
 -- As today, an output of a block that a mempool transaction spends no
 -- longer counts as confirmed balance, and the unconfirmed balance is what
@@ -344,99 +352,30 @@ hiddenOutputs m = HashMap.filterWithKey (\p _ -> not (HashSet.member p made)) m.
 -- The amounts taken from the chain can never be more than it has, as long
 -- as every output that the mempool spends exists. If they ever are, the
 -- result stops at zero rather than wrapping around.
-mergeBalance :: Address -> Maybe Balance -> AddressMempool -> Maybe Balance
-mergeBalance a chain m
-  | isNothing chain && null m.txs && HashMap.null m.spent && null m.created = Nothing
-  | otherwise =
-      Just
-        Balance
-          { address = a,
-            confirmed = c.confirmed `minus` sum (HashMap.elems hidden),
-            unconfirmed = c.unconfirmed + sum (map (.value) fresh),
-            utxo = (c.utxo `minus` fromIntegral (HashMap.size hidden)) + fromIntegral (length fresh),
-            txs = c.txs + fromIntegral (length m.txs),
-            received = c.received + sum (map (.value) m.created)
-          }
+applyMempool :: Balance -> AddressMempool -> Balance
+applyMempool c m =
+  Balance
+    { address = c.address,
+      confirmed = c.confirmed `minus` sum (HashMap.elems hidden),
+      unconfirmed = c.unconfirmed + sum (map (.value) fresh),
+      utxo = (c.utxo `minus` fromIntegral (HashMap.size hidden)) + fromIntegral (length fresh),
+      txs = c.txs + fromIntegral (length m.txs),
+      received = c.received + sum (map (.value) m.created)
+    }
   where
-    c = fromMaybe (zeroBalance a) chain
     hidden = hiddenOutputs m
     fresh = mempoolUnspents m
     minus x y = if y > x then 0 else x - y
 
--- | Unspent outputs of an address as the API gives them, newest first, from
--- those that the chain has, newest first, and what the mempool does at the
--- address: the unspent outputs of the mempool, then those of the chain that
--- the mempool does not spend.
-mergeUnspents :: AddressMempool -> [Unspent] -> [Unspent]
-mergeUnspents m chain =
-  mempoolUnspents m <> [u | u <- chain, not (HashMap.member u.outpoint m.spent)]
-
--- | Transactions of an address as the API gives them, newest first: those of
--- the mempool, then those of the chain.
-mergeTxRefs :: AddressMempool -> [TxRef] -> [TxRef]
-mergeTxRefs m chain = m.txs <> chain
-
--------------------------------------------------------------------------------
--- Queries over both layers
--------------------------------------------------------------------------------
-
--- | Data of a transaction, with the spenders of its outputs, those in blocks
--- and those in the mempool. A transaction in the mempool comes from the
--- mempool area, a confirmed one from the chain, and one that was deleted
--- from where it was kept: the mempool area, or the chain for those that
--- version 20 deleted.
-getTxData :: DatabaseReader -> TxHash -> IO (Maybe TxData)
-getTxData r h =
-  getMempoolTx r h >>= \case
-    Just td -> Just <$> spent td
-    Nothing ->
-      Q.getTxData r h >>= \case
-        Just td | not td.deleted -> Just <$> spent td
-        old -> (<|> old) <$> getDeletedTx r h
-  where
-    spent td = do
-      ms <- getMempoolSpenders r h
-      return (td :: TxData) {spenders = IntMap.union td.spenders ms}
-
--- | Input that spends an output, in the mempool or in a block.
-getSpender :: DatabaseReader -> OutPoint -> IO (Maybe Spender)
-getSpender r p =
-  retrieveCF r.db (mempoolCF r.db) (MemSpenderKey p) >>= \case
-    Just s -> return (Just s)
-    Nothing -> Q.getSpender r p
-
--- | Unspent output, if it exists and neither a block nor the mempool spends
--- it: one that the chain has, or one of a mempool transaction.
-getUnspent :: DatabaseReader -> OutPoint -> IO (Maybe Unspent)
-getUnspent r p =
-  retrieveCF r.db (mempoolCF r.db) (MemSpenderKey p) >>= \case
-    Just (_ :: Spender) -> return Nothing
-    Nothing ->
-      Q.getUnspent r p >>= \case
-        Just u -> return (Just u)
-        Nothing -> (>>= output) <$> getMempoolTx r p.hash
-  where
-    output td = case drop (fromIntegral p.index) td.tx.outputs of
-      o : _ ->
-        Just
-          Unspent
-            { block = td.block,
-              outpoint = p,
-              value = o.value,
-              script = o.script,
-              address = eitherToMaybe (scriptToAddressBS r.net r.ctx o.script)
-            }
-      [] -> Nothing
-
--- | Balance of an address, with the mempool applied.
-getBalance :: DatabaseReader -> Address -> IO (Maybe Balance)
-getBalance r a = mergeBalance a <$> Q.getBalance r a <*> getAddressMempool r a
-
--- | All transactions of an address, newest first, with those of the mempool.
-getAddressTxs :: DatabaseReader -> Address -> IO [TxRef]
-getAddressTxs r a = mergeTxRefs <$> getAddressMempool r a <*> Q.getAddressTxs r a def
-
--- | All unspent outputs of an address, newest first, with the mempool
--- applied.
-getAddressUnspents :: DatabaseReader -> Address -> IO [Unspent]
-getAddressUnspents r a = mergeUnspents <$> getAddressMempool r a <*> Q.getAddressUnspents r a def
+-- | Balance of an address as the API gives it, from its balance in the
+-- chain, if it has one, and what the mempool does at it ('applyMempool').
+-- 'Nothing' if the address was never used in either.
+--
+-- Version 20 answers with a balance of zero, rather than with 'Nothing',
+-- for an address whose only transactions were deleted from the mempool: it
+-- leaves the balance that it wrote for them behind. The API shows an unknown
+-- address as a balance of zero, so the two are the same to it.
+mergeBalance :: Address -> Maybe Balance -> AddressMempool -> Maybe Balance
+mergeBalance a chain m
+  | isNothing chain && null m.txs && HashMap.null m.spent && null m.created = Nothing
+  | otherwise = Just (applyMempool (fromMaybe (zeroBalance a) chain) m)

@@ -350,12 +350,12 @@ the Haskell heap. `/dbstats` shows where it goes.
 `--bloom` builds no filters at present when the store is built against
 RocksDB 6.24 or later: `rocksdb-haskell-jprupp` 2.6.1 passes the size of the
 filter to RocksDB with the wrong type, and RocksDB builds none, without an
-error. The fix is
-[pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21) of the
-binding. Once the store is built with it, the option will work, for the
-table files written from then on, and the filters will need about 1.25 bytes
-for each key, held in the block cache: on a chain with billions of keys, size
-that before turning it on.
+error. The fix is in `rocksdb-haskell-jprupp` 2.6.2
+([pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21));
+`stack.yaml` still pins 2.6.1. Once the store is built with the fix, the
+option will work, for the table files written from then on, and the filters
+will need about 1.25 bytes for each key, held in the block cache: on a chain
+with billions of keys, size that before turning it on.
 
 ## API
 
@@ -477,15 +477,19 @@ Today unconfirmed transactions are written into the same indices as the
 block chain. `docs/layered-database.md` is a design, partly built, for
 keeping them in an area of their own and applying them on top of the chain
 when a query is answered, so that nothing the mempool does changes the
-chain's data, and so that the cache can be split the same way. Three parts
+chain's data, and so that the cache can be split the same way. Four parts
 of it are written and tested, and the store does not use them yet:
 
 - the migration from the present layout (`Haskoin.Store.Database.Migrate`);
-- the rules that put the two areas together when reading
+- the keys that a mempool transaction writes, and what the mempool does to
+  the balance and the unspent outputs of an address
   (`Haskoin.Store.Database.Mempool`);
 - the rules that import blocks and transactions in that layout
   (`Haskoin.Store.Logic.Layered`), which the tests hold to the results of
-  today's rules, operation by operation and key by key.
+  today's rules, operation by operation and key by key;
+- the queries over both areas (`Haskoin.Store.Database.Query.Layered`), each
+  on a snapshot of the database, which the tests hold to the answers of
+  today's queries, page by page.
 
 ## Monitoring
 

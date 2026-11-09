@@ -39,30 +39,39 @@ that could be built and proved ahead of the switch.
 | Piece | Where | State |
 |---|---|---|
 | Keys of the mempool area | `Haskoin.Store.Database.Types` | written |
-| The keys of one transaction, and the merge of the two areas | `Haskoin.Store.Database.Mempool` | written, whole lists only |
+| The keys of one transaction, and what the mempool does to a balance | `Haskoin.Store.Database.Mempool` | written |
 | Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, not called by the store |
 | Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against today's rules, not used by the store |
-| Tests against today's database and today's rules | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs` | passing |
+| Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, not used by the store |
+| Tests against today's database, rules and queries | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs`, `test/Haskoin/Store/Database/Query/LayeredSpec.hs` | passing |
 | Cost of the extra lookups | `docs/layered-database/` | measured |
-| Paged queries over both areas, the web server on them | `Haskoin.Store.Database.Query` | not started |
+| The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web` | not started |
 | The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
 
-Four findings came out of the work, in order of how soon they matter:
+Five findings came out of the work, in order of how soon they matter:
 
 1. **Bloom filters were never built.** `--bloom` has no effect with the
    RocksDB binding as released, on RocksDB 6.24 or later. The fix is
    [rocksdb-haskell pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21).
    See [Bloom filters](#bloom-filters-were-not-being-built).
-2. **The migration works, and the merge gives today's answers.** For 350
-   random histories of blocks, payments, replacements, deletions and
-   reorganisations, the migrated database answers every query as the
+2. **The migration works, and the merge gives today's answers.** For
+   hundreds of random histories of blocks, payments, replacements, deletions
+   and reorganisations, the migrated database answers every query as the
    version 20 database did, and its chain area is that of a database that
    never saw a mempool. See [Evidence](#evidence).
 3. **The new rules do what today's rules do.** Given the same random
    history, the rules of the layered layout and today's rules followed by
    the migration leave the same database, key for key, and every operation
-   has the same result on the way. See [Evidence](#evidence).
-4. **The extra lookups are cheap with filters and almost free in memory.**
+   has the same result on the way. So does a store that is upgraded in the
+   middle of the history, which is what a store in production will be. See
+   [Evidence](#evidence).
+4. **The new queries give today's pages.** Every query that the web server
+   uses is written for the two areas, on a snapshot of the database. Asked
+   for pages with random limits, offsets and starts, about addresses and an
+   extended public key, they answer as today's queries do, on migrated
+   databases and on databases that the new rules built. See
+   [Evidence](#evidence).
+5. **The extra lookups are cheap with filters and almost free in memory.**
    Between 0.5 and 1.1 microseconds to find that a transaction, an output or
    an address has nothing in the mempool area, against 0.05 to 0.1 in
    memory. See [What it costs](#what-it-costs-measurements).
@@ -209,6 +218,13 @@ Bodies that version 20 already marked as deleted stay in `tx`. Finding them
 would take a scan of the whole column family. Nothing refers to them, and
 the lookup of a transaction falls back to them, so the API answers the same.
 
+Such a leftover can outlive its use. If its transaction comes back into the
+mempool after the upgrade, the new body goes to the mempool area, and the
+old one stays in `tx` until a block confirms the transaction and writes over
+it, or for good if the transaction is deleted again. So a lookup takes the
+first body it finds in this order: the mempool's, a confirmed one, one
+deleted since the upgrade, one deleted before it.
+
 ### The time a transaction was first seen
 
 One thing in the chain area still comes from the mempool: a confirmed body
@@ -254,17 +270,27 @@ nothing the mempool does can change it.
 
 ## Reading: the mempool applied on top
 
-`Haskoin.Store.Database.Mempool` has the merge. Each query reads the chain,
-reads what the mempool area has for the same thing, and combines them.
+`Haskoin.Store.Database.Query.Layered` has every query of
+`Haskoin.Store.Database.Query` for the two areas, with the same names and the
+same arguments. Each reads the chain, reads what the mempool area has for the
+same thing, and combines them. `layeredRead` gives them as the record of
+queries that the web server answers with, as `databaseRead` gives today's.
 
 | Query | Chain area | Mempool area | Combined |
 |---|---|---|---|
 | Transaction | body, spenders in blocks | body if unconfirmed; mempool spenders of its outputs | the body from where it is, with both sets of spenders |
+| Transactions with a short number | scan of `tx` by the start of the hash | the same scan of its bodies and of the deleted ones | all of them, in the order of their hashes |
 | Spender of an output | from the body of its transaction | `MemSpenderKey` | the mempool's, or else the chain's |
 | Unspent output | `unspent` | spender; body of its transaction | none if the mempool spends it; else the chain's, or an output of a mempool body |
 | Transactions of an address | `addr-tx` | `MemAddrTxKey` entries | the mempool's, then the chain's |
 | Unspent outputs of an address | `addr-out` | the address entries | the mempool's unspent ones, then the chain's that the mempool does not spend |
 | Balance of an address | `balance` | the address entries | the formula below |
+| Number of transactions of some addresses | distinct keys of `addr-tx` | distinct transactions in the address entries | the sum: no transaction is in both |
+
+The queries about an extended public key are built from these: its balances
+are those of its addresses, so an address that only the mempool has used
+counts as used when the gap is measured, as today; its lists are those of
+its addresses, merged.
 
 **Balance.** With *hidden* the outputs that the mempool spends and did not
 create, and *fresh* those it creates and does not spend:
@@ -306,15 +332,78 @@ today. Every rule about starts, offsets and limits applies to it unchanged.
 Ties between mempool transactions of the same second are broken by the same
 bytes as today, because the keys have the same layout.
 
-**A consistent view.** Reading two areas at different moments can show a
-transaction twice, or not at all, if a block is imported in between; a
-balance could even take the same payment off twice. Today's queries read
-without a snapshot and get away with it, because each key is whole in
-itself. The layered queries must read both areas through one RocksDB
-snapshot. `withSnapshot` gives a database handle that the existing query
-functions can use as they are; creating and releasing one took about 1.1
-microseconds in the measurements. One snapshot for each request also ends
-the mixed reads that version 20 can produce while a block is imported.
+### Pages
+
+A page is cut from the merged list by today's rules: where it starts, then
+the offset, then the limit.
+
+| The page starts at | Mempool's part | Chain's part |
+|---|---|---|
+| the top | all of it | from its newest entry |
+| a mempool transaction | from that transaction on, by time and then by hash | from its newest entry |
+| a confirmed transaction | none | from the position of the transaction |
+| a height | none | from the last position in the block at that height |
+| a deleted transaction | where the transaction was: one of the two rows above | |
+| a transaction that is not known | none | none |
+
+- **The mempool's part is read whole.** It is the few entries of the
+  address, read with the one scan that its balance needs too. The chain's
+  part is streamed from its index only as far as the page needs, as today.
+- **Several addresses are merged as today.** For a set of addresses or an
+  extended public key, the list of each address is its mempool's part
+  followed by its chain's part, and the lists are merged by the functions
+  that merge them today (`joinDescStreams`, `mergeDescGroups`).
+- **A list of transactions that starts in the chain does not read the
+  mempool area.** That is every page after the first of a long history.
+- **Outputs that the mempool spends are dropped as the chain's part is
+  streamed**, before the offset and the limit are counted.
+- **A height never includes the mempool**, not even a height above the best
+  block. That is what today's queries do. The comment on `AtBlock` said the
+  opposite, and has been corrected.
+
+### Reading transactions
+
+A body can be in three places: the mempool area, for a transaction in the
+mempool; `tx`, for a confirmed one, and for those that version 20 deleted;
+and the mempool area again, under `MemDeletedKey`, for those deleted since.
+
+- **The mempool area is asked first**, for all the transactions of a request
+  in one multi-get. Most are confirmed, but with its filter the mempool area
+  says so for a fraction of the cost of reading a body, and `tx` is then
+  asked only for the others. The deleted ones are looked up last, and only
+  for what is still missing.
+- **Mempool spenders are looked up only for outputs that no block spends.**
+  The mempool cannot spend the others. For an old transaction that is few
+  outputs or none. All of them, for all the transactions of the request, go
+  in one multi-get.
+- **A transaction with more than eight such outputs is scanned instead.**
+  Its mempool spenders share a prefix, and a scan costs about as much as
+  eight lookups whatever it finds.
+
+### A consistent view
+
+Reading two areas at different moments can show a transaction twice, or not
+at all, if a block is imported in between; a balance could even count the
+same payment twice. Today's queries read without a snapshot and get away
+with it, because each of their answers is one key or one scan.
+
+So the new queries do not take the database. They take a `View`: both areas
+through one RocksDB snapshot. `withView` is the only way to make one, so a
+query cannot be run on the live database by mistake. Taking and releasing a
+snapshot took about 1.1 microseconds in the measurements.
+
+- **One view for each request** is how the web server is meant to use it.
+  The queries of one request then agree with each other as well: the
+  balances of an xpub with its unspent outputs, a list of transactions with
+  their bodies. Today a block can land between them.
+- **The view has to last as long as the response.** A streamed response
+  reads while it is sent, so the view must be held around the sending, not
+  only around the handler. RocksDB keeps what a view can see for as long as
+  it is open, so a slow client holds old data back from compaction until its
+  response ends.
+- **Nothing made from a view may be used after it is released.** The
+  snapshot is freed then, and RocksDB would be handed a dangling pointer.
+  The types do not prevent it; the comment on `withView` warns of it.
 
 ## Writing
 
@@ -389,7 +478,8 @@ mempool:
 | Request | Extra lookups | Extra time in RocksDB | In memory |
 |---|---|---|---|
 | Balance of an address | 1 scan | 1 µs | 0.1 µs |
-| Page of 100 transactions with spenders | 100 gets and 100 scans | 0.6 ms | about 0.02 ms |
+| Page of 100 transactions with spenders, read as first measured | 100 gets and 100 scans | 0.6 ms | about 0.02 ms |
+| The same, as the queries read it now, if each has two outputs that no block spends | 300 gets | 0.2 ms | about 0.02 ms |
 | Balances of an xpub with 1,000 addresses | 1,000 scans | 1.1 ms | 0.1 ms |
 | The same, without filters | 1,000 scans | 6.6 ms | 0.1 ms |
 
@@ -446,9 +536,11 @@ RocksDB reported `filter block size=0; # entries for filter=0`.
   away, and the mempool rules come down to checks and to adding or removing
   the keys of a transaction. Wiping is deleting keys.
 - **More complex: reading.** Every query has two sources and needs a
-  snapshot, and paging has to run across both. The merge itself is small:
-  the five functions that apply the mempool to a balance, a list of unspent
-  outputs and a list of transactions are about forty lines.
+  snapshot, and paging runs across both. It came out smaller than feared:
+  `Haskoin.Store.Database.Query.Layered` is about as long as the module of
+  today's queries, and uses its streams and merges for the chain's part.
+  What is new is where a page starts, the mempool's part of each list, and
+  the three places a body can be in.
 - **More complex: the transition.** Two layouts, a migration, and a cache
   protocol to specify again.
 
@@ -674,19 +766,22 @@ with the store's own rules, migrates them, and compares.
 
 - **Random histories.** 50 histories each time the suite runs, each of 57
   operations chosen at random: payments from outputs that are unspent, in a
-  block or in the mempool, between five addresses and a script that has no
-  address, some signalling replace-by-fee; transactions that replace one in
+  block or in the mempool, between ten addresses, five of them of an
+  extended public key, and a script that has no address, some signalling
+  replace-by-fee, a few with ten outputs; transactions that replace one in
   the mempool; blocks with part of the mempool, in or out of order, with
   transactions the mempool has not seen, or with one that conflicts with
   it; deletions; reversals of the best block; and operations that are
-  refused. The histories differ from run to run: 300 of them passed over six
-  runs with the choices as they are now, after 350 with a narrower set. In
-  the last run, every history ended with ten or more mempool transactions,
-  and 98% with ten or more of them spending another mempool transaction.
-- **Every answer is kept.** After the migration, the merged queries give
-  what version 20 gave: the balance, transactions and unspent outputs of
-  every address, the data of every transaction ever made with its spenders,
-  the spender and the unspent state of every output, and the mempool.
+  refused. The histories differ from run to run: 250 of them passed
+  over five runs with the choices as they are now, after 650 with
+  narrower sets. In the last run, every history ended with ten or more
+  mempool transactions, and 86% with ten or more of them spending
+  another mempool transaction.
+- **Every answer is kept.** After the migration, the new queries give what
+  version 20 gave: the balance, transactions and unspent outputs of every
+  address, the data of every transaction ever made with its spenders, asked
+  for by hash and by short number, the spender and the unspent state of
+  every output, and the mempool.
 - **The chain area is clean.** Its column families are compared key by key
   with those of a second database that imported the same blocks and never
   saw a mempool. They are equal, apart from first-seen times and what
@@ -706,9 +801,12 @@ with the store's own rules, migrates them, and compares.
 
 ### The new rules against today's
 
-`test/Haskoin/Store/Logic/LayeredSpec.hs` gives the same history to both
-sets of rules, each with a database of its own, on Bitcoin and on Bitcoin
-Cash, which has no replace-by-fee.
+`test/Haskoin/Store/Logic/LayeredSpec.hs` gives the same history to three
+stores, each with a database of its own, on Bitcoin and on Bitcoin Cash,
+which has no replace-by-fee. One runs today's rules. One runs the new rules.
+The third is upgraded on the way: it runs today's rules up to a point
+chosen at random, its database is migrated, and it runs the new rules from
+there on, as a store in production will.
 
 - **Histories.** 40 on each network every time the suite runs, each of 70
   operations chosen at random as above. Those that must be refused are
@@ -716,8 +814,9 @@ Cash, which has no replace-by-fee.
   the same output twice, more than their inputs, or no inputs but a
   coinbase's; blocks with an unknown output, an output already spent, or
   beside the best block; and deletions of confirmed transactions. Earlier
-  transactions are sent again too, whatever became of them. Over six runs,
-  240 histories passed on each network.
+  transactions are sent again too, whatever became of them. Over five
+  runs, 200 histories passed on each network with the
+  choices as they are now, after 240 with a narrower set and two stores.
 - **Every operation has the same outcome.** The same result or the same
   error, and the same transactions entering and leaving the mempool, which
   is what the store publishes as events.
@@ -728,11 +827,22 @@ Cash, which has no replace-by-fee.
   key for key and value for value. The only difference allowed is where the
   bodies of deleted transactions are kept, and the bodies themselves must be
   equal.
+- **The upgraded store ends the same too**, but for the deleted bodies. It
+  keeps in `tx` those that version 20 deleted before the upgrade, even when
+  the transaction came back afterwards and has a body elsewhere. The
+  queries never answer with such a leftover, which is what the comparison
+  after every operation checks.
 - **The tests can fail.** With the correction of flags left out, with
   deleted bodies not kept, or with conflicting mempool transactions not
   deleted by a block, the comparison failed each time. It also found a real
   difference while the rules were written: the flag kept in the deleted body
   of a transaction that spent the coinbase of a reverted block.
+- **So can the comparison with the upgraded store.** Three faults that make
+  no difference to a database built by the new rules, and so pass the other
+  two stores, were caught by the third: the rules taking a body that version
+  20 deleted for a confirmed transaction; and the queries answering with
+  such a body when the transaction was deleted again since, or, asked by
+  short number, when it is back in the mempool.
 - **Particular cases.** A block that spends an output of the mempool is
   refused by the new rules and leaves the database untouched. When a block
   confirms a transaction, the keys of a mempool transaction that spends it
@@ -740,36 +850,115 @@ Cash, which has no replace-by-fee.
   as two coinbases of 2010 are, ends in the same place under both sets of
   rules, through the reversal of both blocks too.
 
-What this does not show: how the new rules perform, and how they behave in
-the store itself, which does not use them yet. The paged queries over both
-areas do not exist either; the comparison uses queries that return whole
-lists.
+### The new queries against today's
+
+`test/Haskoin/Store/Database/Query/LayeredSpec.hs` asks today's queries and
+the new ones the same questions.
+
+- **Questions.** Pages of the transactions and of the unspent outputs of
+  one address, of several addresses, and of an extended public key, with
+  limits from 1 to 6 or none and offsets up to 3. Pages start at the top, at
+  any transaction ever made in the history, whatever became of it, at a
+  transaction that was never made, and at heights from 0 to two above the
+  best block. Also: the balances of several addresses, the bodies of several
+  transactions, transactions by short number, pages of the mempool, and the
+  balances and the number of transactions of the extended public key.
+  Addresses repeat, and one of them was never used.
+- **On migrated databases.** 30 histories on each network every time the
+  suite runs. A database is built by today's rules, 150 questions are asked
+  of it, it is migrated, and the questions are asked again. Over five
+  runs, 150 histories passed on each network.
+- **On databases that the new rules built, and on upgraded ones.** The
+  comparison of the rules, above, ends by asking 60 such questions of all
+  three of its databases.
+- **The gap of the extended public key.** Histories pay five of its
+  addresses: the first, third and sixth that it gives out, and the first
+  and third of its change. Each question is asked twice: with the gaps that
+  the tests open their databases with, 20 and 32, which reach all five, and
+  with an initial gap of 2 and a gap of 3, under which the later ones are
+  found only if earlier ones are used, by a block or by the mempool alone.
+- **What the pages covered.** In one run on Bitcoin, 3,576 pages: 29%
+  started at the top, 16% at a mempool transaction, 22% at a confirmed one,
+  10% at a deleted one, 18% at a height, and 6% at a transaction that was
+  never made, which gives an empty page. 54% had something in them, and each
+  of the other kinds of start had 180 or more that did.
+- **One moment.** A view is taken; a block confirms two mempool
+  transactions and two more arrive; the view still answers every question
+  as before, and a view taken afterwards does not.
+- **An example with numbers.** The example of this document, M and its two
+  payments, page by page, before and after a block confirms the first
+  payment.
+- **The tests can fail.** Thirteen faults were put in the queries, one at
+  a time, and the tests caught each:
+  - a view that takes no snapshot;
+  - a page that starts at a mempool transaction and keeps what is newer, of
+    transactions and of outputs, or that loses the transaction itself;
+  - a page that starts in the chain and keeps the mempool's part;
+  - outputs that the mempool spends left in the list;
+  - the mempool spenders of a transaction with many outputs not read;
+  - mempool transactions not counted, and balances without the mempool;
+  - deleted transactions not found by short number, and not accepted as the
+    start of a page;
+  - a height that starts at the first transaction of its block, not the
+    last;
+  - an address read too short when a page has an offset.
+
+  Two changes that must make no difference made none: reading every mempool
+  spender by scan, and every one by multi-get.
+
+What this does not show:
+
+- **Performance.** Neither the new rules nor the new queries have been
+  timed. The costs above are those of single lookups.
+- **The store itself**, which uses none of this yet.
+- **Bloom filters.** The tests ran with the binding that builds none, so
+  no read here went through a filter. The mempool's column families ask for
+  them, one by prefix of the key. A store built against RocksDB 6.24 or
+  later has never read through a filter either, whatever `--bloom` said.
+- **Long lists.** The histories are short: an address has tens of entries,
+  not thousands, and the extended public key has five addresses in use.
 
 ## Order of work
 
 Each step ends with something that can be tested against today's behaviour.
 
 1. **Build the store with the fixed RocksDB binding.** Needed for the read
-   costs above. Independent of everything else.
-2. **A snapshot for each request.** No change of layout. It also ends the
-   mixed reads of today.
+   costs above. Independent of everything else. The fix is released, in
+   `rocksdb-haskell-jprupp` 2.6.2; `stack.yaml` still pins 2.6.1, so the
+   tests ran with no filter built.
+2. **A snapshot for each request.** The new queries already cannot be asked
+   without one (`withView`). What is left is to take it in the web server,
+   around each request and the sending of its response.
 3. **New rules, beside the old.** Done: `Haskoin.Store.Logic.Layered`.
    Chain rules that import and revert blocks in the chain area alone;
    mempool rules that add and remove keys. Tested: for random histories, the
    same database, key for key, as the old rules followed by the migration.
-4. **Paged queries over both areas.** Test: the same pages as version 20,
-   for random limits, offsets and starts, on migrated databases.
+4. **Paged queries over both areas.** Done:
+   `Haskoin.Store.Database.Query.Layered`. Tested: the same pages as today's
+   queries, for random limits, offsets and starts, on migrated databases and
+   on databases built by the new rules.
 5. **The switch.** Version 21: the store opens with `mempool-addr`, runs the
    migration, uses the new rules and queries; `--wipe-mempool` empties the
    mempool area; the old paths are deleted. Then measure with
-   `scripts/bench-web.sh` and the stress test.
+   `scripts/bench-web.sh` and the stress test. What that takes in the web
+   server and the cache:
+   - the record of queries is built once today, when the server starts
+     (`webQuery`); it has to be built for each request, from its view;
+   - some reads go to the database beside that record, with today's
+     queries, and have to go through a view too. In the web server: the
+     bodies that the cache does not have, the queries of a request with
+     `nocache=true`, and the count of transactions of
+     `/blockchain/multiaddr`. In `Haskoin.Store.Cache`: every read of the
+     database, some twenty of them, which today's cache needs until it is
+     rebuilt on two layers.
 6. **The mirror in memory**, if the measurements of step 5 call for it.
 7. **The cache on two layers**, specified and model-tested in
    `Haskoin.Store.Cache.Protocol` first.
 
-Steps 1 and 2 are small and useful by themselves. Steps 3 to 5 are the
-database change, of which step 3 is done. Step 7 is where the concurrency
-problems of the cache are actually removed.
+Step 1 is small and useful by itself. Steps 2 to 5 are the database change,
+of which steps 3 and 4 are done, and step 2 as far as it can be before the
+switch. Step 7 is where the concurrency problems of the cache are actually
+removed.
 
 ## Alternatives considered
 

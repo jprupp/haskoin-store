@@ -69,7 +69,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         Q.getBalance db one `shouldReturn` Nothing
         Q.getBalance db two `shouldReturn` Nothing
         -- and with the mempool on top, every answer is what it was
-        ask (layered db) db hist.made `shouldReturn` old
+        layered db (ask hist) `shouldReturn` old
         -- a second run finds nothing to do
         migrateLayered db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0}
 
@@ -90,7 +90,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 done.checked `shouldBe` length old.mempool
                 done.moved `shouldBe` length old.mempool
                 -- every answer is what it was
-                ask (layered db) db hist.made `shouldReturn` old
+                layered db (ask hist) `shouldReturn` old
                 -- the chain's column families are those of the fresh database,
                 -- but for the times at which transactions were first seen
                 migrated <- chainOf db
@@ -106,8 +106,8 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 dump db (mempoolAddrCF db.db) `shouldReturn` sort (concatMap (snd . M.recordEntries) records)
                 -- without the mempool area, the answers are those of the chain
                 void (M.wipeMempoolArea db)
-                wiped <- ask (layered db) db hist.made
-                alone <- ask (mixed fresh) fresh hist.made
+                wiped <- layered db (ask hist)
+                alone <- mixed fresh (ask hist)
                 (wiped.balances, wiped.addressTxs, wiped.addressUnspents, wiped.unspents, wiped.mempool)
                   `shouldBe` (alone.balances, alone.addressTxs, alone.addressUnspents, alone.unspents, [])
           let inMempool = [td | (_, Just td) <- old.txs, not td.deleted, MemRef {} <- [td.block]]
@@ -142,7 +142,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           done.moved `shouldBe` length old.mempool - stopAt
           done.checked `shouldBe` length old.mempool
           (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
-          ask (layered db) db hist.made `shouldReturn` old
+          layered db (ask hist) `shouldReturn` old
 
   it "refuses a database that it cannot handle, and leaves it untouched" $ do
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
@@ -184,7 +184,7 @@ mixedDatabase ::
 mixedDatabase ctx dir go =
   open20 net ctx dir $ \db -> do
     hist <- start mixedRules db >>= go db
-    answers <- ask (mixed db) db hist.made
+    answers <- mixed db (ask hist)
     return (hist, answers)
 
 -- | Add a transaction to the mempool, by the rules of today's layout.

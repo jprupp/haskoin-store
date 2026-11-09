@@ -26,6 +26,7 @@ import Haskoin.Store.Data (TxData (..), Unspent (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Migrate (migrateLayered)
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     blockCF,
@@ -39,7 +40,9 @@ import Haskoin.Store.Logic (ImportException (..))
 import Haskoin.Store.TestBlocks (coinbaseTx, script)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
-import Test.QuickCheck (forAll, ioProperty, property, tabulate, vectorOf)
+import Test.QuickCheck (choose, forAll, ioProperty, property, tabulate, vectorOf)
+import Test.QuickCheck.Gen (unGen)
+import Test.QuickCheck.Random (mkQCGen)
 import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
@@ -47,8 +50,10 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
   forM_ [("Bitcoin", btcRegTest), ("Bitcoin Cash, without replace-by-fee", bchRegTest)] $ \(name, net) ->
     modifyMaxSuccess (const 40) $
       it ("leave the database that today's rules and the migration leave, on " <> name) $
-        property . forAll (vectorOf 70 anyNumber) $ \seeds -> ioProperty $ do
-          (outcomes, hist) <- both ctx net [\db h -> plan db h seed | seed <- seeds]
+        -- the number says when the third store is upgraded, and which
+        -- pages are asked for at the end
+        property . forAll ((,) <$> vectorOf 70 anyNumber <*> choose (0, 1000000)) $ \(seeds, number) -> ioProperty $ do
+          (outcomes, hist) <- sameHistory ctx net number [\db h -> plan db h seed | seed <- seeds]
           let count p = length (filter p outcomes)
               bucket n
                 | n == 0 = "none"
@@ -70,7 +75,8 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
         revert _ h = return $ case h.chain of
           (b, _) : _ -> (h, Just (Revert (headerHash b.header)))
           [] -> (h, Nothing)
-    (outcomes, _) <- both ctx btcRegTest [mine [twice], pay spend, mine [spend], revert, revert]
+    -- the third store is upgraded with the spend in its mempool
+    (outcomes, _) <- sameHistory ctx btcRegTest 2 [mine [twice], pay spend, mine [spend], revert, revert]
     map (either show (const "done") . (.result)) outcomes `shouldBe` replicate 5 "done"
 
   it "refuse a block that spends an output of the mempool, which today's rules import" $
@@ -107,34 +113,77 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
         dump db (mempoolAddrCF db.db) `shouldReturn` sortOn fst byAddress
         -- and the spent output of the parent, now in the chain, is still
         -- spent to anyone who asks
-        M.getUnspent db (OutPoint (txHash parent) 0) `shouldReturn` Nothing
+        L.withView db (\v -> L.getUnspent v (OutPoint (txHash parent) 0)) `shouldReturn` Nothing
         (fmap (.value) <$> Q.getUnspent db (OutPoint (txHash parent) 0)) `shouldReturn` Just 4000
 
--- | Give the same history to both sets of rules: to those of today's
--- layout in one database, and to those of the layered layout in another.
+-- | Give the same history to three stores, each with a database of its
+-- own:
+--
+-- * one that runs the rules of today's layout;
+--
+-- * one that runs the rules of the layered layout;
+--
+-- * one that is upgraded on the way: it runs today's rules for the first
+--   operations, as many as a number says, then its database is migrated,
+--   and it runs the rules of the layered layout from there on.
+--
 -- Each operation is chosen from the first database and the history so far.
--- Every operation must have the same outcome in both, and leave the same
--- answers to every query. At the end, migrate the first database and
--- compare it with the second, key for key. Gives the outcomes and the
--- history.
-both :: Ctx -> Network -> [DatabaseReader -> History -> IO (History, Maybe Op)] -> IO ([Outcome], History)
-both ctx net choices =
+-- Every operation must have the same outcome in all of them, and leave the
+-- same answers to every query. At the end all are asked for the same pages,
+-- chosen from the number. Then the first database is migrated: it must equal
+-- the second key for key, and the third in everything but the bodies of
+-- deleted transactions, which each set of rules leaves in its own place.
+-- Gives the outcomes and the history.
+sameHistory ::
+  Ctx ->
+  Network ->
+  Int ->
+  [DatabaseReader -> History -> IO (History, Maybe Op)] ->
+  IO ([Outcome], History)
+sameHistory ctx net number choices =
   withSystemTempDirectory "haskoin-store-mixed-" $ \dirOld ->
     withSystemTempDirectory "haskoin-store-layered-" $ \dirNew ->
-      openLayered net ctx dirNew $ \new -> do
-        (outcomes, hist) <- open20 net ctx dirOld $ \old -> do
-          hist0 <- start mixedRules old
-          void (start layeredRules new)
-          foldM (next old new) ([], hist0) choices
-        migrated <- openLayered net ctx dirOld $ \old -> migrateLayered old >> everything old
-        mine <- everything new
-        -- the same, but for where the bodies of deleted transactions are:
-        -- the layered rules keep none of them in the chain
-        mine `shouldBe` migrated {inChain = []}
-        return (reverse outcomes, hist)
+      withSystemTempDirectory "haskoin-store-upgraded-" $ \dirUp -> do
+        -- the store to upgrade begins with a database of version 20
+        open20 net ctx dirUp (\_ -> return ())
+        openLayered net ctx dirNew $ \new ->
+          openLayered net ctx dirUp $ \up -> do
+            (outcomes, hist) <- open20 net ctx dirOld $ \old -> do
+              hist0 <- start mixedRules old
+              void (start layeredRules new)
+              void (start mixedRules up)
+              let (earlier, later) = splitAt (number `mod` (length choices + 1)) choices
+                  today op _ _ _ = void (apply mixedRules up op)
+                  upgraded op was hist answers = do
+                    now <- apply layeredRules up op
+                    (show op, now) `shouldBe` (show op, was)
+                    layered up (ask hist) `shouldReturn` answers
+              half <- foldM (next old new today) ([], hist0) earlier
+              void (migrateLayered up)
+              done@(_, hist) <- foldM (next old new upgraded) half later
+              -- pages, of databases that the new rules built or carried on
+              -- with, against today's
+              let asked = unGen (questions net ctx hist 60) (mkQCGen number) 30
+              was <- mixed old (\queries -> mapM (answer queries) asked)
+              forM_ [new, up] $ \db -> do
+                now <- layered db (\queries -> mapM (answer queries) asked)
+                take 2 (differences asked was now) `shouldBe` []
+              return done
+            migrated <- openLayered net ctx dirOld $ \old -> migrateLayered old >> everything old
+            mine <- everything new
+            -- the same, but for where the bodies of deleted transactions
+            -- are: the layered rules keep none of them in the chain
+            mine `shouldBe` migrated {inChain = []}
+            -- the upgraded store has those that it deleted before the
+            -- upgrade in the chain, as version 20 left them, even when the
+            -- transaction came back later: the queries, compared after
+            -- every operation, do not answer with those
+            theirs <- everything up
+            theirs {deleted = [], inChain = []} `shouldBe` migrated {deleted = [], inChain = []}
+            return (reverse outcomes, hist)
   where
-    next old new (outcomes, hist) choose =
-      choose old hist >>= \case
+    next old new third (outcomes, hist) chosen =
+      chosen old hist >>= \case
         (hist', Nothing) -> return (outcomes, hist')
         (hist', Just op) -> do
           was <- apply mixedRules old op
@@ -142,8 +191,9 @@ both ctx net choices =
           (show op, now) `shouldBe` (show op, was)
           -- and every answer is the same after it
           let hist'' = record old hist' op was
-          answers <- ask (mixed old) old hist''.made
-          ask (layered new) new hist''.made `shouldReturn` answers
+          answers <- mixed old (ask hist'')
+          layered new (ask hist'') `shouldReturn` answers
+          third op was hist'' answers :: IO ()
           return (was : outcomes, hist'')
 
 -- | Everything in a database of the layered layout.

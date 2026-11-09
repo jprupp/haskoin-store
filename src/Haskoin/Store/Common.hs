@@ -127,8 +127,9 @@ data Start
     -- entered the mempool, and for a confirmed one, at its position in the
     -- chain
     AtTx !TxHash
-  | -- | at this block height, including every transaction in the mempool if it
-    -- is above the best block
+  | -- | at the last transaction confirmed at or below this block height.
+    -- Nothing of the mempool is in the page, not even when the height is
+    -- above the best block
     AtBlock !BlockHeight
   deriving (Eq, Show)
 

@@ -530,6 +530,10 @@ instance KeyValue MemAddrKey MemAddrVal
 data MemDeletedKey
   = -- | key of a deleted transaction
     MemDeletedKey !TxHash
+  | -- | short key that matches the deleted transactions whose hash starts
+    -- with these six bytes, as 'TxKeyS' does for the others; see
+    -- 'decodeTxKey'
+    MemDeletedKeyP !(Word32, Word16)
   | -- | short key that matches every deleted transaction
     MemDeletedKeyS
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
@@ -537,6 +541,10 @@ data MemDeletedKey
 instance Serialize MemDeletedKey where
   -- 0x0e · TxHash
   put (MemDeletedKey h) = do
+    put MemDeletedKeyS
+    put h
+  -- 0x0e · first six bytes of a TxHash
+  put (MemDeletedKeyP h) = do
     put MemDeletedKeyS
     put h
   -- 0x0e

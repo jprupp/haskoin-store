@@ -6,6 +6,10 @@
 -- blocks, deletions and reversals, some of them invalid. Each is chosen from
 -- a number and from what a database of today's layout holds at that point,
 -- so that the same history can be given to both sets of rules.
+--
+-- Payments go to a handful of fixed scripts and to a few addresses of an
+-- extended public key, 'wallet', so that the queries about extended public
+-- keys have something to find.
 module Haskoin.Store.Histories
   ( -- * Databases and rules
     open20,
@@ -32,13 +36,22 @@ module Haskoin.Store.Histories
     p2pkh,
     hashLock,
     addressesOf,
+    wallet,
 
     -- * Answers
-    Reads (..),
     mixed,
     layered,
     Answers (..),
     ask,
+
+    -- * Pages
+    Question (..),
+    Reply (..),
+    questions,
+    answer,
+    differences,
+    startOf,
+    size,
 
     -- * Column families
     Chain (..),
@@ -49,6 +62,7 @@ where
 
 import Control.Monad (void)
 import Data.Bifunctor (first)
+import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
@@ -57,15 +71,16 @@ import Data.Hashable (hashWithSalt)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort, sortOn)
-import Data.Maybe (catMaybes, fromMaybe)
-import Data.Serialize (decode, encode)
-import Data.Word (Word16, Word8)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Serialize (decode, encode, getWord64be, runGet)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Database.RocksDB (ColumnFamily, iterEntry, iterFirst, iterNext, withIterCF)
 import Haskoin
   ( Address,
     Block (..),
     BlockHash,
     BlockHeader (..),
+    BlockHeight,
     BlockNode (..),
     Ctx,
     Network,
@@ -74,29 +89,44 @@ import Haskoin
     TxHash (..),
     TxIn (..),
     TxOut (..),
+    addressToScriptBS,
+    deriveXPubKey,
     headerHash,
+    makeXPrvKey,
     nullOutPoint,
+    pubSubKey,
     scriptToAddressBS,
     sha256,
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger (..))
-import Haskoin.Store.Common (sortTxs)
+import Haskoin.Store.Common
+  ( Limits (..),
+    Start (..),
+    StoreRead (..),
+    deriveAddresses,
+    deriveFunction,
+    sortTxs,
+  )
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
     BlockRef (..),
+    DeriveType (..),
     Prev (..),
     Spender (..),
     TxData (..),
     TxRef (..),
     UnixTime,
     Unspent (..),
+    XPubBal (..),
+    XPubSpec (..),
+    XPubUnspent (..),
     confirmed,
     zeroBalance,
   )
-import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     addrOutCF,
@@ -113,7 +143,7 @@ import Haskoin.Store.Logic (ImportException)
 import Haskoin.Store.Logic qualified as Mixed
 import Haskoin.Store.Logic.Layered qualified as Layered
 import Haskoin.Store.TestBlocks (nextBlock, script)
-import Test.QuickCheck (Gen, choose)
+import Test.QuickCheck (Gen, choose, elements, frequency, vectorOf)
 import UnliftIO (try)
 
 -------------------------------------------------------------------------------
@@ -170,13 +200,15 @@ run db = try . runWriterMempool db.net db.ctx db quiet
 
 -- | What happened to a database: its main chain, newest block first, every
 -- transaction ever made for it, taken or not, coinbases included, the
--- outputs made that have no address, which no index of addresses lists, and
--- the time to give the next mempool transaction.
+-- outputs made that have no address, which no index of addresses lists, the
+-- time to give the next mempool transaction, and the scripts that payments
+-- go to.
 data History = History
   { chain :: ![(Block, BlockNode)],
     made :: ![Tx],
     loose :: ![OutPoint],
-    clock :: !UnixTime
+    clock :: !UnixTime,
+    scripts :: ![ByteString]
   }
 
 -- | Something that happens to a store.
@@ -243,7 +275,7 @@ record db hist op out = case op of
 start :: Rules -> DatabaseReader -> IO History
 start rules db = do
   void (run db rules.initBest) :: IO ()
-  let hist = History {chain = [], made = [], loose = [], clock = 1000}
+  let hist = History {chain = [], made = [], loose = [], clock = 1000, scripts = places db.ctx}
   block <- blockOn db []
   record db hist block <$> apply rules db block
 
@@ -260,10 +292,24 @@ coinOf hist = case hist.chain of
   (Block {txs = coinbase : _}, _) : _ -> OutPoint (txHash coinbase) 0
   _ -> error "no block with a coinbase"
 
--- | Scripts that pay to five addresses: that of every coinbase, and four
--- more.
-scripts :: [ByteString]
-scripts = script : map p2pkh [1 .. 4]
+-- | The scripts that the payments of a history go to: one that has no
+-- address on Bitcoin, that of every coinbase, four more of the same kind,
+-- and those of five addresses of the 'wallet'.
+places :: Ctx -> [ByteString]
+places ctx = hashLock : script : map p2pkh [1 .. 4] <> mapMaybe (addressToScriptBS ctx) paid
+  where
+    spec = wallet ctx
+    branch m = map snd (deriveAddresses (deriveFunction ctx spec.deriv) (pubSubKey ctx spec.key m) 0)
+    -- with addresses that are never paid between them, so that whether the
+    -- later ones are within the gap depends on which earlier ones are used
+    paid = map (branch 0 !!) [0, 2, 5] <> map (branch 1 !!) [0, 2]
+
+-- | An extended public key. Five of its addresses are paid in histories:
+-- three that it gives out to be paid, and two for its change.
+wallet :: Ctx -> XPubSpec
+wallet ctx = XPubSpec {key = deriveXPubKey ctx (makeXPrvKey seed), deriv = DeriveNormal}
+  where
+    seed = "the wallet of the histories of the tests of haskoin-store" :: ByteString
 
 p2pkh :: Word8 -> ByteString
 p2pkh n = "\x76\xa9\x14" <> B.replicate 20 n <> "\x88\xac"
@@ -272,10 +318,9 @@ p2pkh n = "\x76\xa9\x14" <> B.replicate 20 n <> "\x88\xac"
 hashLock :: ByteString
 hashLock = "\xaa\x20" <> B.replicate 32 0xbb <> "\x87"
 
--- | The addresses of the scripts of the tests that have one on the network
--- of a database.
-addressesOf :: DatabaseReader -> [Address]
-addressesOf db = rights (map (scriptToAddressBS db.net db.ctx) (hashLock : scripts))
+-- | The addresses of the scripts of a history that have one on a network.
+addressesOf :: Network -> Ctx -> History -> [Address]
+addressesOf net ctx hist = rights (map (scriptToAddressBS net ctx) hist.scripts)
 
 -- | Eight payments, each from the change of the one before, starting from
 -- a coin: a chain in the mempool.
@@ -307,8 +352,9 @@ step db hist seed =
 
 -- | Choose the next operation of a history from a number, given a database
 -- of today's layout that has gone through the history so far. Out of
--- sixteen: six are payments between the scripts of the tests, from outputs
--- that are unspent, in a block or in the mempool; one is a transaction that
+-- sixteen: six are payments between the scripts of the history, from outputs
+-- that are unspent, in a block or in the mempool, a few of them with ten
+-- outputs and the others with up to three; one is a transaction that
 -- must be refused; one conflicts with a mempool transaction; four are
 -- blocks, with part of the mempool, with a transaction that the mempool has
 -- not seen, or with one that conflicts with the mempool; two are deletions;
@@ -333,7 +379,7 @@ plan db hist0 seed = (hist,) <$> chosen
       | kind == 14 = revert
       | otherwise = again
     rotate k xs = let k' = k `mod` max 1 (length xs) in drop k' xs <> take k' xs
-    target j = (hashLock : scripts) !! ((s `div` 11 + j) `mod` 6)
+    target j = hist.scripts !! ((s `div` 11 + j) `mod` length hist.scripts)
     spending us values =
       let outputs = [TxOut v (target j) | (j, v) <- zip [0 ..] values]
        in Tx 2 [TxIn u.outpoint "" signal | u <- us] outputs [] 0
@@ -344,12 +390,13 @@ plan db hist0 seed = (hist,) <$> chosen
     pool = map snd <$> Q.getMempool db
     -- outputs that nothing spends, in a block or in the mempool
     unspent = do
-      listed <- concat <$> mapM (\a -> Q.getAddressUnspents db a def) (addressesOf db)
+      listed <- concat <$> mapM (\a -> Q.getAddressUnspents db a def) (addressesOf db.net db.ctx hist)
       (listed <>) . catMaybes <$> mapM (Q.getUnspent db) hist.loose
-    -- a payment from some of them, in equal shares
+    -- a payment from some of them, in equal shares: now and then in ten of
+    -- them, for a transaction with many outputs to spend
     payment us =
       let total = sum (map (.value) us)
-          count = 1 + (s `div` 7) `mod` 3
+          count = if s `mod` 13 == 5 && total >= 50000 then 10 else 1 + (s `div` 7) `mod` 3
           share = (total - 500) `div` fromIntegral count
        in if null us || total < 500 + 600 * fromIntegral count
             then Nothing
@@ -437,69 +484,205 @@ plan db hist0 seed = (hist,) <$> chosen
 -- Answers
 -------------------------------------------------------------------------------
 
--- | The queries of a layout.
-data Reads = Reads
-  { txData :: TxHash -> IO (Maybe TxData),
-    spender :: OutPoint -> IO (Maybe Spender),
-    unspent :: OutPoint -> IO (Maybe Unspent),
-    balance :: Address -> IO (Maybe Balance),
-    addressTxs :: Address -> IO [TxRef],
-    addressUnspents :: Address -> IO [Unspent]
-  }
+-- | Run an action with the queries of a database: those of today's layout,
+-- where one set of indices has the chain and the mempool mixed, or those of
+-- the layered layout, on a view of the database as it is now.
+mixed, layered :: DatabaseReader -> (StoreRead -> IO a) -> IO a
+mixed db action = action (Q.databaseRead db)
+layered db action = L.withView db (action . L.layeredRead)
 
--- | Queries of today's layout, where one set of indices has the chain and
--- the mempool mixed.
-mixed :: DatabaseReader -> Reads
-mixed db =
-  Reads
-    { txData = Q.getTxData db,
-      spender = Q.getSpender db,
-      unspent = Q.getUnspent db,
-      balance = Q.getBalance db,
-      addressTxs = \a -> Q.getAddressTxs db a def,
-      addressUnspents = \a -> Q.getAddressUnspents db a def
-    }
-
--- | Queries of the layered layout.
-layered :: DatabaseReader -> Reads
-layered db =
-  Reads
-    { txData = M.getTxData db,
-      spender = M.getSpender db,
-      unspent = M.getUnspent db,
-      balance = M.getBalance db,
-      addressTxs = M.getAddressTxs db,
-      addressUnspents = M.getAddressUnspents db
-    }
-
--- | Everything that the API could say about a history.
+-- | Everything that the API could say about a history, in whole lists.
 data Answers = Answers
   { balances :: ![(Address, Balance)],
     addressTxs :: ![(Address, [TxRef])],
     addressUnspents :: ![(Address, [Unspent])],
     txs :: ![(TxHash, Maybe TxData)],
+    numbered :: ![(TxHash, [TxData])],
     spenders :: ![(OutPoint, Maybe Spender)],
     unspents :: ![(OutPoint, Maybe Unspent)],
     mempool :: ![(UnixTime, TxHash)]
   }
   deriving (Eq, Show)
 
--- | Ask everything about the addresses of the tests and about every
--- transaction made, with each of its outputs and one that it does not have.
-ask :: Reads -> DatabaseReader -> [Tx] -> IO Answers
-ask queries db made = do
-  balances <- mapM (\a -> (a,) . fromMaybe (zeroBalance a) <$> queries.balance a) as
-  addressTxs <- mapM (\a -> (a,) <$> queries.addressTxs a) as
-  addressUnspents <- mapM (\a -> (a,) <$> queries.addressUnspents a) as
-  txs <- mapM (\h -> (h,) <$> queries.txData h) hashes
-  spenders <- mapM (\p -> (p,) <$> queries.spender p) outpoints
-  unspents <- mapM (\p -> (p,) <$> queries.unspent p) outpoints
-  mempool <- Q.getMempool db
-  return Answers {balances, addressTxs, addressUnspents, txs, spenders, unspents, mempool}
+-- | Ask everything about the addresses of a history and about every
+-- transaction made, by its hash and by its short number, with each of its
+-- outputs and one that it does not have. An address that was never used and
+-- one whose balance is zero are the same to the API, and are the same here.
+ask :: History -> StoreRead -> IO Answers
+ask hist queries = do
+  balances <- mapM (\a -> (a,) . fromMaybe (zeroBalance a) <$> queries.getBalance a) as
+  addressTxs <- mapM (\a -> (a,) <$> queries.getAddressTxs a def) as
+  addressUnspents <- mapM (\a -> (a,) <$> queries.getAddressUnspents a def) as
+  txs <- mapM (\h -> (h,) <$> queries.getTxData h) hashes
+  numbered <- mapM (\h -> (h,) <$> queries.getNumTxData (shortNumber h)) hashes
+  spenders <- mapM (\p -> (p,) <$> queries.getSpender p) outpoints
+  unspents <- mapM (\p -> (p,) <$> queries.getUnspent p) outpoints
+  mempool <- queries.getMempool
+  return Answers {balances, addressTxs, addressUnspents, txs, numbered, spenders, unspents, mempool}
   where
-    as = addressesOf db
-    hashes = map txHash made
-    outpoints = [OutPoint (txHash tx) i | tx <- made, i <- [0 .. fromIntegral (length tx.outputs)]]
+    as = addressesOf queries.net queries.ctx hist
+    hashes = map txHash hist.made
+    outpoints = [OutPoint (txHash tx) i | tx <- hist.made, i <- [0 .. fromIntegral (length tx.outputs)]]
+
+-------------------------------------------------------------------------------
+-- Pages
+-------------------------------------------------------------------------------
+
+-- | A question whose answer is a page of a list, or is read in a way that
+-- the questions of 'ask' do not use: many at a time, by number, or through
+-- an extended public key.
+data Question
+  = -- | a page of the transactions of an address
+    AddressTxs !Address !Limits
+  | -- | a page of the transactions of some addresses
+    AddressesTxs ![Address] !Limits
+  | -- | a page of the unspent outputs of an address
+    AddressUnspents !Address !Limits
+  | -- | a page of the unspent outputs of some addresses
+    AddressesUnspents ![Address] !Limits
+  | -- | the balances of some addresses
+    Balances ![Address]
+  | -- | the data of some transactions
+    Bodies ![TxHash]
+  | -- | the transactions with a short number of the Blockchain.info API
+    Numbered !Word64
+  | -- | a page of the mempool
+    Pool !Limits
+  | -- | the balances of the addresses of the 'wallet'
+    WalletBalances
+  | -- | a page of the transactions of the 'wallet'
+    WalletTxs !Limits
+  | -- | a page of the unspent outputs of the 'wallet'
+    WalletUnspents !Limits
+  | -- | the number of transactions of the 'wallet'
+    WalletCount
+  | -- | a page of the transactions of some addresses, read as those of an
+    -- extended public key are
+    SetTxs ![Address] !Limits
+  | -- | a page of the unspent outputs of some addresses, read as those of
+    -- an extended public key are
+    SetUnspents ![Address] !Limits
+  | -- | the number of distinct transactions of some addresses
+    SetCount ![Address]
+  deriving (Eq, Show)
+
+-- | The answer to a 'Question'.
+data Reply
+  = Refs ![TxRef]
+  | Outputs ![Unspent]
+  | Amounts ![Balance]
+  | Data ![Maybe TxData]
+  | Matches ![TxData]
+  | Listed ![(UnixTime, TxHash)]
+  | Paths ![XPubBal]
+  | PathOutputs ![XPubUnspent]
+  | Number !Word32
+  deriving (Eq, Show)
+
+-- | Ask a question.
+answer :: StoreRead -> Question -> IO Reply
+answer queries = \case
+  AddressTxs a limits -> Refs <$> queries.getAddressTxs a limits
+  AddressesTxs as limits -> Refs <$> queries.getAddressesTxs as limits
+  AddressUnspents a limits -> Outputs <$> queries.getAddressUnspents a limits
+  AddressesUnspents as limits -> Outputs <$> queries.getAddressesUnspents as limits
+  Balances as -> Amounts <$> queries.getBalances as
+  Bodies hs -> Data <$> queries.getManyTxData hs
+  Numbered i -> Matches <$> queries.getNumTxData i
+  Pool limits -> Listed <$> queries.getMempoolPage limits
+  WalletBalances -> Paths <$> queries.xPubBals spec
+  WalletTxs limits -> Refs <$> (queries.xPubBals spec >>= \bals -> queries.xPubTxs spec bals limits)
+  WalletUnspents limits -> PathOutputs <$> (queries.xPubBals spec >>= \bals -> queries.xPubUnspents spec bals limits)
+  WalletCount -> Number <$> (queries.xPubBals spec >>= queries.xPubTxCount spec)
+  SetTxs as limits -> Refs <$> (set as >>= \bals -> queries.xPubTxs spec bals limits)
+  SetUnspents as limits -> PathOutputs <$> (set as >>= \bals -> queries.xPubUnspents spec bals limits)
+  SetCount as -> Number <$> (set as >>= queries.xPubTxCount spec)
+  where
+    spec = wallet queries.ctx
+    -- the queries about an extended public key take the balances of its
+    -- addresses, so any addresses can be given to them
+    set as = zipWith (\i b -> XPubBal {path = [0, i], balance = b}) [0 ..] <$> queries.getBalances as
+
+-- | The questions that two databases answer differently, with the answers
+-- of both.
+differences :: [Question] -> [Reply] -> [Reply] -> [(Question, Reply, Reply)]
+differences asked was now = [(q, a, b) | (q, a, b) <- zip3 asked was now, a /= b]
+
+-- | How much there is in an answer.
+size :: Reply -> Int
+size = \case
+  Refs xs -> length xs
+  Outputs xs -> length xs
+  Amounts xs -> length xs
+  Data xs -> length (catMaybes xs)
+  Matches xs -> length xs
+  Listed xs -> length xs
+  Paths xs -> length xs
+  PathOutputs xs -> length xs
+  Number n -> fromIntegral n
+
+-- | Where the page of a question starts, if it has a page.
+startOf :: Question -> Maybe (Maybe Start)
+startOf = \case
+  AddressTxs _ limits -> Just limits.start
+  AddressesTxs _ limits -> Just limits.start
+  AddressUnspents _ limits -> Just limits.start
+  AddressesUnspents _ limits -> Just limits.start
+  WalletTxs limits -> Just limits.start
+  WalletUnspents limits -> Just limits.start
+  SetTxs _ limits -> Just limits.start
+  SetUnspents _ limits -> Just limits.start
+  _ -> Nothing
+
+-- | Questions about a history: pages with small limits and offsets, from the
+-- top, from any transaction ever made, whatever became of it, from one that
+-- was never made, and from heights up to above the best block; about the
+-- addresses of the history, one at a time and several together, with one
+-- that was never used and with repetitions; and about the 'wallet'.
+questions :: Network -> Ctx -> History -> Int -> Gen [Question]
+questions net ctx hist n = vectorOf n question
+  where
+    question =
+      frequency
+        [ (4, AddressTxs <$> address <*> limits),
+          (4, AddressesTxs <$> several address <*> limits),
+          (4, AddressUnspents <$> address <*> limits),
+          (4, AddressesUnspents <$> several address <*> limits),
+          (1, Balances <$> several address),
+          (1, Bodies <$> several hash),
+          (1, Numbered . shortNumber <$> hash),
+          (1, Pool <$> limits),
+          (1, pure WalletBalances),
+          (3, WalletTxs <$> limits),
+          (3, WalletUnspents <$> limits),
+          (1, pure WalletCount),
+          (3, SetTxs <$> several address <*> limits),
+          (3, SetUnspents <$> several address <*> limits),
+          (1, SetCount <$> several address)
+        ]
+    address = frequency [(12, elements (addressesOf net ctx hist)), (1, elements unused)]
+    unused = rights [scriptToAddressBS net ctx (p2pkh 9)]
+    hash = frequency [(12, elements (map txHash hist.made)), (1, pure (TxHash (sha256 ("never made" :: ByteString))))]
+    several :: Gen a -> Gen [a]
+    several one = frequency [(1, pure 0), (12, choose (1, 6))] >>= (`vectorOf` one)
+    limits =
+      Limits
+        <$> frequency [(1, pure 0), (5, choose (1, 6))]
+        <*> frequency [(3, pure 0), (2, choose (1, 3))]
+        <*> frequency
+          [ (3, pure Nothing),
+            (6, Just . AtTx <$> hash),
+            (2, Just . AtBlock <$> choose (0, best + 2))
+          ]
+    best :: BlockHeight
+    best = case hist.chain of
+      (_, node) : _ -> node.height
+      [] -> 0
+
+-- | The short number of a transaction in the Blockchain.info API: the first
+-- 53 bits of its hash.
+shortNumber :: TxHash -> Word64
+shortNumber h = either error (`shiftR` 11) (runGet getWord64be (encode h))
 
 -------------------------------------------------------------------------------
 -- The chain's column families
