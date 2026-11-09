@@ -1197,6 +1197,17 @@ damagedTest env = do
   void . redisRun env $ Redis.hset (xpubKey env x "meta") (pure ("height", "0"))
   cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
   checkXPub env x ref
+  -- a reload writes only differences, computed from what Redis has, so
+  -- members that should not be there go, and the generation goes up
+  gen0 <- redisRun env $ Redis.hget (xpubKey env x "meta") "gen"
+  void . redisRun env $ Redis.zadd (xpubKey env x "txs") [(1, "not a transaction")]
+  void . redisRun env $ Redis.zadd (xpubKey env x "utxo") [(1, "not an output")]
+  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
+  redisRun env (Redis.zscore (xpubKey env x "txs") "not a transaction") `shouldReturn` Nothing
+  redisRun env (Redis.zscore (xpubKey env x "utxo") "not an output") `shouldReturn` Nothing
+  gen1 <- redisRun env $ Redis.hget (xpubKey env x "meta") "gen"
+  (read . C8.unpack <$> gen1) `shouldBe` ((+ (1 :: Int)) . read . C8.unpack <$> gen0)
+  checkXPub env x ref
 
 -- | An output of a cached transaction that pays an address outside the xpub
 -- is spent by a transaction that does not touch the xpub. The xpub is not

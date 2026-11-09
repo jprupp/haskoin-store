@@ -82,8 +82,10 @@
 -- and with stores of other networks.
 --
 -- * @x:\<id\>:meta@: hash with the serialized xpub (@spec@), the height of
---   the best block it was read at (@height@) and the format version (@ver@). @\<id\>@ is the
---   hexadecimal of the first 16 bytes of the SHA-256 of the serialized xpub.
+--   the best block it was read at (@height@), the format version (@ver@) and
+--   the generation of the entry (@gen@), which every reload increments.
+--   @\<id\>@ is the hexadecimal of the first 16 bytes of the SHA-256 of the
+--   serialized xpub.
 -- * @x:\<id\>:bal@: balances of the addresses up to the gap, serialized.
 -- * @x:\<id\>:txs@: sorted set of transaction hashes, scored by 'blockRefScore'.
 -- * @x:\<id\>:utxo@: sorted set of serialized unspent outputs, scored the same.
@@ -205,6 +207,7 @@ import UnliftIO
     modifyTVar',
     newIORef,
     newTVarIO,
+    pooledForConcurrentlyN_,
     readIORef,
     readTVar,
     tryAny,
@@ -630,49 +633,63 @@ cacheEvict c n = do
 -- before the entry is: the entry and the missing bodies are written in one
 -- Lua script, which writes nothing if a body is missing, so a store that is
 -- behind never finds a cached transaction that it cannot serve.
+--
+-- The xpub is read in full from the database, but only the differences
+-- with the entry in Redis are written: the transactions, unspent outputs
+-- and addresses that are new, moved or gone, and the bodies of the new and
+-- moved transactions. The entry is read first ('readStored'), and the
+-- script writes nothing if it changed since, so the result is exactly what
+-- a full rewrite would give. A full rewrite of a large xpub took Redis tens
+-- of milliseconds, during which it answered no one, every other server
+-- included; the differences of one block or transaction take a moment.
 cacheRefresh :: Cache -> XPubSpec -> HashSet TxHash -> IO Reload
 cacheRefresh c x changed =
   fromMaybe Locked <$> withLock c x (timed (go (3 :: Int) []))
   where
     def' = Limits {limit = 0, offset = 0, start = Nothing}
     go tries extra = do
-      (stamp, old) <- run c $ do
-        h <- R.hget (xkey c x "meta") "height"
-        o <- R.zrangeWithscores (xkey c x "txs") 0 (-1)
-        return ((,) <$> h <*> o)
+      st <- readStored c x
       height <- bestHeight c
-      let stamped = readMaybe . C8.unpack =<< stamp
-      if not (mayReplace stamped height False)
+      if not (mayReplace st.stamp height False)
         then behind
         else do
           bals <- Q.xPubBals c.db x
           txs <- Q.xPubTxs c.db bals def'
-          let new = HashSet.fromList (map (encode . (.txid)) txs)
-              gone = [h | (bs, _) <- old, not (HashSet.member bs new), Right h <- [decode bs]]
+          let newTxs = [(encode t.txid, blockRefScore t.block) | t <- txs]
+              newTxSet = HashSet.fromList (map fst newTxs)
+              txDel = [m | m <- HashMap.keys st.txs, not (HashSet.member m newTxSet)]
           -- a transaction that Redis has and this store has never seen
-          known <- Q.getManyTxData c.db gone
-          if not (mayReplace stamped height (any isNothing known))
+          known <- Q.getManyTxData c.db [h | m <- txDel, Right h <- [decode m]]
+          if not (mayReplace st.stamp height (any isNothing known))
             then behind
             else do
               utxos <- Q.xPubUnspents c.db bals def'
-              present <- run c (sequence <$> mapM (R.exists . txKey c . (.txid)) txs)
               now <- nowMs
-              let scores = HashMap.fromList old
+              let txAdd = [(m, sc) | (m, sc) <- newTxs, HashMap.lookup m st.txs /= Just sc]
+                  newUs = [(encode u.unspent, blockRefScore u.unspent.block) | u <- utxos]
+                  newUSet = HashSet.fromList (map fst newUs)
+                  utxoAdd = [(m, sc) | (m, sc) <- newUs, not (HashSet.member m st.utxos)]
+                  utxoDel = [m | m <- HashSet.toList st.utxos, not (HashSet.member m newUSet)]
+                  newAs = HashSet.fromList [encode b.balance.address | b <- bals]
+                  addrAdd = [a | a <- HashSet.toList newAs, not (HashSet.member a st.addrs)]
+                  addrDel = [a | a <- HashSet.toList st.addrs, not (HashSet.member a newAs)]
+                  -- bodies of the transactions that are new or moved, or
+                  -- that changed, and of those the script found missing;
+                  -- the others are in Redis, kept there by this entry
                   wanted =
-                    nub $
+                    HashSet.toList . HashSet.fromList $
                       extra
-                        <> [ t.txid
-                           | (t, p) <- zip txs present,
-                             not p
-                               || HashMap.lookup (encode t.txid) scores /= Just (blockRefScore t.block)
-                               || t.txid `HashSet.member` changed
-                           ]
+                        <> [h | (m, _) <- txAdd, Right h <- [decode m]]
+                        <> [t.txid | t <- txs, t.txid `HashSet.member` changed]
               bodies <- catMaybes <$> Q.getManyTxData c.db wanted
               let args =
-                    [c.prefix, xpubId x, num height, num now, encode x, encode bals]
-                      <> counted [encode b.balance.address | b <- bals]
-                      <> counted2 [(encode t.txid, num' (blockRefScore t.block)) | t <- txs]
-                      <> counted2 [(encode u.unspent, num' (blockRefScore u.unspent.block)) | u <- utxos]
+                    [c.prefix, xpubId x, num height, num now, encode x, encode bals, st.gen]
+                      <> counted addrAdd
+                      <> counted addrDel
+                      <> counted2 [(m, num' sc) | (m, sc) <- txAdd]
+                      <> counted txDel
+                      <> counted2 [(m, num' sc) | (m, sc) <- utxoAdd]
+                      <> counted utxoDel
                       <> bodyArgs bodies
               run c (R.eval commitScript [] args) >>= \case
                 ["ok"] -> do
@@ -682,6 +699,8 @@ cacheRefresh c x changed =
                   return Reloaded
                 ("missing" : missing)
                   | tries > 0 -> go (tries - 1) (rights (map decode missing))
+                ["changed"]
+                  | tries > 0 -> go (tries - 1) extra
                 _ -> behind
     behind = do
       count c (.stale) 1
@@ -693,6 +712,48 @@ cacheRefresh c x changed =
       end <- nowMs
       forM_ c.metrics $ \m -> addTiming m.reloadTime (fromInteger (end - start))
       return r
+
+-- | The entry of an xpub in Redis, as a reload finds it: the height it is
+-- stamped with, its generation, which every commit increments, and the
+-- members of its sets.
+data Stored = Stored
+  { stamp :: !(Maybe Integer),
+    gen :: !ByteString,
+    txs :: !(HashMap ByteString Double),
+    utxos :: !(HashSet ByteString),
+    addrs :: !(HashSet ByteString)
+  }
+
+-- | Read the entry of an xpub. The sorted sets are read in chunks, so that
+-- no command holds Redis for long however large the xpub. The chunks are not
+-- read atomically, but nothing changes the entry while this store holds its
+-- lock except deleting or evicting it, which changes its generation, and the
+-- commit checks the generation.
+readStored :: Cache -> XPubSpec -> IO Stored
+readStored c x = do
+  (h, g, as) <- run c $ do
+    h <- R.hget (xkey c x "meta") "height"
+    g <- R.hget (xkey c x "meta") "gen"
+    a <- R.smembers (xkey c x "addrs")
+    return ((,,) <$> h <*> g <*> a)
+  ts <- chunks (\i j -> R.zrangeWithscores (xkey c x "txs") i j)
+  us <- chunks (\i j -> R.zrange (xkey c x "utxo") i j)
+  return
+    Stored
+      { stamp = readMaybe . C8.unpack =<< h,
+        gen = fromMaybe "" g,
+        txs = HashMap.fromList ts,
+        utxos = HashSet.fromList us,
+        addrs = HashSet.fromList as
+      }
+  where
+    size = 5000 :: Integer
+    chunks :: (Integer -> Integer -> Redis (Either Reply [a])) -> IO [a]
+    chunks f = loop 0
+      where
+        loop i = do
+          xs <- run c (f i (i + size - 1))
+          if toInteger (length xs) < size then return xs else (xs <>) <$> loop (i + size)
 
 -- | Arguments for bodies and their spenders: the number of bodies, the hash
 -- and body of each, the number of spenders, and the transaction, output index
@@ -805,12 +866,12 @@ work c lastBest js = do
         HashMap.fromListWith
           (\(a, b) (a', b') -> (a <> a', b <> b'))
           (claimed <> [(x, (ts, ks)) | JobHeld x ts ks <- js])
-  forM_ (HashMap.toList held) $ \(x, (ts, ks)) ->
+  pooledForConcurrentlyN_ parallelReloads (HashMap.toList held) $ \(x, (ts, ks)) ->
     afterReload <$> reload x ts >>= \case
       Finish -> finishClaims c ks
       Release -> releaseClaims c ks
       Hold -> extendClaims c ks >> later c (JobHeld x ts ks)
-  forM_ (nub [x | JobCache x <- js, not (HashMap.member x held)]) $ \x ->
+  pooledForConcurrentlyN_ parallelReloads (nub [x | JobCache x <- js, not (HashMap.member x held)]) $ \x ->
     cacheIsCached c x >>= \case
       True -> return ()
       False ->
@@ -824,6 +885,12 @@ work c lastBest js = do
         Left e -> do
           log' c LevelError ("Could not cache xpub: " <> cs (show e))
           return Locked
+
+-- | How many xpubs a store reloads at once. Each holds the lock of its xpub,
+-- so two stores never reload the same one; reloading several at once keeps
+-- one large xpub from holding up the others.
+parallelReloads :: Int
+parallelReloads = 4
 
 -- | Changes that an event makes to cached xpubs: for each xpub, the key of
 -- the claim for the change, and the transactions that make it. Also keeps the
@@ -1042,15 +1109,22 @@ pageScript =
   \if lim > 0 then count = lim end\n\
   \return out(redis.call('ZRANGEBYSCORE', set, score, '+inf', 'WITHSCORES', 'LIMIT', off + skip, count))\n"
 
--- | Replace the entry of an xpub, unless the stored one is stamped with a
--- higher block. Arguments: prefix, id, height, time of use, serialized xpub,
--- balances; the number of addresses and the addresses; the number of
--- transactions and the hash and score of each; the number of unspent outputs
--- and the output and score of each; the number of bodies and the hash and
--- body of each; the number of spenders and the hash, output index and spender
--- of each. Returns @{\"stale\"}@ if the stored entry has a higher block,
--- @{\"missing\", ...}@ with the hashes of transactions that have no body in
--- Redis nor in the arguments, without writing anything, or @{\"ok\"}@.
+-- | Apply the differences of an entry of an xpub, unless the stored one is
+-- stamped with a higher block, or is not the generation they were computed
+-- from. Arguments: prefix, id, height, time of use, serialized xpub,
+-- balances, generation (empty for none); then, each preceded by its number,
+-- the addresses to add, the addresses to remove, the transactions to add or
+-- move with their scores, the transactions to remove, the unspent outputs to
+-- add with their scores, the unspent outputs to remove, the bodies to write
+-- with their hashes, and the spenders with their transaction and output
+-- index. Returns @{\"stale\"}@ if the stored entry has a higher block,
+-- @{\"changed\"}@ if its generation is not the one given,
+-- @{\"missing\", ...}@ with the hashes of added transactions that have no
+-- body in Redis nor in the arguments, or @{\"ok\"}@. Nothing is written
+-- unless it returns @{\"ok\"}@.
+--
+-- A transaction removed from the entry loses this xpub from its set of
+-- xpubs, and its body goes when no cached xpub has it any more.
 commitScript :: ByteString
 commitScript =
   "local p = ARGV[1]\nlocal id = ARGV[2]\n\
@@ -1059,52 +1133,59 @@ commitScript =
   \local meta = xk .. 'meta'\n\
   \local oh = redis.call('HGET', meta, 'height')\n\
   \if oh and h < tonumber(oh) then return {'stale'} end\n\
-  \local i = 7\n\
-  \local na = tonumber(ARGV[i]); local ai = i + 1; i = ai + na\n\
-  \local nt = tonumber(ARGV[i]); local ti = i + 1; i = ti + 2 * nt\n\
-  \local nu = tonumber(ARGV[i]); local ui = i + 1; i = ui + 2 * nu\n\
-  \local nb = tonumber(ARGV[i]); local bi = i + 1; i = bi + 2 * nb\n\
-  \local ns = tonumber(ARGV[i]); local si = i + 1\n\
+  \if (redis.call('HGET', meta, 'gen') or '') ~= ARGV[7] then return {'changed'} end\n\
+  \local i = 8\n\
+  \local function list(width)\n\
+  \  local n = tonumber(ARGV[i])\n\
+  \  local s = i + 1\n\
+  \  i = s + width * n\n\
+  \  return s, n\n\
+  \end\n\
+  \local aa, naa = list(1)\n\
+  \local ad, nad = list(1)\n\
+  \local ta, nta = list(2)\n\
+  \local td, ntd = list(1)\n\
+  \local ua, nua = list(2)\n\
+  \local ud, nud = list(1)\n\
+  \local bi, nb = list(2)\n\
+  \local si, ns = list(3)\n\
   \local given = {}\n\
   \for j = 0, nb - 1 do given[ARGV[bi + 2 * j]] = true end\n\
   \local missing = {'missing'}\n\
-  \for j = 0, nt - 1 do\n\
-  \  local t = ARGV[ti + 2 * j]\n\
+  \for j = 0, nta - 1 do\n\
+  \  local t = ARGV[ta + 2 * j]\n\
   \  if not given[t] and redis.call('EXISTS', p .. 'tx:' .. t) == 0 then\n\
   \    table.insert(missing, t)\n\
   \  end\n\
   \end\n\
   \if #missing > 1 then return missing end\n\
-  \local addrs = {}\n\
-  \for j = 0, na - 1 do addrs[ARGV[ai + j]] = true end\n\
-  \for _, a in ipairs(redis.call('SMEMBERS', xk .. 'addrs')) do\n\
-  \  if not addrs[a] then redis.call('SREM', p .. 'a:' .. a, id) end\n\
+  \for j = 0, nad - 1 do\n\
+  \  local a = ARGV[ad + j]\n\
+  \  redis.call('SREM', p .. 'a:' .. a, id)\n\
+  \  redis.call('SREM', xk .. 'addrs', a)\n\
   \end\n\
-  \redis.call('DEL', xk .. 'addrs')\n\
-  \for a, _ in pairs(addrs) do\n\
+  \for j = 0, naa - 1 do\n\
+  \  local a = ARGV[aa + j]\n\
   \  redis.call('SADD', p .. 'a:' .. a, id)\n\
   \  redis.call('SADD', xk .. 'addrs', a)\n\
   \end\n\
-  \local txs = {}\n\
-  \for j = 0, nt - 1 do txs[ARGV[ti + 2 * j]] = true end\n\
-  \for _, t in ipairs(redis.call('ZRANGE', xk .. 'txs', 0, -1)) do\n\
-  \  if not txs[t] then\n\
-  \    local rk = p .. 'txref:' .. t\n\
-  \    redis.call('SREM', rk, id)\n\
-  \    if redis.call('SCARD', rk) == 0 then\n\
-  \      redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)\n\
-  \    end\n\
+  \for j = 0, ntd - 1 do\n\
+  \  local t = ARGV[td + j]\n\
+  \  local rk = p .. 'txref:' .. t\n\
+  \  redis.call('ZREM', xk .. 'txs', t)\n\
+  \  redis.call('SREM', rk, id)\n\
+  \  if redis.call('SCARD', rk) == 0 then\n\
+  \    redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)\n\
   \  end\n\
   \end\n\
-  \redis.call('DEL', xk .. 'txs')\n\
-  \for j = 0, nt - 1 do\n\
-  \  local t = ARGV[ti + 2 * j]\n\
-  \  redis.call('ZADD', xk .. 'txs', ARGV[ti + 2 * j + 1], t)\n\
+  \for j = 0, nta - 1 do\n\
+  \  local t = ARGV[ta + 2 * j]\n\
+  \  redis.call('ZADD', xk .. 'txs', ARGV[ta + 2 * j + 1], t)\n\
   \  redis.call('SADD', p .. 'txref:' .. t, id)\n\
   \end\n\
-  \redis.call('DEL', xk .. 'utxo')\n\
-  \for j = 0, nu - 1 do\n\
-  \  redis.call('ZADD', xk .. 'utxo', ARGV[ui + 2 * j + 1], ARGV[ui + 2 * j])\n\
+  \for j = 0, nud - 1 do redis.call('ZREM', xk .. 'utxo', ARGV[ud + j]) end\n\
+  \for j = 0, nua - 1 do\n\
+  \  redis.call('ZADD', xk .. 'utxo', ARGV[ua + 2 * j + 1], ARGV[ua + 2 * j])\n\
   \end\n\
   \for j = 0, nb - 1 do\n\
   \  local t = ARGV[bi + 2 * j]\n\
@@ -1119,6 +1200,7 @@ commitScript =
   \end\n\
   \redis.call('SET', xk .. 'bal', ARGV[6])\n\
   \redis.call('HSET', meta, 'spec', ARGV[5], 'height', ARGV[3], 'ver', '2')\n\
+  \redis.call('HINCRBY', meta, 'gen', 1)\n\
   \redis.call('ZADD', p .. 'lru', ARGV[4], id)\n\
   \return {'ok'}\n"
 

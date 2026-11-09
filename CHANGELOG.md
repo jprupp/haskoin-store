@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     Redis, and checks that they end with the entry of the tip, that no
     store replaces an entry with one that knows less, that each change is
     written once, and that stores catching up after the first write nothing.
+  - A reload writes only the differences between the xpub in the database
+    and its entry in Redis, read in chunks first, instead of rewriting the
+    whole entry; its script checks that the entry did not change since.
+    Rewriting an xpub of 15,000 transactions held Redis for up to 77 ms,
+    during which it answered no other client. A store reloads up to four
+    xpubs at once.
   - A page of the transactions or unspent outputs of a cached xpub is one
     round trip to Redis: a Lua script finds where it starts, from the
     position of the start transaction in the xpub itself, and reads it.
