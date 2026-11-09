@@ -548,6 +548,10 @@ its slow log), and the latencies of each endpoint over time.
 - No container is left behind, even if the script is interrupted or
   killed: the program removes its containers when it ends, and the script
   removes any that carry its label and stops the server.
+- Results of past runs are kept in `stress/results/<date>/` for comparison:
+  the report, the measurements (without the server log), and a README with
+  the commits, the machine and what the run found. A new run worth keeping
+  goes there too.
 
 ### Contributing
 

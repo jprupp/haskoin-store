@@ -154,6 +154,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   latencies, and a check of the cached answers at the end. The Podman helpers of the integration tests are an internal library
   (`integration`) that the stress program shares, and the test image has
   wrk in a layer of its own.
+- `stress/results/2026-11-09/`: the results of a full default stress run,
+  kept for comparison with later runs.
 - `runWebSocket` serves the API on a socket that already listens. The tests
   bind port 0 and pass the socket, so their web servers get free ports with
   no window in which another program could take them; the containers publish
