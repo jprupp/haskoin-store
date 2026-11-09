@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `StoreReadBase` and `StoreReadExtra` classes remain for the web server.
   This changes the library API.
 
+- The packages live in `haskoin-store/` and `haskoin-store-data/`, named
+  after them, instead of `store/` and `data/`. Each has its README and
+  changelog, a full description, PVP upper bounds on every dependency, and no
+  `Setup.hs`. haskoin-store-data builds with the same warnings as
+  haskoin-store.
+
 ### Fixed
 
 - Mempool transactions that entered the mempool in the same second could be

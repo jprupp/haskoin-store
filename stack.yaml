@@ -17,8 +17,8 @@ nix:
   - pkg-config
   - cacert
 packages:
-  - store
-  - data
+  - haskoin-store
+  - haskoin-store-data
 extra-deps:
   - base16-2.0
   - hashtables-1.4.2

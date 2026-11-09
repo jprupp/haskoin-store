@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-for DIR in data/src data/test store/app store/src store/test
+for DIR in haskoin-store-data/src haskoin-store-data/test haskoin-store/app haskoin-store/src haskoin-store/test haskoin-store/bench
 do
 	find "$DIR" -type f -name '*.hs' | xargs ormolu -i
 done

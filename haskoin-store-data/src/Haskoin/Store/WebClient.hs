@@ -101,7 +101,6 @@ import Control.Lens ((.~), (?~), (^.))
 import Control.Monad.Except
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson qualified as A
-import Data.ByteString.Lazy qualified as BL
 import Data.Bytes.Get
 import Data.Bytes.Put
 import Data.Bytes.Serial

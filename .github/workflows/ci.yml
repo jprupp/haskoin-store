@@ -50,8 +50,8 @@ jobs:
           path: |
             ~/.stack
             .stack-work
-            data/.stack-work
-            store/.stack-work
+            haskoin-store-data/.stack-work
+            haskoin-store/.stack-work
           key: stack-os-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
           restore-keys: stack-os-${{ runner.os }}-
 
@@ -104,8 +104,8 @@ jobs:
           path: |
             ~/.stack
             .stack-work
-            data/.stack-work
-            store/.stack-work
+            haskoin-store-data/.stack-work
+            haskoin-store/.stack-work
           key: stack-nix-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
           restore-keys: stack-nix-${{ runner.os }}-
 

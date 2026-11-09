@@ -1,12 +1,12 @@
 cradle:
   stack:
-    - path: "./data/src"
+    - path: "./haskoin-store-data/src"
       component: haskoin-store-data:lib
-    - path: "./data/test"
+    - path: "./haskoin-store-data/test"
       component: haskoin-store-data:test:spec
-    - path: "./store/src"
+    - path: "./haskoin-store/src"
       component: haskoin-store:lib
-    - path: "./store/app"
+    - path: "./haskoin-store/app"
       component: haskoin-store:exe:haskoin-store
-    - path: "./store/test"
+    - path: "./haskoin-store/test"
       component: haskoin-store:test:spec

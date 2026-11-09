@@ -15,7 +15,7 @@ info:
     email: jprupp@protonmail.ch
   license:
     name: MIT
-    url: https://github.com/jprupp/haskoin-store/blob/master/store/LICENSE
+    url: https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE
   description: |
     Rich and fast API to query indexed block chain data for Bitcoin and Bitcoin
     Cash.

@@ -3,7 +3,7 @@
 [![CI](https://github.com/jprupp/haskoin-store/actions/workflows/ci.yml/badge.svg)](https://github.com/jprupp/haskoin-store/actions/workflows/ci.yml)
 [![Hackage haskoin-store](https://img.shields.io/hackage/v/haskoin-store.svg?label=haskoin-store)](https://hackage.haskell.org/package/haskoin-store)
 [![Hackage haskoin-store-data](https://img.shields.io/hackage/v/haskoin-store-data.svg?label=haskoin-store-data)](https://hackage.haskell.org/package/haskoin-store-data)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/haskoin-store/blob/master/store/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE)
 
 A Bitcoin (BTC) and Bitcoin Cash (BCH) block chain indexer with a REST API,
 written in Haskell. It connects to the peer-to-peer network directly, so it
@@ -463,9 +463,9 @@ Every module has Haddock documentation; build it with `stack haddock`.
 
 This repository holds two Haskell packages:
 
-- **`store/`** — `haskoin-store`: the indexer, the web server and the
+- **`haskoin-store/`** — `haskoin-store`: the indexer, the web server and the
   executable.
-- **`data/`** — `haskoin-store-data`: the data types, their JSON and binary
+- **`haskoin-store-data/`** — `haskoin-store-data`: the data types, their JSON and binary
   encodings, and a client for the API (`Haskoin.Store.WebClient`). Use this
   one to talk to a Haskoin Store server from Haskell.
 
@@ -495,7 +495,7 @@ and that the cache answers exactly like the database on every xpub endpoint.
 - The first run builds the image `localhost/haskoin-store-test`, which needs
   network access: Ubuntu 26.04 pinned by digest, Valkey from a fixed snapshot of
   the Ubuntu archive, and the release tarballs of both nodes, checked against
-  SHA-256 hashes pinned in `store/test/Haskoin/Store/Integration/Image.hs`. No
+  SHA-256 hashes pinned in `haskoin-store/test/Haskoin/Store/Integration/Image.hs`. No
   third-party image is used.
 - Containers are removed when the tests end, data lives in tmpfs mounts and
   under `/dev/shm`, and every container has a memory limit.
@@ -504,7 +504,7 @@ and that the cache answers exactly like the database on every xpub endpoint.
 The test suite runs with at most four cores and a 4 GiB heap, so that a
 runaway test fails instead of exhausting the machine.
 
-`package.yaml` in `store/` and `data/` is the source of each package
+`package.yaml` in `haskoin-store/` and `haskoin-store-data/` is the source of each package
 description. Change it rather than the `.cabal` files, which
 [hpack](https://github.com/sol/hpack) generates.
 
@@ -533,4 +533,4 @@ Pull requests are welcome.
 ## License
 
 Haskoin Store is released under the
-[MIT License](https://github.com/jprupp/haskoin-store/blob/master/store/LICENSE).
+[MIT License](https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE).

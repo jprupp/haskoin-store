@@ -31,7 +31,72 @@
 -- Describing each endpoint once, as a type, keeps the server and the client from
 -- drifting apart: the path, parameters and response type that the server routes
 -- are the same ones the client builds requests from.
-module Haskoin.Store.WebCommon where
+module Haskoin.Store.WebCommon
+  ( ApiResource (..),
+    PostBox (..),
+    ParamBox (..),
+    ProxyBox (..),
+    GetBlock (..),
+    GetBlocks (..),
+    GetBlockRaw (..),
+    GetBlockBest (..),
+    GetBlockBestRaw (..),
+    GetBlockLatest (..),
+    GetBlockHeight (..),
+    GetBlockHeights (..),
+    GetBlockHeightRaw (..),
+    GetBlockTime (..),
+    GetBlockTimeRaw (..),
+    GetBlockMTP (..),
+    GetBlockMTPRaw (..),
+    GetTx (..),
+    GetTxs (..),
+    GetTxRaw (..),
+    GetTxsRaw (..),
+    GetTxsBlock (..),
+    GetTxsBlockRaw (..),
+    GetTxAfter (..),
+    PostTx (..),
+    GetMempool (..),
+    GetEvents (..),
+    GetAddrTxs (..),
+    GetAddrsTxs (..),
+    GetAddrTxsFull (..),
+    GetAddrsTxsFull (..),
+    GetAddrBalance (..),
+    GetAddrsBalance (..),
+    GetAddrUnspent (..),
+    GetAddrsUnspent (..),
+    GetXPub (..),
+    GetXPubTxs (..),
+    GetXPubTxsFull (..),
+    GetXPubBalances (..),
+    GetXPubUnspent (..),
+    DelCachedXPub (..),
+    GetPeers (..),
+    GetHealth (..),
+    (<:>),
+    (<+>),
+    (<++>),
+    fill,
+    noDefBox,
+    noMaybeBox,
+    asProxy,
+    queryPath,
+    capturePath,
+    paramLabel,
+    Param (..),
+    StartParam (..),
+    OffsetParam (..),
+    LimitParam (..),
+    LimitsParam (..),
+    HeightParam (..),
+    HeightsParam (..),
+    TimeParam (..),
+    NoCache (..),
+    NoTx (..)
+  )
+where
 
 import Control.Applicative ((<|>))
 import Control.Monad (guard)
@@ -507,14 +572,14 @@ class Param a where
 
 instance Param Address where
   proxyLabel = const "address"
-  encodeParam net ctx a = (: []) <$> addrToText net a
-  parseParam net ctx [a] = textToAddr net a
-  parseParam net ctx _ = Nothing
+  encodeParam net _ctx a = (: []) <$> addrToText net a
+  parseParam net _ctx [a] = textToAddr net a
+  parseParam _net _ctx _ = Nothing
 
 instance Param [Address] where
   proxyLabel = const "addresses"
-  encodeParam net ctx = mapM (addrToText net)
-  parseParam net ctx = mapM (textToAddr net)
+  encodeParam net _ctx = mapM (addrToText net)
+  parseParam net _ctx = mapM (textToAddr net)
 
 -- | Where a page of results starts. In URLs it is a transaction hash, a block
 -- height, or a Unix timestamp. Numbers up to 1230768000 are heights and larger
@@ -530,7 +595,7 @@ data StartParam
 
 instance Param StartParam where
   proxyLabel = const "height"
-  encodeParam net ctx p =
+  encodeParam _net _ctx p =
     case p of
       StartParamHash h -> return [txHashToHex (TxHash h)]
       StartParamHeight h -> do
@@ -539,7 +604,7 @@ instance Param StartParam where
       StartParamTime t -> do
         guard $ t > 1230768000
         return [cs $ show t]
-  parseParam net ctx [s] =
+  parseParam _net _ctx [s] =
     parseHash <|> parseHeight <|> parseUnix
     where
       parseHash = do
@@ -554,7 +619,7 @@ instance Param StartParam where
         x <- readMaybe $ cs s
         guard $ x > 1230768000
         return $ StartParamTime x
-  parseParam net ctx _ = Nothing
+  parseParam _net _ctx _ = Nothing
 
 -- | Number of results to skip (@offset@).
 newtype OffsetParam = OffsetParam {get :: Natural}
@@ -565,9 +630,9 @@ instance Default OffsetParam where
 
 instance Param OffsetParam where
   proxyLabel = const "offset"
-  encodeParam net ctx (OffsetParam o) = Just [cs $ show o]
-  parseParam net ctx [s] = OffsetParam <$> readMaybe (cs s)
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx (OffsetParam o) = Just [cs $ show o]
+  parseParam _net _ctx [s] = OffsetParam <$> readMaybe (cs s)
+  parseParam _net _ctx _ = Nothing
 
 -- | Maximum number of results (@limit@).
 newtype LimitParam = LimitParam {get :: Natural}
@@ -575,9 +640,9 @@ newtype LimitParam = LimitParam {get :: Natural}
 
 instance Param LimitParam where
   proxyLabel = const "limit"
-  encodeParam net ctx (LimitParam l) = Just [cs $ show l]
-  parseParam net ctx [s] = LimitParam <$> readMaybe (cs s)
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx (LimitParam l) = Just [cs $ show l]
+  parseParam _net _ctx [s] = LimitParam <$> readMaybe (cs s)
+  parseParam _net _ctx _ = Nothing
 
 -- | Pagination of a list of results.
 data LimitsParam = LimitsParam
@@ -600,9 +665,9 @@ newtype HeightParam = HeightParam {get :: Natural}
 
 instance Param HeightParam where
   proxyLabel = const "height"
-  encodeParam net ctx (HeightParam h) = Just [cs $ show h]
-  parseParam net ctx [s] = HeightParam <$> readMaybe (cs s)
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx (HeightParam h) = Just [cs $ show h]
+  parseParam _net _ctx [s] = HeightParam <$> readMaybe (cs s)
+  parseParam _net _ctx _ = Nothing
 
 -- | List of block heights (@heights@).
 newtype HeightsParam = HeightsParam {get :: [Natural]}
@@ -610,8 +675,8 @@ newtype HeightsParam = HeightsParam {get :: [Natural]}
 
 instance Param HeightsParam where
   proxyLabel = const "heights"
-  encodeParam net ctx (HeightsParam hs) = Just $ cs . show <$> hs
-  parseParam net ctx xs = HeightsParam <$> mapM (readMaybe . cs) xs
+  encodeParam _net _ctx (HeightsParam hs) = Just $ cs . show <$> hs
+  parseParam _net _ctx xs = HeightsParam <$> mapM (readMaybe . cs) xs
 
 -- | Unix timestamp in seconds (@time@).
 newtype TimeParam = TimeParam {get :: Store.UnixTime}
@@ -619,22 +684,22 @@ newtype TimeParam = TimeParam {get :: Store.UnixTime}
 
 instance Param TimeParam where
   proxyLabel = const "time"
-  encodeParam net ctx (TimeParam t) = Just [cs $ show t]
-  parseParam net ctx [s] = TimeParam <$> readMaybe (cs s)
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx (TimeParam t) = Just [cs $ show t]
+  parseParam _net _ctx [s] = TimeParam <$> readMaybe (cs s)
+  parseParam _net _ctx _ = Nothing
 
 instance Param XPubKey where
   proxyLabel = const "xpub"
   encodeParam net ctx p = Just [xPubExport net ctx p]
   parseParam net ctx [s] = xPubImport net ctx s
-  parseParam net ctx _ = Nothing
+  parseParam _net _ctx _ = Nothing
 
 instance Param Store.DeriveType where
   proxyLabel = const "derive"
-  encodeParam net ctx p = do
+  encodeParam net _ctx p = do
     guard (net.segWit || p == Store.DeriveNormal)
     Just [Store.deriveTypeToText p]
-  parseParam net ctx d = do
+  parseParam net _ctx d = do
     res <- case d of
       [x] -> Store.textToDeriveType x
       _ -> Nothing
@@ -650,9 +715,9 @@ instance Default NoCache where
 
 instance Param NoCache where
   proxyLabel = const "nocache"
-  encodeParam net ctx (NoCache True) = Just ["true"]
-  encodeParam net ctx (NoCache False) = Just ["false"]
-  parseParam net ctx = \case
+  encodeParam _net _ctx (NoCache True) = Just ["true"]
+  encodeParam _net _ctx (NoCache False) = Just ["false"]
+  parseParam _net _ctx = \case
     ["true"] -> Just $ NoCache True
     ["false"] -> Just $ NoCache False
     _ -> Nothing
@@ -667,31 +732,31 @@ instance Default NoTx where
 
 instance Param NoTx where
   proxyLabel = const "notx"
-  encodeParam net ctx (NoTx True) = Just ["true"]
-  encodeParam net ctx (NoTx False) = Just ["false"]
-  parseParam net ctx = \case
+  encodeParam _net _ctx (NoTx True) = Just ["true"]
+  encodeParam _net _ctx (NoTx False) = Just ["false"]
+  parseParam _net _ctx = \case
     ["true"] -> Just $ NoTx True
     ["false"] -> Just $ NoTx False
     _ -> Nothing
 
 instance Param BlockHash where
   proxyLabel = const "block"
-  encodeParam net ctx b = Just [blockHashToHex b]
-  parseParam net ctx [s] = hexToBlockHash s
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx b = Just [blockHashToHex b]
+  parseParam _net _ctx [s] = hexToBlockHash s
+  parseParam _net _ctx _ = Nothing
 
 instance Param [BlockHash] where
   proxyLabel = const "blocks"
-  encodeParam net ctx bs = Just $ blockHashToHex <$> bs
-  parseParam net ctx = mapM hexToBlockHash
+  encodeParam _net _ctx bs = Just $ blockHashToHex <$> bs
+  parseParam _net _ctx = mapM hexToBlockHash
 
 instance Param TxHash where
   proxyLabel = const "txid"
-  encodeParam net ctx t = Just [txHashToHex t]
-  parseParam net ctx [s] = hexToTxHash s
-  parseParam net ctx _ = Nothing
+  encodeParam _net _ctx t = Just [txHashToHex t]
+  parseParam _net _ctx [s] = hexToTxHash s
+  parseParam _net _ctx _ = Nothing
 
 instance Param [TxHash] where
   proxyLabel = const "txids"
-  encodeParam net ctx ts = Just $ txHashToHex <$> ts
-  parseParam net ctx = mapM hexToTxHash
+  encodeParam _net _ctx ts = Just $ txHashToHex <$> ts
+  parseParam _net _ctx = mapM hexToTxHash

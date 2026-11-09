@@ -144,10 +144,9 @@ where
 import Control.Applicative (optional, (<|>))
 import Control.DeepSeq (NFData)
 import Control.Exception (Exception)
-import Control.Monad (guard, join, mzero, unless, (<=<))
+import Control.Monad (guard, join, mzero, unless)
 import Data.Aeson
-  ( Encoding,
-    FromJSON (..),
+  ( FromJSON (..),
     ToJSON (..),
     Value (..),
     (.!=),
@@ -163,7 +162,6 @@ import Data.Bits (Bits (..))
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
-import Data.ByteString.Builder qualified as Builder
 import Data.Bytes.Get
 import Data.Bytes.Get qualified as Bytes.Get
 import Data.Bytes.Put
@@ -193,8 +191,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as LazyText
-import Data.Text.Lazy.Encoding qualified as LazyText
-import Data.Time (UTCTime (UTCTime), rfc822DateFormat)
 import Data.Time.Clock.POSIX
   ( posixSecondsToUTCTime,
     utcTimeToPOSIXSeconds,
@@ -203,10 +199,6 @@ import Data.Time.Format
   ( defaultTimeLocale,
     formatTime,
     parseTimeM,
-  )
-import Data.Time.Format.ISO8601
-  ( iso8601ParseM,
-    iso8601Show,
   )
 import Data.Vector qualified as V
 import Data.Word (Word32, Word64)
@@ -790,7 +782,7 @@ instance MarshalJSON Network BlockData where
           bool mempty ("weight" `A.pair` A.word32 b.weight) net.segWit
         ]
 
-  unmarshalValue net = parseJSON
+  unmarshalValue _net = parseJSON
 
 -- | Transaction input with information about the output it spends.
 data StoreInput
@@ -890,7 +882,7 @@ instance MarshalJSON Network StoreInput where
         "address" .= (marshalValue net <$> address),
         "witness" .= map encodeHex witness
       ]
-  marshalValue net StoreCoinbase {..} =
+  marshalValue _net StoreCoinbase {..} =
     A.object
       [ "coinbase" .= True,
         "txid" .= outpoint.hash,
@@ -916,7 +908,7 @@ instance MarshalJSON Network StoreInput where
           "address" `A.pair` maybe A.null_ (marshalEncoding net) address,
           "witness" `A.pair` A.list (hexEncoding . B.fromStrict) witness
         ]
-  marshalEncoding net StoreCoinbase {..} =
+  marshalEncoding _net StoreCoinbase {..} =
     A.pairs $
       mconcat
         [ "coinbase" .= True,
@@ -2223,8 +2215,7 @@ instance FromJSON Except where
 toIntTxId :: TxHash -> Word64
 toIntTxId h =
   let bs = runPutS (serialize h)
-      Right w64 = runGetS getWord64be bs
-   in w64 `shift` (-11)
+   in either error id (runGetS getWord64be bs) `shift` (-11)
 
 -- | Block identified by hash or by height.
 data BinfoBlockId
@@ -2504,7 +2495,7 @@ data BinfoBalance
   deriving (Eq, Show, Generic, NFData)
 
 instance MarshalJSON (Network, Ctx) BinfoBalance where
-  marshalValue (net, ctx) b@BinfoAddrBalance {} =
+  marshalValue (net, _ctx) b@BinfoAddrBalance {} =
     A.object
       [ "address" .= marshalValue net b.address,
         "final_balance" .= b.balance,
@@ -2543,7 +2534,7 @@ instance MarshalJSON (Network, Ctx) BinfoBalance where
         sent <- o .: "total_sent"
         return BinfoAddrBalance {..}
 
-  marshalEncoding (net, ctx) b@BinfoAddrBalance {} =
+  marshalEncoding (net, _ctx) b@BinfoAddrBalance {} =
     A.pairs $
       mconcat
         [ "address" `A.pair` marshalEncoding net b.address,
@@ -3538,7 +3529,7 @@ relevantTxs addrs prune t =
       return txid
     outs = mapMaybe f t.outputs
     g StoreCoinbase {} = Nothing
-    g StoreInput {outpoint = OutPoint h i} = Just h
+    g StoreInput {outpoint = OutPoint h _i} = Just h
     ins = mapMaybe g t.inputs
 
 -- | Balances of addresses and xpubs in the Blockchain.info format.
@@ -3776,7 +3767,7 @@ data BinfoAddr
 
 -- | Parse addresses and xpubs separated by pipes or commas. Returns 'Nothing' if any is invalid.
 parseBinfoAddr :: Network -> Ctx -> Text -> Maybe [BinfoAddr]
-parseBinfoAddr net ctx "" = Just []
+parseBinfoAddr _net _ctx "" = Just []
 parseBinfoAddr net ctx s =
   mapM f $
     concatMap (filter (not . T.null) . T.splitOn ",") (T.splitOn "|" s)
