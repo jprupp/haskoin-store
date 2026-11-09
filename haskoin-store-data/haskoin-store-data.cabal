@@ -78,6 +78,8 @@ test-suite spec
   main-is: Spec.hs
   other-modules:
       Haskoin.Store.DataSpec
+      Haskoin.Store.Gen
+      Haskoin.Store.Laws
       Haskoin.Store.WebCommonSpec
       Paths_haskoin_store_data
   hs-source-dirs:
