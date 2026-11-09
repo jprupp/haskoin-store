@@ -179,8 +179,8 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/health
 ### 2. Get the balance of a wallet
 
 Most wallets are an extended public key. Ask for its summary, and say which
-kind of addresses it derives (`normal`, `compat` for nested SegWit, `segwit`
-for native SegWit):
+kind of addresses it derives (`legacy`, the default, `compat` for nested
+SegWit, `segwit` for native SegWit):
 
 ```sh
 curl 'localhost:3000/xpub/xpub6C...?derive=segwit&pretty=true'
@@ -379,7 +379,7 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 | Transactions | `/transaction/:txid`, `/transactions`, `/transactions/block/:hash`, `/transaction/:txid/after/:height`, `POST /transactions`, `/raw` variants |
 | Mempool | `/mempool` |
 | Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
-| Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=normal\|compat\|segwit` picks the address type |
+| Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=legacy\|compat\|segwit` picks the address type (`normal`, the old name of `legacy`, still works) |
 | Network | `/peers`, `/health` (503 when unhealthy), `/dbstats` |
 | Events | `/events`, as JSON lines over HTTP or as a WebSocket |
 | Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |

@@ -99,6 +99,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   of this one; `store/` and `data/` are gone. haskoin-store depends on
   `haskoin-store-data ^>= 1.9`. The package has a full description, PVP
   upper bounds on every dependency, and no `Setup.hs`.
+- Legacy addresses are called `legacy` in the `derive` parameter, the default.
+  `normal`, the name they had, is still accepted, so old URLs keep working;
+  it said nothing about the kind of address. Error messages use the new
+  name. Built with haskoin-store-data at commit `b304acd2`.
 - An xpub asked about with the wrong `derive` gives 400, with a message that
   names the right kind, instead of an empty wallet: when the xpub has no
   transactions with the kind asked for, the store checks the first

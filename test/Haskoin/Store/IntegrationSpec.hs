@@ -485,7 +485,7 @@ wifOf _ _ p = error ("Bad path: " <> show p)
 -- | Parameter that selects the derivation of an xpub.
 deriveParam :: XPub -> String
 deriveParam x = case x.spec.deriv of
-  DeriveNormal -> "normal"
+  DeriveNormal -> "legacy"
   DeriveP2SH -> "compat"
   DeriveP2WPKH -> "segwit"
 
@@ -894,7 +894,7 @@ tiesTest env = do
   forM_ [env.plain, env.cached] (pagesAddUp x)
   where
     pagesAddUp x base = do
-      let t = "/xpub/" <> x.text <> "/transactions?derive=normal"
+      let t = "/xpub/" <> x.text <> "/transactions?derive=legacy"
       (_, whole) <- getJSON base t
       let go acc start = do
             let p = case start of
@@ -1069,16 +1069,18 @@ deriveTest env = do
   checkXPub env x ref
   let b = "/xpub/" <> x.text
       ends = ["", "/transactions", "/transactions/full", "/balances", "/unspent"]
-      wrong = [b <> e <> "?derive=" <> d | e <- ends, d <- ["normal", "compat"]]
+      wrong = [b <> e <> "?derive=" <> d | e <- ends, d <- ["legacy", "normal", "compat"]]
   forM_ (wrong <> ["/blockchain/rawaddr/" <> x.text <> "?derive=normal"]) $ \p ->
     forM_ [env.plain, env.cached] $ \base -> do
       (code, v) <- getJSON base p
       (p, code) `shouldBe` (p, 400)
       textField "error" v `shouldBe` Just "user-error"
       fmap (T.isInfixOf "derive=segwit") (textField "message" v) `shouldBe` Just True
-  (code, v) <- getJSON env.plain ("/xpub/" <> fresh.text <> "?derive=normal")
-  code `shouldBe` 200
-  num "confirmed" (v ! "balance") `shouldBe` 0
+  -- legacy is the default, and normal its old name
+  forM_ ["", "?derive=legacy", "?derive=normal"] $ \q -> do
+    (code, v) <- getJSON env.plain ("/xpub/" <> fresh.text <> q)
+    code `shouldBe` 200
+    num "confirmed" (v ! "balance") `shouldBe` 0
 
 -- | A transaction confirmed in a block that a reorganisation removes, and
 -- double-spent in the new chain, must disappear from the store and from the

@@ -2517,7 +2517,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
@@ -2818,7 +2818,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
@@ -2883,7 +2883,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
@@ -2964,7 +2964,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
@@ -3052,7 +3052,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
@@ -3286,7 +3286,7 @@ paths:
               example:
                 error: user-error
                 message: >-
-                  This xpub has no transactions with derive=normal, but has
+                  This xpub has no transactions with derive=legacy, but has
                   some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid argument.
@@ -7223,9 +7223,10 @@ components:
       description: |
         The kind of address the wallet derives from the key:
 
-        - `normal`: pay-to-public-key-hash (P2PKH), addresses starting with `1`
+        - `legacy`: pay-to-public-key-hash (P2PKH), addresses starting with `1`
           on BTC; the default, and the only kind on networks without SegWit, such as
-          BCH;
+          BCH. `normal`, its name up to version 1.8, is still accepted, so old
+          URLs keep working;
         - `compat`: SegWit nested in pay-to-script-hash (P2SH-P2WPKH), addresses
           starting with `3`, as BIP 49 wallets use;
         - `segwit`: native SegWit (P2WPKH), addresses starting with `bc1q`, as BIP
@@ -7239,7 +7240,8 @@ components:
       required: false
       schema:
         type: string
-        enum: [segwit, compat, normal]
+        enum: [legacy, compat, segwit, normal]
+        default: legacy
 
     prettyParam:
       name: pretty
