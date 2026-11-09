@@ -85,7 +85,7 @@ import Haskoin.Store
     StoreConfig (..),
     WebConfig (..),
     XPubSpec (..),
-    runWeb,
+    runWebSocket,
     withStore,
   )
 import Haskoin.Store.Cache
@@ -207,13 +207,12 @@ withEnv kind ctx go = do
         let net = nodeNetwork kind
             cfg = storeConfig net ctx logger dir redisURL p2pPort
         withStore cfg $ \store -> do
-            cachedPort <- freePort
-            plainPort <- freePort
-            let web s p = runWeb (webConfig logger s p)
+          listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
+            let web s = runWebSocket (webConfig logger s)
             conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
             cache <- maybe (fail "The store has no cache") return store.cache
-            withAsync (web store cachedPort) $ \a1 ->
-              withAsync (web store {cache = Nothing} plainPort) $ \a2 -> do
+            withAsync (web store cachedSock) $ \a1 ->
+              withAsync (web store {cache = Nothing} plainSock) $ \a2 -> do
                 link a1
                 link a2
                 let env =
@@ -323,11 +322,11 @@ storeConfig net ctx logger dir redisURL p2pPort =
       logger = logger
     }
 
-webConfig :: Logger -> Store -> Int -> WebConfig
-webConfig logger store port =
+webConfig :: Logger -> Store -> WebConfig
+webConfig logger store =
   WebConfig
     { host = "127.0.0.1",
-      port = port,
+      port = 0,
       store = store,
       maxLaggingBlocks = 100,
       maxPendingTxs = 10000,
@@ -345,12 +344,16 @@ webConfig logger store port =
       logger = logger
     }
 
--- | A free TCP port on the loopback interface.
-freePort :: IO Int
-freePort =
+-- | A socket that listens on a port of the loopback interface that the
+-- system chose, with that port. Nothing else can take the port between
+-- choosing it and serving on it.
+listening :: ((Socket.Socket, Int) -> IO a) -> IO a
+listening f =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \s -> do
     Socket.bind s (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-    fromIntegral <$> Socket.socketPort s
+    Socket.listen s 128
+    port <- Socket.socketPort s
+    f (s, fromIntegral port)
 
 -------------------------------------------------------------------------------
 -- Talking to the store

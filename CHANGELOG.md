@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- `runWebSocket` serves the API on a socket that already listens. The tests
+  bind port 0 and pass the socket, so their web servers get free ports with
+  no window in which another program could take them; the containers publish
+  their ports on random ports of the host.
 - Integration tests against regtest chains of Bitcoin Core and Bitcoin Cash
   Node, with Valkey, in Podman containers built from Ubuntu 26.04 and
   release tarballs checked against pinned hashes, one cached layer per

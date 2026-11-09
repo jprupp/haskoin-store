@@ -51,6 +51,7 @@ module Haskoin.Store.Web
     Except (..),
     WebLimits (..),
     runWeb,
+    runWebSocket,
 
     -- * Request parsing
     decodeTxBody,
@@ -202,9 +203,11 @@ import Network.HTTP.Types
     statusIsServerError,
     statusIsSuccessful,
   )
+import Network.Socket (Socket)
 import Network.Wai
   ( Middleware,
     Request (..),
+    Response,
     responseStatus,
   )
 import Network.Wai.Handler.Warp
@@ -618,11 +621,32 @@ instance (MonadUnliftIO m) => StoreReadExtra (ActionT m) where
 -- Path Handlers --
 -------------------
 
--- | Run the web server forever. Also starts a thread that updates prices, unless
--- the Blockchain.info endpoints are disabled, and a thread that runs health
--- checks.
+-- | Run the web server forever on the host and port of the configuration.
+-- Also starts a thread that updates prices, unless the Blockchain.info
+-- endpoints are disabled, and a thread that runs health checks.
 runWeb :: (MonadUnliftIO m) => WebConfig -> m ()
-runWeb config = do
+runWeb config = serveWeb config (S.scottyOptsT opts)
+  where
+    opts = S.defaultOptions {S.settings = settings defaultSettings}
+    settings = setPort config.port . setHost (fromString config.host)
+
+-- | Like 'runWeb', on a socket that already listens; the host and port of the
+-- configuration are ignored. Binding port 0 and passing the socket gives a
+-- free port with no window in which another program can take it, which
+-- finding a free port first and binding it later has.
+runWebSocket :: (MonadUnliftIO m) => WebConfig -> Socket -> m ()
+runWebSocket config sock = serveWeb config (S.scottySocketT S.defaultOptions sock)
+
+-- | Run the web server with a function of Scotty that serves it.
+serveWeb ::
+  (MonadUnliftIO m) =>
+  WebConfig ->
+  ( (ReaderT WebState m Response -> IO Response) ->
+    ScottyT m () ->
+    m ()
+  ) ->
+  m ()
+serveWeb config serve = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
   session <- liftIO Wreq.Session.newAPISession
@@ -631,7 +655,7 @@ runWeb config = do
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health) $ \_a2 -> do
       runner <- askRunInIO
-      S.scottyOptsT opts (runner . flip runReaderT state) $ do
+      serve (runner . flip runReaderT state) $ do
         S.middleware $ webSocketEvents state
         S.middleware (logIt config.logger)
         handlePaths config
@@ -649,8 +673,6 @@ runWeb config = do
     healthCheckLoop v = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
-    opts = S.defaultOptions {S.settings = settings defaultSettings}
-    settings = setPort config.port . setHost (fromString config.host)
 
 -- | Historical prices of the coin of the network in a currency at several times. Returns an empty list on failure.
 getRates ::
