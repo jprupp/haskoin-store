@@ -37,6 +37,7 @@ library
   exposed-modules:
       Haskoin.Store
       Haskoin.Store.BlockStore
+      Haskoin.Store.BlockStore.Pending
       Haskoin.Store.BlockStore.Sync
       Haskoin.Store.Cache
       Haskoin.Store.Cache.Protocol
@@ -165,6 +166,7 @@ test-suite spec
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Haskoin.Store.BlockStore.PendingSpec
       Haskoin.Store.BlockStore.SyncSpec
       Haskoin.Store.Cache.ProtocolSpec
       Haskoin.Store.CacheSpec

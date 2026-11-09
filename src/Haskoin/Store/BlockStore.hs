@@ -32,7 +32,9 @@
 -- announce. Received transactions are queued and imported in batches on every
 -- clock tick, in dependency order. Transactions that spend unknown outputs are
 -- kept for up to an hour, waiting for their parents. Mempool transactions older
--- than 'mempoolTimeout' days are deleted.
+-- than 'mempoolTimeout' days are deleted. The transactions on their way in,
+-- requested or received, are the pure value of
+-- "Haskoin.Store.BlockStore.Pending".
 --
 -- = Feeding the block store
 --
@@ -90,21 +92,17 @@ import Control.Monad
   ( forM,
     forM_,
     unless,
-    void,
     when,
     (>=>),
   )
 import Data.Bool (bool)
 import Data.ByteString qualified as B
-import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.Maybe
   ( catMaybes,
-    fromJust,
     isJust,
-    mapMaybe,
   )
 import Data.Serialize (encode)
 import Data.String (fromString)
@@ -114,7 +112,6 @@ import Data.Text qualified as T
 import Data.Time.Clock
   ( NominalDiffTime,
     UTCTime,
-    diffUTCTime,
     getCurrentTime,
   )
 import Data.Time.Clock.POSIX
@@ -166,13 +163,15 @@ import Haskoin.Node
     setBusy,
     setFree,
   )
+import Haskoin.Store.BlockStore.Pending (Pending, PendingTx (..))
+import Haskoin.Store.BlockStore.Pending qualified as Pending
 import Haskoin.Store.BlockStore.Sync
   ( Accept (..),
     Sync (..),
     needsMoreBlocks,
   )
 import Haskoin.Store.BlockStore.Sync qualified as Sync
-import Haskoin.Store.Common (StoreEvent (..), loopForever, sortTxs)
+import Haskoin.Store.Common (StoreEvent (..), loopForever)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Query qualified as Q
@@ -208,7 +207,6 @@ import UnliftIO
     MonadUnliftIO,
     STM,
     TVar,
-    async,
     atomically,
     catch,
     liftIO,
@@ -222,7 +220,6 @@ import UnliftIO
     throwIO,
     try,
     withAsync,
-    writeTVar,
   )
 import UnliftIO.Concurrent (threadDelay)
 
@@ -259,17 +256,6 @@ data BlockException
     MempoolImportFailed
   deriving (Show, Eq, Ord, Exception)
 
--- | Transaction received from a peer and waiting to be imported.
-data PendingTx = PendingTx
-  { -- | when it was received
-    time :: !UTCTime,
-    -- | the transaction
-    tx :: !Tx,
-    -- | parent transactions that are missing; empty if it can be imported
-    deps :: !(HashSet TxHash)
-  }
-  deriving (Show, Eq, Ord)
-
 -- | Block store process state.
 data BlockStore = BlockStore
   { -- | mailbox of the process
@@ -279,9 +265,8 @@ data BlockStore = BlockStore
     -- | state of the block download ("Haskoin.Store.BlockStore.Sync")
     sync :: !(TVar (Sync Peer)),
     -- | transactions received and waiting to be imported
-    txs :: !(TVar (HashMap TxHash PendingTx)),
-    -- | transactions requested from peers in the last twenty seconds
-    requested :: !(TVar (HashSet TxHash)),
+    -- ("Haskoin.Store.BlockStore.Pending")
+    pending :: !(TVar Pending),
     -- | StatsD metrics, if enabled
     metrics :: !(Maybe StoreMetrics),
     -- | labels of the peers whose mempool was already requested
@@ -343,8 +328,8 @@ setHeadersHeight self =
 setPendingTxs :: BlockStore -> IO ()
 setPendingTxs self =
   forM_ self.metrics $ \m -> do
-    p <- readTVarIO self.txs
-    setGauge m.queuedTxs (HashMap.size p)
+    p <- readTVarIO self.pending
+    setGauge m.queuedTxs (Pending.queued p)
 
 -- | Update the gauge of online peers.
 setPeersConnected :: BlockStore -> IO ()
@@ -484,8 +469,7 @@ withBlockStore ::
   m a
 withBlockStore cfg action = do
   pb <- newTVarIO Idle
-  ts <- newTVarIO HashMap.empty
-  rq <- newTVarIO HashSet.empty
+  ts <- newTVarIO Pending.empty
   sy <- newTVarIO HashSet.empty
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
@@ -494,8 +478,7 @@ withBlockStore cfg action = do
           { mailbox = inboxToMailbox inbox,
             config = cfg,
             sync = pb,
-            txs = ts,
-            requested = rq,
+            pending = ts,
             metrics = metrics,
             syncedMempool = sy
           }
@@ -678,112 +661,53 @@ processTx self p tx = guardMempool self $ do
       <> txHashToHex (txHash tx)
       <> " by peer: "
       <> p.label
-  addPendingTx self $ PendingTx t tx HashSet.empty
+  changePending self (Pending.received t tx HashSet.empty)
 
--- | Drop queued transactions received more than an hour ago.
+-- | Forget old requests, and drop transactions that waited for their parents
+-- for too long.
 pruneOrphans :: BlockStore -> IO ()
 pruneOrphans self = guardMempool self $ do
-  let ts = self.txs
-  now <- liftIO getCurrentTime
-  -- keep pending transactions received within the last hour, drop older ones
-  atomically . modifyTVar' ts . HashMap.filter $ \p ->
-    now `diffUTCTime` p.time <= 3600
+  now <- getCurrentTime
+  changePending self (Pending.prune now)
 
--- | Queue a transaction for import.
-addPendingTx :: BlockStore -> PendingTx -> IO ()
-addPendingTx self p = do
-  let ts = self.txs
-  let rq = self.requested
-  atomically $ do
-    modifyTVar ts $ HashMap.insert th p
-    modifyTVar rq $ HashSet.delete th
+-- | Change the mempool transactions on their way into the database.
+changePending :: BlockStore -> (Pending -> Pending) -> IO ()
+changePending self f = do
+  atomically $ modifyTVar' self.pending f
   setPendingTxs self
-  where
-    th = txHash p.tx
-
--- | Remember for twenty seconds that a transaction was requested, so that it is not requested again.
-addRequestedTx :: BlockStore -> TxHash -> IO ()
-addRequestedTx self th = do
-  let qbox = self.requested
-  atomically $ modifyTVar qbox $ HashSet.insert th
-  void . async $ do
-    threadDelay 20000000
-    atomically $ modifyTVar qbox $ HashSet.delete th
 
 -- | Whether a transaction is queued or was requested recently.
 isPending :: BlockStore -> TxHash -> IO Bool
-isPending self th = do
-  let tbox = self.txs
-  let qbox = self.requested
-  atomically $ do
-    ts <- readTVar tbox
-    rs <- readTVar qbox
-    return $
-      th `HashMap.member` ts
-        || th `HashSet.member` rs
+isPending self th = Pending.isPending th <$> readTVarIO self.pending
 
 -- | Take up to this many queued transactions that have no missing parents, in
 -- dependency order, out of the queue.
 pendingTxs :: BlockStore -> Int -> IO [PendingTx]
 pendingTxs self i = do
-  selected <-
-    let box = self.txs
-     in atomically $ do
-          pending <- readTVar box
-          let (selected, rest) = select pending
-          writeTVar box rest
-          return selected
+  selected <- atomically $ stateTVar self.pending (Pending.takeReady i)
   setPendingTxs self
   return selected
-  where
-    select pend =
-      let eligible = HashMap.filter (null . (.deps)) pend
-          orphans = HashMap.difference pend eligible
-          selected = take i $ sortit eligible
-          remaining = HashMap.filter (`notElem` selected) eligible
-       in (selected, remaining <> orphans)
-    sortit m =
-      let sorted = sortTxs $ map (.tx) $ HashMap.elems m
-          txids = map (txHash . snd) sorted
-       in mapMaybe (`HashMap.lookup` m) txids
-
--- | Mark a transaction as no longer missing for the queued transactions that spend it.
-fulfillOrphans :: (MonadIO m) => BlockStore -> TxHash -> m ()
-fulfillOrphans block_read th =
-  atomically $ modifyTVar box (HashMap.map fulfill)
-  where
-    box = block_read.txs
-    fulfill p = p {deps = HashSet.delete th p.deps}
 
 -- | Drop queued transactions that are already in the database, and recompute the
 -- missing parents of the others.
 updateOrphans :: BlockStore -> IO ()
 updateOrphans self = do
-  let box = self.txs
-  pending <- readTVarIO box
-  let orphans = HashMap.filter (not . null . (.deps)) pending
-  updated <- forM orphans $ \p -> do
-    let tx = p.tx
-    exists (txHash tx) >>= \case
-      True -> return Nothing
-      False -> Just <$> fill_deps p
-  let pruned = HashMap.map fromJust $ HashMap.filter isJust updated
-  atomically $ writeTVar box pruned
+  orphans <- Pending.waiting <$> readTVarIO self.pending
+  updates <- forM orphans $ \p -> do
+    let h = txHash p.tx
+    exists h >>= \case
+      True -> return (h, Nothing)
+      False -> do
+        found <- catMaybes <$> mapM (getUnspent self . (.outpoint)) p.tx.inputs
+        let have = HashSet.fromList (map (.outpoint.hash) found)
+        return (h, Just (HashSet.difference p.deps have))
+  changePending self (Pending.refresh (HashMap.fromList updates))
   where
     exists th =
       getTxData self th >>= \case
         Nothing -> return False
         Just TxData {deleted = True} -> return False
         Just TxData {deleted = False} -> return True
-    prev_utxos tx = catMaybes <$> mapM (getUnspent self . (.outpoint)) tx.inputs
-    fulfill p unspent =
-      let unspent_hash = unspent.outpoint.hash
-          new_deps = HashSet.delete unspent_hash p.deps
-       in p {deps = new_deps}
-    fill_deps p = do
-      let tx = p.tx
-      unspents <- prev_utxos tx
-      return $ foldl fulfill p unspents
 
 -- | Queue a transaction that spends unknown outputs, recording which parents are missing.
 newOrphanTx ::
@@ -792,26 +716,16 @@ newOrphanTx ::
   Tx ->
   Writer ->
   IO ()
-newOrphanTx block_read time tx wr = do
-  logAt LevelDebug block_read.config.logger $
+newOrphanTx self time tx wr = do
+  logAt LevelDebug self.config.logger $
     "Import tx "
       <> txHashToHex (txHash tx)
       <> ": Orphan"
-  let box = block_read.txs
   unspents <- catMaybes <$> mapM (W.getUnspent wr) prevs
-  let unspent_set = HashSet.fromList (map (.outpoint) unspents)
-      missing_set = HashSet.difference prev_set unspent_set
-      missing_txs = HashSet.map (.hash) missing_set
-  atomically . modifyTVar box $
-    HashMap.insert
-      (txHash tx)
-      PendingTx
-        { time = time,
-          tx = tx,
-          deps = missing_txs
-        }
+  let have = HashSet.fromList (map (.outpoint) unspents)
+      missing = HashSet.map (.hash) (HashSet.difference (HashSet.fromList prevs) have)
+  atomically . modifyTVar' self.pending $ Pending.received time tx missing
   where
-    prev_set = HashSet.fromList prevs
     prevs = map (.outpoint) tx.inputs
 
 -- | Import a transaction into the mempool. Returns 'True' if imported. A
@@ -834,7 +748,7 @@ importMempoolTx block_read time tx wr =
         bool "Already have" "Imported" t
           <> " tx "
           <> txHashToHex (txHash tx)
-      when t $ fulfillOrphans block_read tx_hash
+      when t . atomically . modifyTVar' block_read.pending $ Pending.imported tx_hash
       return t
 
 -- | Import up to 2000 queued transactions.
@@ -928,7 +842,8 @@ processTxs self p hs = guardMempool self . guardSync self $ do
                   <> "Requesting"
               return (Just h)
     go xs = do
-      mapM_ (addRequestedTx self) xs
+      now <- getCurrentTime
+      changePending self (Pending.requested now xs)
       let net = self.config.net
       let inv = if net.segWit then InvWitnessTx else InvTx
           vec = map (InvVector inv . (.get)) xs
@@ -1274,10 +1189,7 @@ blockStorePendingTxs =
 -- | 'STM' version of 'blockStorePendingTxs'.
 blockStorePendingTxsSTM ::
   BlockStore -> STM Int
-blockStorePendingTxsSTM BlockStore {..} = do
-  x <- HashMap.keysSet <$> readTVar txs
-  y <- readTVar requested
-  return $ HashSet.size $ x `HashSet.union` y
+blockStorePendingTxsSTM store = Pending.size <$> readTVar store.pending
 
 -- | Describe a block for logs: height, time, hash and, if the block is given, size.
 blockText :: BlockNode -> Maybe Block -> Text

@@ -79,6 +79,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   now a pure state machine (`Haskoin.Store.BlockStore.Sync`) with property
   tests, which also found that a block listed twice in one request was
   outstanding twice.
+- The block store no longer starts a thread for every transaction it
+  requests, to forget the request twenty seconds later. Requested and
+  received mempool transactions are one pure value
+  (`Haskoin.Store.BlockStore.Pending`), with property tests, and old
+  requests are forgotten on the clock tick of the block store.
 - Build against haskoin-node 2.4.0. The store stopped following the chain
   when a peer announced new blocks with an inventory message instead of
   headers, which peers do when many blocks are found at once; it stayed at
