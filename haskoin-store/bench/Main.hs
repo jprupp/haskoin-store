@@ -14,25 +14,24 @@
 module Main (main) where
 
 import Conduit
-import Control.Monad (forever, unless)
-import Data.ByteString (ByteString)
-import Data.ByteString qualified as B
-import Data.HashMap.Strict qualified as HashMap
-import Data.List (find)
 import Control.DeepSeq (NFData, force)
+import Control.Monad (forever, unless)
 import Data.Aeson (toEncoding)
 import Data.Aeson.Encoding (encodingToLazyByteString)
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as B
 import Data.Default (def)
+import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap.Strict qualified as IntMap
-import Data.Vector qualified as V
-import GHC.Clock (getMonotonicTimeNSec)
-import Haskoin.Store.Data
+import Data.List (find)
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Serialize (decode, encode, runGet, runPut)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Vector qualified as V
 import Data.Word (Word32)
+import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store

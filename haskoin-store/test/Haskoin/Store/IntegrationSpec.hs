@@ -36,19 +36,20 @@ module Haskoin.Store.IntegrationSpec (spec) where
 import Control.Lens ((&), (?~), (^.))
 import Control.Monad (forM_, replicateM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
-import Data.Default (def)
 import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as C8
 import Data.ByteString.Lazy qualified as BL
+import Data.Default (def)
+import Data.Either (isRight)
 import Data.Foldable (toList)
+import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sort, sortOn)
-import Data.Ord (Down (..))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
-import Data.Either (isRight)
-import Data.HashSet qualified as HashSet
-import Data.IntMap.Strict qualified as IntMap
+import Data.Ord (Down (..))
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -58,19 +59,19 @@ import Haskoin
   ( Address,
     Ctx,
     Network,
+    TxHash (..),
     XPrvKey,
     addrToText,
     addressToScriptBS,
-    deriveXPubKey,
-    TxHash (..),
     blockHashToHex,
+    deriveXPubKey,
     encodeHex,
     hexToTxHash,
-    sha256,
     makeXPrvKey,
     prepareContext,
     prvSubKey,
     pubSubKey,
+    sha256,
     xPrvWif,
     xPubAddr,
     xPubCompatWitnessAddr,
@@ -97,6 +98,7 @@ import Haskoin.Store.Cache
     cachePrefix,
     cacheRefresh,
     cacheTxData,
+    cacheXPubBals,
     xpubId,
   )
 import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), XPubBal)
@@ -168,9 +170,9 @@ data Env = Env
     redisCache :: !Cache,
     -- | connection to Redis, to look at the keys
     redis :: !Redis.Connection,
-    -- | a second store, with its own database, syncing from the same node
-    -- and sharing the same Redis
-    other :: !Store
+    -- | configuration of a store like this one with its database in a
+    -- directory, to start another one
+    configIn :: FilePath -> StoreConfig
   }
 
 -- | Initial gap and gap of the store under test, the defaults.
@@ -204,33 +206,32 @@ withEnv kind ctx go = do
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
             cfg = storeConfig net ctx logger dir redisURL p2pPort
-        withStore cfg $ \store -> withRamDir $ \dir2 ->
-         withStore (storeConfig net ctx logger dir2 redisURL p2pPort) {maxPeers = 1} $ \other -> do
-          cachedPort <- freePort
-          plainPort <- freePort
-          let web s p = runWeb (webConfig logger s p)
-          conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
-          cache <- maybe (fail "The store has no cache") return store.cache
-          withAsync (web store cachedPort) $ \a1 ->
-            withAsync (web store {cache = Nothing} plainPort) $ \a2 -> do
-              link a1
-              link a2
-              let env =
-                    Env
-                      { kind = kind,
-                        node = node,
-                        net = net,
-                        ctx = ctx,
-                        store = store,
-                        cached = "http://127.0.0.1:" <> show cachedPort,
-                        plain = "http://127.0.0.1:" <> show plainPort,
-                        miner = miner,
-                        redisCache = cache,
-                        redis = conn,
-                        other = other
-                      }
-              waitSynced env
-              go env
+        withStore cfg $ \store -> do
+            cachedPort <- freePort
+            plainPort <- freePort
+            let web s p = runWeb (webConfig logger s p)
+            conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
+            cache <- maybe (fail "The store has no cache") return store.cache
+            withAsync (web store cachedPort) $ \a1 ->
+              withAsync (web store {cache = Nothing} plainPort) $ \a2 -> do
+                link a1
+                link a2
+                let env =
+                      Env
+                        { kind = kind,
+                          node = node,
+                          net = net,
+                          ctx = ctx,
+                          store = store,
+                          cached = "http://127.0.0.1:" <> show cachedPort,
+                          plain = "http://127.0.0.1:" <> show plainPort,
+                          miner = miner,
+                          redisCache = cache,
+                          redis = conn,
+                          configIn = \d -> storeConfig net ctx logger d redisURL p2pPort
+                        }
+                waitSynced env
+                go env
 
 -- | Valkey, the Redis-compatible server of Ubuntu, from the test image, listening on every interface of the container
 -- (only its published port is reachable, on 127.0.0.1), with nothing saved
@@ -400,11 +401,31 @@ sameAnswers env paths = forM_ paths $ \p -> go p (120 :: Int)
               expectationFailure $
                 "GET "
                   <> p
-                  <> "\nwith the cache:    "
-                  <> take 3000 (show a)
-                  <> "\nwithout the cache: "
-                  <> take 3000 (show b)
+                  <> "\nstatus with and without the cache: "
+                  <> show (fst a, fst b)
+                  <> "\nfirst difference: "
+                  <> difference "" (snd a) (snd b)
             else threadDelay 250000 >> go p (n - 1)
+
+-- | Where two JSON values first differ, with the two values there.
+difference :: String -> Value -> Value -> String
+difference at' (Object x) (Object y)
+  | KeyMap.keys x /= KeyMap.keys y = at' <> ": keys " <> show (KeyMap.keys x) <> " and " <> show (KeyMap.keys y)
+  | otherwise =
+      case [ difference (at' <> "." <> show k) v w
+           | (k, v) <- KeyMap.toList x,
+             Just w <- [KeyMap.lookup k y],
+             v /= w
+           ] of
+        d : _ -> d
+        [] -> at' <> ": none"
+difference at' (Array x) (Array y)
+  | length x /= length y = at' <> ": " <> show (length x) <> " and " <> show (length y) <> " elements"
+  | otherwise =
+      case [difference (at' <> "[" <> show i <> "]") v w | (i, v, w) <- zip3 [0 :: Int ..] (toList x) (toList y), v /= w] of
+        d : _ -> d
+        [] -> at' <> ": none"
+difference at' x y = at' <> ": " <> take 1000 (show x) <> " and " <> take 1000 (show y)
 
 -- | Wait until the store has the best block of the node and every
 -- transaction of its mempool, for up to 60 seconds.
@@ -441,7 +462,6 @@ mine env n = do
   hs <- generateTo env.node n env.miner
   waitSynced env
   return hs
-
 
 -------------------------------------------------------------------------------
 -- Test wallets
@@ -1148,7 +1168,11 @@ reorgTest env = do
 
 -- | Try a check for up to 30 seconds.
 waitFor :: String -> IO Bool -> IO ()
-waitFor what check = go (120 :: Int)
+waitFor = waitForSeconds 30
+
+-- | Like 'waitFor', with a limit in seconds.
+waitForSeconds :: Int -> String -> IO Bool -> IO ()
+waitForSeconds secs what check = go (secs * 4)
   where
     go n =
       check >>= \case
@@ -1238,9 +1262,10 @@ spenderTest env = do
   raw <- rpc env.node "createrawtransaction" [toJSON ([] :: [Value]), object [Key.fromText (at env x [0, 0]) .= btc 200000, Key.fromText w .= btc 300000]]
   funded <- rpc env.node "fundrawtransaction" [raw]
   signed <- rpc env.node "signrawtransactionwithwallet" [(funded ! "hex")]
-  txT <- rpc env.node "sendrawtransaction" [(signed ! "hex")] >>= \case
-    String t -> return t
-    v -> fail (show v)
+  txT <-
+    rpc env.node "sendrawtransaction" [(signed ! "hex")] >>= \case
+      String t -> return t
+      v -> fail (show v)
   record env x ref txT
   void $ mine env 1
   checkXPub env x ref
@@ -1257,9 +1282,10 @@ spenderTest env = do
   w2 <- getNewAddress env.node
   raw2 <- rpc env.node "createrawtransaction" [toJSON [object ["txid" .= txT, "vout" .= vout]], object [Key.fromText w2 .= btc 290000]]
   signed2 <- rpc env.node "signrawtransactionwithwallet" [raw2]
-  txU <- rpc env.node "sendrawtransaction" [(signed2 ! "hex")] >>= \case
-    String t -> return t
-    v -> fail (show v)
+  txU <-
+    rpc env.node "sendrawtransaction" [(signed2 ! "hex")] >>= \case
+      String t -> return t
+      v -> fail (show v)
   waitSynced env
   let th = fromMaybe (error "bad txid") (hexToTxHash txT)
       spenderOf = \case
@@ -1309,43 +1335,58 @@ oldKeysTest env =
   forM_ oldKeys $ \(k, v) ->
     redisRun env (Redis.get k) `shouldReturn` Just v
 
--- | Wait until the second store has the best block of the node.
-waitOther :: Env -> IO ()
-waitOther env =
-  waitFor "the second store to sync" $ do
-    best <- bestBlockHash env.node
-    ours <- Q.getBestBlock env.other.db
-    return (fmap blockHashToHex ours == Just best)
+-- | Run a second store, with its own database, syncing from the same node
+-- and sharing the same Redis, while an action runs.
+withOther :: Env -> (Store -> IO a) -> IO a
+withOther env f = withRamDir $ \dir -> withStore (env.configIn dir) f
 
--- | Reloads done by both stores.
-reloads :: Env -> IO (Int, Int)
-reloads env = do
-  cache2 <- maybe (fail "The second store has no cache") return env.other.cache
-  a <- cacheCounters env.redisCache
-  b <- cacheCounters cache2
-  return (a.reloads + b.reloads, a.behind + b.behind)
+-- | Wait until a store has the best block of the node. A store that starts
+-- late has the whole chain to sync, about 300 blocks by the end of the suite,
+-- which takes the best part of a minute.
+waitStore :: Env -> Store -> IO ()
+waitStore env st =
+  waitForSeconds 180 "the second store to sync" $ do
+    best <- bestBlockHash env.node
+    ours <- Q.getBestBlock st.db
+    return (fmap blockHashToHex ours == Just best)
 
 -- | Two stores share a Redis and see the same events. A payment to a cached
 -- xpub, then the block that confirms it, are each applied once: one store
 -- claims each change and reloads the xpub, the other finds it done.
+--
+-- The stores record their own times for mempool transactions, so which of
+-- them wrote the entry shows in the times of its transactions; only the
+-- balances are compared with the database here.
 onceTest :: Env -> IO ()
-onceTest env = do
+onceTest env = withOther env $ \other -> do
+  cache2 <- maybe (fail "The second store has no cache") return other.cache
   let x = newXPub env "once" DeriveNormal
+      both = do
+        a <- cacheCounters env.redisCache
+        b <- cacheCounters cache2
+        return (a.reloads + b.reloads, a.behind + b.behind)
+      synced = waitSynced env >> waitStore env other
+      balancesMatch =
+        waitFor "the cached balances" $ do
+          cached <- cacheXPubBals env.redisCache x.spec
+          stored <- Q.xPubBals env.store.db x.spec
+          return (cached == Just stored)
   ref <- newLedger
   void $ pay env x ref [([0, 0], 100000)]
   void $ mine env 1
-  waitOther env
-  checkXPub env x ref
+  synced
+  _ <- getJSON env.cached ("/xpub/" <> x.text <> "/balances")
+  waitCached env x
   threadDelay 1000000
-  (r0, b0) <- reloads env
+  (r0, b0) <- both
   void $ pay env x ref [([0, 1], 200000)]
-  waitSynced env
-  checkXPub env x ref
+  synced
+  balancesMatch
   void $ mine env 1
-  waitOther env
-  checkXPub env x ref
+  synced
+  balancesMatch
   threadDelay 2000000
-  (r1, b1) <- reloads env
+  (r1, b1) <- both
   (r1 - r0, b1 - b0) `shouldBe` (2, 0)
 
 -- | Redis has a transaction of a cached xpub that this store has never seen:

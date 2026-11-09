@@ -1,4 +1,3 @@
-
 -- |
 -- Module      : Haskoin.Store.Database.Query
 -- Copyright   : (c) Haskoin Developers
@@ -22,7 +21,6 @@
 --
 -- Streams are still conduits, run in 'IO': they are a good fit for merging the
 -- sorted indices of many addresses and reading only as far as a page needs.
-
 module Haskoin.Store.Database.Query
   ( -- * Blocks
     getBestBlock,

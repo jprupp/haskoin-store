@@ -14,7 +14,6 @@ import Data.Serialize
 import Data.Time.Clock.POSIX
 import Data.Word
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
-import System.Mem (performMajorGC)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store
@@ -22,6 +21,7 @@ import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.TestBlocks (nextBlock)
 import NQE
 import Network.Socket
+import System.Mem (performMajorGC)
 import System.Random
 import Test.Hspec
 import UnliftIO

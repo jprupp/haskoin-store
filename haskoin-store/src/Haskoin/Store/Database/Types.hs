@@ -1,49 +1,48 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE RecordWildCards #-}
 
-{- |
-Module      : Haskoin.Store.Database.Types
-Copyright   : (c) Haskoin Developers
-License     : MIT
-Maintainer  : jprupp@protonmail.ch
-Stability   : experimental
-Portability : POSIX
-
-Keys and values stored in RocksDB.
-
-Every key type serializes to a distinct first byte, so that keys of different
-types never collide even when they share a column family. Many key types
-have short variants (suffixed @A@, @B@ or @S@) that serialize to a prefix of
-the full key, for use with the prefix queries of "Database.RocksDB.Query".
-
-+-----------+--------------+----------------------------------------+
-| Prefix    | Key          | Value                                  |
-+===========+==============+========================================+
-| 32 x 0x00 | 'BestKey'    | hash of the best block                 |
-+-----------+--------------+----------------------------------------+
-| 0x01      | 'BlockKey'   | 'BlockData'                            |
-+-----------+--------------+----------------------------------------+
-| 0x02      | 'TxKey'      | 'TxData'                               |
-+-----------+--------------+----------------------------------------+
-| 0x03      | 'HeightKey'  | hashes of the blocks at a height       |
-+-----------+--------------+----------------------------------------+
-| 0x04      | 'BalKey'     | 'BalVal'                               |
-+-----------+--------------+----------------------------------------+
-| 0x05      | 'AddrTxKey'  | nothing                                |
-+-----------+--------------+----------------------------------------+
-| 0x06      | 'AddrOutKey' | 'OutVal'                               |
-+-----------+--------------+----------------------------------------+
-| 0x07      | 'MemKey'     | whole mempool (legacy)                 |
-+-----------+--------------+----------------------------------------+
-| 0x08      | 'MemTxKey'   | time a transaction entered the mempool |
-+-----------+--------------+----------------------------------------+
-| 0x09      | 'UnspentKey' | 'UnspentVal'                           |
-+-----------+--------------+----------------------------------------+
-| 0x0a      | 'VersionKey' | database version                       |
-+-----------+--------------+----------------------------------------+
-| 0x0b      | 'MemTimeKey' | nothing                                |
-+-----------+--------------+----------------------------------------+
--}
+-- |
+-- Module      : Haskoin.Store.Database.Types
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Keys and values stored in RocksDB.
+--
+-- Every key type serializes to a distinct first byte, so that keys of different
+-- types never collide even when they share a column family. Many key types
+-- have short variants (suffixed @A@, @B@ or @S@) that serialize to a prefix of
+-- the full key, for use with the prefix queries of "Database.RocksDB.Query".
+--
+-- +-----------+--------------+----------------------------------------+
+-- | Prefix    | Key          | Value                                  |
+-- +===========+==============+========================================+
+-- | 32 x 0x00 | 'BestKey'    | hash of the best block                 |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x01      | 'BlockKey'   | 'BlockData'                            |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x02      | 'TxKey'      | 'TxData'                               |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x03      | 'HeightKey'  | hashes of the blocks at a height       |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x04      | 'BalKey'     | 'BalVal'                               |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x05      | 'AddrTxKey'  | nothing                                |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x06      | 'AddrOutKey' | 'OutVal'                               |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x07      | 'MemKey'     | whole mempool (legacy)                 |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x08      | 'MemTxKey'   | time a transaction entered the mempool |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x09      | 'UnspentKey' | 'UnspentVal'                           |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x0a      | 'VersionKey' | database version                       |
+-- +-----------+--------------+----------------------------------------+
+-- | 0x0b      | 'MemTimeKey' | nothing                                |
+-- +-----------+--------------+----------------------------------------+
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),

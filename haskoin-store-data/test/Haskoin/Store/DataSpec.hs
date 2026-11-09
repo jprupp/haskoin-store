@@ -9,10 +9,10 @@ import Data.ByteString qualified as B
 import Data.ByteString.Lazy qualified as BL
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (Serial, serialize)
-import Data.Text (Text)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IntMap qualified as IntMap
 import Data.Maybe (fromJust)
+import Data.Text (Text)
 import Haskoin
 import Haskoin.Store.Data
 import Haskoin.Store.Gen
@@ -254,7 +254,6 @@ spec = prepareContext $ \ctx -> do
       PayWitnessScriptHash {} -> InputWitnessMulSig 1 1
       PayWitness 1 bs | B.length bs == 32 -> InputTaproot
       _ -> InputPKHash
-
 
 -- | A value has this JSON and these bytes.
 wire :: (Show a, A.ToJSON a, Serial a) => a -> BL.ByteString -> Text -> Spec

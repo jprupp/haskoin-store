@@ -30,6 +30,7 @@ module Haskoin.Store.WebClient
     ApiConfig (..),
     apiCall,
     apiBatch,
+
     -- * Blocks
     GetBlock (..),
     GetBlocks (..),
@@ -42,6 +43,7 @@ module Haskoin.Store.WebClient
     GetBlockHeightRaw (..),
     GetBlockTime (..),
     GetBlockTimeRaw (..),
+
     -- * Transactions
     GetTx (..),
     GetTxs (..),
@@ -53,6 +55,7 @@ module Haskoin.Store.WebClient
     PostTx (..),
     GetMempool (..),
     GetEvents (..),
+
     -- * Addresses
     GetAddrTxs (..),
     GetAddrsTxs (..),
@@ -62,6 +65,7 @@ module Haskoin.Store.WebClient
     GetAddrsBalance (..),
     GetAddrUnspent (..),
     GetAddrsUnspent (..),
+
     -- * Extended public keys
     GetXPub (..),
     GetXPubTxs (..),
@@ -69,9 +73,11 @@ module Haskoin.Store.WebClient
     GetXPubBalances (..),
     GetXPubUnspent (..),
     DelCachedXPub (..),
+
     -- * Network
     GetPeers (..),
     GetHealth (..),
+
     -- * Parameters
     StartParam (..),
     OffsetParam (..),

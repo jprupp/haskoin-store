@@ -63,11 +63,11 @@ import Control.Monad
     when,
     zipWithM_,
   )
-import qualified Data.ByteString as B
+import Data.ByteString qualified as B
 import Data.Either (rights)
-import qualified Data.HashMap.Strict as M
-import qualified Data.HashSet as H
-import qualified Data.IntMap.Strict as I
+import Data.HashMap.Strict qualified as M
+import Data.HashSet qualified as H
+import Data.IntMap.Strict qualified as I
 import Data.List (nub)
 import Data.Maybe
   ( catMaybes,
@@ -322,7 +322,8 @@ importBlock wr b n = do
   logDebug wr $
     "Inserting block entries for: "
       <> blockHashToHex (headerHash n.header)
-  setBlocksAtHeight wr
+  setBlocksAtHeight
+    wr
     (nub (headerHash n.header : bs))
     n.height
   setBest wr (headerHash n.header)
@@ -445,13 +446,15 @@ replaceAddressTx wr t new = do
   net <- getNetwork wr
   ctx <- getCtx wr
   forM_ (txDataAddresses net ctx t) $ \a -> do
-    deleteAddrTx wr
+    deleteAddrTx
+      wr
       a
       TxRef
         { block = t.block,
           txid = txHash t.tx
         }
-    insertAddrTx wr
+    insertAddrTx
+      wr
       a
       TxRef
         { block = new,
@@ -482,7 +485,8 @@ adjustAddressOutput wr op o old new = do
       ctx <- getCtx wr
       let ma = eitherToMaybe (scriptToAddressBS net ctx pk)
       deleteUnspent wr op
-      insertUnspent wr
+      insertUnspent
+        wr
         Unspent
           { block = new,
             outpoint = op,
@@ -492,7 +496,8 @@ adjustAddressOutput wr op o old new = do
           }
       forM_ ma $ replace_addr_unspent pk
     replace_addr_unspent pk a = do
-      deleteAddrUnspent wr
+      deleteAddrUnspent
+        wr
         a
         Unspent
           { block = old,
@@ -501,7 +506,8 @@ adjustAddressOutput wr op o old new = do
             script = pk,
             address = Just a
           }
-      insertAddrUnspent wr
+      insertAddrUnspent
+        wr
         a
         Unspent
           { block = new,

@@ -86,16 +86,16 @@ import Conduit
 import Control.Monad.Trans (lift)
 import Control.Monad.Trans.Reader (runReaderT)
 import Data.ByteString (ByteString)
-import Data.Serialize (encode)
 import Data.Default (Default (..))
 import Data.Graph qualified as G
 import Data.HashMap.Strict qualified as M
 import Data.HashSet qualified as H
 import Data.Hashable (Hashable)
-import Data.Map.Strict qualified as Map
 import Data.List (sortOn)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Ord (Down (..))
+import Data.Serialize (encode)
 import Data.Time.Clock.System
   ( getSystemTime,
     systemNanoseconds,
@@ -168,16 +168,21 @@ instance Default Limits where
 class (Monad m) => StoreReadBase m where
   -- | Network the store indexes.
   getNetwork :: m Network
+
   -- | Context for secp256k1 operations, needed to parse and derive keys.
   getCtx :: m Ctx
+
   -- | Hash of the best block imported, or 'Nothing' if none was imported yet.
   getBestBlock :: m (Maybe BlockHash)
+
   -- | Hashes of all blocks imported at a height, including those on side
   -- chains.
   getBlocksAtHeight :: BlockHeight -> m [BlockHash]
+
   -- | Data of a block imported in the past, whether still in the main chain
   -- or not. Check 'Haskoin.Store.Data.main' to know.
   getBlock :: BlockHash -> m (Maybe BlockData)
+
   -- | Data of a transaction, including deleted ones. Check
   -- 'Haskoin.Store.Data.deleted' to know.
   getTxData :: TxHash -> m (Maybe TxData)
@@ -189,10 +194,13 @@ class (Monad m) => StoreReadBase m where
 
   -- | Transaction input that spends an output, if it is spent.
   getSpender :: OutPoint -> m (Maybe Spender)
+
   -- | Balance of an address, or 'Nothing' if it was never used.
   getBalance :: Address -> m (Maybe Balance)
+
   -- | Unspent output, or 'Nothing' if it does not exist or is spent.
   getUnspent :: OutPoint -> m (Maybe Unspent)
+
   -- | Whole mempool, newest first.
   getMempool :: m [(UnixTime, TxHash)]
 
@@ -208,33 +216,44 @@ class (StoreReadBase m) => StoreReadExtra m where
   -- | Transactions involving any of the addresses, newest first, without
   -- duplicates.
   getAddressesTxs :: [Address] -> Limits -> m [TxRef]
+
   -- | Unspent outputs of any of the addresses, newest first.
   getAddressesUnspents :: [Address] -> Limits -> m [Unspent]
+
   -- | Number of unused addresses to look ahead when deriving the addresses of
   -- an extended public key that has no transactions yet.
   getInitialGap :: m Word32
+
   -- | Number of consecutive unused addresses after which derivation of an
   -- extended public key stops.
   getMaxGap :: m Word32
+
   -- | Transactions whose hash, read as a number, matches the short identifier
   -- used by the Blockchain.info compatibility API. There may be more than one.
   getNumTxData :: Word64 -> m [TxData]
+
   -- | Balances of the addresses, in the same order. Addresses never used get
   -- a zero balance.
   getBalances :: [Address] -> m [Balance]
+
   -- | Transactions involving an address, newest first.
   getAddressTxs :: Address -> Limits -> m [TxRef]
+
   -- | Unspent outputs of an address, newest first.
   getAddressUnspents :: Address -> Limits -> m [Unspent]
+
   -- | Balances of the used addresses of an extended public key, with their
   -- derivation paths.
   xPubBals :: XPubSpec -> m [XPubBal]
+
   -- | Unspent outputs of an extended public key, newest first. The second
   -- argument is the result of 'xPubBals' for the same key.
   xPubUnspents :: XPubSpec -> [XPubBal] -> Limits -> m [XPubUnspent]
+
   -- | Transactions of an extended public key, newest first. The second
   -- argument is the result of 'xPubBals' for the same key.
   xPubTxs :: XPubSpec -> [XPubBal] -> Limits -> m [TxRef]
+
   -- | Number of transactions of an extended public key. The second argument
   -- is the result of 'xPubBals' for the same key.
   xPubTxCount :: XPubSpec -> [XPubBal] -> m Word32

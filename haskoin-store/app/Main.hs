@@ -24,7 +24,6 @@ import Haskoin.Node
     withLogger,
     withSource,
   )
-import Haskoin.Store.Common (loopForever)
 import Haskoin.Store
   ( Store (..),
     StoreConfig (..),
@@ -33,6 +32,7 @@ import Haskoin.Store
     runWeb,
     withStore,
   )
+import Haskoin.Store.Common (loopForever)
 import NQE (receive, withSubscription)
 import Options.Applicative
   ( Parser,

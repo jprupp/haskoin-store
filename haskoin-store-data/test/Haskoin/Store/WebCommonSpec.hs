@@ -5,9 +5,9 @@ module Haskoin.Store.WebCommonSpec (spec) where
 import Control.Monad (forM_)
 import Data.ByteString qualified as B
 import Data.Maybe (fromJust)
-import Data.Text (Text)
 import Data.Proxy (Proxy (..))
 import Data.String.Conversions (cs)
+import Data.Text (Text)
 import Data.Word (Word64)
 import Haskoin
 import Haskoin.Store.Data (DeriveType (..))

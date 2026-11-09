@@ -90,12 +90,12 @@ import System.Metrics.StatsD
 import UnliftIO
   ( MonadIO,
     MonadUnliftIO,
-    withRunInIO,
     STM,
     atomically,
     liftIO,
     link,
     withAsync,
+    withRunInIO,
   )
 
 -- | Store mailboxes. Handles to the running components of a store, given by

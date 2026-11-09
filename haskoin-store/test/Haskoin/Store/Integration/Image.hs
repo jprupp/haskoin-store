@@ -42,9 +42,9 @@ where
 
 import Data.ByteString.Char8 qualified as C8
 import Data.List (intercalate)
-import Haskoin (encodeHex, sha256)
 import Data.Serialize (encode)
 import Data.Text qualified as T
+import Haskoin (encodeHex, sha256)
 import System.Exit (ExitCode (..))
 import System.Process (readProcessWithExitCode)
 import UnliftIO.Temporary (withSystemTempDirectory)

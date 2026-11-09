@@ -116,6 +116,7 @@ module Haskoin.Store.Cache
     cacheEvict,
 
     -- * Internals
+
     -- | Exported for tests.
     cachePrefix,
     xpubId,
@@ -130,13 +131,13 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
 import Data.Either (rights)
+import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Functor ((<&>))
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
@@ -168,26 +169,6 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import NQE (Inbox, Publisher, receive, withSubscription)
-import Text.Read (readMaybe)
-import UnliftIO
-  ( IORef,
-    atomicModifyIORef',
-    TVar,
-    atomically,
-    checkSTM,
-    handleAny,
-    link,
-    modifyTVar',
-    newIORef,
-    readIORef,
-    writeIORef,
-    newTVarIO,
-    readTVar,
-    tryAny,
-    withAsync,
-    writeTVar,
-  )
-import System.Random (randomIO)
 import System.Metrics.StatsD
   ( StatCounter,
     StatTiming,
@@ -196,6 +177,26 @@ import System.Metrics.StatsD
     incrementCounter,
     newStatCounter,
     newStatTiming,
+  )
+import System.Random (randomIO)
+import Text.Read (readMaybe)
+import UnliftIO
+  ( IORef,
+    TVar,
+    atomicModifyIORef',
+    atomically,
+    checkSTM,
+    handleAny,
+    link,
+    modifyTVar',
+    newIORef,
+    newTVarIO,
+    readIORef,
+    readTVar,
+    tryAny,
+    withAsync,
+    writeIORef,
+    writeTVar,
   )
 import UnliftIO.Concurrent (forkIO, threadDelay)
 

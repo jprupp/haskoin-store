@@ -84,17 +84,17 @@ module Haskoin.Store.BlockStore
   )
 where
 
-import Data.Functor ((<&>))
 import Control.Monad
   ( forM,
     forM_,
-    (>=>),
     unless,
     void,
     when,
+    (>=>),
   )
 import Data.Bool (bool)
 import Data.ByteString qualified as B
+import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
@@ -419,9 +419,13 @@ runImport self net ctx f = fmap fst <$> runImportMempool self net ctx f
 runImportMempool :: BlockStore -> Network -> Ctx -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
 runImportMempool self net ctx f = do
   r <- try $ runWriterMempool net ctx self.config.db self.config.logger f
-  forM_ r $ \(_, c) -> forM_ self.metrics (\m -> do
-    incrementGauge m.mempool (length c.added)
-    decrementGauge m.mempool (length c.removed))
+  forM_ r $ \(_, c) ->
+    forM_
+      self.metrics
+      ( \m -> do
+          incrementGauge m.mempool (length c.added)
+          decrementGauge m.mempool (length c.removed)
+      )
   return r
 
 -- | Run an import and publish the transactions that it added to the
@@ -642,11 +646,11 @@ processBlock self peer block =
 -- | Set the blocks requested from the syncing peer.
 setSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
 setSyncingBlocks self hs =
-  let box = self.peer in
-    atomically $
-      modifyTVar box $ \case
-        Nothing -> Nothing
-        Just x -> Just (x :: Syncing) {blocks = hs}
+  let box = self.peer
+   in atomically $
+        modifyTVar box $ \case
+          Nothing -> Nothing
+          Just x -> Just (x :: Syncing) {blocks = hs}
 
 -- | Blocks requested from the syncing peer and not yet imported.
 getSyncingBlocks :: BlockStore -> IO [BlockHash]
@@ -658,11 +662,11 @@ getSyncingBlocks self =
 -- | Add blocks to those requested from the syncing peer.
 addSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
 addSyncingBlocks self hs =
-  let box = self.peer in
-    atomically $
-      modifyTVar box $ \case
-        Nothing -> Nothing
-        Just x -> Just (x :: Syncing) {blocks = x.blocks <> hs}
+  let box = self.peer
+   in atomically $
+        modifyTVar box $ \case
+          Nothing -> Nothing
+          Just x -> Just (x :: Syncing) {blocks = x.blocks <> hs}
 
 -- | Remove a block from those requested from the syncing peer.
 removeSyncingBlock :: BlockStore -> BlockHash -> IO ()
@@ -759,11 +763,12 @@ isPending self th = do
 pendingTxs :: BlockStore -> Int -> IO [PendingTx]
 pendingTxs self i = do
   selected <-
-    let box = self.txs in atomically $ do
-      pending <- readTVar box
-      let (selected, rest) = select pending
-      writeTVar box rest
-      return selected
+    let box = self.txs
+     in atomically $ do
+          pending <- readTVar box
+          let (selected, rest) = select pending
+          writeTVar box rest
+          return selected
   setPendingTxs self
   return selected
   where

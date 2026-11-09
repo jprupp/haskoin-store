@@ -20,7 +20,6 @@ import Haskoin
     OutPoint (..),
     Tx (..),
     TxHash (..),
-    sha256,
     TxIn (..),
     TxOut (..),
     bchRegTest,
@@ -29,6 +28,7 @@ import Haskoin
     headerHash,
     prepareContext,
     scriptToAddressBS,
+    sha256,
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger (..))

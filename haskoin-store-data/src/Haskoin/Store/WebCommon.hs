@@ -84,7 +84,7 @@ module Haskoin.Store.WebCommon
     HeightsParam (..),
     TimeParam (..),
     NoCache (..),
-    NoTx (..)
+    NoTx (..),
   )
 where
 
@@ -124,17 +124,21 @@ class (Serial b) => ApiResource a b | a -> b where
   -- | HTTP method; 'GET' by default.
   resourceMethod :: Proxy a -> StdMethod
   resourceMethod _ = GET
+
   -- | Path of the endpoint, given the encoded values of the parameters that
   -- are part of the path.
   resourcePath :: Proxy a -> ([Text] -> Text)
+
   -- | Parameters of a request: those that go in the path, and those that go in
   -- the query string.
   queryParams :: a -> ([ParamBox], [ParamBox]) -- (resource, querystring)
   queryParams _ = ([], [])
+
   -- | Types of the parameters that go in the path, used to build the route
   -- pattern of the server.
   captureParams :: Proxy a -> [ProxyBox]
   captureParams _ = []
+
   -- | Body of the request, if any.
   resourceBody :: a -> Maybe PostBox
   resourceBody = const Nothing
@@ -153,6 +157,7 @@ data ProxyBox = forall p. (Param p) => ProxyBox !(Proxy p)
 --------------------
 
 -- Blocks
+
 -- | Request for a block by hash: @GET \/block\/:block@.
 data GetBlock = GetBlock !BlockHash !NoTx
 
@@ -193,6 +198,7 @@ data GetBlockMTP = GetBlockMTP !TimeParam !NoTx
 newtype GetBlockMTPRaw = GetBlockMTPRaw TimeParam
 
 -- Transactions
+
 -- | Request for a transaction: @GET \/transaction\/:txid@.
 newtype GetTx = GetTx TxHash
 
@@ -224,6 +230,7 @@ data GetMempool = GetMempool !(Maybe LimitParam) !OffsetParam
 data GetEvents = GetEvents
 
 -- Address
+
 -- | Request for transactions of an address: @GET \/address\/:address\/transactions@.
 data GetAddrTxs = GetAddrTxs !Address !LimitsParam
 
@@ -249,6 +256,7 @@ data GetAddrUnspent = GetAddrUnspent !Address !LimitsParam
 data GetAddrsUnspent = GetAddrsUnspent ![Address] !LimitsParam
 
 -- XPubs
+
 -- | Request for summary of an extended public key: @GET \/xpub\/:xpub@.
 data GetXPub = GetXPub !XPubKey !Store.DeriveType !NoCache
 
@@ -268,6 +276,7 @@ data GetXPubUnspent = GetXPubUnspent !XPubKey !Store.DeriveType !LimitsParam !No
 data DelCachedXPub = DelCachedXPub !XPubKey !Store.DeriveType
 
 -- Network
+
 -- | Request for connected peers: @GET \/peers@.
 data GetPeers = GetPeers
 
@@ -554,9 +563,11 @@ paramLabel = proxyLabel . asProxy
 class Param a where
   -- | Name of the parameter in URLs.
   proxyLabel :: Proxy a -> Text
+
   -- | Encode a value as one or more strings. A list parameter is sent as
   -- comma-separated values.
   encodeParam :: Network -> Ctx -> a -> Maybe [Text]
+
   -- | Parse a value from one or more strings.
   parseParam :: Network -> Ctx -> [Text] -> Maybe a
 
