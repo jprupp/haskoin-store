@@ -395,12 +395,17 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 - Reorganisations are handled by reverting blocks until the best block is
   back on the main chain of headers.
 - The **cache** (`Haskoin.Store.Cache`) keeps xpubs with many used addresses
-  in Redis: their balances, transactions, unspent outputs and the bodies of
-  their transactions. It never patches an entry: when a block, a mempool
-  transaction or a reorganisation touches a cached xpub, the store reads the
-  whole xpub again from RocksDB, with the same queries that answer uncached
-  requests, and replaces the entry in one Lua script, together with every
-  transaction body it needs. Stores sharing a Redis claim each change, so it
+  or many transactions in Redis: their balances, transactions, unspent
+  outputs and the bodies of their transactions. It never patches an entry
+  from what it guesses changed: when a block, a mempool transaction or a
+  reorganisation touches a cached xpub, the store reads the whole xpub again
+  from RocksDB, with the same queries that answer uncached requests,
+  compares it with the entry in Redis, and writes the differences in one Lua
+  script, together with every transaction body the entry needs. The script
+  writes nothing if the entry changed since it was read, so the entry is
+  always what the database says; and Redis, which answers one client at a
+  time, is held for the size of the change, not of the xpub. A page of a
+  cached xpub is one round trip to Redis. Stores sharing a Redis claim each change, so it
   is applied once, by the first store to see it; a store never replaces an
   entry that knows more than its database (a higher block, or a transaction
   it has not seen), and a store that is catching up does no cache work.
