@@ -1,6 +1,3 @@
 #!/usr/bin/env bash
-
-for DIR in haskoin-store-data/src haskoin-store-data/test haskoin-store/app haskoin-store/src haskoin-store/test haskoin-store/bench
-do
-	find "$DIR" -type f -name '*.hs' | xargs ormolu -i
-done
+# Format every Haskell file with ormolu.
+cd "$(dirname "$0")/.." && find app bench src test -type f -name '*.hs' -print0 | xargs -0 ormolu -i

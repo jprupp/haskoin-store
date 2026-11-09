@@ -15,8 +15,12 @@ change touches:
 - `swagger.yaml`: the API reference. Update it whenever an endpoint, a
   parameter, a response field or an error changes.
 - The configuration tables in `README.md`: keep them in step with the options
-  and environment variables in `haskoin-store/app/Main.hs`.
-- Haddock in `haskoin-store/src`, `haskoin-store-data/src` and `haskoin-store/app`.
+  and environment variables in `app/Main.hs`.
+- Haddock in `src` and `app`.
+
+The data types, their encodings and the API client are in the separate
+haskoin-store-data package and repository. A change to them is made there,
+released, and then picked up here.
 - Module headers and declaration comments: add Haddock for every new
   declaration, and fix comments that the change made wrong.
 

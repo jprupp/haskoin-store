@@ -461,20 +461,24 @@ Every module has Haddock documentation; build it with `stack haddock`.
 
 ## Packages
 
-This repository holds two Haskell packages:
+Haskoin Store is two Haskell packages, each in its own repository:
 
-- **`haskoin-store/`** — `haskoin-store`: the indexer, the web server and the
+- **`haskoin-store`**, this repository: the indexer, the web server and the
   executable.
-- **`haskoin-store-data/`** — `haskoin-store-data`: the data types, their JSON and binary
-  encodings, and a client for the API (`Haskoin.Store.WebClient`). Use this
-  one to talk to a Haskoin Store server from Haskell.
+- **[`haskoin-store-data`](https://github.com/jprupp/haskoin-store-data)**:
+  the data types, their JSON and binary encodings, and a client for the API
+  (`Haskoin.Store.WebClient`). Use this one to talk to a Haskoin Store server
+  from Haskell. It is small to depend on, as it has no database or node.
+
+They were released together from this repository up to 1.8.1. A change to
+the wire format is made in haskoin-store-data, released, and then picked up
+here; `swagger.yaml` stays here and describes the server.
 
 ## Development
 
 ```sh
 stack build --test --no-run-tests
-stack test haskoin-store-data
-stack test haskoin-store       # includes a 6000-block heap-growth test
+stack test                     # includes a 6000-block heap-growth test
 scripts/format                 # ormolu, the code style used here
 scripts/bench-web.sh           # load-test the API with wrk
 ```
@@ -495,7 +499,7 @@ and that the cache answers exactly like the database on every xpub endpoint.
 - The first run builds the image `localhost/haskoin-store-test`, which needs
   network access: Ubuntu 26.04 pinned by digest, Valkey from a fixed snapshot of
   the Ubuntu archive, and the release tarballs of both nodes, checked against
-  SHA-256 hashes pinned in `haskoin-store/test/Haskoin/Store/Integration/Image.hs`. No
+  SHA-256 hashes pinned in `test/Haskoin/Store/Integration/Image.hs`. No
   third-party image is used.
 - Containers are removed when the tests end, data lives in tmpfs mounts and
   under `/dev/shm`, and every container has a memory limit.
@@ -504,8 +508,8 @@ and that the cache answers exactly like the database on every xpub endpoint.
 The test suite runs with at most four cores and a 4 GiB heap, so that a
 runaway test fails instead of exhausting the machine.
 
-`package.yaml` in `haskoin-store/` and `haskoin-store-data/` is the source of each package
-description. Change it rather than the `.cabal` files, which
+`package.yaml` is the source of the package description. Change it rather
+than `haskoin-store.cabal`, which
 [hpack](https://github.com/sol/hpack) generates.
 
 ### Contributing

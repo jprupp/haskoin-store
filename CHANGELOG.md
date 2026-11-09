@@ -54,15 +54,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   which implements them with the queries; `DatabaseReaderT`, `withDB` and
   the instances of the classes for the database reader are gone. This
   changes the library API.
-- Both packages use the GHC2024 edition, with `DuplicateRecordFields`,
+- The package uses the GHC2024 edition, with `DuplicateRecordFields`,
   `NoFieldSelectors`, `OverloadedRecordDot` and `OverloadedStrings` on for
   every module, and explicit deriving strategies.
 
-- The packages live in `haskoin-store/` and `haskoin-store-data/`, named
-  after them, instead of `store/` and `data/`. Each has its README and
-  changelog, a full description, PVP upper bounds on every dependency, and no
-  `Setup.hs`. haskoin-store-data builds with the same warnings as
-  haskoin-store.
+- haskoin-store-data moves to its own repository,
+  [jprupp/haskoin-store-data](https://github.com/jprupp/haskoin-store-data),
+  with its history and its own releases, and haskoin-store moves to the root
+  of this one; `store/` and `data/` are gone. haskoin-store depends on
+  `haskoin-store-data ^>= 1.8.1`. The package has a full description, PVP
+  upper bounds on every dependency, and no `Setup.hs`.
 
 ### Fixed
 
@@ -77,11 +78,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
-- Tests of haskoin-store-data checked by law for every type: binary
-  encodings round-trip and agree between Serial, cereal and binary; JSON
-  round-trips and the fast encoders write the same JSON as `toJSON`; the
-  wire format of the basic types is pinned. The suite runs in about 25
-  seconds instead of nearly four minutes.
 - Integration tests against regtest chains of Bitcoin Core and Bitcoin Cash
   Node, with Valkey, in Podman containers built from Ubuntu 26.04 and
   release tarballs checked against pinned hashes, one cached layer per

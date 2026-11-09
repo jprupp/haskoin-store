@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Load test of the web API with wrk.
 #
-# Starts the benchmark server (haskoin-store/bench/Main.hs) on a synthetic regtest
+# Starts the benchmark server (bench/Main.hs) on a synthetic regtest
 # chain, waits until it serves, then runs wrk against a fixed list of
 # endpoints and prints requests per second and latency percentiles for each.
 #
@@ -33,7 +33,7 @@ WRK_CPUS=${WRK_CPUS:-3}
 cd "$(dirname "$0")/.."
 if [ -z "${BIN:-}" ]; then
   BIN=$(stack --no-nix --system-ghc path --dist-dir 2>/dev/null)
-  BIN=haskoin-store/$BIN/build/haskoin-store-bench/haskoin-store-bench
+  BIN=$BIN/build/haskoin-store-bench/haskoin-store-bench
 fi
 OUT=$(mktemp)
 trap 'kill $SERVER 2>/dev/null || true; rm -f "$OUT" "$OUT.wrk"' EXIT
