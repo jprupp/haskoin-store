@@ -11,7 +11,7 @@
 --
 -- The tests use no third-party images. The image starts from the official
 -- Ubuntu 26.04 image, pinned by the digest of its multi-architecture index,
--- installs Valkey (the Redis-compatible server Ubuntu ships) from the Ubuntu archive at a fixed snapshot date (apt checks
+-- installs Valkey (the Redis-compatible server Ubuntu ships) and wrk from the Ubuntu archive at a fixed snapshot date (apt checks
 -- the signatures of the archive; the certificates needed to reach the
 -- snapshot service over HTTPS come from the regular archive first), and
 -- downloads Bitcoin Core and Bitcoin Cash
@@ -37,6 +37,7 @@ module Haskoin.Store.Integration.Image
     coreBin,
     bchnBin,
     valkeyBin,
+    wrkBin,
   )
 where
 
@@ -84,11 +85,16 @@ bchnBin = "/opt/bitcoin-cash-node/bin/bitcoind"
 valkeyBin :: String
 valkeyBin = "/usr/bin/valkey-server"
 
+-- | The HTTP load generator wrk in the image, for the stress test of the
+-- cache.
+wrkBin :: String
+wrkBin = "/usr/bin/wrk"
+
 -- | Recipe of the image.
 --
 -- Every download is its own layer, ordered from the one that changes least
 -- often: the packages of the snapshot, then Bitcoin Core, then Bitcoin Cash
--- Node. Podman keeps the layers it builds and reuses each one whose
+-- Node, then wrk for the stress test, which came last. Podman keeps the layers it builds and reuses each one whose
 -- instruction, and those before it, did not change, so moving one node to a
 -- new release downloads only that release. Nothing in the image depends on
 -- the time it is built.
@@ -117,6 +123,10 @@ containerfile =
         ("https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v" <> bchnVersion <> "/bitcoin-cash-node-" <> bchnVersion <> "-$a-linux-gnu.tar.gz")
         bchnAmd64
         bchnArm64
+      <> [ "RUN apt-get update --error-on=any --snapshot " <> snapshot <> " \\",
+           " && apt-get install -y --no-install-recommends --snapshot " <> snapshot <> " wrk \\",
+           " && rm -rf /var/lib/apt/lists/*"
+         ]
   where
     -- download a release for the architecture of the image, check its hash,
     -- and unpack it; @$a@ in the URL stands for the architecture
@@ -143,7 +153,7 @@ tag =
 -- | Build the image unless it exists already, and return its tag. The first
 -- build downloads the base image, the packages and the two releases, and may
 -- take a few minutes; later builds of a changed recipe reuse the layers that
--- did not change ('containerfile'). Images and layers are never removed by
+-- did not change (see the recipe above). Images and layers are never removed by
 -- the tests. The build may use 1 GiB of memory.
 testImage :: IO String
 testImage = do

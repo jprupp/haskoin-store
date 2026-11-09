@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Containers left by an integration test run that was killed are removed
+  by the next run, as intended: listing them used a template that Podman
+  refuses, so they were never found.
+- `--peer HOST[:PORT]` works as documented. It was read as a Haskell
+  string, so only `--peer '"HOST:PORT"'`, with the quotes, was accepted.
 - The syncing peer is disconnected when it sends a block that was not
   requested, as the documentation of the block store said. The block was
   imported if the node knew its header. The state of the block download is
@@ -99,6 +104,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- `scripts/stress-cache.sh`, a stress test of the Redis cache: a regtest
+  chain, Valkey and wrk in Podman, a haskoin-store server, hundreds of
+  thousands of transactions between a few wallets, and wrk on their xpubs
+  all the while, with a report (`scripts/stress-report.py`) of reloads,
+  lag, resources and latencies, and a check of the cached answers at the
+  end. The Podman helpers of the integration tests are an internal library
+  (`integration`) that the stress program shares, and the test image has
+  wrk in a layer of its own.
 - `runWebSocket` serves the API on a socket that already listens. The tests
   bind port 0 and pass the socket, so their web servers get free ports with
   no window in which another program could take them; the containers publish

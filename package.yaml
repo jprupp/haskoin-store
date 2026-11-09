@@ -83,6 +83,13 @@ ghc-options:
 - -Wredundant-constraints
 library:
   source-dirs: src
+internal-libraries:
+  # Regtest nodes and Valkey in Podman containers, for the integration tests
+  # and the stress test of the cache.
+  integration:
+    source-dirs: integration
+    dependencies:
+      - process ^>= 1.6.26.1
 executables:
   haskoin-store:
     main: Main.hs
@@ -114,8 +121,7 @@ tests:
       - QuickCheck ^>= 2.17.1.0
       - base64 ^>= 1.0.1
       - fast-logger ^>= 3.2.9
-      # the integration tests run podman
-      - process ^>= 1.6.26.1
+      - integration
 benchmarks:
   # Load-test server: syncs a synthetic chain and serves the web API on it.
   # Build with `stack build --bench --no-run-benchmarks` and run it with
@@ -130,3 +136,18 @@ benchmarks:
     dependencies:
       - haskoin-store
       - vector ^>= 0.13.2.0
+  # Stress test of the Redis cache: regtest chain and Valkey in Podman, a
+  # haskoin-store server, hundreds of thousands of transactions between a
+  # few wallets, and wrk on their xpubs. Run it with scripts/stress-cache.sh.
+  haskoin-store-stress:
+    main: Main.hs
+    source-dirs: stress
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N2
+    dependencies:
+      - haskoin-store
+      - integration
+      - process ^>= 1.6.26.1
+      - optparse-applicative ^>= 0.19.0.0

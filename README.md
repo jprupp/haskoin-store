@@ -481,6 +481,7 @@ stack build --test --no-run-tests
 stack test                     # includes a 6000-block heap-growth test
 scripts/format                 # ormolu, the code style used here
 scripts/bench-web.sh           # load-test the API with wrk
+scripts/stress-cache.sh        # stress the Redis cache, with a report
 ```
 
 `stack.yaml` must pin released versions of every dependency. Pointing
@@ -511,6 +512,34 @@ runaway test fails instead of exhausting the machine.
 `package.yaml` is the source of the package description. Change it rather
 than `haskoin-store.cabal`, which
 [hpack](https://github.com/sol/hpack) generates.
+
+### Stress test of the cache
+
+`scripts/stress-cache.sh [OUT_DIR] [-- OPTIONS]` measures the cache while it
+works hard. It runs a regtest chain of Bitcoin Core, Valkey and wrk in Podman
+containers from the test image, and the `haskoin-store` binary with the
+cache on. A few wallets, whose keys the stress program (`stress/Main.hs`)
+holds, make hundreds of thousands of transactions between them, signed by
+the program and sent to the node in batches, with a block after each batch.
+Every transaction changes two cached xpubs, so the cache reloads them over
+and over, while wrk asks the server about the xpubs on five endpoints
+(summary, balances, transactions, unspent outputs and multiaddr) the whole
+time. At the end it compares the cached answers with those of the database,
+and `scripts/stress-report.py` writes `OUT_DIR/report.md`: how fast the
+transactions went in, how many reloads the cache did and how long they took
+as the xpubs grew, how far the server fell behind, its CPU and memory, the
+memory of Valkey, and the latencies of each endpoint over time.
+
+- The defaults are 200,000 transactions between 4 wallets of 200 receiving
+  and 200 change addresses, 2,000 per block; pass `-- --help` for the
+  options, and `-- --txs 20000` for a run of a few minutes. A default run
+  takes about half an hour and up to about 7 GiB of memory.
+- The raw measurements stay in `OUT_DIR` as JSON lines (`rounds.jsonl`,
+  `samples.jsonl`, `wrk.jsonl`), with `summary.json` and the log of the
+  server.
+- No container is left behind, even if the script is interrupted or
+  killed: the program removes its containers when it ends, and the script
+  removes any that carry its label and stops the server.
 
 ### Contributing
 

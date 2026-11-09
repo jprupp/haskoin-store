@@ -310,7 +310,7 @@ config c = do
   peers <-
     fmap (mappend c.peers) $
       many $
-        option auto $
+        strOption $
           metavar "HOSTNAME[:PORT]"
             <> long "peer"
             <> short 'p'

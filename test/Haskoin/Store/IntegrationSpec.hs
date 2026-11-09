@@ -103,9 +103,10 @@ import Haskoin.Store.Cache
   )
 import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), XPubBal)
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Integration.Image (testImage, valkeyBin)
+import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
+import Haskoin.Store.Integration.Valkey
 import Network.Socket qualified as Socket
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
@@ -113,8 +114,6 @@ import System.Environment (lookupEnv)
 import Test.Hspec
 import UnliftIO (bracket, link, tryAny, withAsync)
 import UnliftIO.Concurrent (threadDelay)
-import UnliftIO.Directory (doesDirectoryExist, getTemporaryDirectory)
-import UnliftIO.Temporary (withTempDirectory)
 
 spec :: Spec
 spec = do
@@ -231,55 +230,6 @@ withEnv kind ctx go = do
                         }
                 waitSynced env
                 go env
-
--- | Valkey, the Redis-compatible server of Ubuntu, from the test image, listening on every interface of the container
--- (only its published port is reachable, on 127.0.0.1), with nothing saved
--- to disk and at most 128 MiB of data.
-redisContainer :: String -> ContainerSpec
-redisContainer image =
-  ContainerSpec
-    { name = "redis",
-      image = image,
-      options = ["--memory", "256m", "--entrypoint", valkeyBin],
-      command =
-        [ "--bind",
-          "0.0.0.0",
-          "--protected-mode",
-          "no",
-          "--save",
-          "",
-          "--appendonly",
-          "no",
-          "--maxmemory",
-          "128mb"
-        ],
-      ports = [6379]
-    }
-
--- | Wait until Redis answers, for up to 30 seconds.
-waitRedis :: String -> IO ()
-waitRedis url = go (120 :: Int)
-  where
-    info = either error id (Redis.parseConnectInfo url)
-    go n =
-      tryAny (bracket (Redis.checkedConnect info) Redis.disconnect (const (return ()))) >>= \case
-        Right () -> return ()
-        Left e
-          | n <= 0 -> fail ("Redis did not start: " <> show e)
-          | otherwise -> threadDelay 250000 >> go (n - 1)
-
--- | A temporary directory in memory: under @/dev/shm@ if there is one, else
--- under @$XDG_RUNTIME_DIR@, else the usual temporary directory.
-withRamDir :: (FilePath -> IO a) -> IO a
-withRamDir f = do
-  shm <- doesDirectoryExist "/dev/shm"
-  xdg <- lookupEnv "XDG_RUNTIME_DIR"
-  tmp <- getTemporaryDirectory
-  let base
-        | shm = "/dev/shm"
-        | Just x <- xdg = x
-        | otherwise = tmp
-  withTempDirectory base "haskoin-store-test" f
 
 -- | A logger that prints the log of the store if @HASKOIN_TEST_LOG@ is set,
 -- and discards it otherwise.

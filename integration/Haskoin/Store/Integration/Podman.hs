@@ -33,10 +33,17 @@ module Haskoin.Store.Integration.Podman
     Container (..),
     withContainer,
     hostPort,
+    withRamDir,
   )
 where
 
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, unless, void)
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString.Char8 qualified as C8
+import Data.ByteString.Lazy qualified as BL
+import Data.Text qualified as T
 import Data.Char (isDigit, isSpace)
 import Data.List (dropWhileEnd)
 import System.Environment (lookupEnv)
@@ -44,7 +51,8 @@ import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
 import System.Process (getCurrentPid, readProcessWithExitCode)
 import UnliftIO (bracket, onException, timeout, tryAny)
-import UnliftIO.Directory (doesPathExist)
+import UnliftIO.Directory (doesDirectoryExist, doesPathExist, getTemporaryDirectory)
+import UnliftIO.Temporary (withTempDirectory)
 
 -- | Whether Podman can run containers here, or why not. Set
 -- @HASKOIN_STORE_NO_PODMAN@ to a value other than @0@ to skip the tests that
@@ -129,30 +137,31 @@ withContainer spec act = do
       (_, out, err) <- readProcessWithExitCode "podman" ["logs", "--tail", "40", c.cid] ""
       hPutStrLn stderr $ "--- last lines of the log of " <> c.name <> " ---\n" <> out <> err
 
--- | Remove the containers of test runs whose process is gone.
+-- | Remove the containers of test runs whose process is gone. The list
+-- comes as JSON: the Go templates of @podman ps@ cannot index the labels in
+-- every version of Podman.
 removeStale :: IO ()
 removeStale = do
   (code, out, _) <-
     readProcessWithExitCode
       "podman"
-      [ "ps",
-        "--all",
-        "--filter",
-        "label=" <> testLabel,
-        "--format",
-        "{{.ID}} {{index .Labels \"" <> testLabel <> "\"}}"
-      ]
+      ["ps", "--all", "--filter", "label=" <> testLabel, "--format", "json"]
       ""
-  case code of
-    ExitSuccess ->
-      forM_ (map words (lines out)) $ \case
-        [cid, pid] | all isDigit pid -> do
+  case (code, A.decode (BL.fromStrict (C8.pack out))) of
+    (ExitSuccess, Just cs) ->
+      forM_ (cs :: [A.Value]) $ \c -> case staleOf c of
+        Just (cid, pid) | all isDigit pid -> do
           alive <- doesPathExist ("/proc/" <> pid)
-          if alive
-            then return ()
-            else void $ readProcessWithExitCode "podman" ["rm", "--force", cid] ""
+          unless alive . void $ readProcessWithExitCode "podman" ["rm", "--force", cid] ""
         _ -> return ()
     _ -> return ()
+  where
+    staleOf c = do
+      A.Object o <- Just c
+      A.String cid <- KeyMap.lookup "Id" o
+      A.Object labels <- KeyMap.lookup "Labels" o
+      A.String pid <- KeyMap.lookup (Key.fromString testLabel) labels
+      return (T.unpack cid, T.unpack pid)
 
 -- | Port of the host where a port of a container is published.
 hostPort :: Container -> Int -> IO Int
@@ -166,3 +175,16 @@ hostPort c p = do
 
 trim :: String -> String
 trim = dropWhileEnd isSpace . dropWhile isSpace
+
+-- | A temporary directory in memory: under @/dev/shm@ if there is one, else
+-- under @$XDG_RUNTIME_DIR@, else the usual temporary directory.
+withRamDir :: (FilePath -> IO a) -> IO a
+withRamDir f = do
+  shm <- doesDirectoryExist "/dev/shm"
+  xdg <- lookupEnv "XDG_RUNTIME_DIR"
+  tmp <- getTemporaryDirectory
+  let base
+        | shm = "/dev/shm"
+        | Just x <- xdg = x
+        | otherwise = tmp
+  withTempDirectory base "haskoin-store-test" f
