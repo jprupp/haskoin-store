@@ -53,6 +53,7 @@ import Data.Ord (Down (..))
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
@@ -136,8 +137,9 @@ chainSpec kind = do
   it "pages mempool transactions of the same second without duplicates" tiesTest
   it "counts every transaction of a multiaddr wallet" multiaddrTest
   it "answers the address, block and transaction endpoints like the node" endpointsTest
-  when (kind == BitcoinCore) $
+  when (kind == BitcoinCore) $ do
     it "derives native and nested SegWit addresses" segwitTest
+    it "refuses the wrong kind of address for an xpub" deriveTest
   it "does not use or fill the cache when asked not to" noCacheTest
   it "recovers from damaged entries and keeps newer data" damagedTest
   it "keeps the spenders of cached transactions up to date" spenderTest
@@ -1053,6 +1055,30 @@ segwitTest env = do
   void $ mine env 1
   checkXPub env xs rs
   sameAnswers env ["/blockchain/multiaddr?activeBech32=" <> xs.text <> "&activeP2SH=" <> xc.text]
+
+-- | An xpub asked about with the wrong @derive@ must give an error that names
+-- the right one, from the database and from the cache, and from every xpub
+-- endpoint; an xpub unused with every kind must still give an empty wallet.
+deriveTest :: Env -> IO ()
+deriveTest env = do
+  let x = newXPub env "derive" DeriveP2WPKH
+      fresh = newXPub env "derive-fresh" DeriveP2WPKH
+  ref <- newLedger
+  void $ pay env x ref [([0, 0], 300000)]
+  void $ mine env 1
+  checkXPub env x ref
+  let b = "/xpub/" <> x.text
+      ends = ["", "/transactions", "/transactions/full", "/balances", "/unspent"]
+      wrong = [b <> e <> "?derive=" <> d | e <- ends, d <- ["normal", "compat"]]
+  forM_ (wrong <> ["/blockchain/rawaddr/" <> x.text <> "?derive=normal"]) $ \p ->
+    forM_ [env.plain, env.cached] $ \base -> do
+      (code, v) <- getJSON base p
+      (p, code) `shouldBe` (p, 400)
+      textField "error" v `shouldBe` Just "user-error"
+      fmap (T.isInfixOf "derive=segwit") (textField "message" v) `shouldBe` Just True
+  (code, v) <- getJSON env.plain ("/xpub/" <> fresh.text <> "?derive=normal")
+  code `shouldBe` 200
+  num "confirmed" (v ! "balance") `shouldBe` 0
 
 -- | A transaction confirmed in a block that a reorganisation removes, and
 -- double-spent in the new chain, must disappear from the store and from the

@@ -90,7 +90,8 @@ import Conduit
 import Control.Applicative ((<|>))
 import Control.Lens ((.~), (^.))
 import Control.Monad
-  ( forM_,
+  ( filterM,
+    forM_,
     unless,
     void,
     when,
@@ -1424,7 +1425,7 @@ handleXPub ::
 handleXPub st (GetXPub xpub deriv (NoCache noCache)) =
   withMetrics st (.xpub) $
     let xs = XPubSpec xpub deriv
-     in xPubSummary xs <$> (cacheOr noCache st).query.xPubBals xs
+     in xPubSummary xs <$> xPubBalsChecked st noCache xs
 
 -- | Handler for @DELETE \/xpub\/:xpub@: remove an extended public key from the cache. Returns 'True' if it was cached.
 handleDelXPub ::
@@ -1436,6 +1437,53 @@ handleDelXPub st (DelCachedXPub xpub deriv) =
     let c = st.config.store.cache
     r <- maybe (return False) (`cacheDelete` XPubSpec xpub deriv) c
     return $ GenericResult r
+
+-- | Balances of the addresses of an extended public key ('xPubBals'), from
+-- the cache unless told not to, refusing a wrong kind of address
+-- ('checkDerive').
+xPubBalsChecked :: WebState -> Bool -> XPubSpec -> IO [XPubBal]
+xPubBalsChecked st noCache xs = do
+  bals <- (cacheOr noCache st).query.xPubBals xs
+  checkDerive st xs bals
+  return bals
+
+-- | Answer with an error if an extended public key has no transactions with
+-- the kind of address asked for, but has some with another kind: the request
+-- named the wrong kind.
+--
+-- An xpub does not record which kind of address its wallet derives, and the
+-- same key gives different addresses for each kind, so a request with the
+-- wrong @derive@ would otherwise get an empty wallet: a valid answer, and a
+-- wrong one, that a wallet would show its user as a zero balance. An error
+-- says what went wrong and how to fix it.
+--
+-- The check costs nothing for a wallet that has transactions. For one that
+-- looks unused, it reads the balances of the first addresses of each other
+-- kind, as many as the store reads to decide that an xpub is unused, in one
+-- read per kind. A wallet unused with every kind is a new wallet, and gets its
+-- empty answer. Networks without SegWit have one kind only, and no check.
+checkDerive :: WebState -> XPubSpec -> [XPubBal] -> IO ()
+checkDerive st xs bals =
+  when (net.segWit && all (\b -> b.balance.txs == 0) bals) $ do
+    used <- filterM usedAs others
+    forM_ (take 1 used) $ \d ->
+      raise st . UserError $
+        unwords
+          [ "This xpub has no transactions with derive=" <> name xs.deriv <> ",",
+            "but has some with derive=" <> name d <> ";",
+            "ask with derive=" <> name d <> "."
+          ]
+  where
+    net = st.config.store.net
+    ctx = st.config.store.ctx
+    others = filter (/= xs.deriv) [DeriveNormal, DeriveP2SH, DeriveP2WPKH]
+    name = T.unpack . deriveTypeToText
+    usedAs d = do
+      let external = pubSubKey ctx xs.key 0
+          addrs =
+            map snd . take (fromIntegral st.query.initialGap) $
+              deriveAddresses (deriveFunction ctx d) external 0
+      any (\b -> b.txs > 0) <$> st.query.getBalances addrs
 
 -- | Transactions of an extended public key, optionally without the cache.
 getXPubTxs ::
@@ -1449,7 +1497,7 @@ getXPubTxs st xpub deriv plimits nocache = do
   limits <- paramToLimits st False plimits
   let xs = XPubSpec xpub deriv
       st' = cacheOr nocache st
-  xbals <- st'.query.xPubBals xs
+  xbals <- xPubBalsChecked st nocache xs
   st'.query.xPubTxs xs xbals limits
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions@: transactions of an extended public key.
@@ -1479,7 +1527,7 @@ handleXPubBalances ::
   IO [XPubBal]
 handleXPubBalances st (GetXPubBalances xpub deriv (NoCache noCache)) =
   withMetrics st (.xpubBalance) $
-    (cacheOr noCache st).query.xPubBals (XPubSpec xpub deriv)
+    xPubBalsChecked st noCache (XPubSpec xpub deriv)
 
 -- | Handler for @GET \/xpub\/:xpub\/unspent@: unspent outputs of an extended public key.
 handleXPubUnspent ::
@@ -1491,7 +1539,7 @@ handleXPubUnspent st (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
     limits <- paramToLimits st False pLimits
     let xspec = XPubSpec xpub deriv
         st' = cacheOr noCache st
-    xbals <- st'.query.xPubBals xspec
+    xbals <- xPubBalsChecked st noCache xspec
     st'.query.xPubUnspents xspec xbals limits
 
 ---------------------------------------
@@ -2142,6 +2190,7 @@ handleRawAddr st req =
       n <- getBinfoCount st req "limit"
       off <- getBinfoOffset st req
       xbals <- (getXBals st.query (HashSet.singleton xspec))
+      checkDerive st xspec (xBals xspec xbals)
       let net = st.config.store.net
       let summary = xPubSummary xspec (xBals xspec xbals)
           abook = compute_abook xpub (xBals xspec xbals)

@@ -176,7 +176,12 @@ info:
 
     The `derive` parameter says which kind of address the wallet derives. An
     xpub does not say it, and the same key gives different addresses for each
-    kind, so asking for the wrong kind gives an empty wallet.
+    kind, so asking for the wrong kind would find nothing, and a wallet would
+    show its user a zero balance. Instead, when a wallet has no transactions
+    with the kind asked for but has some with another kind, the server answers
+    400 with a message that names the right one. A wallet with no transactions
+    of any kind is new, and gets an empty answer. The check only runs for
+    wallets that look empty, so it costs nothing for wallets in use.
 
     Servers with a Redis cache keep large wallets ready: their first query reads
     the database and caches the result, and later ones are answered from memory.
@@ -2500,6 +2505,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2787,6 +2806,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2838,6 +2871,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2905,6 +2952,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2979,6 +3040,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -3199,6 +3274,20 @@ paths:
                     result: 2275183814
                     balance: 2275183814
 
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=normal, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid argument.
           content:
@@ -7143,8 +7232,10 @@ components:
           84 wallets use.
 
         An xpub does not record which kind its wallet uses, and each kind gives
-        different addresses from the same key, so the wrong kind gives an empty
-        wallet rather than an error.
+        different addresses from the same key. When the wallet has no
+        transactions with this kind but has some with another, the request
+        fails with 400 and a message that names the right kind, rather than
+        answering with an empty wallet.
       required: false
       schema:
         type: string

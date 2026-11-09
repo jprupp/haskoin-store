@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   of this one; `store/` and `data/` are gone. haskoin-store depends on
   `haskoin-store-data ^>= 1.9`. The package has a full description, PVP
   upper bounds on every dependency, and no `Setup.hs`.
+- An xpub asked about with the wrong `derive` gives 400, with a message that
+  names the right kind, instead of an empty wallet: when the xpub has no
+  transactions with the kind asked for, the store checks the first
+  `--xpub-gap-init` addresses of the other kinds. This applies to the `/xpub`
+  endpoints and to `/blockchain/rawaddr`. A wallet unused with every kind
+  still gets an empty answer, and wallets in use cost nothing more.
 - `swagger.yaml` explains the API, not only lists it: an introduction to its
   conventions (amounts, ordering, paging, formats, errors, unconfirmed
   transactions, reorganisations, xpubs, live events, Blockchain.info

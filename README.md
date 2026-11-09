@@ -190,6 +190,11 @@ The answer has confirmed and unconfirmed balances, and the index of the last
 used receiving and change address, so the wallet knows where to derive the
 next address.
 
+If you get `derive` wrong, the store says so: a wallet with no transactions
+of the kind you asked for, but some of another kind, gets a 400 whose message
+names the right one, instead of an empty wallet that looks like a zero
+balance.
+
 ### 3. List its transactions, page by page
 
 ```sh
@@ -423,6 +428,15 @@ used one of each chain, then exactly `--xpub-gap` unused ones, and always the
 first `--xpub-gap-init` addresses. A payment further away is not seen, as a
 wallet following BIP 44 with the same gap would not see it; raise the gap to
 see it.
+
+An xpub does not record which kind of address its wallet derives, so a
+request names it with `derive`. When an xpub has no transactions with the
+kind asked for, the store reads the first `--xpub-gap-init` addresses of the
+other kinds, and if one of them is used it refuses the request with 400 and
+names that kind: an empty answer would look like a wallet with no money, a
+mistake that is easy to miss. The extra reads happen only for wallets that
+look empty, and not at all on networks without SegWit, which have one kind of
+address.
 
 The database layout is described in `Haskoin.Store.Database.Types`.
 
