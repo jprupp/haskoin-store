@@ -64,18 +64,24 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   addresses and xpubs, not only those on the page, and `n_tx_filtered` those
   that pass the filter. `n_tx` of `/blockchain/rawaddr` for an xpub is its
   number of transactions, not the size of the page.
-- No monad transformers in the store, except the `ActionT` of Scotty in the
-  web server, conduits, and the header search of haskoin-node. Database
-  queries are plain functions in `IO` that take the `DatabaseReader`
-  (`Haskoin.Store.Database.Query`); imports take a `Writer` handle
-  (`Haskoin.Store.Database.Writer`, `Haskoin.Store.Logic`); the block store
-  and the manager pass their state explicitly. `WriterT`, `ImportM`, the
-  `StoreWrite` class, `BlockT` and `CacheT` are gone, and
-  `withDatabaseReader` passes the reader to a plain function. The
-  `StoreReadBase` and `StoreReadExtra` classes remain for the web server,
-  which implements them with the queries; `DatabaseReaderT`, `withDB` and
-  the instances of the classes for the database reader are gone. This
-  changes the library API.
+- No monad transformers, except the `ActionT` of Scotty in the web server
+  and conduits, and no functions polymorphic over `MonadIO` or
+  `MonadUnliftIO`: everything runs in plain `IO`. Database queries are
+  functions that take the `DatabaseReader` (`Haskoin.Store.Database.Query`);
+  imports take a `Writer` handle (`Haskoin.Store.Database.Writer`,
+  `Haskoin.Store.Logic`); the block store and the manager pass their state
+  explicitly. The classes `StoreReadBase` and `StoreReadExtra` are replaced
+  by `StoreRead`, a record of the same queries as functions in `IO`, which
+  `databaseRead` gives for a database; `getTransaction` and the other
+  helpers of `Haskoin.Store.Common` take it as their first argument. The web
+  server runs its handlers in `ActionT IO` with the `WebState` as an
+  argument, instead of a `ReaderT` under `ActionT`, and its state holds the
+  queries to answer with, the cache in front of those about xpubs;
+  `nocache=true` gives a handler a state whose queries read only the
+  database. `withStore`, `runWeb`, `runWebSocket` and the `blockStore*`
+  functions are in `IO`. `WriterT`, `ImportM`, the `StoreWrite` class,
+  `BlockT`, `CacheT`, `DatabaseReaderT` and `withDB` were removed earlier
+  in this release. This changes the library API.
 - The package uses the GHC2024 edition, with `DuplicateRecordFields`,
   `NoFieldSelectors`, `OverloadedRecordDot` and `OverloadedStrings` on for
   every module, and explicit deriving strategies.

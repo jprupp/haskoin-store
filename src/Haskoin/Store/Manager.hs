@@ -88,14 +88,10 @@ import NQE
 import Network.Socket (SockAddr (..))
 import System.Metrics.StatsD
 import UnliftIO
-  ( MonadIO,
-    MonadUnliftIO,
-    STM,
+  ( STM,
     atomically,
-    liftIO,
     link,
     withAsync,
-    withRunInIO,
   )
 
 -- | Store mailboxes. Handles to the running components of a store, given by
@@ -190,11 +186,10 @@ data StoreConfig = StoreConfig
 -- The database is opened first, then the node, the block store and the cache
 -- (if 'redis' is set).
 withStore ::
-  (MonadUnliftIO m) =>
   StoreConfig ->
-  (Store -> m a) ->
-  m a
-withStore cfg action = withRunInIO $ \run ->
+  (Store -> IO a) ->
+  IO a
+withStore cfg action =
   connectDB cfg $ \db ->
     withPublisher $ \pub ->
       withPublisher $ \node_pub ->
@@ -204,7 +199,7 @@ withStore cfg action = withRunInIO $ \run ->
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
                 withStoreCache cfg db node.chain pub $ \cache ->
-                  run . action $
+                  action $
                     Store
                       { peerMgr = node.peerMgr,
                         chain = node.chain,
@@ -218,40 +213,37 @@ withStore cfg action = withRunInIO $ \run ->
 
 -- | Run the cache while an action runs, if Redis is configured.
 withStoreCache ::
-  (MonadUnliftIO m) =>
   StoreConfig ->
   DatabaseReader ->
   Chain ->
   Publisher StoreEvent ->
-  (Maybe Cache -> m a) ->
-  m a
+  (Maybe Cache -> IO a) ->
+  IO a
 withStoreCache cfg db chain pub action =
   case cfg.redis of
     Nothing -> action Nothing
     Just url ->
-      withRunInIO $ \io ->
-        withCache
-          CacheConfig
-            { url = url,
-              minAddrs = cfg.redisMinAddrs,
-              minTxs = cfg.redisMinTxs,
-              maxXPubs = cfg.redisMaxXPubs,
-              stats = cfg.stats
-            }
-          db
-          chain
-          pub
-          (withSource "Cache" cfg.logger)
-          (io . action . Just)
+      withCache
+        CacheConfig
+          { url = url,
+            minAddrs = cfg.redisMinAddrs,
+            minTxs = cfg.redisMinTxs,
+            maxXPubs = cfg.redisMaxXPubs,
+            stats = cfg.stats
+          }
+        db
+        chain
+        pub
+        (withSource "Cache" cfg.logger)
+        (action . Just)
 
 -- | Open the database described by the configuration and run an action with its reader.
 connectDB ::
-  (MonadUnliftIO m) =>
   StoreConfig ->
-  (DatabaseReader -> m a) ->
-  m a
+  (DatabaseReader -> IO a) ->
+  IO a
 connectDB cfg f = do
-  stats <- liftIO $ mapM createDataMetrics cfg.stats
+  stats <- mapM createDataMetrics cfg.stats
   withDatabaseReader
     cfg.net
     cfg.ctx
@@ -319,11 +311,10 @@ nodeCfg cfg db pub =
 
 -- | Forward every node event to the block store and the store publisher, forever.
 nodeForwarder ::
-  (MonadIO m) =>
   BlockStore ->
   Publisher StoreEvent ->
   Inbox NodeEvent ->
-  m ()
+  IO ()
 nodeForwarder b pub sub =
   loopForever $ receive sub >>= atomically . storeDispatch b pub
 

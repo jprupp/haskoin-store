@@ -34,8 +34,8 @@
 --
 -- * "Haskoin.Store.Data": types of the data returned by the store and the API.
 -- * "Haskoin.Store.Common": helpers for paging, ordering and deriving
---   addresses, and the 'StoreReadBase' and 'StoreReadExtra' classes that the
---   web server still uses.
+--   addresses, and 'StoreRead', the queries of a store as a record of
+--   functions in 'IO'.
 -- * "Haskoin.Store.Database.Reader": opening the RocksDB database.
 -- * "Haskoin.Store.Database.Query": queries against RocksDB, as plain
 --   functions.
@@ -64,9 +64,11 @@
 --   query is a seek and a short scan, newest first; see
 --   "Haskoin.Store.Database.Types".
 --
--- * __One query interface, several back ends.__ The database, the import buffer
---   and the Redis cache all implement 'StoreReadBase' and 'StoreReadExtra', so
---   the same query code runs against any of them.
+-- * __Plain functions in 'IO'.__ Queries take the database reader, or a
+--   'StoreRead' record of them, which the web server builds with the Redis
+--   cache in front of the queries about xpubs. Nothing runs in a stack of
+--   monad transformers, except the conduits that merge sorted streams and
+--   the handlers of Scotty.
 --
 -- * __The mempool is a first-class citizen.__ Unconfirmed transactions are indexed
 --   like confirmed ones, ordered before them, and kept across restarts, because
@@ -91,8 +93,8 @@ module Haskoin.Store
     cacheEvict,
 
     -- * Store Reader
-    StoreReadBase (..),
-    StoreReadExtra (..),
+    StoreRead (..),
+    databaseRead,
     Limits (..),
     Start (..),
 
@@ -110,7 +112,7 @@ import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
 -- the instances of the store classes for the database reader
-import Haskoin.Store.Database.Query ()
+import Haskoin.Store.Database.Query (databaseRead)
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import Haskoin.Store.Manager

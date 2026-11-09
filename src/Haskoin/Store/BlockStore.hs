@@ -206,13 +206,10 @@ import System.Metrics.StatsD
 import System.Random (randomRIO)
 import UnliftIO
   ( Exception,
-    MonadIO,
-    MonadUnliftIO,
     STM,
     TVar,
     atomically,
     catch,
-    liftIO,
     link,
     modifyTVar,
     modifyTVar',
@@ -295,9 +292,9 @@ data StoreMetrics = StoreMetrics
   }
 
 -- | Register the block store metrics, if StatsD is configured, with their current values.
-newStoreMetrics :: (MonadIO m) => BlockStoreConfig -> m (Maybe StoreMetrics)
+newStoreMetrics :: BlockStoreConfig -> IO (Maybe StoreMetrics)
 newStoreMetrics cfg =
-  forM cfg.stats $ \s -> liftIO $ do
+  forM cfg.stats $ \s -> do
     m <- Q.getMempool cfg.db
     b <-
       Q.getBestBlock cfg.db >>= \case
@@ -468,17 +465,16 @@ getCtx self = return self.config.ctx
 
 -- | Run block store process.
 withBlockStore ::
-  (MonadUnliftIO m) =>
   BlockStoreConfig ->
-  (BlockStore -> m a) ->
-  m a
+  (BlockStore -> IO a) ->
+  IO a
 withBlockStore cfg action = do
   pb <- newTVarIO Idle
   ts <- newTVarIO Pending.empty
   sy <- newTVarIO HashSet.empty
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
-  owner <- liftIO (newOwner "block store")
+  owner <- (newOwner "block store")
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -489,7 +485,7 @@ withBlockStore cfg action = do
             syncedMempool = sy,
             owner = owner
           }
-  withAsync (liftIO (go r inbox)) $ \a -> do
+  withAsync ((go r inbox)) $ \a -> do
     link a
     action r
   where
@@ -1097,7 +1093,7 @@ processBlockStoreMessage self (BlockPing r) = do
   atomically (r ())
 
 -- | Send a clock tick to the block store every 0.1 to 1 second, waiting for each to be handled.
-pingMe :: (MonadIO m) => Mailbox BlockStoreMessage -> m ()
+pingMe :: Mailbox BlockStoreMessage -> IO ()
 pingMe mbox =
   loopForever $ do
     BlockPing `query` mbox
@@ -1105,43 +1101,43 @@ pingMe mbox =
     threadDelay delay
 
 -- | Tell the block store that a peer connected.
-blockStorePeerConnect :: (MonadIO m) => Peer -> BlockStore -> m ()
+blockStorePeerConnect :: Peer -> BlockStore -> IO ()
 blockStorePeerConnect peer store =
   BlockPeerConnect peer `send` store.mailbox
 
 -- | Tell the block store that a peer disconnected.
 blockStorePeerDisconnect ::
-  (MonadIO m) => Peer -> BlockStore -> m ()
+  Peer -> BlockStore -> IO ()
 blockStorePeerDisconnect peer store =
   BlockPeerDisconnect peer `send` store.mailbox
 
 -- | Tell the block store that the node has a new best header.
 blockStoreHead ::
-  (MonadIO m) => BlockNode -> BlockStore -> m ()
+  BlockNode -> BlockStore -> IO ()
 blockStoreHead node store =
   BlockNewBest node `send` store.mailbox
 
 -- | Give the block store a block received from a peer.
 blockStoreBlock ::
-  (MonadIO m) => Peer -> Block -> BlockStore -> m ()
+  Peer -> Block -> BlockStore -> IO ()
 blockStoreBlock peer block store =
   BlockReceived peer block `send` store.mailbox
 
 -- | Tell the block store that a peer could not find blocks.
 blockStoreNotFound ::
-  (MonadIO m) => Peer -> [BlockHash] -> BlockStore -> m ()
+  Peer -> [BlockHash] -> BlockStore -> IO ()
 blockStoreNotFound peer blocks store =
   BlockNotFound peer blocks `send` store.mailbox
 
 -- | Give the block store a transaction received from a peer.
 blockStoreTx ::
-  (MonadIO m) => Peer -> Tx -> BlockStore -> m ()
+  Peer -> Tx -> BlockStore -> IO ()
 blockStoreTx peer tx store =
   TxRefReceived peer tx `send` store.mailbox
 
 -- | Tell the block store that a peer announced transactions.
 blockStoreTxHash ::
-  (MonadIO m) => Peer -> [TxHash] -> BlockStore -> m ()
+  Peer -> [TxHash] -> BlockStore -> IO ()
 blockStoreTxHash peer txhashes store =
   TxRefAvailable peer txhashes `send` store.mailbox
 
@@ -1189,7 +1185,7 @@ blockStoreTxHashSTM peer txhashes store =
 
 -- | Number of transactions queued or requested by the block store.
 blockStorePendingTxs ::
-  (MonadIO m) => BlockStore -> m Int
+  BlockStore -> IO Int
 blockStorePendingTxs =
   atomically . blockStorePendingTxsSTM
 

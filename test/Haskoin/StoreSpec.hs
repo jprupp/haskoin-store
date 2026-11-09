@@ -44,7 +44,7 @@ spec = prepareContext $ \ctx -> do
           StoreBestBlock b -> Just b
           _ -> Nothing
         let bestHash = last bs
-        bestNodeM <- liftIO $ chainGetBlock testStoreChain bestHash
+        bestNodeM <- chainGetBlock testStoreChain bestHash
         bestNodeM `shouldSatisfy` isJust
         let bestNode = fromJust bestNodeM
             bestHeight = bestNode.height
@@ -73,7 +73,7 @@ spec = prepareContext $ \ctx -> do
         bs <- replicateM 80 . receiveMatch testStoreEvents $ \case
           StoreBestBlock b -> Just b
           _ -> Nothing
-        bestNodeM <- liftIO $ chainGetBlock testStoreChain (last bs)
+        bestNodeM <- chainGetBlock testStoreChain (last bs)
         fmap (.height) bestNodeM `shouldBe` Just 80
         readTVarIO testStoreBlockRequests `shouldReturn` [64, 16]
 
@@ -109,23 +109,21 @@ spec = prepareContext $ \ctx -> do
         growth `shouldSatisfy` (< 1024 * 1024)
 
 withTestStore ::
-  (MonadUnliftIO m) =>
   Network ->
   Ctx ->
   String ->
-  (TestStore -> m a) ->
-  m a
+  (TestStore -> IO a) ->
+  IO a
 withTestStore = withTestStoreBlocks allBlocks
 
 -- | Like 'withTestStore', with the mock peer serving these blocks.
 withTestStoreBlocks ::
-  (MonadUnliftIO m) =>
   [Block] ->
   Network ->
   Ctx ->
   String ->
-  (TestStore -> m a) ->
-  m a
+  (TestStore -> IO a) ->
+  IO a
 withTestStoreBlocks blocks net ctx t f =
   withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
     requests <- newTVarIO []

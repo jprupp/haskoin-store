@@ -11,9 +11,9 @@
 --
 -- = Why plain functions
 --
--- The queries used to be the methods of the classes 'Haskoin.Store.Common.StoreReadBase' and
--- 'Haskoin.Store.Common.StoreReadExtra', run in @ReaderT DatabaseReader@, and reached the web
--- server through more layers of @ReaderT@ for the cache. Every caller then
+-- The queries used to be the methods of two classes, run in
+-- @ReaderT DatabaseReader@, and reached the web server through more layers of
+-- @ReaderT@ for the cache. Every caller then
 -- had to live in a stack of monad transformers to ask the database anything,
 -- and every layer had to lift or re-implement every method. A function that
 -- takes the reader and runs in 'IO' can be called from anywhere, needs no
@@ -22,7 +22,10 @@
 -- Streams are still conduits, run in 'IO': they are a good fit for merging the
 -- sorted indices of many addresses and reading only as far as a page needs.
 module Haskoin.Store.Database.Query
-  ( -- * Blocks
+  ( -- * All of them
+    databaseRead,
+
+    -- * Blocks
     getBestBlock,
     getBlocksAtHeight,
     getBlock,
@@ -114,6 +117,7 @@ import Haskoin
 import Haskoin.Store.Common
   ( Limits (..),
     Start (..),
+    StoreRead (..),
     applyLimitsC,
     deOffset,
     joinDescStreams,
@@ -134,6 +138,38 @@ import UnliftIO
     newIORef,
     readIORef,
   )
+
+-- | The queries of a database as a 'StoreRead', for code that takes its
+-- queries as a value, such as the web server, which puts the Redis cache in
+-- front of some of them.
+databaseRead :: DatabaseReader -> StoreRead
+databaseRead r =
+  StoreRead
+    { net = r.net,
+      ctx = r.ctx,
+      getBestBlock = getBestBlock r,
+      getBlocksAtHeight = getBlocksAtHeight r,
+      getBlock = getBlock r,
+      getTxData = getTxData r,
+      getManyTxData = getManyTxData r,
+      getSpender = getSpender r,
+      getBalance = getBalance r,
+      getUnspent = getUnspent r,
+      getMempool = getMempool r,
+      getMempoolPage = getMempoolPage r,
+      getAddressesTxs = getAddressesTxs r,
+      getAddressesUnspents = getAddressesUnspents r,
+      initialGap = r.initGap,
+      maxGap = r.maxGap,
+      getNumTxData = getNumTxData r,
+      getBalances = getBalances r,
+      getAddressTxs = getAddressTxs r,
+      getAddressUnspents = getAddressUnspents r,
+      xPubBals = xPubBals r,
+      xPubUnspents = \_ -> xPubUnspents r,
+      xPubTxs = \_ -> xPubTxs r,
+      xPubTxCount = \_ -> xPubTxCount r
+    }
 
 -- | Count something in the metrics, if they are enabled.
 count :: DatabaseReader -> (DataMetrics -> IO ()) -> IO ()

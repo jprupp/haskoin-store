@@ -10,26 +10,15 @@
 --
 -- Interfaces shared by every part of the store.
 --
--- 'StoreReadBase' and 'StoreReadExtra' are the queries that the web server
--- and the block store ask about blocks, transactions, addresses and extended
--- public keys, with instances that read the RocksDB database (in
--- "Haskoin.Store.Database.Query").
+-- 'StoreRead' is the queries that the web server asks about blocks,
+-- transactions, addresses and extended public keys, as a record of functions
+-- in 'IO': "Haskoin.Store.Database.Query" gives them for the RocksDB
+-- database, and the web server puts the Redis cache in front of some.
 --
 -- This module also has helpers for pagination ('Limits'), for deriving
 -- addresses from extended public keys ('scanXPubBals'), for the order of
 -- transactions and outputs ('txRefKey', 'unspentKey'), and for merging sorted
 -- streams.
---
--- = The classes are on their way out
---
--- The classes let the same queries be asked of the database, of the buffer of
--- an import in progress, and of a Redis cache, each a different stack of monad
--- transformers. The database queries are now plain functions in 'IO' that take
--- the 'Haskoin.Store.Database.Reader.DatabaseReader'
--- ("Haskoin.Store.Database.Query"), and the import reads its buffer through
--- plain functions of the 'Haskoin.Store.Database.Writer.Writer'. The classes
--- remain only for the web server and the block store, whose handlers still run
--- in monads that carry the reader.
 --
 -- = Why pages start at a transaction
 --
@@ -40,8 +29,7 @@
 module Haskoin.Store.Common
   ( Limits (..),
     Start (..),
-    StoreReadBase (..),
-    StoreReadExtra (..),
+    StoreRead (..),
     StoreEvent (..),
     getActiveBlock,
     getActiveTxData,
@@ -86,13 +74,14 @@ import Conduit
 import Control.Monad.Trans (lift)
 import Data.ByteString (ByteString)
 import Data.Default (Default (..))
+import Data.Functor ((<&>))
 import Data.Graph qualified as G
 import Data.HashMap.Strict qualified as M
 import Data.HashSet qualified as H
 import Data.Hashable (Hashable)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (encode)
 import Data.Time.Clock.System
@@ -122,7 +111,6 @@ import Haskoin.Store.Data
     toTransaction,
     zeroBalance,
   )
-import UnliftIO (MonadIO, liftIO)
 
 -- | Function to derive the address at an index of an extended public key.
 type DeriveAddr = XPubKey -> KeyIndex -> Address
@@ -163,120 +151,97 @@ defaultLimits = Limits {limit = 0, offset = 0, start = Nothing}
 instance Default Limits where
   def = defaultLimits
 
--- | Basic queries that every store answers.
-class (Monad m) => StoreReadBase m where
-  -- | Network the store indexes.
-  getNetwork :: m Network
-
-  -- | Context for secp256k1 operations, needed to parse and derive keys.
-  getCtx :: m Ctx
-
-  -- | Hash of the best block imported, or 'Nothing' if none was imported yet.
-  getBestBlock :: m (Maybe BlockHash)
-
-  -- | Hashes of all blocks imported at a height, including those on side
-  -- chains.
-  getBlocksAtHeight :: BlockHeight -> m [BlockHash]
-
-  -- | Data of a block imported in the past, whether still in the main chain
-  -- or not. Check 'Haskoin.Store.Data.main' to know.
-  getBlock :: BlockHash -> m (Maybe BlockData)
-
-  -- | Data of a transaction, including deleted ones. Check
-  -- 'Haskoin.Store.Data.deleted' to know.
-  getTxData :: TxHash -> m (Maybe TxData)
-
-  -- | Data of many transactions, in the order of their hashes. Stores that
-  -- can read many keys at once read them together.
-  getManyTxData :: [TxHash] -> m [Maybe TxData]
-  getManyTxData = mapM getTxData
-
-  -- | Transaction input that spends an output, if it is spent.
-  getSpender :: OutPoint -> m (Maybe Spender)
-
-  -- | Balance of an address, or 'Nothing' if it was never used.
-  getBalance :: Address -> m (Maybe Balance)
-
-  -- | Unspent output, or 'Nothing' if it does not exist or is spent.
-  getUnspent :: OutPoint -> m (Maybe Unspent)
-
-  -- | Whole mempool, newest first.
-  getMempool :: m [(UnixTime, TxHash)]
-
-  -- | Page of the mempool, newest first, from the offset and limit of the
-  -- 'Limits'; its start is ignored. Stores that index the mempool by time
-  -- read only the entries of the page instead of the whole mempool.
-  getMempoolPage :: Limits -> m [(UnixTime, TxHash)]
-  getMempoolPage l = applyLimits l <$> getMempool
-
--- | Queries about addresses and extended public keys, which need indices or
--- configuration beyond the basic store.
-class (StoreReadBase m) => StoreReadExtra m where
-  -- | Transactions involving any of the addresses, newest first, without
-  -- duplicates.
-  getAddressesTxs :: [Address] -> Limits -> m [TxRef]
-
-  -- | Unspent outputs of any of the addresses, newest first.
-  getAddressesUnspents :: [Address] -> Limits -> m [Unspent]
-
-  -- | Number of unused addresses to look ahead when deriving the addresses of
-  -- an extended public key that has no transactions yet.
-  getInitialGap :: m Word32
-
-  -- | Number of consecutive unused addresses after which derivation of an
-  -- extended public key stops.
-  getMaxGap :: m Word32
-
-  -- | Transactions whose hash, read as a number, matches the short identifier
-  -- used by the Blockchain.info compatibility API. There may be more than one.
-  getNumTxData :: Word64 -> m [TxData]
-
-  -- | Balances of the addresses, in the same order. Addresses never used get
-  -- a zero balance.
-  getBalances :: [Address] -> m [Balance]
-
-  -- | Transactions involving an address, newest first.
-  getAddressTxs :: Address -> Limits -> m [TxRef]
-
-  -- | Unspent outputs of an address, newest first.
-  getAddressUnspents :: Address -> Limits -> m [Unspent]
-
-  -- | Balances of the used addresses of an extended public key, with their
-  -- derivation paths.
-  xPubBals :: XPubSpec -> m [XPubBal]
-
-  -- | Unspent outputs of an extended public key, newest first. The second
-  -- argument is the result of 'xPubBals' for the same key.
-  xPubUnspents :: XPubSpec -> [XPubBal] -> Limits -> m [XPubUnspent]
-
-  -- | Transactions of an extended public key, newest first. The second
-  -- argument is the result of 'xPubBals' for the same key.
-  xPubTxs :: XPubSpec -> [XPubBal] -> Limits -> m [TxRef]
-
-  -- | Number of transactions of an extended public key. The second argument
-  -- is the result of 'xPubBals' for the same key.
-  xPubTxCount :: XPubSpec -> [XPubBal] -> m Word32
+-- | The queries that the web server answers with, as plain functions in
+-- 'IO'. "Haskoin.Store.Database.Query" gives them for the database
+-- ('Haskoin.Store.Database.Query.databaseRead'); the web server puts the
+-- Redis cache in front of some of them.
+--
+-- A record of functions rather than a class: a class needs a monad to pick
+-- its instance, and the store has no monads of its own to pick it with, only
+-- 'IO'. The record makes the source of every answer an ordinary value that
+-- can be passed around and replaced, as @nocache=true@ does.
+data StoreRead = StoreRead
+  { -- | network the store indexes
+    net :: !Network,
+    -- | context for secp256k1 operations, needed to parse and derive keys
+    ctx :: !Ctx,
+    -- | hash of the best block imported, or 'Nothing' if none yet
+    getBestBlock :: IO (Maybe BlockHash),
+    -- | hashes of all blocks imported at a height, side chains included
+    getBlocksAtHeight :: BlockHeight -> IO [BlockHash],
+    -- | data of a block imported in the past, whether still in the main
+    -- chain or not; check 'Haskoin.Store.Data.main' to know
+    getBlock :: BlockHash -> IO (Maybe BlockData),
+    -- | data of a transaction, deleted ones included; check
+    -- 'Haskoin.Store.Data.deleted' to know
+    getTxData :: TxHash -> IO (Maybe TxData),
+    -- | data of many transactions, in the order of their hashes, read
+    -- together
+    getManyTxData :: [TxHash] -> IO [Maybe TxData],
+    -- | transaction input that spends an output, if it is spent
+    getSpender :: OutPoint -> IO (Maybe Spender),
+    -- | balance of an address, or 'Nothing' if it was never used
+    getBalance :: Address -> IO (Maybe Balance),
+    -- | unspent output, or 'Nothing' if it does not exist or is spent
+    getUnspent :: OutPoint -> IO (Maybe Unspent),
+    -- | whole mempool, newest first
+    getMempool :: IO [(UnixTime, TxHash)],
+    -- | page of the mempool, newest first, from the offset and limit of the
+    -- 'Limits'; its start is ignored
+    getMempoolPage :: Limits -> IO [(UnixTime, TxHash)],
+    -- | transactions involving any of the addresses, newest first, without
+    -- duplicates
+    getAddressesTxs :: [Address] -> Limits -> IO [TxRef],
+    -- | unspent outputs of any of the addresses, newest first
+    getAddressesUnspents :: [Address] -> Limits -> IO [Unspent],
+    -- | unused addresses to look at for an extended public key with no
+    -- transactions yet
+    initialGap :: !Word32,
+    -- | consecutive unused addresses after which derivation of an extended
+    -- public key stops
+    maxGap :: !Word32,
+    -- | transactions whose hash, read as a number, matches the short
+    -- identifier of the Blockchain.info compatible API; there may be more
+    -- than one
+    getNumTxData :: Word64 -> IO [TxData],
+    -- | balances of the addresses, in the same order; addresses never used
+    -- get a zero balance
+    getBalances :: [Address] -> IO [Balance],
+    -- | transactions involving an address, newest first
+    getAddressTxs :: Address -> Limits -> IO [TxRef],
+    -- | unspent outputs of an address, newest first
+    getAddressUnspents :: Address -> Limits -> IO [Unspent],
+    -- | balances of the used addresses of an extended public key, with
+    -- their derivation paths
+    xPubBals :: XPubSpec -> IO [XPubBal],
+    -- | unspent outputs of an extended public key, newest first, given its
+    -- balances from 'xPubBals'
+    xPubUnspents :: XPubSpec -> [XPubBal] -> Limits -> IO [XPubUnspent],
+    -- | transactions of an extended public key, newest first, given its
+    -- balances from 'xPubBals'
+    xPubTxs :: XPubSpec -> [XPubBal] -> Limits -> IO [TxRef],
+    -- | number of transactions of an extended public key, given its
+    -- balances from 'xPubBals'
+    xPubTxCount :: XPubSpec -> [XPubBal] -> IO Word32
+  }
 
 -- | Data of a block, or 'Nothing' if it is unknown or not in the main chain.
-getActiveBlock :: (StoreReadExtra m) => BlockHash -> m (Maybe BlockData)
-getActiveBlock bh =
-  getBlock bh >>= \case
-    Just b | b.main -> return (Just b)
-    _ -> return Nothing
+getActiveBlock :: StoreRead -> BlockHash -> IO (Maybe BlockData)
+getActiveBlock r bh =
+  r.getBlock bh <&> \case
+    Just b | b.main -> Just b
+    _ -> Nothing
 
 -- | Data of a transaction, or 'Nothing' if it is unknown or was deleted.
-getActiveTxData :: (StoreReadBase m) => TxHash -> m (Maybe TxData)
-getActiveTxData th =
-  getTxData th >>= \case
-    Just td | not td.deleted -> return (Just td)
-    _ -> return Nothing
+getActiveTxData :: StoreRead -> TxHash -> IO (Maybe TxData)
+getActiveTxData r th =
+  r.getTxData th <&> \case
+    Just td | not td.deleted -> Just td
+    _ -> Nothing
 
 -- | Balance of an address, or a zero balance if the address was never used.
-getDefaultBalance :: (StoreReadBase m) => Address -> m Balance
-getDefaultBalance a =
-  getBalance a >>= \case
-    Nothing -> return $ zeroBalance a
-    Just b -> return b
+getDefaultBalance :: StoreRead -> Address -> IO Balance
+getDefaultBalance r a = fromMaybe (zeroBalance a) <$> r.getBalance a
 
 -- | Infinite list of the addresses of an extended public key, with their
 -- indices, from the given index on.
@@ -383,41 +348,24 @@ xPubSummary _xspec xbals =
     rx = sum [b.balance.received | b <- xt]
 
 -- | Transaction with its metadata, or 'Nothing' if it is unknown.
-getTransaction ::
-  (StoreReadBase m) => TxHash -> m (Maybe Transaction)
-getTransaction h = do
-  net <- getNetwork
-  ctx <- getCtx
-  fmap (toTransaction net ctx) <$> getTxData h
+getTransaction :: StoreRead -> TxHash -> IO (Maybe Transaction)
+getTransaction r h = fmap (toTransaction r.net r.ctx) <$> r.getTxData h
 
 -- | Many transactions, in the order of their hashes, read together.
-getTransactions ::
-  (StoreReadBase m) => [TxHash] -> m [Maybe Transaction]
-getTransactions hs = do
-  net <- getNetwork
-  ctx <- getCtx
-  map (fmap (toTransaction net ctx)) <$> getManyTxData hs
+getTransactions :: StoreRead -> [TxHash] -> IO [Maybe Transaction]
+getTransactions r hs = map (fmap (toTransaction r.net r.ctx)) <$> r.getManyTxData hs
 
 -- | Transactions that match a short numeric identifier; see 'getNumTxData'.
-getNumTransaction ::
-  (StoreReadExtra m) => Word64 -> m [Transaction]
-getNumTransaction i = do
-  net <- getNetwork
-  ctx <- getCtx
-  map (toTransaction net ctx) <$> getNumTxData i
+getNumTransaction :: StoreRead -> Word64 -> IO [Transaction]
+getNumTransaction r i = map (toTransaction r.net r.ctx) <$> r.getNumTxData i
 
 -- | First block in the main chain whose timestamp is at or after the given time,
 -- or 'Nothing' if there is none.
-blockAtOrAfter ::
-  (MonadIO m, StoreReadExtra m) =>
-  Chain ->
-  UnixTime ->
-  m (Maybe BlockData)
-blockAtOrAfter ch q = do
-  net <- getNetwork
-  liftIO (chainRunHeaders ch (firstGreaterOrEqual net f)) >>= \case
+blockAtOrAfter :: StoreRead -> Chain -> UnixTime -> IO (Maybe BlockData)
+blockAtOrAfter r ch q =
+  chainRunHeaders ch (firstGreaterOrEqual r.net f) >>= \case
     Nothing -> return Nothing
-    Just x -> getBlock (headerHash x.header)
+    Just x -> r.getBlock (headerHash x.header)
   where
     f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x =
@@ -426,16 +374,11 @@ blockAtOrAfter ch q = do
 
 -- | Last block in the main chain whose timestamp is at or before the given time,
 -- or 'Nothing' if there is none.
-blockAtOrBefore ::
-  (MonadIO m, StoreReadExtra m) =>
-  Chain ->
-  UnixTime ->
-  m (Maybe BlockData)
-blockAtOrBefore ch q = do
-  net <- getNetwork
-  liftIO (chainRunHeaders ch (lastSmallerOrEqual net f)) >>= \case
+blockAtOrBefore :: StoreRead -> Chain -> UnixTime -> IO (Maybe BlockData)
+blockAtOrBefore r ch q =
+  chainRunHeaders ch (lastSmallerOrEqual r.net f) >>= \case
     Nothing -> return Nothing
-    Just x -> getBlock (headerHash x.header)
+    Just x -> r.getBlock (headerHash x.header)
   where
     f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x =
@@ -444,16 +387,11 @@ blockAtOrBefore ch q = do
 
 -- | First block in the main chain whose median time past is at or after the given
 -- time, or 'Nothing' if there is none.
-blockAtOrAfterMTP ::
-  (MonadIO m, StoreReadExtra m) =>
-  Chain ->
-  UnixTime ->
-  m (Maybe BlockData)
-blockAtOrAfterMTP ch q = do
-  net <- getNetwork
-  liftIO (chainRunHeaders ch (firstGreaterOrEqual net f)) >>= \case
+blockAtOrAfterMTP :: StoreRead -> Chain -> UnixTime -> IO (Maybe BlockData)
+blockAtOrAfterMTP r ch q =
+  chainRunHeaders ch (firstGreaterOrEqual r.net f) >>= \case
     Nothing -> return Nothing
-    Just x -> getBlock (headerHash x.header)
+    Just x -> r.getBlock (headerHash x.header)
   where
     f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x = do
@@ -554,12 +492,12 @@ loopForever action = go
 {-# INLINE loopForever #-}
 
 -- | Current time in microseconds since the Unix epoch.
-microseconds :: (MonadIO m) => m Integer
+microseconds :: IO Integer
 microseconds =
   let f t =
         toInteger (systemSeconds t) * 1000000
           + toInteger (systemNanoseconds t) `div` 1000
-   in liftIO $ f <$> getSystemTime
+   in f <$> getSystemTime
 
 -- | Stream every result of a paged query, fetching one page at a time.
 --

@@ -69,7 +69,6 @@ import System.Metrics.StatsD
     withStats,
   )
 import Text.Read (readMaybe)
-import UnliftIO (MonadIO)
 import UnliftIO.Directory
   ( createDirectoryIfMissing,
     getAppUserDataDirectory,
@@ -135,13 +134,13 @@ data Config = Config
   }
 
 -- | Read an environment variable with a parser, or return the default if it is unset or invalid.
-env :: (MonadIO m) => String -> a -> (String -> Maybe a) -> m a
+env :: String -> a -> (String -> Maybe a) -> IO a
 env e d p = do
   ms <- lookupEnv e
   return $ fromMaybe d $ p =<< ms
 
 -- | Default configuration, taken from environment variables where set.
-defConfig :: (MonadIO m) => m Config
+defConfig :: IO Config
 defConfig = do
   dir <-
     getDir

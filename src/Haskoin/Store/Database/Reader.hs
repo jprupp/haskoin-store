@@ -52,7 +52,6 @@ module Haskoin.Store.Database.Reader
   )
 where
 
-import Conduit
 import Control.Monad (forM)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
@@ -197,7 +196,6 @@ dataVersion = 20
 -- families are flushed, block cache size in bytes, and metrics. 'Nothing' leaves
 -- a setting to RocksDB.
 withDatabaseReader ::
-  (MonadUnliftIO m) =>
   Network ->
   Ctx ->
   Word32 ->
@@ -209,24 +207,23 @@ withDatabaseReader ::
   Maybe Int ->
   Maybe Int ->
   Maybe DataMetrics ->
-  (DatabaseReader -> m a) ->
-  m a
+  (DatabaseReader -> IO a) ->
+  IO a
 withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal blockCache stats m =
-  withRunInIO $ \run ->
-    withDBCF dir cfg (columnFamilyConfig bloom (isJust blockCache)) $ \db -> do
-      derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
-      let bdb =
-            DatabaseReader
-              { db = db,
-                maxGap = gap,
-                net = net,
-                initGap = igap,
-                metrics = stats,
-                ctx = ctx,
-                derived = derived
-              }
-      initRocksDB bdb
-      run (m bdb)
+  withDBCF dir cfg (columnFamilyConfig bloom (isJust blockCache)) $ \db -> do
+    derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
+    let bdb =
+          DatabaseReader
+            { db = db,
+              maxGap = gap,
+              net = net,
+              initGap = igap,
+              metrics = stats,
+              ctx = ctx,
+              derived = derived
+            }
+    initRocksDB bdb
+    m bdb
   where
     cfg =
       def

@@ -96,7 +96,6 @@ import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import UnliftIO
   ( IORef,
-    MonadIO,
     liftIO,
     newIORef,
     readIORef,
@@ -278,11 +277,11 @@ runWriterMempool net ctx bdb@DatabaseReader {db} logger f = do
   x <- f Writer {reader = bdb, memory = hm, logger}
   ops <- hashMapOps db hm
   (mops, changes) <- mempoolOps db hm.mempoolTable
-  liftIO $ writeBatch db (ops <> mops)
+  writeBatch db (ops <> mops)
   return (x, changes)
 
 -- | Database operations for all changes of a batch except the mempool.
-hashMapOps :: (MonadIO m) => DB -> Memory -> m [BatchOp]
+hashMapOps :: DB -> Memory -> IO [BatchOp]
 hashMapOps db Memory {..} =
   mconcat
     <$> sequence
@@ -297,7 +296,7 @@ hashMapOps db Memory {..} =
       ]
 
 -- | Operation for the change of the best block, if any.
-bestBlockOp :: (MonadIO m) => BestRef -> m [BatchOp]
+bestBlockOp :: BestRef -> IO [BatchOp]
 bestBlockOp r =
   readIORef r >>= \case
     Nothing -> return []
@@ -305,42 +304,42 @@ bestBlockOp r =
     Just (Just b) -> return [insertOp BestKey b]
 
 -- | Operations for changed blocks.
-blockHashOps :: (MonadIO m) => DB -> BlockTable -> m [BatchOp]
-blockHashOps db t = map (uncurry f) <$> liftIO (H.toList t)
+blockHashOps :: DB -> BlockTable -> IO [BatchOp]
+blockHashOps db t = map (uncurry f) <$> (H.toList t)
   where
     f k (Just d) = insertOpCF (blockCF db) (BlockKey k) d
     f k Nothing = deleteOpCF (blockCF db) (BlockKey k)
 
 -- | Operations for changed block heights.
-blockHeightOps :: (MonadIO m) => DB -> HeightTable -> m [BatchOp]
-blockHeightOps db t = map (uncurry f) <$> liftIO (H.toList t)
+blockHeightOps :: DB -> HeightTable -> IO [BatchOp]
+blockHeightOps db t = map (uncurry f) <$> (H.toList t)
   where
     f = insertOpCF (heightCF db) . HeightKey
 
 -- | Operations for changed transactions.
-txOps :: (MonadIO m) => DB -> TxTable -> m [BatchOp]
-txOps db t = map (uncurry f) <$> liftIO (H.toList t)
+txOps :: DB -> TxTable -> IO [BatchOp]
+txOps db t = map (uncurry f) <$> (H.toList t)
   where
     f k (Just t') = insertOpCF (txCF db) (TxKey k) t'
     f k Nothing = deleteOpCF (txCF db) (TxKey k)
 
 -- | Operations for changed balances.
-balOps :: (MonadIO m) => DB -> BalanceTable -> m [BatchOp]
-balOps db t = map (uncurry f) <$> liftIO (H.toList t)
+balOps :: DB -> BalanceTable -> IO [BatchOp]
+balOps db t = map (uncurry f) <$> (H.toList t)
   where
     f a (Just b) = insertOpCF (balanceCF db) (BalKey a) (balanceToVal b)
     f a Nothing = deleteOpCF (balanceCF db) (BalKey a)
 
 -- | Operations for changed address transactions.
-addrTxOps :: (MonadIO m) => DB -> AddrTxTable -> m [BatchOp]
-addrTxOps db t = map (uncurry f) <$> liftIO (H.toList t)
+addrTxOps :: DB -> AddrTxTable -> IO [BatchOp]
+addrTxOps db t = map (uncurry f) <$> (H.toList t)
   where
     f (a, t') (Just ()) = insertOpCF (addrTxCF db) (AddrTxKey a t') ()
     f (a, t') Nothing = deleteOpCF (addrTxCF db) (AddrTxKey a t')
 
 -- | Operations for changed address unspent outputs.
-addrOutOps :: (MonadIO m) => DB -> AddrOutTable -> m [BatchOp]
-addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
+addrOutOps :: DB -> AddrOutTable -> IO [BatchOp]
+addrOutOps db t = map (uncurry f) <$> (H.toList t)
   where
     f (a, b, p) (Just l) =
       insertOpCF
@@ -356,8 +355,8 @@ addrOutOps db t = map (uncurry f) <$> liftIO (H.toList t)
 -- compared to the database: its time is needed to update the index by
 -- time, and the comparison says which transactions really entered or left
 -- the mempool.
-mempoolOps :: (MonadIO m) => DB -> MempoolTable -> m ([BatchOp], MempoolChanges)
-mempoolOps db t = liftIO $ do
+mempoolOps :: DB -> MempoolTable -> IO ([BatchOp], MempoolChanges)
+mempoolOps db t = do
   changes <- H.toList t
   rows <- forM changes $ \(h, new) -> do
     old <- retrieveCF db cf (MemTxKey h)
@@ -380,8 +379,8 @@ mempoolOps db t = liftIO $ do
       | otherwise = deleteOpCF cf (MemTimeKey o h) : mempoolInsertOps db h n
 
 -- | Operations for changed unspent outputs.
-unspentOps :: (MonadIO m) => DB -> UnspentTable -> m [BatchOp]
-unspentOps db t = map (uncurry f) <$> liftIO (H.toList t)
+unspentOps :: DB -> UnspentTable -> IO [BatchOp]
+unspentOps db t = map (uncurry f) <$> (H.toList t)
   where
     f p (Just u) =
       insertOpCF (unspentCF db) (UnspentKey p) (snd (unspentToVal u))
@@ -430,10 +429,9 @@ getMempool w = do
 
 -- | Empty set of changes.
 newMemory ::
-  (MonadIO m) =>
   Network ->
   Ctx ->
-  m Memory
+  IO Memory
 newMemory net ctx = do
   best <- newIORef Nothing
   blockTable <- liftIO H.new
