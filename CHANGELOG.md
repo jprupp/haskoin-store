@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `normal`, the name they had, is still accepted, so old URLs keep working;
   it said nothing about the kind of address. Error messages use the new
   name. Built with haskoin-store-data at commit `b304acd2`.
+- Breaking: parameters are checked. A request with a parameter that its
+  endpoint does not accept, such as a misspelt `limt=10` or `pretty` on the
+  Blockchain.info endpoints, which never honoured it, gives 400
+  `Unknown parameter: …`; and a value that cannot be read, such as
+  `notx=yes`, `limit=-1`, `filter=4`, `format=xml` or an unknown currency,
+  gives 400 `Invalid value for parameter …`. Both used to be ignored, and
+  the client got an answer to a question it did not ask. Requests are
+  checked before anything is done. The Blockchain.info endpoints accept
+  `format=json`, which their clients often send. Each route of the router
+  declares the parameters it accepts, and reading an undeclared one is an
+  error of the program, so the two cannot drift apart.
 - An xpub asked about with the wrong `derive` gives 400, with a message that
   names the right kind, instead of an empty wallet: when the xpub has no
   transactions with the kind asked for, the store checks the first

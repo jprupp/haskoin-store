@@ -103,13 +103,33 @@ info:
     protocol, in hexadecimal inside JSON (`{"result": "0100…"}`), or as bytes
     with the binary format.
 
+    ## Parameters are checked
+
+    Every endpoint lists the parameters it accepts, and refuses a request with
+    any other, with 400 and a message that names it:
+
+    ```json
+    {"error": "user-error", "message": "Unknown parameter: limt"}
+    ```
+
+    A value that the endpoint cannot read is refused the same way, such as
+    `limit=ten`, `notx=yes` or `derive=Legacy`. Without this, a misspelt
+    parameter or a value the server does not understand would be ignored, and
+    the client would get an answer to a question it did not ask, with nothing
+    to tell it so. Requests are checked before anything is done, so a refused
+    request has no effect.
+
+    One thing is not refused, because it is not a mistake: a `limit` above the
+    server's maximum is lowered to it, as a client cannot know the maximum of
+    every server. Names of parameters are case-sensitive.
+
     ## Errors
 
     An error is a JSON object with a stable `error` code, for programs, and a
     `message`, for people:
 
     ```json
-    {"error": "user-error", "message": "Unable to parse param limit"}
+    {"error": "user-error", "message": "Invalid value for parameter limit: ten"}
     ```
 
     | Status | `error` | When |
@@ -1061,6 +1081,8 @@ paths:
         The newest block, serialized as in the peer-to-peer protocol, with all its
         transactions.
       operationId: getRawBlockHead
+      parameters:
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1227,6 +1249,7 @@ paths:
         its transactions.
       parameters:
         - $ref: '#/components/parameters/blockParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1404,6 +1427,7 @@ paths:
         The blocks at a height, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/blockHeightParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1496,6 +1520,7 @@ paths:
         Like `/block/time/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1593,6 +1618,7 @@ paths:
         Like `/block/mtp/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1791,6 +1817,7 @@ paths:
         send it.
       parameters:
         - $ref: '#/components/parameters/txidParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1998,6 +2025,8 @@ paths:
         peer that accepted it sends it, and the server imports it like any other
         transaction it hears about; a peer that refused it has nothing to send.
       operationId: postTransaction
+      parameters:
+        - $ref: '#/components/parameters/prettyParam'
       requestBody:
         description: >-
           Publish Transaction. The body holds one transaction and nothing
@@ -2246,6 +2275,7 @@ paths:
         the order of the block.
       parameters:
         - $ref: '#/components/parameters/blockParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -2311,6 +2341,7 @@ paths:
         that are not known are left out.
       parameters:
         - $ref: '#/components/parameters/txidsParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >
@@ -2541,7 +2572,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
-        - $ref: '#/components/parameters/nocacheParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: True if xpub got deleted from cache.
@@ -3075,6 +3106,7 @@ paths:
         - $ref: '#/components/parameters/binfoActiveP2SH'
         - $ref: '#/components/parameters/binfoActiveBech32'
         - $ref: '#/components/parameters/binfoCashAddr'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Balance object map.
@@ -3149,6 +3181,7 @@ paths:
         - $ref: '#/components/parameters/binfoOffset'
         - $ref: '#/components/parameters/xpubDerive'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Address balance & transactions.
@@ -3307,6 +3340,7 @@ paths:
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoOffset'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Mempool transactions array.
@@ -3447,6 +3481,7 @@ paths:
         - $ref: '#/components/parameters/binfoCashAddr'
         - $ref: '#/components/parameters/binfoTxIdIndex'
         - $ref: '#/components/parameters/binfoFilter'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Wallet information object.
@@ -3859,6 +3894,7 @@ paths:
         transactions.
       parameters:
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Latest block and list of transactions.
@@ -4020,6 +4056,7 @@ paths:
           schema:
             type: integer
             example: 1304208000000
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: List of blocks for a 24 hour period ending at given timestamp.
@@ -4803,6 +4840,7 @@ paths:
             type: integer
             example: 100
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: List of blocks with transaction data.
@@ -4962,6 +5000,7 @@ paths:
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoConfirmations'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Unspent outputs.
@@ -5105,6 +5144,7 @@ paths:
         - $ref: '#/components/parameters/binfoStart'
         - $ref: '#/components/parameters/binfoEnd'
         - $ref: '#/components/parameters/binfoCurrency'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Transaction history with price.
@@ -6989,10 +7029,6 @@ components:
           type: array
           items:
             type: string
-        onlyShow:
-          type: array
-          items:
-            type: string
         limit:
           type: integer
           example: 2
@@ -7372,6 +7408,8 @@ components:
       description: |
         Keep the outputs of incoming transactions that pay to other addresses. They
         are left out by default, as they belong to other people and can be many.
+        `no_compact` is accepted as another name for it; `noCompact` wins if both
+        are given.
       required: false
       schema:
         type: boolean
@@ -7382,7 +7420,10 @@ components:
       in: query
       description: |
         The currency for the `info` section, such as `USD`, `EUR` or `GBP`, in any
-        case. `USD` by default.
+        case. `USD` by default. A currency that the price service does not list
+        is refused. Until the server has prices, which it does not if the price
+        service cannot be reached, every currency is accepted with a price of
+        zero.
       required: false
       schema:
         type: string
@@ -7441,6 +7482,18 @@ components:
           - type: string
           - type: integer
       example: 369c2a28fc84b060e4423e26ac898fa4ce9eda8943a36d0a48df66e6a6275aa6
+
+    binfoJsonFormat:
+      name: format
+      in: query
+      description: |
+        Only `json` is accepted. Software written for Blockchain.info often sends
+        `format=json`, so it is accepted; any other value is refused rather than
+        answered in JSON anyway.
+      required: false
+      schema:
+        type: string
+        enum: [json]
 
     binfoFormat:
       name: format

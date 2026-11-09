@@ -140,6 +140,7 @@ chainSpec kind = do
   when (kind == BitcoinCore) $ do
     it "derives native and nested SegWit addresses" segwitTest
     it "refuses the wrong kind of address for an xpub" deriveTest
+  it "refuses unknown parameters and values it cannot read" strictTest
   it "does not use or fill the cache when asked not to" noCacheTest
   it "recovers from damaged entries and keeps newer data" damagedTest
   it "keeps the spenders of cached transactions up to date" spenderTest
@@ -1055,6 +1056,48 @@ segwitTest env = do
   void $ mine env 1
   checkXPub env xs rs
   sameAnswers env ["/blockchain/multiaddr?activeBech32=" <> xs.text <> "&activeP2SH=" <> xc.text]
+
+-- | A parameter that an endpoint does not accept, or a value that it cannot
+-- read, must give 400 with a message that names it, rather than an answer
+-- that ignores it; and a value it can read must still be accepted.
+strictTest :: Env -> IO ()
+strictTest env = do
+  let x = newXPub env "strict" DeriveNormal
+      a = at env x [0, 0]
+  (_, best) <- getJSON env.plain "/block/best"
+  coinbase <- case best ! "tx" of
+    Array ts | String t : _ <- toList ts -> return t
+    _ -> fail "No coinbase"
+  let refused =
+        [ ("/block/best?limt=5", "Unknown parameter: limt"),
+          ("/block/best?notx=yes", "Invalid value for parameter notx: yes"),
+          ("/block/best?pretty=maybe", "Invalid value for parameter pretty"),
+          ("/mempool?limit=-1", "Invalid value for parameter limit"),
+          ("/address/" <> cs a <> "/transactions?offset=x", "Invalid value for parameter offset"),
+          ("/xpub/" <> x.text <> "?derive=Legacy", "Invalid value for parameter derive"),
+          ("/blockchain/latestblock?txidindex=1", "Invalid value for parameter txidindex"),
+          ("/blockchain/latestblock?format=hex", "Invalid value for parameter format"),
+          ("/blockchain/latestblock?pretty=true", "Unknown parameter: pretty"),
+          ("/blockchain/rawtx/" <> cs coinbase <> "?format=xml", "Invalid value for parameter format"),
+          ("/blockchain/multiaddr?active=" <> x.text <> "&filter=4", "Invalid value for parameter filter"),
+          ("/blockchain/unspent?active=" <> cs a <> "&confirmations=-2", "Invalid value for parameter confirmations"),
+          ("/blockchain/rawaddr/" <> cs a <> "?limit=ten", "Invalid value for parameter limit")
+        ]
+  forM_ refused $ \(p, msg) -> do
+    (code, v) <- getJSON env.plain p
+    (p, code, textField "error" v) `shouldBe` (p, 400, Just "user-error")
+    fmap (T.isInfixOf msg) (textField "message" v) `shouldBe` Just True
+  -- refused before anything is done: the body is not even read
+  (code, v) <- postForm env.plain "/transactions" [("hex", "00")]
+  (code, textField "message" v) `shouldBe` (400, Just "Unknown parameter: hex")
+  forM_
+    [ "/block/best?notx=true&pretty=true",
+      "/blockchain/latestblock?format=json&txidindex=true",
+      "/xpub/" <> x.text <> "?derive=normal&nocache=false"
+    ]
+    $ \p -> do
+      (code', _) <- getJSON env.plain p
+      (p, code') `shouldBe` (p, 200)
 
 -- | An xpub asked about with the wrong @derive@ must give an error that names
 -- the right one, from the database and from the cache, and from every xpub

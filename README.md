@@ -367,6 +367,10 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 - Lists are paged with `limit` and `offset`, newest first. `height` begins
   a page at a transaction hash, a block hash, a block height or a Unix time
   instead.
+- Parameters are checked: a parameter that an endpoint does not accept, or
+  a value it cannot read, gives 400 with a message that names it, instead of
+  being ignored. The Blockchain.info endpoints accept `format=json`, which
+  clients written for them often send.
 - Errors come back as JSON with an HTTP status: 400 for bad input, 404 for
   unknown things, 409 when a short transaction number is ambiguous, 413 for
   requests that ask for too much.

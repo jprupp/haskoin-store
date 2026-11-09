@@ -253,6 +253,7 @@ test-suite spec
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.TestBlocks
+      Haskoin.Store.Web.RouterSpec
       Haskoin.Store.WebSpec
       Haskoin.StoreSpec
       Paths_haskoin_store

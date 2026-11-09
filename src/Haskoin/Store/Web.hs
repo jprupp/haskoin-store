@@ -92,6 +92,7 @@ import Control.Lens ((.~), (^.))
 import Control.Monad
   ( filterM,
     forM_,
+    guard,
     unless,
     void,
     when,
@@ -585,7 +586,10 @@ serveWeb config serve = do
   let query = webQuery config.store
       st = WebState {..}
       app = router (map (guarded st) (handlePaths st config)) notFound
-      notFound _ = errorResponse st ThingNotFound
+      notFound _ NoRoute = errorResponse st ThingNotFound
+      notFound _ (Unknown ks) =
+        errorResponse st . UserError $
+          "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health) $ \_a2 ->
       serve . webSocketEvents st . logIt config.logger . anyOrigin $ app
@@ -696,45 +700,56 @@ errStatus RequestTooLarge = status413
 -- | The routes of every endpoint, except those disabled in the configuration.
 handlePaths :: WebState -> WebConfig -> [Route]
 handlePaths st cfg =
-  [ marshalled (\r -> GetBlockBest <$> dflt r) (handleBlockBest st),
-    marshalledList (\r -> GetBlockHeight <$> cap r <*> dflt r) (handleBlockHeight st),
-    marshalled (\r -> GetBlockTime <$> cap r <*> dflt r) (handleBlockTime st),
-    marshalled (\r -> GetBlockMTP <$> cap r <*> dflt r) (handleBlockMTP st),
-    marshalled (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
-    marshalled (\r -> GetTx <$> cap r) (handleTx st),
-    plain (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
-    plain (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
-    plainList (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
-    marshalled (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
-    marshalledList (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
-    plainList (\_ -> return GetPeers) (handlePeers st),
-    pathStatus st (\_ -> return GetHealth) (handleHealth st) healthStatus toEncoding toJSON,
-    plainList (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
-    marshalledList (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
-    plain (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
-    plain (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st),
-    marshalledList (\r -> GetBlockLatest <$> dflt r) (handleBlockLatest st),
-    marshalledList (\r -> GetBlockHeights <$> need r <*> dflt r) (handleBlockHeights st),
-    plain (\r -> GetBlockHeightRaw <$> cap r) (handleBlockHeightRaw st),
-    plain (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
-    plain (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
-    marshalledList (\r -> GetTxs <$> need r) (handleTxs st),
-    plain (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
-    marshalledList (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
-    plain (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
-    plain (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
-    plainList (\r -> GetAddrsTxs <$> need r <*> lim r) (handleAddrsTxs st),
-    marshalledList (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
-    marshalledList (\r -> GetAddrsTxsFull <$> need r <*> lim r) (handleAddrsTxsFull st),
-    marshalledList (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
-    marshalledList (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
-    get "/events" (handleEvents st),
-    get "/dbstats" (handleDbStats st)
+  [ marshalled ["notx"] (\r -> GetBlockBest <$> dflt r) (handleBlockBest st),
+    marshalledList ["notx"] (\r -> GetBlockHeight <$> cap r <*> dflt r) (handleBlockHeight st),
+    marshalled ["notx"] (\r -> GetBlockTime <$> cap r <*> dflt r) (handleBlockTime st),
+    marshalled ["notx"] (\r -> GetBlockMTP <$> cap r <*> dflt r) (handleBlockMTP st),
+    marshalled ["notx"] (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
+    marshalled [] (\r -> GetTx <$> cap r) (handleTx st),
+    plain [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
+    plain [] (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
+    plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
+    marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
+    marshalledList limits (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
+    plainList [] (\_ -> return GetPeers) (handlePeers st),
+    pathStatus st [] (\_ -> return GetHealth) (handleHealth st) healthStatus toEncoding toJSON,
+    plainList ["limit", "offset"] (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
+    marshalledList ["blocks", "notx"] (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
+    plain [] (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
+    plain [] (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st),
+    marshalledList ["notx"] (\r -> GetBlockLatest <$> dflt r) (handleBlockLatest st),
+    marshalledList ["heights", "notx"] (\r -> GetBlockHeights <$> need r <*> dflt r) (handleBlockHeights st),
+    plain [] (\r -> GetBlockHeightRaw <$> cap r) (handleBlockHeightRaw st),
+    plain [] (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
+    plain [] (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
+    marshalledList ["txids"] (\r -> GetTxs <$> need r) (handleTxs st),
+    plain ["txids"] (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
+    marshalledList [] (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
+    plain [] (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
+    plain [] (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
+    plainList ("addresses" : limits) (\r -> GetAddrsTxs <$> need r <*> lim r) (handleAddrsTxs st),
+    marshalledList limits (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
+    marshalledList ("addresses" : limits) (\r -> GetAddrsTxsFull <$> need r <*> lim r) (handleAddrsTxsFull st),
+    marshalledList ["addresses"] (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
+    marshalledList ("addresses" : limits) (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
+    get "/events" ["pretty"] (handleEvents st),
+    get "/dbstats" [] (handleDbStats st)
   ]
     <> (if cfg.noXPub then [] else xpubRoutes)
     <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
   where
     net = cfg.store.net
+    -- the parameters that routes accept, beyond those of each route
+    limits = ["limit", "offset", "height"]
+    active = ["active", "activeP2SH", "activeBech32"]
+    -- the Blockchain.info endpoints accept format=json ('jsonOnly')
+    multiaddrParams =
+      ["format", "onlyShow", "n", "offset", "noCompact", "no_compact", "currency", "cashaddr", "txidindex", "filter"]
+        <> active
+    rawaddrParams = ["format", "derive", "limit", "offset", "txidindex"]
+    balanceParams = "format" : "cashaddr" : active
+    unspentParams = "format" : "limit" : "confirmations" : "txidindex" : active
+    historyParams = "format" : "start" : "end" : "currency" : active
     healthStatus h = if isOK h then status200 else status503
     -- the parameters of a request
     cap, need :: (Param a) => Req -> IO a
@@ -749,103 +764,128 @@ handlePaths st cfg =
     -- routes by how they encode their responses: in the JSON of the
     -- network, as a list of those, or in plain JSON
     marshalled ::
-      (ApiResource a b, MarshalJSON Network b) => (Req -> IO a) -> (a -> IO b) -> Route
-    marshalled p h = pathCompact st p h (marshalEncoding net) (marshalValue net)
+      (ApiResource a b, MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
+    marshalled ps p h = pathCompact st ps p h (marshalEncoding net) (marshalValue net)
     marshalledList ::
-      (ApiResource a (SerialList b), MarshalJSON Network b) => (Req -> IO a) -> (a -> IO [b]) -> Route
-    marshalledList p h =
+      (ApiResource a (SerialList b), MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
+    marshalledList ps p h =
       pathCompact
         st
+        ps
         p
         (fmap SerialList . h)
         (list (marshalEncoding net) . (.get))
         (toJSONList . map (marshalValue net) . (.get))
-    plain :: (ApiResource a b, ToJSON b) => (Req -> IO a) -> (a -> IO b) -> Route
-    plain p h = pathCompact st p h toEncoding toJSON
+    plain :: (ApiResource a b, ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
+    plain ps p h = pathCompact st ps p h toEncoding toJSON
     plainList ::
-      (ApiResource a (SerialList b), ToJSON b) => (Req -> IO a) -> (a -> IO [b]) -> Route
-    plainList p h = plain p (fmap SerialList . h)
+      (ApiResource a (SerialList b), ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
+    plainList ps p h = plain ps p (fmap SerialList . h)
     xpubRoutes =
-      [ plain (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st),
-        plainList (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r) (handleXPubTxs st),
+      [ plain ["derive", "nocache"] (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st),
+        plainList
+          ("derive" : "nocache" : limits)
+          (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (handleXPubTxs st),
         marshalledList
+          ("derive" : "nocache" : limits)
           (\r -> GetXPubTxsFull <$> cap r <*> dflt r <*> lim r <*> dflt r)
           (handleXPubTxsFull st),
         marshalledList
+          ["derive", "nocache"]
           (\r -> GetXPubBalances <$> cap r <*> dflt r <*> dflt r)
           (handleXPubBalances st),
         marshalledList
+          ("derive" : "nocache" : limits)
           (\r -> GetXPubUnspent <$> cap r <*> dflt r <*> lim r <*> dflt r)
           (handleXPubUnspent st),
-        plain (\r -> DelCachedXPub <$> cap r <*> dflt r) (handleDelXPub st)
+        plain ["derive"] (\r -> DelCachedXPub <$> cap r <*> dflt r) (handleDelXPub st)
       ]
     binfoRoutes =
-      [ post "/blockchain/multiaddr" (handleMultiAddr st),
-        get "/blockchain/multiaddr" (handleMultiAddr st),
-        get "/blockchain/balance" (handleShortBal st),
-        post "/blockchain/balance" (handleShortBal st),
-        get "/blockchain/rawaddr/:addr" (handleRawAddr st),
-        get "/blockchain/address/:addr" (handleRawAddr st),
-        get "/blockchain/xpub/:addr" (handleRawAddr st),
-        post "/blockchain/unspent" (handleBinfoUnspent st),
-        get "/blockchain/unspent" (handleBinfoUnspent st),
-        get "/blockchain/rawtx/:txid" (handleBinfoTx st),
-        get "/blockchain/rawblock/:block" (handleBinfoBlock st),
-        get "/blockchain/latestblock" (handleBinfoLatest st),
-        get "/blockchain/unconfirmed-transactions" (handleBinfoMempool st),
-        get "/blockchain/block-height/:height" (handleBinfoBlockHeight st),
-        get "/blockchain/blocks/:milliseconds" (handleBinfoBlocksDay st),
-        get "/blockchain/export-history" (handleBinfoHistory st),
-        post "/blockchain/export-history" (handleBinfoHistory st),
-        get "/blockchain/q/addresstohash/:addr" (handleBinfoAddrToHash st),
-        get "/blockchain/q/hashtoaddress/:hash" (handleBinfoHashToAddr st),
-        get "/blockchain/q/addrpubkey/:pubkey" (handleBinfoAddrPubkey st),
-        get "/blockchain/q/pubkeyaddr/:addr" (handleBinfoPubKeyAddr st),
-        get "/blockchain/q/hashpubkey/:pubkey" (handleBinfoHashPubkey st),
-        get "/blockchain/q/getblockcount" (handleBinfoGetBlockCount st),
-        get "/blockchain/q/latesthash" (handleBinfoLatestHash st),
-        get "/blockchain/q/bcperblock" (handleBinfoSubsidy st),
-        get "/blockchain/q/txtotalbtcoutput/:txid" (handleBinfoTotalOut st),
-        get "/blockchain/q/txtotalbtcinput/:txid" (handleBinfoTotalInput st),
-        get "/blockchain/q/txfee/:txid" (handleBinfoTxFees st),
-        get "/blockchain/q/txresult/:txid/:addr" (handleBinfoTxResult st),
-        get "/blockchain/q/getreceivedbyaddress/:addr" (handleBinfoReceived st),
-        get "/blockchain/q/getsentbyaddress/:addr" (handleBinfoSent st),
-        get "/blockchain/q/addressbalance/:addr" (handleBinfoAddrBalance st),
-        get "/blockchain/q/addressfirstseen/:addr" (handleFirstSeen st)
+      [ post "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st)),
+        get "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st)),
+        get "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st)),
+        post "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st)),
+        get "/blockchain/rawaddr/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
+        get "/blockchain/address/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
+        get "/blockchain/xpub/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
+        post "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st)),
+        get "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st)),
+        get "/blockchain/rawtx/:txid" ["format", "txidindex"] (handleBinfoTx st),
+        get "/blockchain/rawblock/:block" ["format", "txidindex"] (handleBinfoBlock st),
+        get "/blockchain/latestblock" ["format", "txidindex"] (jsonOnly (handleBinfoLatest st)),
+        get
+          "/blockchain/unconfirmed-transactions"
+          ["format", "limit", "offset", "txidindex"]
+          (jsonOnly (handleBinfoMempool st)),
+        get "/blockchain/block-height/:height" ["format", "txidindex"] (jsonOnly (handleBinfoBlockHeight st)),
+        get "/blockchain/blocks/:milliseconds" ["format"] (jsonOnly (handleBinfoBlocksDay st)),
+        get "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st)),
+        post "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st)),
+        get "/blockchain/q/addresstohash/:addr" [] (handleBinfoAddrToHash st),
+        get "/blockchain/q/hashtoaddress/:hash" [] (handleBinfoHashToAddr st),
+        get "/blockchain/q/addrpubkey/:pubkey" [] (handleBinfoAddrPubkey st),
+        get "/blockchain/q/pubkeyaddr/:addr" [] (handleBinfoPubKeyAddr st),
+        get "/blockchain/q/hashpubkey/:pubkey" [] (handleBinfoHashPubkey st),
+        get "/blockchain/q/getblockcount" [] (handleBinfoGetBlockCount st),
+        get "/blockchain/q/latesthash" [] (handleBinfoLatestHash st),
+        get "/blockchain/q/bcperblock" [] (handleBinfoSubsidy st),
+        get "/blockchain/q/txtotalbtcoutput/:txid" [] (handleBinfoTotalOut st),
+        get "/blockchain/q/txtotalbtcinput/:txid" [] (handleBinfoTotalInput st),
+        get "/blockchain/q/txfee/:txid" [] (handleBinfoTxFees st),
+        get "/blockchain/q/txresult/:txid/:addr" [] (handleBinfoTxResult st),
+        get "/blockchain/q/getreceivedbyaddress/:addr" [] (handleBinfoReceived st),
+        get "/blockchain/q/getsentbyaddress/:addr" [] (handleBinfoSent st),
+        get "/blockchain/q/addressbalance/:addr" [] (handleBinfoAddrBalance st),
+        get "/blockchain/q/addressfirstseen/:addr" [] (handleFirstSeen st)
       ]
+
+-- | A handler of the Blockchain.info endpoints that answer in JSON only. They
+-- accept @format=json@, which clients written for Blockchain.info often
+-- send, and refuse any other format rather than answering in JSON anyway.
+jsonOnly :: (Req -> IO Response) -> Req -> IO Response
+jsonOnly h req = do
+  paramOr req json "format" ()
+  h req
+  where
+    json "json" = Just ()
+    json _ = Nothing
 
 -- | Register a handler for an API resource, with compact JSON by default.
 pathCompact ::
   (ApiResource a b) =>
   WebState ->
+  [Text] ->
   (Req -> IO a) ->
   (a -> IO b) ->
   (b -> Encoding) ->
   (b -> Value) ->
   Route
-pathCompact st parser action encJson encValue =
-  pathCommon st parser action (const status200) encJson encValue False
+pathCompact st ps parser action encJson encValue =
+  pathCommon st ps parser action (const status200) encJson encValue False
 
 -- | Like 'pathCompact', with the status of the response depending on it, as
 -- the health check answers 503 when the store is not healthy.
 pathStatus ::
   (ApiResource a b) =>
   WebState ->
+  [Text] ->
   (Req -> IO a) ->
   (a -> IO b) ->
   (b -> Status) ->
   (b -> Encoding) ->
   (b -> Value) ->
   Route
-pathStatus st parser action status encJson encValue =
-  pathCommon st parser action status encJson encValue False
+pathStatus st ps parser action status encJson encValue =
+  pathCommon st ps parser action status encJson encValue False
 
 -- | The route of an API resource: parse the request, run the handler, and
--- encode the response as JSON or binary, as the client asked.
+-- encode the response as JSON or binary, as the client asked. It accepts the
+-- parameters given, and @pretty@.
 pathCommon ::
   (ApiResource a b) =>
   WebState ->
+  [Text] ->
   (Req -> IO a) ->
   (a -> IO b) ->
   (b -> Status) ->
@@ -853,9 +893,9 @@ pathCommon ::
   (b -> Value) ->
   Bool ->
   Route
-pathCommon _ parser action status encJson encValue pretty =
-  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) $ \req -> do
-    let proto = serialAs req pretty
+pathCommon _ ps parser action status encJson encValue pretty =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ("pretty" : ps) $ \req -> do
+    proto <- serialAs req pretty
     res <- action =<< parser req
     return $
       responseLBS (status res) [(hContentType, serialType proto)] (protoSerial proto encJson encValue res)
@@ -897,11 +937,12 @@ serialType _ = "application/json"
 -- | The encoding that a request asks for: binary with the header
 -- @Accept: application\/octet-stream@, else JSON, pretty if the @pretty@
 -- parameter or the default says so.
-serialAs :: Req -> Bool -> SerialAs
+serialAs :: Req -> Bool -> IO SerialAs
 serialAs req pretty
-  | Router.header req "accept" == Just "application/octet-stream" = SerialAsBinary
-  | paramOr req readBool "pretty" pretty = SerialAsPrettyJSON
-  | otherwise = SerialAsJSON
+  | Router.header req "accept" == Just "application/octet-stream" = return SerialAsBinary
+  | otherwise = do
+      p <- paramOr req readBool "pretty" pretty
+      return $ if p then SerialAsPrettyJSON else SerialAsJSON
 
 -- GET Block / GET Blocks --
 
@@ -1294,8 +1335,8 @@ webSocketEvents s =
 handleEvents :: WebState -> Req -> IO Response
 handleEvents st req =
   withGaugeIncrease st (.events) $ do
-    let proto = serialAs req False
-        pub = st.config.store.pub
+    proto <- serialAs req False
+    let pub = st.config.store.pub
     return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
       withEventSubscription pub $ \nextEvent ->
         -- ends the response when the client falls too far behind
@@ -1604,7 +1645,7 @@ getBinfoAddrsParam ::
 getBinfoAddrsParam st req name = do
   let net = st.config.store.net
   let ctx = st.config.store.ctx
-  let p = fromMaybe "" (param req name)
+  p <- fromMaybe "" <$> param req name
   if T.null p
     then return HashSet.empty
     else case parseBinfoAddr net ctx p of
@@ -1638,9 +1679,17 @@ getBinfoActive st req = do
     xpub (BinfoXpub x) = Just x
     xpub (BinfoAddr _) = Nothing
 
+-- | A kind of address to derive, as in the @derive@ parameter of the xpub
+-- endpoints: SegWit kinds only on networks with SegWit.
+readDerive :: Network -> Text -> Maybe DeriveType
+readDerive net t = do
+  d <- textToDeriveType t
+  guard (net.segWit || d == DeriveNormal)
+  return d
+
 -- | Whether to identify transactions by short number, unless @txidindex@ is false.
-getNumTxId :: Req -> Bool
-getNumTxId req = not (paramOr req readBool "txidindex" False)
+getNumTxId :: Req -> IO Bool
+getNumTxId req = not <$> paramOr req readBool "txidindex" False
 
 -- | Height of the best header.
 getChainHeight :: WebState -> IO H.BlockHeight
@@ -1652,7 +1701,7 @@ handleBinfoUnspent :: WebState -> Req -> IO Response
 handleBinfoUnspent st req =
   withMetrics st (.binfoUnspent) $ do
     (xspecs, addrs) <- getBinfoActive st req
-    let numtxid = getNumTxId req
+    numtxid <- getNumTxId req
     limit <- get_limit
     min_conf <- get_min_conf
     let net = st.config.store.net
@@ -1666,8 +1715,8 @@ handleBinfoUnspent st req =
           .| (dropWhileC mn >> takeC limit .| sinkList)
     streamEncoding (marshalEncoding (net, ctx) (BinfoUnspents bus))
   where
-    get_limit = return (min 1000 (paramOr req readNum "limit" 250))
-    get_min_conf = return (paramOr req readNum "confirmations" 0)
+    get_limit = min 1000 . fromIntegral <$> paramOr req readNat "limit" 250
+    get_min_conf = fromIntegral <$> paramOr req readNat "confirmations" 0
 
 -- | Stream the unspent outputs of xpubs and addresses, newest first, in the
 -- Blockchain.info format.
@@ -1834,7 +1883,7 @@ pageFor :: Int -> Int -> Word32
 pageFor offset n = fromIntegral (max 16 (min 1000 (offset + n)))
 
 -- | Whether to show addresses in CashAddr format (@cashaddr@).
-getCashAddr :: Req -> Bool
+getCashAddr :: Req -> IO Bool
 getCashAddr req = paramOr req readBool "cashaddr" False
 
 -- | Parse an address. Responds with not found if invalid.
@@ -1932,15 +1981,18 @@ handleBinfoHistory st req =
     xpub_c endM x bs =
       streamThings (st.query.xPubTxs x bs) (Just (.txid)) (lim endM)
 
--- | Currency code in the @currency@ parameter, USD by default, and its latest price.
+-- | Currency code in the @currency@ parameter, USD by default, in any case,
+-- and its latest price. A currency that the price service does not list is
+-- refused. Until the server has prices, which it may never have if the
+-- service cannot be reached, every currency has a price of zero, rather than
+-- every request being refused.
 getPrice :: WebState -> Req -> IO (Text, BinfoTicker)
 getPrice st req = do
-  let code = T.toUpper (paramOr req Just "currency" "USD")
-  let ticker = st.ticker
-  prices <- readTVarIO ticker
-  case HashMap.lookup code prices of
-    Nothing -> return (code, def)
-    Just p -> return (code, p)
+  prices <- readTVarIO st.ticker
+  let known c
+        | HashMap.null prices = Just (c, def)
+        | otherwise = (c,) <$> HashMap.lookup c prices
+  paramOr req (known . T.toUpper) "currency" ("USD", fromMaybe def (HashMap.lookup "USD" prices))
 
 -- | Symbol of the currency in the @currency@ parameter.
 getSymbol :: WebState -> Req -> IO BinfoSymbol
@@ -1973,8 +2025,8 @@ handleMultiAddr :: WebState -> Req -> IO Response
 handleMultiAddr st req =
   withMetrics st (.binfoMultiaddr) $ do
     (addrs', _, saddrs, sxpubs, xspecs) <- get_addrs
-    let numtxid = getNumTxId req
-    let cashaddr = getCashAddr req
+    numtxid <- getNumTxId req
+    cashaddr <- getCashAddr req
     local' <- getSymbol st req
     offset <- getBinfoOffset st req
     n <- getBinfoCount st req "n"
@@ -2088,7 +2140,7 @@ handleMultiAddr st req =
                 <$> st.query.xPubTxCount x (xBals x xbals)
           )
         . HashSet.toList
-    get_filter = return (paramOr req parseBinfoFilter "filter" BinfoFilterAll)
+    get_filter = paramOr req parseBinfoFilter "filter" BinfoFilterAll
     get_best_block =
       st.query.getBestBlock >>= \case
         Nothing -> raise st ThingNotFound
@@ -2096,9 +2148,9 @@ handleMultiAddr st req =
           st.query.getBlock bh >>= \case
             Nothing -> raise st ThingNotFound
             Just b -> return b
-    get_prune =
-      return . not $
-        paramOr req readBool "noCompact" (paramOr req readBool "no_compact" False)
+    get_prune = do
+      noCompact <- paramOr req readBool "no_compact" False
+      not <$> paramOr req readBool "noCompact" noCompact
     only_show_xbals sxpubs =
       HashMap.filterWithKey (\k _ -> k.key `HashSet.member` sxpubs)
     only_show_xspecs sxpubs =
@@ -2156,8 +2208,8 @@ getBinfoCount :: WebState -> Req -> Text -> IO Int
 getBinfoCount st req str = do
   let d = st.config.limits.defItemCount
   let x = st.config.limits.maxFullItemCount
-  let i = min x (paramOr req readNum str d)
-  return (fromIntegral i :: Int)
+  i <- fromIntegral <$> paramOr req readNat str (fromIntegral d)
+  return (fromIntegral (if x == 0 then i else min x i) :: Int)
 
 -- | Offset requested in the @offset@ parameter. Responds with an error if above the maximum.
 getBinfoOffset ::
@@ -2166,7 +2218,7 @@ getBinfoOffset ::
   IO Int
 getBinfoOffset st req = do
   let x = st.config.limits.maxOffset
-  let o = paramOr req readNum "offset" 0
+  o <- fromIntegral <$> paramOr req readNat "offset" 0
   when (o > x) $
     raise st $
       UserError $
@@ -2184,8 +2236,8 @@ handleRawAddr st req =
       BinfoXpub xpub -> do_xpub xpub
   where
     do_xpub xpub = do
-      let numtxid = getNumTxId req
-      let derive = paramOr req textToDeriveType "derive" DeriveNormal
+      numtxid <- getNumTxId req
+      derive <- paramOr req (readDerive st.config.store.net) "derive" DeriveNormal
       let xspec = XPubSpec xpub derive
       n <- getBinfoCount st req "limit"
       off <- getBinfoOffset st req
@@ -2238,7 +2290,7 @@ handleRawAddr st req =
              in (a, Just (BinfoXPubPath xpub m))
        in HashMap.fromList $ map f xbals
     do_addr addr = do
-      let numtxid = getNumTxId req
+      numtxid <- getNumTxId req
       n <- getBinfoCount st req "limit"
       off <- getBinfoOffset st req
       bal <- fromMaybe (zeroBalance addr) <$> st.query.getBalance addr
@@ -2345,7 +2397,7 @@ handleShortBal :: WebState -> Req -> IO Response
 handleShortBal st req =
   withMetrics st (.binfoBalance) $ do
     (xspecs, addrs) <- getBinfoActive st req
-    let cashaddr = getCashAddr req
+    cashaddr <- getCashAddr req
     let net = st.config.store.net
     abals <- catMaybes <$> mapM (getabal net cashaddr) (HashSet.toList addrs)
     xbals <- mapM (getxbal net) (HashSet.toList xspecs)
@@ -2385,14 +2437,18 @@ handleShortBal st req =
       return (xPubExport net ctx xpub.key, sbl)
 
 -- | Whether to respond with hex (@format=hex@).
-getBinfoHex :: Req -> Bool
-getBinfoHex req = param req "format" == Just "hex"
+getBinfoHex :: Req -> IO Bool
+getBinfoHex req = paramOr req format "format" False
+  where
+    format "hex" = Just True
+    format "json" = Just False
+    format _ = Nothing
 
 -- | Handler for @GET \/blockchain\/block-height\/:height@: the blocks at a height, as Blockchain.info.
 handleBinfoBlockHeight :: WebState -> Req -> IO Response
 handleBinfoBlockHeight st req =
   withMetrics st (.binfoBlockHeight) $ do
-    let numtxid = getNumTxId req
+    numtxid <- getNumTxId req
     height <- captureWith req readNum "height"
     bs <- fmap catMaybes $ st.query.getBlocksAtHeight height >>= mapM (st.query.getBlock)
     ns <- fmap catMaybes $ st.query.getBlocksAtHeight (height + 1) >>= mapM (st.query.getBlock)
@@ -2412,7 +2468,7 @@ handleBinfoBlockHeight st req =
 handleBinfoLatest :: WebState -> Req -> IO Response
 handleBinfoLatest st req =
   withMetrics st (.binfoBlockLatest) $ do
-    let numtxid = getNumTxId req
+    numtxid <- getNumTxId req
     b <- (bestBlock st.query) >>= maybe (raise st ThingNotFound) return
     streamEncoding $
       toEncoding
@@ -2428,8 +2484,8 @@ handleBinfoLatest st req =
 handleBinfoBlock :: WebState -> Req -> IO Response
 handleBinfoBlock st req =
   withMetrics st (.binfoBlockRaw) $ do
-    let numtxid = getNumTxId req
-    let hex = getBinfoHex req
+    numtxid <- getNumTxId req
+    hex <- getBinfoHex req
     captureWith req parseBinfoBlockId "block" >>= \case
       BinfoBlockHash bh -> go numtxid hex bh
       BinfoBlockIndex i ->
@@ -2474,8 +2530,8 @@ getBinfoTx st txid = do
 handleBinfoTx :: WebState -> Req -> IO Response
 handleBinfoTx st req =
   withMetrics st (.binfoTxRaw) $ do
-    let numtxid = getNumTxId req
-    let hex = getBinfoHex req
+    numtxid <- getNumTxId req
+    hex <- getBinfoHex req
     txid <- captureWith req parseBinfoTxId "txid"
     tx <-
       getBinfoTx st txid >>= \case
@@ -2554,7 +2610,7 @@ handleBinfoTotalInput st req =
 handleBinfoMempool :: WebState -> Req -> IO Response
 handleBinfoMempool st req =
   withMetrics st (.binfoMempool) $ do
-    let numtxid = getNumTxId req
+    numtxid <- getNumTxId req
     offset <- getBinfoOffset st req
     n <- getBinfoCount st req "limit"
     -- a limit of 0 would mean no limit to st.query.getMempoolPage
@@ -2842,19 +2898,18 @@ paramOptional :: forall a. (Param a) => WebState -> Req -> IO (Maybe a)
 paramOptional st req = do
   let net = st.config.store.net
   let ctx = st.config.store.ctx
-  case T.splitOn "," <$> param req label of
+  param req label >>= \case
     Nothing -> return Nothing -- Parameter was not supplied
-    Just ts -> maybe (raise st err) (return . Just) (parseParam net ctx ts)
+    Just t -> Just <$> readParam (parseParam net ctx . T.splitOn ",") label t
   where
     label = proxyLabel (Proxy :: Proxy a)
-    err = UserError $ "Unable to parse param " <> T.unpack label
 
 -- | Raises an exception if the parameter is not supplied
 paramRequired :: forall a. (Param a) => WebState -> Req -> IO a
 paramRequired st req = maybe (raise st err) return =<< paramOptional st req
   where
     label = T.unpack (proxyLabel (Proxy :: Proxy a))
-    err = UserError $ "Param " <> label <> " not defined"
+    err = UserError $ "Missing parameter " <> label
 
 -- | Returns the default value of a parameter if it is not supplied. Raises an
 -- exception on parse failure.
@@ -3041,16 +3096,33 @@ fmtReq req =
 fmtStatus :: Status -> Text
 fmtStatus s = cs (show (statusCode s)) <> " " <> cs (statusMessage s)
 
--- | A parameter read with a parser, or the default if there is none or it
--- does not parse.
-paramOr :: Req -> (Text -> Maybe a) -> Text -> a -> a
-paramOr req f name d = fromMaybe d (param req name >>= f)
+-- | A parameter read with a parser, or the default if there is none. Answers
+-- with an error if it does not parse ('readParam').
+paramOr :: Req -> (Text -> Maybe a) -> Text -> a -> IO a
+paramOr req f name d = param req name >>= maybe (return d) (readParam f name)
 
 -- | A parameter read with a parser. Answers with an error if there is none or
--- it does not parse.
+-- it does not parse ('readParam').
 requireParam :: WebState -> Req -> (Text -> Maybe a) -> Text -> IO a
 requireParam st req f name =
-  maybe (raise st (UserError ("Missing or invalid param " <> T.unpack name))) return (param req name >>= f)
+  param req name >>= maybe (raise st (UserError ("Missing parameter " <> T.unpack name))) (readParam f name)
+
+-- | The value of a parameter, read with a parser. Answers with an error that
+-- names the parameter and the value if it does not parse: a value that the
+-- server does not understand is a mistake of the client, and answering as if
+-- it had not been given would hide the mistake.
+readParam :: (Text -> Maybe a) -> Text -> Text -> IO a
+readParam f name t =
+  maybe (throwIO (invalidParam name t)) return (f t)
+
+-- | The error for a value of a parameter that does not parse.
+invalidParam :: Text -> Text -> Except
+invalidParam name t =
+  UserError . T.unpack $ "Invalid value for parameter " <> name <> ": " <> t
+
+-- | A count, offset or number of confirmations: a whole number, not negative.
+readNat :: Text -> Maybe Natural
+readNat t = readMaybe (T.unpack t) >>= \(n :: Integer) -> if n < 0 then Nothing else Just (fromInteger n)
 
 -- | @true@ or @false@, in any case.
 readBool :: Text -> Maybe Bool
