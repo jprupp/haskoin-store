@@ -466,6 +466,7 @@ stress o ctx node redisURL srv stats wc = do
     Redis.disconnect conn
     return (n > 0)
   writeScripts o ws
+  slowlogStart redisURL
   stop <- newTVarIO False
   start <- getCurrentTime
   withFile (o.out <> "/samples.jsonl") WriteMode $ \sh ->
@@ -484,6 +485,7 @@ stress o ctx node redisURL srv stats wc = do
           threadDelay ((o.wrkSeconds + 3) * 1000000)
           say "Comparing cached answers with the database"
           checks <- forM ws (consistent srv)
+          slow <- slowlog redisURL
           end <- getCurrentTime
           height <- nodeHeight node
           writeJSON (o.out <> "/summary.json") $
@@ -493,7 +495,8 @@ stress o ctx node redisURL srv stats wc = do
                 "height" .= height,
                 "seconds" .= (realToFrac (end `diffUTCTime` start) :: Double),
                 "catch_up_seconds" .= (realToFrac catchUp :: Double),
-                "consistency" .= concat checks
+                "consistency" .= concat checks,
+                "redis_slow" .= slow
               ]
           say ("Done: " <> show sent <> " transactions, " <> show refused <> " refused")
 
@@ -740,6 +743,36 @@ valkeyMemory conn =
     Left _ -> Nothing
   where
     a <&&> f = f <$> a
+
+-- | Make Valkey log every command that takes 10 ms or more, keeping all of
+-- them: a long script blocks every client of Redis, every server included.
+slowlogStart :: String -> IO ()
+slowlogStart url = withRedis url $ \conn -> Redis.runRedis conn $ do
+  _ <- Redis.sendRequest ["CONFIG", "SET", "slowlog-log-slower-than", "10000"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
+  _ <- Redis.sendRequest ["CONFIG", "SET", "slowlog-max-len", "100000"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
+  _ <- Redis.sendRequest ["SLOWLOG", "RESET"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
+  return ()
+
+-- | The commands that took 10 ms or more: how long each took, in
+-- milliseconds, and its name (with the first bytes of a script).
+slowlog :: String -> IO [Value]
+slowlog url = withRedis url $ \conn ->
+  Redis.runRedis conn (Redis.sendRequest ["SLOWLOG", "GET", "100000"]) <&&> \case
+    Right (Redis.MultiBulk (Just entries)) -> mapMaybe entry entries
+    _ -> []
+  where
+    a <&&> f = f <$> a
+    entry (Redis.MultiBulk (Just (_ : Redis.Integer ts : Redis.Integer us : Redis.MultiBulk (Just args) : _))) =
+      Just $
+        object
+          [ "time" .= ts,
+            "ms" .= (fromIntegral us / 1000 :: Double),
+            "command" .= T.unwords [T.take 24 (decodeUtf8 b) | Redis.Bulk (Just b) <- take 1 args]
+          ]
+    entry _ = Nothing
+
+withRedis :: String -> (Redis.Connection -> IO a) -> IO a
+withRedis url = bracket (Redis.checkedConnect (either error id (Redis.parseConnectInfo url))) Redis.disconnect
 
 -------------------------------------------------------------------------------
 -- StatsD

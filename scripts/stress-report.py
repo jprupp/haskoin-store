@@ -146,6 +146,27 @@ def main():
     w(f"| Evictions | {fmt(int(evictions))} |")
     w("")
 
+    # Redis
+    slow = summary.get("redis_slow")
+    if slow is not None:
+        w("## Commands that blocked Redis\n")
+        w(
+            "Redis runs one command or script at a time, so a long one makes every "
+            "client wait, every server sharing the cache included. These are the "
+            "commands that took 10 ms or more.\n"
+        )
+        if not slow:
+            w("None.\n")
+        else:
+            by = {}
+            for x in slow:
+                by.setdefault(x["command"] or "?", []).append(x["ms"])
+            w("| Command | Count | Total ms | Median ms | Longest ms |")
+            w("|---|---|---|---|---|")
+            for cmd, ms in sorted(by.items(), key=lambda kv: -sum(kv[1])):
+                w(f"| {cmd} | {len(ms)} | {fmt(sum(ms))} | {fmt(statistics.median(ms))} | {fmt(max(ms))} |")
+            w("")
+
     # Over time
     n = min(12, max(1, len(samples)))
     groups = buckets(samples, n)

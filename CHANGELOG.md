@@ -121,8 +121,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   chain, Valkey and wrk in Podman, a haskoin-store server, hundreds of
   thousands of transactions between a few wallets, and wrk on their xpubs
   all the while, with a report (`scripts/stress-report.py`) of reloads,
-  lag, resources and latencies, and a check of the cached answers at the
-  end. The Podman helpers of the integration tests are an internal library
+  lag, resources, the commands that blocked Redis (from its slow log) and
+  latencies, and a check of the cached answers at the end. The Podman helpers of the integration tests are an internal library
   (`integration`) that the stress program shares, and the test image has
   wrk in a layer of its own.
 - `runWebSocket` serves the API on a socket that already listens. The tests

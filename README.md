@@ -528,7 +528,8 @@ time. At the end it compares the cached answers with those of the database,
 and `scripts/stress-report.py` writes `OUT_DIR/report.md`: how fast the
 transactions went in, how many reloads the cache did and how long they took
 as the xpubs grew, how far the server fell behind, its CPU and memory, the
-memory of Valkey, and the latencies of each endpoint over time.
+memory of Valkey, the commands that blocked Redis for 10 ms or more (from
+its slow log), and the latencies of each endpoint over time.
 
 - The defaults are 200,000 transactions between 4 wallets of 200 receiving
   and 200 change addresses, 2,000 per block; pass `-- --help` for the
