@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The syncing peer is disconnected when it sends a block that was not
+  requested, as the documentation of the block store said. The block was
+  imported if the node knew its header. The state of the block download is
+  now a pure state machine (`Haskoin.Store.BlockStore.Sync`) with property
+  tests, which also found that a block listed twice in one request was
+  outstanding twice.
 - Build against haskoin-node 2.4.0. The store stopped following the chain
   when a peer announced new blocks with an inventory message instead of
   headers, which peers do when many blocks are found at once; it stayed at

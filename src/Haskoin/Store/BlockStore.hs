@@ -21,7 +21,9 @@
 -- arrives. If the best block of the database is no longer in the main chain of
 -- headers, blocks are reverted until it is. A syncing peer that sends a block
 -- that was not requested, cannot find a block, or stays silent for longer than
--- 'peerTimeout' is disconnected.
+-- 'peerTimeout' is disconnected. The state of the download, and every rule
+-- about it, is the pure state machine of "Haskoin.Store.BlockStore.Sync";
+-- this module carries out what its transitions decide.
 --
 -- = Mempool
 --
@@ -94,12 +96,10 @@ import Control.Monad
   )
 import Data.Bool (bool)
 import Data.ByteString qualified as B
-import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
-import Data.List (delete)
 import Data.Maybe
   ( catMaybes,
     fromJust,
@@ -166,6 +166,12 @@ import Haskoin.Node
     setBusy,
     setFree,
   )
+import Haskoin.Store.BlockStore.Sync
+  ( Accept (..),
+    Sync (..),
+    needsMoreBlocks,
+  )
+import Haskoin.Store.BlockStore.Sync qualified as Sync
 import Haskoin.Store.Common (StoreEvent (..), loopForever, sortTxs)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query (getMempoolBefore)
@@ -212,6 +218,7 @@ import UnliftIO
     newTVarIO,
     readTVar,
     readTVarIO,
+    stateTVar,
     throwIO,
     try,
     withAsync,
@@ -252,16 +259,6 @@ data BlockException
     MempoolImportFailed
   deriving (Show, Eq, Ord, Exception)
 
--- | State of the sync against the syncing peer.
-data Syncing = Syncing
-  { -- | peer that blocks are downloaded from
-    peer :: !Peer,
-    -- | when it last delivered a block, or when syncing started
-    time :: !UTCTime,
-    -- | blocks requested and not yet imported, in chain order
-    blocks :: ![BlockHash]
-  }
-
 -- | Transaction received from a peer and waiting to be imported.
 data PendingTx = PendingTx
   { -- | when it was received
@@ -279,8 +276,8 @@ data BlockStore = BlockStore
     mailbox :: !(Mailbox BlockStoreMessage),
     -- | configuration
     config :: !BlockStoreConfig,
-    -- | syncing peer, if any
-    peer :: !(TVar (Maybe Syncing)),
+    -- | state of the block download ("Haskoin.Store.BlockStore.Sync")
+    sync :: !(TVar (Sync Peer)),
     -- | transactions received and waiting to be imported
     txs :: !(TVar (HashMap TxHash PendingTx)),
     -- | transactions requested from peers in the last twenty seconds
@@ -486,7 +483,7 @@ withBlockStore ::
   (BlockStore -> m a) ->
   m a
 withBlockStore cfg action = do
-  pb <- newTVarIO Nothing
+  pb <- newTVarIO Idle
   ts <- newTVarIO HashMap.empty
   rq <- newTVarIO HashSet.empty
   sy <- newTVarIO HashSet.empty
@@ -496,7 +493,7 @@ withBlockStore cfg action = do
         BlockStore
           { mailbox = inboxToMailbox inbox,
             config = cfg,
-            peer = pb,
+            sync = pb,
             txs = ts,
             requested = rq,
             metrics = metrics,
@@ -592,15 +589,10 @@ syncMempool self p =
 -- the block is unknown to the node, or if the block cannot be imported.
 processBlock :: BlockStore -> Peer -> Block -> IO ()
 processBlock self peer block =
-  checkPeer self peer >>= \case
-    False -> do
-      logError self $
-        "Non-syncing peer "
-          <> peer.label
-          <> " sent block "
-          <> blockHashToHex blockhash
-      killPeer peer
-    True ->
+  Sync.accept peer blockhash <$> readTVarIO self.sync >>= \case
+    NotSyncingPeer -> refuse "Non-syncing peer"
+    NotRequested -> refuse "Syncing peer"
+    Requested ->
       getBlockNode self blockhash >>= \case
         Nothing -> do
           logError self $
@@ -623,11 +615,19 @@ processBlock self peer block =
     header = block.header
     blockhash = headerHash header
     hexhash = blockHashToHex blockhash
+    refuse who = do
+      logError self $
+        who
+          <> " "
+          <> peer.label
+          <> " sent a block that was not requested: "
+          <> hexhash
+      killPeer peer
     success node = do
       logInfo self $
         "Best block: " <> blockText node (Just block)
-      removeSyncingBlock self $ headerHash node.header
-      touchPeer self
+      now <- getCurrentTime
+      transition self $ \st -> ((), Sync.imported now blockhash st)
       isInSync self >>= \case
         False -> syncMe self
         True -> do
@@ -643,46 +643,10 @@ processBlock self peer block =
           <> cs (show e)
       killPeer peer
 
--- | Set the blocks requested from the syncing peer.
-setSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
-setSyncingBlocks self hs =
-  let box = self.peer
-   in atomically $
-        modifyTVar box $ \case
-          Nothing -> Nothing
-          Just x -> Just (x :: Syncing) {blocks = hs}
-
--- | Blocks requested from the syncing peer and not yet imported.
-getSyncingBlocks :: BlockStore -> IO [BlockHash]
-getSyncingBlocks self =
-  readTVarIO self.peer >>= \case
-    Nothing -> return []
-    Just x -> return x.blocks
-
--- | Add blocks to those requested from the syncing peer.
-addSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
-addSyncingBlocks self hs =
-  let box = self.peer
-   in atomically $
-        modifyTVar box $ \case
-          Nothing -> Nothing
-          Just x -> Just (x :: Syncing) {blocks = x.blocks <> hs}
-
--- | Remove a block from those requested from the syncing peer.
-removeSyncingBlock :: BlockStore -> BlockHash -> IO ()
-removeSyncingBlock self h = do
-  let box = self.peer
-  atomically $
-    modifyTVar box $ \case
-      Nothing -> Nothing
-      Just x -> Just (x :: Syncing) {blocks = delete h x.blocks}
-
--- | Whether a peer is the syncing peer.
-checkPeer :: BlockStore -> Peer -> IO Bool
-checkPeer self p =
-  getSyncingState self <&> \case
-    Just Syncing {peer} -> peer == p
-    Nothing -> False
+-- | Change the state of the block download with a transition of
+-- "Haskoin.Store.BlockStore.Sync", atomically, and give its result.
+transition :: BlockStore -> (Sync Peer -> (a, Sync Peer)) -> IO a
+transition self = atomically . stateTVar self.sync
 
 -- | Header of a block from the node.
 getBlockNode :: BlockStore -> BlockHash -> IO (Maybe BlockNode)
@@ -971,35 +935,15 @@ processTxs self p hs = guardMempool self . guardSync self $ do
           msg = MGetData (GetData vec)
       msg `sendMessage` p
 
--- | Record that the syncing peer just delivered something.
-touchPeer :: BlockStore -> IO ()
-touchPeer self =
-  getSyncingState self >>= \case
-    Nothing -> return ()
-    Just _ -> do
-      let box = self.peer
-      now <- liftIO getCurrentTime
-      atomically $
-        modifyTVar box $
-          fmap $
-            \x -> (x :: Syncing) {time = now}
-
 -- | Disconnect the syncing peer if it has been silent for too long.
 checkTime :: BlockStore -> IO ()
-checkTime self =
-  readTVarIO self.peer >>= \case
+checkTime self = do
+  now <- getCurrentTime
+  Sync.timedOut self.config.peerTimeout now <$> readTVarIO self.sync >>= \case
     Nothing -> return ()
-    Just
-      Syncing
-        { time = t,
-          peer = p
-        } -> do
-        now <- liftIO getCurrentTime
-        let peer_time_out = self.config.peerTimeout
-        when (now `diffUTCTime` t > peer_time_out) $ do
-          logError self $
-            "Syncing peer timeout: " <> p.label
-          killPeer p
+    Just p -> do
+      logError self $ "Syncing peer timeout: " <> p.label
+      killPeer p
 
 -- | Revert blocks until the best block in the database is in the main chain of headers.
 revertToMainChain :: BlockStore -> IO ()
@@ -1020,7 +964,7 @@ revertToMainChain self = do
             <> ": "
             <> cs (show e)
         throwIO e
-      Right () -> setSyncingBlocks self []
+      Right () -> transition self $ \st -> ((), Sync.forgetRequests st)
     revertToMainChain self
 
 -- | Header of the best block in the database.
@@ -1045,16 +989,15 @@ getBest self = do
 getSyncBest :: BlockStore -> IO BlockNode
 getSyncBest self = do
   bb <-
-    getSyncingBlocks self >>= \case
-      [] ->
+    Sync.lastRequested <$> readTVarIO self.sync >>= \case
+      Just h -> return h
+      Nothing ->
         getBestBlock self >>= \case
           Just b -> return b
           Nothing -> do
             logError self "No best block set"
             throwIO Uninitialized
-      hs -> return $ last hs
-  let ch = self.config.chain
-  (chainGetBlock ch bb) >>= \case
+  chainGetBlock self.config.chain bb >>= \case
     Just x -> return x
     Nothing -> do
       logError self $
@@ -1067,29 +1010,12 @@ shouldSync :: BlockStore -> IO (Maybe Peer)
 shouldSync self =
   isInSync self >>= \case
     True -> return Nothing
-    False ->
-      getSyncingState self >>= \case
-        Nothing -> return Nothing
-        Just Syncing {peer = p, blocks = bs} -> do
-          window <- blockWindow self
-          return $
-            if needsMoreBlocks window (length bs)
-              then Just p
-              else Nothing
+    False -> Sync.wantsMore (blockWindow self) <$> readTVarIO self.sync
 
 -- | Blocks to request from the syncing peer in one batch. Never below one,
 -- or the store would never ask for any block.
-blockWindow :: BlockStore -> IO Int
-blockWindow self = return (max 1 self.config.blockWindow)
-
--- | Whether to ask for the next batch, given the window size and how many
--- requested blocks are still waiting to be imported. Asking once fewer than
--- a quarter of the window remain keeps the peer busy, while the queue of
--- downloaded blocks never grows much beyond one window. The threshold is at
--- least one, so that a window smaller than four still refills once empty.
-needsMoreBlocks :: Int -> Int -> Bool
-needsMoreBlocks window outstanding =
-  outstanding < max 1 (window `div` 4)
+blockWindow :: BlockStore -> Int
+blockWindow self = max 1 self.config.blockWindow
 
 -- | Ask the syncing peer for the next batch of blocks, if the window has room.
 syncMe :: BlockStore -> IO ()
@@ -1099,32 +1025,24 @@ syncMe self = do
     Nothing -> return ()
     Just p -> do
       bb <- getSyncBest self
-      bh <- getbh
+      bh <- chainGetBest self.config.chain
       when (bb /= bh) $ do
         bns <- sel bb bh
-        iv <- getiv bns
         logDebug self $
           "Requesting "
-            <> fromString (show (length iv))
+            <> fromString (show (length bns))
             <> " blocks from peer: "
             <> p.label
-        addSyncingBlocks self $ map (headerHash . (.header)) bns
-        MGetData (GetData iv) `sendMessage` p
+        transition self $ \st -> ((), Sync.request (map (headerHash . (.header)) bns) st)
+        MGetData (GetData (map inv bns)) `sendMessage` p
   where
-    getiv bns = do
-      let w = self.config.net.segWit
-      let i = if w then InvWitnessBlock else InvBlock
-          f = InvVector i . (.get) . headerHash . (.header)
-      return $ map f bns
-    getbh =
-      chainGetBest self.config.chain
+    inv = InvVector kind . (.get) . headerHash . (.header)
+    kind = if self.config.net.segWit then InvWitnessBlock else InvBlock
     -- The blocks right after the last requested one, up to one window or
     -- the chain tip, whichever comes first.
     sel bb bh = do
-      window <- blockWindow self
-      top <- findAncestor self (min (bb.height + fromIntegral window) bh.height) bh
-      let ch = self.config.chain
-      ps <- chainGetParents ch (bb.height + 1) top
+      top <- findAncestor self (min (bb.height + fromIntegral (blockWindow self)) bh.height) bh
+      ps <- chainGetParents self.config.chain (bb.height + 1) top
       return $ ps <> [top]
 
 -- | Ancestor of a header at a height. Throws 'AncestorNotInChain' if missing.
@@ -1145,61 +1063,45 @@ findAncestor self height target = do
 -- | Forget a peer: release it if it was the syncing peer, and forget that its mempool was requested.
 finishPeer :: BlockStore -> Peer -> IO ()
 finishPeer self p = do
-  let box = self.peer
-  readTVarIO box >>= \case
-    Just Syncing {peer = p'} | p == p' -> reset_it box
-    _ -> return ()
-  let y = self.syncedMempool
-  atomically $ modifyTVar y $ HashSet.delete p.label
-  where
-    reset_it box = do
-      atomically $ writeTVar box Nothing
-      logDebug self $ "Releasing peer: " <> p.label
-      setFree p
+  released <- transition self (Sync.release p)
+  when released $ do
+    logDebug self $ "Releasing peer: " <> p.label
+    setFree p
+  atomically $ modifyTVar self.syncedMempool $ HashSet.delete p.label
 
 -- | Make a peer the syncing peer if there is none and the peer is not busy.
 trySetPeer :: BlockStore -> Peer -> IO Bool
 trySetPeer self p =
-  getSyncingState self >>= \case
-    Just _ -> return False
-    Nothing -> set_it
-  where
-    set_it =
-      (setBusy p) >>= \case
+  isJust . Sync.syncingPeer <$> readTVarIO self.sync >>= \case
+    True -> return False
+    False ->
+      setBusy p >>= \case
         False -> return False
         True -> do
-          logDebug self $
-            "Locked peer: " <> p.label
-          let box = self.peer
-          now <- liftIO getCurrentTime
-          atomically . writeTVar box $
-            Just
-              Syncing
-                { peer = p,
-                  time = now,
-                  blocks = []
-                }
-          return True
+          now <- getCurrentTime
+          started <- transition self $ \st -> case Sync.start now p st of
+            Just st' -> (True, st')
+            Nothing -> (False, st)
+          if started
+            then logDebug self ("Locked peer: " <> p.label)
+            else setFree p
+          return started
 
--- | If not in sync and there is no syncing peer, pick the fastest free peer and start syncing.
+-- | If not in sync and there is no syncing peer, pick the first free peer and start syncing.
 trySyncing :: BlockStore -> IO ()
 trySyncing self =
   isInSync self >>= \case
     True -> return ()
     False ->
-      getSyncingState self >>= \case
-        Just _ -> return ()
-        Nothing -> online_peer
+      isJust . Sync.syncingPeer <$> readTVarIO self.sync >>= \case
+        True -> return ()
+        False -> getPeers self.config.peerMgr >>= recurse . map (.mailbox)
   where
     recurse [] = return ()
     recurse (p : ps) =
       trySetPeer self p >>= \case
         False -> recurse ps
         True -> syncMe self
-    online_peer = do
-      ops <- getPeers =<< return self.config.peerMgr
-      let ps = map (.mailbox) ops
-      recurse ps
 
 -- | Start syncing against a newly connected peer if needed, or request its mempool if in sync.
 trySyncingPeer :: BlockStore -> Peer -> IO ()
@@ -1211,17 +1113,10 @@ trySyncingPeer self p =
         False -> return ()
         True -> syncMe self
 
--- | State of the sync against the syncing peer, if any.
-getSyncingState :: BlockStore -> IO (Maybe Syncing)
-getSyncingState self =
-  readTVarIO =<< return self.peer
-
 -- | Release the syncing peer, if any.
 clearSyncingState :: BlockStore -> IO ()
 clearSyncingState self =
-  readTVarIO self.peer >>= \case
-    Nothing -> return ()
-    Just Syncing {peer = p} -> finishPeer self p
+  Sync.syncingPeer <$> readTVarIO self.sync >>= mapM_ (finishPeer self)
 
 -- | Handle a message sent to the block store.
 processBlockStoreMessage :: BlockStore -> BlockStoreMessage -> IO ()
