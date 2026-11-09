@@ -90,7 +90,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   [jprupp/haskoin-store-data](https://github.com/jprupp/haskoin-store-data),
   with its history and its own releases, and haskoin-store moves to the root
   of this one; `store/` and `data/` are gone. haskoin-store depends on
-  `haskoin-store-data ^>= 1.8.1`. The package has a full description, PVP
+  `haskoin-store-data ^>= 1.9`. The package has a full description, PVP
   upper bounds on every dependency, and no `Setup.hs`.
 
 ### Fixed

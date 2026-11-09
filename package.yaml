@@ -43,7 +43,7 @@ dependencies:
   - deepseq ^>= 1.5.1.0
   - hashable ^>= 1.5.1.0
   - hashtables ^>= 1.4.2
-  - haskoin-store-data ^>= 1.8.1
+  - haskoin-store-data ^>= 1.9
   - monad-control ^>= 1.0.3.1
   - mtl ^>= 2.3.2
   - haskoin-core ^>= 1.6.1

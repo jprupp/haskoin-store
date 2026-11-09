@@ -32,4 +32,4 @@ extra-deps:
     commit: 10d6a3ce22822be0a08e8b11ce909888f813ac65
   # haskoin-store-data from its repository, until it is on Hackage.
   - git: https://github.com/jprupp/haskoin-store-data.git
-    commit: ba49bf99693e688ee46aa3757cdffa48d3eaf443
+    commit: 1c15b522ef4d15df36cc068737a8fb3d1d74eb83
