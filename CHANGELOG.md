@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     not seen), so stores do not undo each other's work, and every entry is
     written together with the bodies it needs, so a store that is behind can
     serve it in full.
+  - The rules for claims and for replacing entries are pure decisions
+    (`Haskoin.Store.Cache.Protocol`). A model test runs several stores
+    catching up with a chain in random interleavings against a model of
+    Redis, and checks that they end with the entry of the tip, that no
+    store replaces an entry with one that knows less, that each change is
+    written once, and that stores catching up after the first write nothing.
   - Keys start with `hs2:<network>:`, so the cache can share a Redis with the
     cache of older versions and with stores of other networks.
   - `--redis-max-xpubs` (`REDIS_MAX_XPUBS`, default 10000) replaces

@@ -65,6 +65,10 @@
 --   nothing if a body would be missing. A store that is behind can serve a
 --   cached xpub in full, transactions it has not imported included.
 --
+-- The first two rules are the pure decisions of
+-- "Haskoin.Store.Cache.Protocol", where a model test checks them with several
+-- stores catching up in random interleavings.
+--
 -- A lock per xpub keeps two stores from reloading it at the same time, and
 -- every change of several keys is a Lua script, so readers never see half of
 -- one. Stores that answer from Redis serve the same data; stores whose
@@ -164,6 +168,15 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (Chain, LogLevel (..), Logger, chainGetBest, logAt)
+import Haskoin.Store.Cache.Protocol
+  ( Claim (..),
+    OnClaim (..),
+    OnReload (..),
+    Reload (..),
+    afterClaim,
+    afterReload,
+    mayReplace,
+  )
 import Haskoin.Store.Common (Limits (..), Start (..), StoreEvent (..), loopForever)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
@@ -571,18 +584,6 @@ cacheEvict c n = do
   count c (.evictions) evicted
   return evicted
 
--- | What became of a reload.
-data Reload
-  = -- | the entry was replaced
-    Reloaded
-  | -- | Redis knows more about the xpub than this store: its entry is stamped
-    -- with a higher block, or has a transaction this store has never seen. It
-    -- is left for a store that knows more.
-    Behind
-  | -- | another store holds the lock of the xpub
-    Locked
-  deriving (Eq, Show)
-
 -- | Reload an xpub from the database and replace its entry in Redis, unless
 -- another store holds its lock or Redis knows more than this store (see
 -- 'Reload'). The transactions given are the ones that changed it: their
@@ -605,7 +606,8 @@ cacheRefresh c x changed =
         o <- R.zrangeWithscores (xkey c x "txs") 0 (-1)
         return ((,) <$> h <*> o)
       height <- bestHeight c
-      if maybe False (> toInteger height) (readMaybe . C8.unpack =<< stamp)
+      let stamped = readMaybe . C8.unpack =<< stamp
+      if not (mayReplace stamped height False)
         then behind
         else do
           bals <- Q.xPubBals c.db x
@@ -614,7 +616,7 @@ cacheRefresh c x changed =
               gone = [h | (bs, _) <- old, not (HashSet.member bs new), Right h <- [decode bs]]
           -- a transaction that Redis has and this store has never seen
           known <- Q.getManyTxData c.db gone
-          if any isNothing known
+          if not (mayReplace stamped height (any isNothing known))
             then behind
             else do
               utxos <- Q.xPubUnspents c.db bals def'
@@ -760,19 +762,19 @@ work c lastBest js = do
   fromEvents <- concat <$> mapM (eventChanges c lastBest) [e | JobEvent e <- js]
   let toClaim = fromEvents <> [(k, x, ts) | JobClaim x ts ks <- js, k <- ks]
   claimed <- fmap catMaybes . forM toClaim $ \(k, x, ts) ->
-    claim c k >>= \case
-      Claimed -> return (Just (x, (ts, [k])))
-      Done -> return Nothing
-      Busy -> later c (JobClaim x ts [k]) >> return Nothing
+    afterClaim <$> claim c k >>= \case
+      ReloadNow -> return (Just (x, (ts, [k])))
+      Skip -> return Nothing
+      ClaimLater -> later c (JobClaim x ts [k]) >> return Nothing
   let held =
         HashMap.fromListWith
           (\(a, b) (a', b') -> (a <> a', b <> b'))
           (claimed <> [(x, (ts, ks)) | JobHeld x ts ks <- js])
   forM_ (HashMap.toList held) $ \(x, (ts, ks)) ->
-    reload x ts >>= \case
-      Reloaded -> finishClaims c ks
-      Behind -> releaseClaims c ks
-      Locked -> extendClaims c ks >> later c (JobHeld x ts ks)
+    afterReload <$> reload x ts >>= \case
+      Finish -> finishClaims c ks
+      Release -> releaseClaims c ks
+      Hold -> extendClaims c ks >> later c (JobHeld x ts ks)
   forM_ (nub [x | JobCache x <- js, not (HashMap.member x held)]) $ \x ->
     cacheIsCached c x >>= \case
       True -> return ()
@@ -807,15 +809,6 @@ eventChanges c lastBest e = do
       updateSpenders c tds
       affected <- affectedXPubs c tds
       return [(c.prefix <> "ev:" <> name <> ":" <> xpubId x, x, ts) | (x, ts) <- affected]
-
--- | Whether this store may apply a change.
-data Claim
-  = -- | it may: it holds the claim now
-    Claimed
-  | -- | another store applied it
-    Done
-  | -- | another store holds the claim
-    Busy
 
 -- | Claim a change. A claim is held for two minutes, so that a store that
 -- dies while holding it does not keep others from the change for long.
