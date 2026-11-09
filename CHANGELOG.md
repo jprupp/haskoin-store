@@ -50,8 +50,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   and the manager pass their state explicitly. `WriterT`, `ImportM`, the
   `StoreWrite` class, `BlockT` and `CacheT` are gone, and
   `withDatabaseReader` passes the reader to a plain function. The
-  `StoreReadBase` and `StoreReadExtra` classes remain for the web server.
-  This changes the library API.
+  `StoreReadBase` and `StoreReadExtra` classes remain for the web server,
+  which implements them with the queries; `DatabaseReaderT`, `withDB` and
+  the instances of the classes for the database reader are gone. This
+  changes the library API.
+- Both packages use the GHC2024 edition, with `DuplicateRecordFields`,
+  `NoFieldSelectors`, `OverloadedRecordDot` and `OverloadedStrings` on for
+  every module, and explicit deriving strategies.
 
 - The packages live in `haskoin-store/` and `haskoin-store-data/`, named
   after them, instead of `store/` and `data/`. Each has its README and

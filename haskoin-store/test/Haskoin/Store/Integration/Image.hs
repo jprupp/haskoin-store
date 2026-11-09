@@ -1,6 +1,3 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 -- |
 -- Module      : Haskoin.Store.Integration.Image
 -- Copyright   : (c) Haskoin Developers

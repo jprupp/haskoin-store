@@ -1,11 +1,4 @@
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NoFieldSelectors #-}
 
 module Haskoin.StoreSpec (spec) where
 
@@ -26,6 +19,7 @@ import System.Mem (performMajorGC)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Store
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.TestBlocks (nextBlock)
 import NQE
 import Network.Socket
@@ -58,7 +52,7 @@ spec = prepareContext $ \ctx -> do
         bestHeight `shouldBe` 8
     it "get a block and its transactions" $
       withTestStore bchRegTest ctx "get-block-txs" $ \TestStore {..} ->
-        flip runReaderT testStoreDB $ do
+        do
           let h1 = "5369ef2386c72acdf513ffd80aeba2a1774e2f004d120761e54a8bf614173f3e"
               get_the_block h =
                 receive testStoreEvents >>= \case
@@ -68,14 +62,13 @@ spec = prepareContext $ \ctx -> do
                         get_the_block ((h :: Int) - 1)
                   _ -> get_the_block h
           bh <- get_the_block 15
-          m <- getBlock bh
+          m <- Q.getBlock testStoreDB bh
           let bd = fromMaybe (error "Could not get block") m
-          t1 <- getTransaction h1
-          lift $ do
-            bd.height `shouldBe` 15
-            length bd.txs `shouldBe` 1
-            listToMaybe bd.txs `shouldBe` Just h1
-            fmap (txHash . transactionData) t1 `shouldBe` Just h1
+          t1 <- Q.getTxData testStoreDB h1
+          bd.height `shouldBe` 15
+          length bd.txs `shouldBe` 1
+          listToMaybe bd.txs `shouldBe` Just h1
+          fmap (txHash . (.tx)) t1 `shouldBe` Just h1
     it "downloads 80 blocks with a request for 64 and one for the remaining 16" $
       withTestStore bchRegTest ctx "block-window" $ \TestStore {..} -> do
         bs <- replicateM 80 . receiveMatch testStoreEvents $ \case

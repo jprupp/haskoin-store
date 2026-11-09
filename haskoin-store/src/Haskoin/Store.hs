@@ -1,5 +1,3 @@
-{-# LANGUAGE DuplicateRecordFields #-}
-
 -- |
 -- Module      : Haskoin.Store
 -- Copyright   : (c) Haskoin Developers

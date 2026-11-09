@@ -1,15 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
 
 -- |
@@ -369,12 +359,12 @@ setPeersConnected self =
 -- | Record how long a successful block import took.
 withBlockTiming :: BlockStore -> IO (Either l r) -> IO (Either l r)
 withBlockTiming self go = do
-  return self.metrics >>= \case
+  case self.metrics of
     Just m -> do
-      start <- round . (* 1000) <$> liftIO getPOSIXTime
+      start <- round . (* 1000) <$> getPOSIXTime
       go >>= \case
         Right x -> do
-          end <- round . (* 1000) <$> liftIO getPOSIXTime
+          end <- round . (* 1000) <$> getPOSIXTime
           addTiming m.block (end - start)
           return (Right x)
         Left y -> return (Left y)
@@ -429,7 +419,7 @@ runImport self net ctx f = fmap fst <$> runImportMempool self net ctx f
 runImportMempool :: BlockStore -> Network -> Ctx -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
 runImportMempool self net ctx f = do
   r <- try $ runWriterMempool net ctx self.config.db self.config.logger f
-  forM_ r $ \(_, c) -> return self.metrics >>= mapM_ (\m -> do
+  forM_ r $ \(_, c) -> forM_ self.metrics (\m -> do
     incrementGauge m.mempool (length c.added)
     decrementGauge m.mempool (length c.removed))
   return r
@@ -444,7 +434,7 @@ runImportNotify self block f = do
   runImportMempool self net ctx f >>= \case
     Left e -> return (Left e)
     Right (x, c) -> do
-      l <- return self.config.pub
+      let l = self.config.pub
       forM_ (filter notInBlock c.removed) $ \h ->
         publish (StoreMempoolDelete h) l
       forM_ (filter notInBlock c.added) $ \h ->
@@ -567,7 +557,7 @@ isInSync self =
       logError self "Block database uninitialized"
       throwIO Uninitialized
     Just bb -> do
-      cb <- return self.config.chain >>= liftIO . chainGetBest
+      cb <- chainGetBest self.config.chain
       if headerHash cb.header == bb
         then clearSyncingState self >> return True
         else return False
@@ -578,20 +568,20 @@ guardSync self f = isInSync self >>= \s -> when s f
 
 -- | Run an action only if the mempool is indexed.
 guardMempool :: BlockStore -> IO () -> IO ()
-guardMempool self f = return self.config.noMempool >>= \n -> unless n f
+guardMempool self f = unless self.config.noMempool f
 
 -- | Ask a peer for its mempool, once per peer, if in sync and mempool sync is enabled.
 syncMempool :: BlockStore -> Peer -> IO ()
 syncMempool self p =
   guardMempool self . guardSync self $ do
-    s <- return self.config.syncMempool
-    m <- return self.syncedMempool
+    let s = self.config.syncMempool
+    let m = self.syncedMempool
     y <- not . HashSet.member p.label <$> readTVarIO m
     when (s && y) $ do
       logDebug self $
         "Requesting mempool from peer: " <> p.label
       atomically . modifyTVar m $ HashSet.insert p.label
-      liftIO $ MMempool `sendMessage` p
+      MMempool `sendMessage` p
 
 -- | Import a block from the syncing peer, then ask for more blocks or, if now in
 -- sync, sync the mempool. Disconnects the peer if it is not the syncing peer, if
@@ -652,7 +642,7 @@ processBlock self peer block =
 -- | Set the blocks requested from the syncing peer.
 setSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
 setSyncingBlocks self hs =
-  return self.peer >>= \box ->
+  let box = self.peer in
     atomically $
       modifyTVar box $ \case
         Nothing -> Nothing
@@ -661,14 +651,14 @@ setSyncingBlocks self hs =
 -- | Blocks requested from the syncing peer and not yet imported.
 getSyncingBlocks :: BlockStore -> IO [BlockHash]
 getSyncingBlocks self =
-  return self.peer >>= readTVarIO >>= \case
+  readTVarIO self.peer >>= \case
     Nothing -> return []
     Just x -> return x.blocks
 
 -- | Add blocks to those requested from the syncing peer.
 addSyncingBlocks :: BlockStore -> [BlockHash] -> IO ()
 addSyncingBlocks self hs =
-  return self.peer >>= \box ->
+  let box = self.peer in
     atomically $
       modifyTVar box $ \case
         Nothing -> Nothing
@@ -677,7 +667,7 @@ addSyncingBlocks self hs =
 -- | Remove a block from those requested from the syncing peer.
 removeSyncingBlock :: BlockStore -> BlockHash -> IO ()
 removeSyncingBlock self h = do
-  box <- return self.peer
+  let box = self.peer
   atomically $
     modifyTVar box $ \case
       Nothing -> Nothing
@@ -693,8 +683,8 @@ checkPeer self p =
 -- | Header of a block from the node.
 getBlockNode :: BlockStore -> BlockHash -> IO (Maybe BlockNode)
 getBlockNode self blockhash = do
-  ch <- return self.config.chain
-  liftIO $ chainGetBlock ch blockhash
+  let ch = self.config.chain
+  chainGetBlock ch blockhash
 
 -- | Disconnect a peer that could not find requested blocks.
 processNoBlocks :: BlockStore -> Peer -> [BlockHash] -> IO ()
@@ -714,7 +704,7 @@ processNoBlocks self p hs = do
 -- | Queue a transaction received from a peer for import.
 processTx :: BlockStore -> Peer -> Tx -> IO ()
 processTx self p tx = guardMempool self $ do
-  t <- liftIO getCurrentTime
+  t <- getCurrentTime
   logDebug self $
     "Received tx "
       <> txHashToHex (txHash tx)
@@ -725,7 +715,7 @@ processTx self p tx = guardMempool self $ do
 -- | Drop queued transactions received more than an hour ago.
 pruneOrphans :: BlockStore -> IO ()
 pruneOrphans self = guardMempool self $ do
-  ts <- return self.txs
+  let ts = self.txs
   now <- liftIO getCurrentTime
   -- keep pending transactions received within the last hour, drop older ones
   atomically . modifyTVar' ts . HashMap.filter $ \p ->
@@ -734,8 +724,8 @@ pruneOrphans self = guardMempool self $ do
 -- | Queue a transaction for import.
 addPendingTx :: BlockStore -> PendingTx -> IO ()
 addPendingTx self p = do
-  ts <- return self.txs
-  rq <- return self.requested
+  let ts = self.txs
+  let rq = self.requested
   atomically $ do
     modifyTVar ts $ HashMap.insert th p
     modifyTVar rq $ HashSet.delete th
@@ -746,17 +736,17 @@ addPendingTx self p = do
 -- | Remember for twenty seconds that a transaction was requested, so that it is not requested again.
 addRequestedTx :: BlockStore -> TxHash -> IO ()
 addRequestedTx self th = do
-  qbox <- return self.requested
+  let qbox = self.requested
   atomically $ modifyTVar qbox $ HashSet.insert th
-  liftIO . void . async $ do
+  void . async $ do
     threadDelay 20000000
     atomically $ modifyTVar qbox $ HashSet.delete th
 
 -- | Whether a transaction is queued or was requested recently.
 isPending :: BlockStore -> TxHash -> IO Bool
 isPending self th = do
-  tbox <- return self.txs
-  qbox <- return self.requested
+  let tbox = self.txs
+  let qbox = self.requested
   atomically $ do
     ts <- readTVar tbox
     rs <- readTVar qbox
@@ -769,7 +759,7 @@ isPending self th = do
 pendingTxs :: BlockStore -> Int -> IO [PendingTx]
 pendingTxs self i = do
   selected <-
-    return self.txs >>= \box -> atomically $ do
+    let box = self.txs in atomically $ do
       pending <- readTVar box
       let (selected, rest) = select pending
       writeTVar box rest
@@ -800,7 +790,7 @@ fulfillOrphans block_read th =
 -- missing parents of the others.
 updateOrphans :: BlockStore -> IO ()
 updateOrphans self = do
-  box <- return self.txs
+  let box = self.txs
   pending <- readTVarIO box
   let orphans = HashMap.filter (not . null . (.deps)) pending
   updated <- forM orphans $ \p -> do
@@ -900,14 +890,14 @@ processMempool self = guardMempool self $ do
 pruneMempool :: BlockStore -> IO ()
 pruneMempool self =
   guardMempool self $ do
-    days <- return self.config.mempoolTimeout
+    let days = self.config.mempoolTimeout
     when (days > 0) $ do
-      time <- (floor . utcTimeToPOSIXSeconds) <$> liftIO getCurrentTime
+      time <- (floor . utcTimeToPOSIXSeconds) <$> getCurrentTime
       let thresh = time - (fromIntegral days * 24 * 60 * 60)
       -- runs on every clock tick: read only the expired entries, oldest
       -- first, from the index by time
-      db <- return self.config.db
-      txs <- map snd <$> liftIO (getMempoolBefore db thresh 1000)
+      let db = self.config.db
+      txs <- map snd <$> (getMempoolBefore db thresh 1000)
       unless (null txs) $ do
         logInfo self $
           "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
@@ -970,11 +960,11 @@ processTxs self p hs = guardMempool self . guardSync self $ do
               return (Just h)
     go xs = do
       mapM_ (addRequestedTx self) xs
-      net <- return self.config.net
+      let net = self.config.net
       let inv = if net.segWit then InvWitnessTx else InvTx
           vec = map (InvVector inv . (.get)) xs
           msg = MGetData (GetData vec)
-      liftIO $ msg `sendMessage` p
+      msg `sendMessage` p
 
 -- | Record that the syncing peer just delivered something.
 touchPeer :: BlockStore -> IO ()
@@ -982,7 +972,7 @@ touchPeer self =
   getSyncingState self >>= \case
     Nothing -> return ()
     Just _ -> do
-      box <- return self.peer
+      let box = self.peer
       now <- liftIO getCurrentTime
       atomically $
         modifyTVar box $
@@ -992,7 +982,7 @@ touchPeer self =
 -- | Disconnect the syncing peer if it has been silent for too long.
 checkTime :: BlockStore -> IO ()
 checkTime self =
-  return self.peer >>= readTVarIO >>= \case
+  readTVarIO self.peer >>= \case
     Nothing -> return ()
     Just
       Syncing
@@ -1000,7 +990,7 @@ checkTime self =
           peer = p
         } -> do
         now <- liftIO getCurrentTime
-        peer_time_out <- return self.config.peerTimeout
+        let peer_time_out = self.config.peerTimeout
         when (now `diffUTCTime` t > peer_time_out) $ do
           logError self $
             "Syncing peer timeout: " <> p.label
@@ -1010,10 +1000,10 @@ checkTime self =
 revertToMainChain :: BlockStore -> IO ()
 revertToMainChain self = do
   h <- headerHash . (.header) <$> getBest self
-  ch <- return self.config.chain
+  let ch = self.config.chain
   net <- getNetwork self
   ctx <- getCtx self
-  liftIO (chainBlockMain ch h) >>= \x -> unless x $ do
+  (chainBlockMain ch h) >>= \x -> unless x $ do
     logWarn self $
       "Reverting best block: "
         <> blockHashToHex h
@@ -1037,8 +1027,8 @@ getBest self = do
       Nothing -> do
         logError self "No best block set"
         throwIO Uninitialized
-  ch <- return self.config.chain
-  liftIO (chainGetBlock ch bb) >>= \case
+  let ch = self.config.chain
+  (chainGetBlock ch bb) >>= \case
     Just x -> return x
     Nothing -> do
       logError self $
@@ -1058,8 +1048,8 @@ getSyncBest self = do
             logError self "No best block set"
             throwIO Uninitialized
       hs -> return $ last hs
-  ch <- return self.config.chain
-  liftIO (chainGetBlock ch bb) >>= \case
+  let ch = self.config.chain
+  (chainGetBlock ch bb) >>= \case
     Just x -> return x
     Nothing -> do
       logError self $
@@ -1114,29 +1104,29 @@ syncMe self = do
             <> " blocks from peer: "
             <> p.label
         addSyncingBlocks self $ map (headerHash . (.header)) bns
-        liftIO $ MGetData (GetData iv) `sendMessage` p
+        MGetData (GetData iv) `sendMessage` p
   where
     getiv bns = do
-      w <- return self.config.net.segWit
+      let w = self.config.net.segWit
       let i = if w then InvWitnessBlock else InvBlock
           f = InvVector i . (.get) . headerHash . (.header)
       return $ map f bns
     getbh =
-      liftIO . chainGetBest =<< return self.config.chain
+      chainGetBest self.config.chain
     -- The blocks right after the last requested one, up to one window or
     -- the chain tip, whichever comes first.
     sel bb bh = do
       window <- blockWindow self
       top <- findAncestor self (min (bb.height + fromIntegral window) bh.height) bh
-      ch <- return self.config.chain
-      ps <- liftIO $ chainGetParents ch (bb.height + 1) top
+      let ch = self.config.chain
+      ps <- chainGetParents ch (bb.height + 1) top
       return $ ps <> [top]
 
 -- | Ancestor of a header at a height. Throws 'AncestorNotInChain' if missing.
 findAncestor :: BlockStore -> BlockHeight -> BlockNode -> IO BlockNode
 findAncestor self height target = do
-  ch <- return self.config.chain
-  liftIO (chainGetAncestor ch height target) >>= \case
+  let ch = self.config.chain
+  (chainGetAncestor ch height target) >>= \case
     Just ancestor -> return ancestor
     Nothing -> do
       let h = headerHash target.header
@@ -1150,17 +1140,17 @@ findAncestor self height target = do
 -- | Forget a peer: release it if it was the syncing peer, and forget that its mempool was requested.
 finishPeer :: BlockStore -> Peer -> IO ()
 finishPeer self p = do
-  box <- return self.peer
+  let box = self.peer
   readTVarIO box >>= \case
     Just Syncing {peer = p'} | p == p' -> reset_it box
     _ -> return ()
-  y <- return self.syncedMempool
+  let y = self.syncedMempool
   atomically $ modifyTVar y $ HashSet.delete p.label
   where
     reset_it box = do
       atomically $ writeTVar box Nothing
       logDebug self $ "Releasing peer: " <> p.label
-      liftIO $ setFree p
+      setFree p
 
 -- | Make a peer the syncing peer if there is none and the peer is not busy.
 trySetPeer :: BlockStore -> Peer -> IO Bool
@@ -1170,12 +1160,12 @@ trySetPeer self p =
     Nothing -> set_it
   where
     set_it =
-      liftIO (setBusy p) >>= \case
+      (setBusy p) >>= \case
         False -> return False
         True -> do
           logDebug self $
             "Locked peer: " <> p.label
-          box <- return self.peer
+          let box = self.peer
           now <- liftIO getCurrentTime
           atomically . writeTVar box $
             Just
@@ -1202,7 +1192,7 @@ trySyncing self =
         False -> recurse ps
         True -> syncMe self
     online_peer = do
-      ops <- liftIO . getPeers =<< return self.config.peerMgr
+      ops <- getPeers =<< return self.config.peerMgr
       let ps = map (.mailbox) ops
       recurse ps
 
@@ -1224,7 +1214,7 @@ getSyncingState self =
 -- | Release the syncing peer, if any.
 clearSyncingState :: BlockStore -> IO ()
 clearSyncingState self =
-  return self.peer >>= readTVarIO >>= \case
+  readTVarIO self.peer >>= \case
     Nothing -> return ()
     Just Syncing {peer = p} -> finishPeer self p
 
@@ -1289,7 +1279,7 @@ pingMe :: (MonadIO m) => Mailbox BlockStoreMessage -> m ()
 pingMe mbox =
   loopForever $ do
     BlockPing `query` mbox
-    delay <- liftIO $ randomRIO (100 * 1000, 1000 * 1000)
+    delay <- randomRIO (100 * 1000, 1000 * 1000)
     threadDelay delay
 
 -- | Tell the block store that a peer connected.

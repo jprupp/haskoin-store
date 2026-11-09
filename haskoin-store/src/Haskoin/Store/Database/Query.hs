@@ -1,15 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE NoFieldSelectors #-}
--- The instances of the store classes for 'DatabaseReaderT' live here, next to
--- the functions they wrap, rather than with the class or the type. They are
--- only kept until the last users of the classes are rewritten.
-{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- |
 -- Module      : Haskoin.Store.Database.Query
@@ -34,10 +22,7 @@
 --
 -- Streams are still conduits, run in 'IO': they are a good fit for merging the
 -- sorted indices of many addresses and reading only as far as a page needs.
---
--- The instances of the classes for 'DatabaseReaderT' remain, as thin wrappers
--- over these functions, until the code that still uses the classes (the web
--- server and the import logic) is rewritten.
+
 module Haskoin.Store.Database.Query
   ( -- * Blocks
     getBestBlock,
@@ -87,7 +72,6 @@ import Conduit
     (.|),
   )
 import Control.Monad (replicateM, (>=>))
-import Control.Monad.Reader (ReaderT (..))
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.Default (def)
@@ -139,16 +123,13 @@ import Haskoin.Store.Common
     txRefKey,
     unspentKey,
   )
-import Haskoin.Store.Common qualified as C
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import System.Metrics.StatsD (decrementGauge, incrementCounter, incrementGauge)
 import UnliftIO
-  ( MonadIO,
-    bracket,
+  ( bracket,
     bracket_,
-    liftIO,
     mask_,
     modifyIORef',
     newIORef,
@@ -542,35 +523,3 @@ retrieveManyCF db cf keys =
 joinConduits :: (Ord k) => (o -> k) -> [ConduitT () o IO ()] -> Limits -> IO [o]
 joinConduits key cs l =
   runConduit $ joinDescStreams key cs .| applyLimitsC l .| sinkList
-
--------------------------------------------------------------------------------
--- Temporary instances
--------------------------------------------------------------------------------
-
-instance (MonadIO m) => C.StoreReadBase (ReaderT DatabaseReader m) where
-  getCtx = ReaderT $ \r -> return r.ctx
-  getNetwork = ReaderT $ \r -> return r.net
-  getBestBlock = ReaderT $ \r -> liftIO (getBestBlock r)
-  getBlocksAtHeight h = ReaderT $ \r -> liftIO (getBlocksAtHeight r h)
-  getBlock h = ReaderT $ \r -> liftIO (getBlock r h)
-  getTxData th = ReaderT $ \r -> liftIO (getTxData r th)
-  getManyTxData ths = ReaderT $ \r -> liftIO (getManyTxData r ths)
-  getSpender op = ReaderT $ \r -> liftIO (getSpender r op)
-  getBalance a = ReaderT $ \r -> liftIO (getBalance r a)
-  getUnspent op = ReaderT $ \r -> liftIO (getUnspent r op)
-  getMempool = ReaderT $ \r -> liftIO (getMempool r)
-  getMempoolPage l = ReaderT $ \r -> liftIO (getMempoolPage r l)
-
-instance (MonadIO m) => C.StoreReadExtra (ReaderT DatabaseReader m) where
-  getAddressesTxs as l = ReaderT $ \r -> liftIO (getAddressesTxs r as l)
-  getAddressesUnspents as l = ReaderT $ \r -> liftIO (getAddressesUnspents r as l)
-  getInitialGap = ReaderT $ \r -> return r.initGap
-  getMaxGap = ReaderT $ \r -> return r.maxGap
-  getNumTxData i = ReaderT $ \r -> liftIO (getNumTxData r i)
-  getBalances as = ReaderT $ \r -> liftIO (getBalances r as)
-  getAddressTxs a l = ReaderT $ \r -> liftIO (getAddressTxs r a l)
-  getAddressUnspents a l = ReaderT $ \r -> liftIO (getAddressUnspents r a l)
-  xPubBals x = ReaderT $ \r -> liftIO (xPubBals r x)
-  xPubUnspents _ bs l = ReaderT $ \r -> liftIO (xPubUnspents r bs l)
-  xPubTxs _ bs l = ReaderT $ \r -> liftIO (xPubTxs r bs l)
-  xPubTxCount _ bs = ReaderT $ \r -> liftIO (xPubTxCount r bs)

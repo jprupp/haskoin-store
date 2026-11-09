@@ -51,6 +51,11 @@ library
       Paths_haskoin_store
   hs-source-dirs:
       src
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       aeson >=2.2.5.1 && <2.3
@@ -94,7 +99,7 @@ library
     , warp >=3.4.17 && <3.5
     , websockets >=0.13.0.0 && <0.14
     , wreq >=0.5.4.5 && <0.6
-  default-language: Haskell2010
+  default-language: GHC2024
 
 executable haskoin-store
   main-is: Main.hs
@@ -102,6 +107,11 @@ executable haskoin-store
       Paths_haskoin_store
   hs-source-dirs:
       app
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson >=2.2.5.1 && <2.3
@@ -148,7 +158,7 @@ executable haskoin-store
     , warp >=3.4.17 && <3.5
     , websockets >=0.13.0.0 && <0.14
     , wreq >=0.5.4.5 && <0.6
-  default-language: Haskell2010
+  default-language: GHC2024
 
 test-suite spec
   type: exitcode-stdio-1.0
@@ -168,6 +178,11 @@ test-suite spec
       Paths_haskoin_store
   hs-source-dirs:
       test
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N4 -T -M4g"
   build-depends:
       QuickCheck >=2.17.1.0 && <2.18
@@ -217,7 +232,7 @@ test-suite spec
     , warp >=3.4.17 && <3.5
     , websockets >=0.13.0.0 && <0.14
     , wreq >=0.5.4.5 && <0.6
-  default-language: Haskell2010
+  default-language: GHC2024
   build-tool-depends: hspec-discover:hspec-discover
 
 benchmark haskoin-store-bench
@@ -227,6 +242,11 @@ benchmark haskoin-store-bench
       Paths_haskoin_store
   hs-source-dirs:
       bench
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson >=2.2.5.1 && <2.3
@@ -272,4 +292,4 @@ benchmark haskoin-store-bench
     , warp >=3.4.17 && <3.5
     , websockets >=0.13.0.0 && <0.14
     , wreq >=0.5.4.5 && <0.6
-  default-language: Haskell2010
+  default-language: GHC2024

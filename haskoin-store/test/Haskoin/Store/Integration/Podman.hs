@@ -1,8 +1,3 @@
-{-# LANGUAGE NoFieldSelectors #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-
 -- |
 -- Module      : Haskoin.Store.Integration.Podman
 -- Copyright   : (c) Haskoin Developers

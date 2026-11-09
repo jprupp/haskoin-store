@@ -1,12 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NoFieldSelectors #-}
 
 {- |
 Module      : Haskoin.Store.Database.Types
@@ -364,7 +357,8 @@ instance KeyValue MemTimeKey ()
 
 -- | Block entry database key.
 newtype BlockKey = BlockKey BlockHash
-  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+  deriving stock (Show, Read, Eq, Ord, Generic)
+  deriving anyclass (Hashable)
 
 instance Serialize BlockKey where
   -- 0x01 · BlockHash
@@ -381,7 +375,8 @@ instance KeyValue BlockKey BlockData
 
 -- | Block height database key.
 newtype HeightKey = HeightKey BlockHeight
-  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+  deriving stock (Show, Read, Eq, Ord, Generic)
+  deriving anyclass (Hashable)
 
 instance Serialize HeightKey where
   -- 0x03 · BlockHeight

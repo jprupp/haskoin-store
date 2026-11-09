@@ -1,6 +1,3 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Haskoin.Store.CacheSpec (spec) where
 
 import Data.ByteString qualified as BS

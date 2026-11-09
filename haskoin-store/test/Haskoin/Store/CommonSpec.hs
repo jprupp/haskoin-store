@@ -1,8 +1,3 @@
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-
 module Haskoin.Store.CommonSpec (spec) where
 
 import Conduit (runConduit, runConduitPure, sinkList, takeC, yieldMany, (.|))

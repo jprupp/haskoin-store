@@ -1,7 +1,3 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | Regtest blocks for tests. Their headers carry valid proof of work, so
 -- they pass haskoin-node's header checks as well as the store's import.
 module Haskoin.Store.TestBlocks

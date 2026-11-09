@@ -1,13 +1,4 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NoFieldSelectors #-}
 
 -- |
 -- Module      : Haskoin.Store.Database.Reader
@@ -17,15 +8,15 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Queries against the RocksDB database of the store.
---
--- 'DatabaseReaderT' implements 'Haskoin.Store.Common.StoreReadBase' and 'Haskoin.Store.Common.StoreReadExtra' by reading
--- the indices directly from RocksDB. The database is opened with
--- 'withDatabaseReader', which also creates or migrates it.
+-- The RocksDB database of the store: opening it ('withDatabaseReader'), which
+-- also creates or migrates it, its column families, its metrics, and the
+-- memo of the addresses of extended public keys. The queries are in
+-- "Haskoin.Store.Database.Query".
 --
 -- Data is split across column families by kind; see 'addrTxCF' and the other
 -- column family accessors. The keys stored in each are described in
 -- "Haskoin.Store.Database.Types".
+--
 -- = Why column families
 --
 -- Each kind of record lives in its own column family. Their keys and access
@@ -43,11 +34,9 @@
 module Haskoin.Store.Database.Reader
   ( -- * RocksDB Database Access
     DatabaseReader (..),
-    DatabaseReaderT,
     DataMetrics (..),
     Derived (..),
     derivedAddrs,
-    withDB,
     createDataMetrics,
     withDatabaseReader,
     memoryReport,
@@ -65,7 +54,6 @@ where
 
 import Conduit
 import Control.Monad (forM)
-import Control.Monad.Reader
 import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
@@ -83,9 +71,6 @@ import Haskoin.Store.Database.Types
 import System.Metrics.StatsD
 import Text.Read (readMaybe)
 import UnliftIO
-
--- | Monad transformer to query the database.
-type DatabaseReaderT = ReaderT DatabaseReader
 
 -- | Open database and its settings.
 data DatabaseReader = DatabaseReader
@@ -202,10 +187,6 @@ createDataMetrics s = do
 -- read with the wrong layout.
 dataVersion :: Word32
 dataVersion = 20
-
--- | Run a query against a database.
-withDB :: DatabaseReader -> DatabaseReaderT m a -> m a
-withDB = flip runReaderT
 
 -- | Open the database and run a query against it. Creates the database and its
 -- column families if missing, and migrates it from older versions.

@@ -1,20 +1,17 @@
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Haskoin.Store.LogicSpec (spec) where
 
 import Control.Monad (forM_, void)
-import Control.Monad.Reader (runReaderT)
 import Data.ByteString qualified as B
+import Data.Functor ((<&>))
 import Data.List (sort, sortOn)
+import Data.Maybe (fromMaybe)
 import Data.Ord (Down (..))
 import Data.Text qualified as T
 import Data.Word (Word32, Word64)
 import Database.RocksDB.Query (insert, insertCF, matchingAsListCF, retrieve)
 import Haskoin
-  ( Block (..),
+  ( Address,
+    Block (..),
     BlockHash,
     BlockHeader (..),
     BlockNode (..),
@@ -35,7 +32,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger (..))
-import Haskoin.Store.Common (Limits (..), StoreReadBase (..), getActiveTxData, getDefaultBalance)
+import Haskoin.Store.Common (Limits (..))
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -43,9 +40,10 @@ import Haskoin.Store.Data
     Spender (..),
     TxData (..),
     Unspent (..),
+    zeroBalance,
   )
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Reader (DatabaseReader (..), DatabaseReaderT, memoryReport, mempoolCF, withDatabaseReader)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), memoryReport, mempoolCF, withDatabaseReader)
 import Haskoin.Store.Database.Types (MemKey (..), MemTimeKey (..), MemTxKey (..), VersionKey (..))
 import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, addToMempool, deleteFromMempool, runWriter, runWriterMempool)
 import Haskoin.Store.Logic
@@ -68,7 +66,7 @@ spec = prepareContext $ \ctx -> do
       withDB btcRegTest ctx $ \db -> do
         importing db initBest `shouldReturn` Right ()
         importing db initBest `shouldReturn` Right ()
-        reading db getBestBlock `shouldReturn` Just genesis
+        Q.getBestBlock db `shouldReturn` Just genesis
 
   describe "memoryReport" $
     it "lists the memory of every column family" $
@@ -90,8 +88,8 @@ spec = prepareContext $ \ctx -> do
           insert r.db VersionKey (18 :: Word32)
           insert r.db MemKey old
         open $ \r -> do
-          reading r getMempool `shouldReturn` old
-          reading r (getMempoolPage (Limits 1 1 Nothing)) `shouldReturn` drop 1 old
+          Q.getMempool r `shouldReturn` old
+          Q.getMempoolPage r (Limits 1 1 Nothing) `shouldReturn` drop 1 old
           (retrieve r.db MemKey :: IO (Maybe [(Word64, TxHash)])) `shouldReturn` Nothing
           retrieve r.db VersionKey `shouldReturn` Just (20 :: Word32)
 
@@ -107,7 +105,7 @@ spec = prepareContext $ \ctx -> do
           (matchingAsListCF r.db (mempoolCF r.db) MemTimeKeyS :: IO [(MemTimeKey, ())])
             `shouldReturn` []
         open $ \r -> do
-          reading r getMempool `shouldReturn` old
+          Q.getMempool r `shouldReturn` old
           retrieve r.db VersionKey `shouldReturn` Just (20 :: Word32)
 
   describe "mempool index" $ do
@@ -117,9 +115,9 @@ spec = prepareContext $ \ctx -> do
     it "pages the mempool newest first" $
       withDB btcRegTest ctx $ \db -> do
         _ <- fill db
-        reading db getMempool `shouldReturn` newest
+        Q.getMempool db `shouldReturn` newest
         forM_ [(0, 0), (3, 0), (3, 2), (2, 5), (4, 7), (0, 3)] $ \(l, o) ->
-          reading db (getMempoolPage (Limits l o Nothing))
+          Q.getMempoolPage db (Limits l o Nothing)
             `shouldReturn` take' l (drop (fromIntegral o) newest)
     it "reads the oldest entries before a time" $
       withDB btcRegTest ctx $ \db -> do
@@ -138,13 +136,13 @@ spec = prepareContext $ \ctx -> do
         (sort c.added, c.removed) `shouldBe` (sort [h1, h2], [])
         -- a new time moves the entry in the index, and is no change
         batch (\w -> addToMempool w h1 30) `shouldReturn` MempoolChanges [] []
-        reading db getMempool `shouldReturn` [(30, h1), (20, h2)]
+        Q.getMempool db `shouldReturn` [(30, h1), (20, h2)]
         -- removing what is not there, or adding and removing in one batch,
         -- is no change either
         batch (\w -> deleteFromMempool w h3) `shouldReturn` MempoolChanges [] []
         batch (\w -> addToMempool w h3 40 >> deleteFromMempool w h3) `shouldReturn` MempoolChanges [] []
         batch (\w -> deleteFromMempool w h2) `shouldReturn` MempoolChanges [] [h2]
-        reading db getMempool `shouldReturn` [(30, h1)]
+        Q.getMempool db `shouldReturn` [(30, h1)]
         (matchingAsListCF db.db (mempoolCF db.db) MemTimeKeyS :: IO [(MemTimeKey, ())])
           `shouldReturn` [(MemTimeKey 30 h1, ())]
 
@@ -153,9 +151,9 @@ spec = prepareContext $ \ctx -> do
       withCoin btcRegTest ctx $ \db coin -> do
         let tx = spend [coin] [1000, 2000]
         importing db (\w -> newMempoolTx w tx 1700000000) `shouldReturn` Right True
-        reading db getMempool `shouldReturn` [(1700000000, txHash tx)]
-        reading db (getSpender coin) `shouldReturn` Just (Spender (txHash tx) 0)
-        fmap (.value) <$> reading db (getUnspent (out tx 1)) `shouldReturn` Just 2000
+        Q.getMempool db `shouldReturn` [(1700000000, txHash tx)]
+        Q.getSpender db coin `shouldReturn` Just (Spender (txHash tx) 0)
+        fmap (.value) <$> Q.getUnspent db (out tx 1) `shouldReturn` Just 2000
 
     it "ignores a transaction it already has" $
       withCoin btcRegTest ctx $ \db coin -> do
@@ -200,8 +198,8 @@ spec = prepareContext $ \ctx -> do
         mapM (addTx db) [original, child, replacement]
           `shouldReturn` [Right True, Right True, Right True]
         mempool db `shouldReturn` [txHash replacement]
-        reading db (getSpender coin) `shouldReturn` Just (Spender (txHash replacement) 0)
-        fmap (.deleted) <$> reading db (getTxData (txHash original)) `shouldReturn` Just True
+        Q.getSpender db coin `shouldReturn` Just (Spender (txHash replacement) 0)
+        fmap (.deleted) <$> Q.getTxData db (txHash original) `shouldReturn` Just True
 
     it "replaces a transaction and its descendant when both conflict" $
       withCoin btcRegTest ctx $ \db coin1 -> do
@@ -252,7 +250,7 @@ spec = prepareContext $ \ctx -> do
         importing db (\w -> newMempoolTx w good 0 >> newMempoolTx w orphan 0)
           `shouldReturn` Left Orphan
         mempool db `shouldReturn` []
-        reading db (getSpender coin) `shouldReturn` Nothing
+        Q.getSpender db coin `shouldReturn` Nothing
 
   describe "importBlock" $ do
     it "confirms mempool transactions" $
@@ -262,7 +260,7 @@ spec = prepareContext $ \ctx -> do
         _ <- mine db [tx]
         mempool db `shouldReturn` []
         fmap (\t -> (t.block, t.rbf)) <$> txData db tx `shouldReturn` Just (BlockRef 2 1, False)
-        fmap (.block) <$> reading db (getUnspent (out tx 0)) `shouldReturn` Just (BlockRef 2 1)
+        fmap (.block) <$> Q.getUnspent db (out tx 0) `shouldReturn` Just (BlockRef 2 1)
 
     it "confirms a transaction whose outputs are spent in the mempool" $
       withCoin btcRegTest ctx $ \db coin -> do
@@ -272,7 +270,7 @@ spec = prepareContext $ \ctx -> do
         _ <- mine db [parent]
         mempool db `shouldReturn` [txHash child]
         fmap (.block) <$> txData db parent `shouldReturn` Just (BlockRef 2 1)
-        reading db (getSpender (out parent 0)) `shouldReturn` Just (Spender (txHash child) 0)
+        Q.getSpender db (out parent 0) `shouldReturn` Just (Spender (txHash child) 0)
 
     it "stops flagging a descendant once its signalling ancestor confirms" $
       withCoin btcRegTest ctx $ \db coin -> do
@@ -287,7 +285,7 @@ spec = prepareContext $ \ctx -> do
         let parent = spend [coin] [4000000000]
             child = spend [out parent 0] [3999990000]
         block <- mine db [child, parent]
-        Just bd <- reading db (getBlock (headerHash block.header))
+        Just bd <- Q.getBlock db (headerHash block.header)
         (bd.height, bd.main, bd.txs) `shouldBe` (2, True, map txHash block.txs)
         (bd.subsidy, bd.fee, bd.outputs) `shouldBe` (5000000000, 1000010000, 7999990000)
         fmap (.block) <$> txData db child `shouldReturn` Just (BlockRef 2 1)
@@ -304,9 +302,9 @@ spec = prepareContext $ \ctx -> do
 
     it "rejects blocks that spend unknown outputs, changing nothing" $
       withCoin btcRegTest ctx $ \db _ -> do
-        best <- reading db getBestBlock
+        best <- Q.getBestBlock db
         tryMine db [spend [out (coinbaseTx 9) 0] [1]] `shouldReturn` Left Orphan
-        reading db getBestBlock `shouldReturn` best
+        Q.getBestBlock db `shouldReturn` best
 
     it "rejects blocks that do not build on the best block" $
       withDB btcRegTest ctx $ \db -> do
@@ -323,9 +321,9 @@ spec = prepareContext $ \ctx -> do
         block <- mine db [tx]
         let h = headerHash block.header
         importing db (`revertBlock` h) `shouldReturn` Right ()
-        reading db getBestBlock `shouldReturn` Just block.header.prev
-        fmap (.main) <$> reading db (getBlock h) `shouldReturn` Just False
-        reading db getMempool `shouldReturn` [(1296689802, txHash tx)]
+        Q.getBestBlock db `shouldReturn` Just block.header.prev
+        fmap (.main) <$> Q.getBlock db h `shouldReturn` Just False
+        Q.getMempool db `shouldReturn` [(1296689802, txHash tx)]
         rbfFlag db tx `shouldReturn` Just True
         txData db (coinbaseTx 2) `shouldReturn` Nothing
 
@@ -354,7 +352,7 @@ spec = prepareContext $ \ctx -> do
         mapM (addTx db) [parent, child] `shouldReturn` [Right True, Right True]
         importing db (\w -> deleteUnconfirmedTx w False (txHash parent)) `shouldReturn` Right ()
         mempool db `shouldReturn` []
-        fmap (.value) <$> reading db (getUnspent coin) `shouldReturn` Just 5000000000
+        fmap (.value) <$> Q.getUnspent db coin `shouldReturn` Just 5000000000
 
     it "ignores unknown transactions" $
       withCoin btcRegTest ctx $ \db _ ->
@@ -373,7 +371,7 @@ spec = prepareContext $ \ctx -> do
         let tx = spend [coin] [1000, 2000]
             -- confirmed, unconfirmed, outputs, transactions, received
             balance = do
-              b <- reading db (getDefaultBalance a)
+              b <- defaultBalance db a
               return (b.confirmed, b.unconfirmed, b.utxo, b.txs, b.received)
         balance `shouldReturn` (5000000000, 0, 1, 1, 5000000000)
         addTx db tx `shouldReturn` Right True
@@ -391,7 +389,7 @@ spec = prepareContext $ \ctx -> do
         let hashLock = "\xaa\x20" <> B.replicate 32 0xbb <> "\x87"
             tx = Tx 2 [TxIn coin "" maxBound] [TxOut 1000 hashLock] [] 0
         addTx db tx `shouldReturn` Right True
-        coinAddress <- fmap (.address) <$> reading db (getUnspent (out tx 0))
+        coinAddress <- fmap (.address) <$> Q.getUnspent db (out tx 0)
         coinAddress `shouldBe` Just Nothing
 
 -- | Run with an empty database in a temporary directory.
@@ -430,26 +428,30 @@ take' :: Word32 -> [a] -> [a]
 take' 0 = id
 take' l = take (fromIntegral l)
 
-reading :: DatabaseReader -> DatabaseReaderT IO a -> IO a
-reading db f = runReaderT f db
+-- | Balance of an address, or a zero balance if never used.
+defaultBalance :: DatabaseReader -> Address -> IO Balance
+defaultBalance db a = fromMaybe (zeroBalance a) <$> Q.getBalance db a
 
 addTx :: DatabaseReader -> Tx -> IO (Either ImportException Bool)
 addTx db tx = importing db (\w -> newMempoolTx w tx 0)
 
 txData :: DatabaseReader -> Tx -> IO (Maybe TxData)
-txData db = reading db . getActiveTxData . txHash
+txData db tx =
+  Q.getTxData db (txHash tx) <&> \case
+    Just td | not td.deleted -> Just td
+    _ -> Nothing
 
 rbfFlag :: DatabaseReader -> Tx -> IO (Maybe Bool)
 rbfFlag db tx = fmap (.rbf) <$> txData db tx
 
 mempool :: DatabaseReader -> IO [TxHash]
-mempool db = sort . map snd <$> reading db getMempool
+mempool db = sort . map snd <$> Q.getMempool db
 
 -- | Mine a block with these transactions on top of the best block.
 tryMine :: DatabaseReader -> [Tx] -> IO (Either ImportException Block)
 tryMine db txs = do
-  Just h <- reading db getBestBlock
-  Just parent <- reading db (getBlock h)
+  Just h <- Q.getBestBlock db
+  Just parent <- Q.getBlock db h
   let (block, node) = nextBlock db.net parent.height parent.header txs
   fmap (const block) <$> importing db (\w -> importBlock w block node)
 

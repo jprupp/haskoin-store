@@ -22,6 +22,13 @@ tested-with: GHC == 9.12.4
 extra-doc-files:
   - README.md
   - CHANGELOG.md
+language: GHC2024
+# used by every module: records with fields of the same name, read with a dot
+default-extensions:
+  - DuplicateRecordFields
+  - NoFieldSelectors
+  - OverloadedRecordDot
+  - OverloadedStrings
 dependencies:
   - aeson ^>= 2.2.5.1
   - aeson-pretty ^>= 0.8.11

@@ -1,17 +1,6 @@
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
 -- |
@@ -186,8 +175,7 @@ import Haskoin.Store.BlockStore
 import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
--- the instances of the store classes for the database reader
-import Haskoin.Store.Database.Query ()
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Manager
 import Haskoin.Store.WebCommon
@@ -552,32 +540,32 @@ instance
   (MonadUnliftIO m) =>
   StoreReadBase (ReaderT WebState m)
   where
-  getCtx = runInWebReader getCtx
-  getNetwork = runInWebReader getNetwork
-  getBestBlock = runInWebReader getBestBlock
-  getBlocksAtHeight height = runInWebReader (getBlocksAtHeight height)
-  getBlock bh = runInWebReader (getBlock bh)
+  getCtx = asks (.config.store.ctx)
+  getNetwork = asks (.config.store.net)
+  getBestBlock = webDB Q.getBestBlock
+  getBlocksAtHeight height = webDB (`Q.getBlocksAtHeight` height)
+  getBlock bh = webDB (`Q.getBlock` bh)
   getTxData th = listToMaybe' <$> webTxData [th]
   getManyTxData = webTxData
-  getSpender op = runInWebReader (getSpender op)
-  getUnspent op = runInWebReader (getUnspent op)
-  getBalance a = runInWebReader (getBalance a)
-  getMempool = runInWebReader getMempool
-  getMempoolPage = runInWebReader . getMempoolPage
+  getSpender op = webDB (`Q.getSpender` op)
+  getUnspent op = webDB (`Q.getUnspent` op)
+  getBalance a = webDB (`Q.getBalance` a)
+  getMempool = webDB Q.getMempool
+  getMempoolPage l = webDB (`Q.getMempoolPage` l)
 
 instance
   (MonadUnliftIO m) =>
   StoreReadExtra (ReaderT WebState m)
   where
-  getMaxGap = runInWebReader getMaxGap
-  getInitialGap = runInWebReader getInitialGap
-  getBalances as = runInWebReader (getBalances as)
-  getAddressesTxs as = runInWebReader . getAddressesTxs as
-  getAddressTxs a = runInWebReader . getAddressTxs a
-  getAddressUnspents a = runInWebReader . getAddressUnspents a
-  getAddressesUnspents as = runInWebReader . getAddressesUnspents as
+  getMaxGap = asks (.config.store.db.maxGap)
+  getInitialGap = asks (.config.store.db.initGap)
+  getBalances as = webDB (`Q.getBalances` as)
+  getAddressesTxs as l = webDB (\db -> Q.getAddressesTxs db as l)
+  getAddressTxs a l = webDB (\db -> Q.getAddressTxs db a l)
+  getAddressUnspents a l = webDB (\db -> Q.getAddressUnspents db a l)
+  getAddressesUnspents as l = webDB (\db -> Q.getAddressesUnspents db as l)
   xPubBals xpub =
-    withWebCache (`cacheXPubBals` xpub) (runInWebReader (xPubBals xpub)) >>= \case
+    withWebCache (`cacheXPubBals` xpub) (webDB (`Q.xPubBals` xpub)) >>= \case
       Right bals -> return bals
       Left (Just cache, bals) -> liftIO (cacheRequest cache xpub bals) >> return bals
       Left (Nothing, bals) -> return bals
@@ -585,18 +573,18 @@ instance
     either snd id
       <$> withWebCache
         (\c -> cacheXPubUnspents c xpub xbals limits)
-        (runInWebReader (xPubUnspents xpub xbals limits))
+        (webDB (\db -> Q.xPubUnspents db xbals limits))
   xPubTxs xpub xbals limits =
     either snd id
       <$> withWebCache
         (\c -> cacheXPubTxs c xpub limits)
-        (runInWebReader (xPubTxs xpub xbals limits))
+        (webDB (\db -> Q.xPubTxs db xbals limits))
   xPubTxCount xpub xbals =
     either snd id
       <$> withWebCache
         (`cacheXPubTxCount` xpub)
-        (runInWebReader (xPubTxCount xpub xbals))
-  getNumTxData = runInWebReader . getNumTxData
+        (webDB (`Q.xPubTxCount` xbals))
+  getNumTxData i = webDB (`Q.getNumTxData` i)
 
 instance (MonadUnliftIO m) => StoreReadBase (ActionT m) where
   getCtx = lift getCtx
@@ -657,7 +645,7 @@ runWeb config = do
           session
           config.tickerURL
           config.tickerRefresh
-    runHealthCheck = runReaderT (healthCheck config) config.store.db
+    runHealthCheck = liftIO (healthCheck config)
     healthCheckLoop v = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
@@ -2812,16 +2800,15 @@ scottyHealth _ =
     return h
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
-blockHealthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) =>
-  WebConfig ->
-  m BlockHealth
+blockHealthCheck :: WebConfig -> IO BlockHealth
 blockHealthCheck cfg = do
   let ch = cfg.store.chain
-  headers <- (.height) <$> liftIO (chainGetBest ch)
+      db = cfg.store.db
+  headers <- (.height) <$> chainGetBest ch
   blocks <-
-    maybe 0 (.height)
-      <$> runMaybeT (MaybeT getBestBlock >>= MaybeT . getBlock)
+    Q.getBestBlock db >>= \case
+      Nothing -> return 0
+      Just h -> maybe 0 (.height) <$> Q.getBlock db h
   return
     BlockHealth
       { headers,
@@ -2830,11 +2817,7 @@ blockHealthCheck cfg = do
       }
 
 -- | Age of the best header and the maximum allowed.
-lastBlockHealthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) =>
-  Chain ->
-  WebLimits ->
-  m TimeHealth
+lastBlockHealthCheck :: Chain -> WebLimits -> IO TimeHealth
 lastBlockHealthCheck ch WebLimits {blockTimeout} = do
   n <- round <$> liftIO getPOSIXTime
   t <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
@@ -2845,15 +2828,12 @@ lastBlockHealthCheck ch WebLimits {blockTimeout} = do
       }
 
 -- | Age of the newest mempool transaction or best header, and the maximum allowed.
-lastTxHealthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) =>
-  WebConfig ->
-  m TimeHealth
+lastTxHealthCheck :: WebConfig -> IO TimeHealth
 lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
   n <- round <$> liftIO getPOSIXTime
   b <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
   t <-
-    getMempoolPage (Limits 1 0 Nothing) >>= \case
+    Q.getMempoolPage store'.db (Limits 1 0 Nothing) >>= \case
       t : _ ->
         let x = fromIntegral $ fst t
          in return $ max x b
@@ -2871,10 +2851,7 @@ lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
         else limits.txTimeout
 
 -- | Transactions waiting to be imported and the maximum allowed.
-pendingTxsHealthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) =>
-  WebConfig ->
-  m MaxHealth
+pendingTxsHealthCheck :: WebConfig -> IO MaxHealth
 pendingTxsHealthCheck cfg = do
   n <- blockStorePendingTxs cfg.store.block
   return
@@ -2884,17 +2861,13 @@ pendingTxsHealthCheck cfg = do
       }
 
 -- | Online peers and the minimum required.
-peerHealthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) =>
-  WebConfig ->
-  m CountHealth
+peerHealthCheck :: WebConfig -> IO CountHealth
 peerHealthCheck cfg = do
   count <- fromIntegral . length <$> liftIO (getPeers cfg.store.peerMgr)
   return CountHealth {min = fromIntegral cfg.minPeers, count}
 
 -- | Run every health check.
-healthCheck ::
-  (MonadUnliftIO m, StoreReadBase m) => WebConfig -> m HealthCheck
+healthCheck :: WebConfig -> IO HealthCheck
 healthCheck cfg = do
   blocks <- blockHealthCheck cfg
   lastBlock <- lastBlockHealthCheck cfg.store.chain cfg.limits
@@ -3059,13 +3032,8 @@ validateLimit wl full limitM =
 ---------------
 
 -- | Run a query against the database.
-runInWebReader ::
-  (MonadIO m) =>
-  DatabaseReaderT m a ->
-  ReaderT WebState m a
-runInWebReader f = do
-  bdb <- asks (.config.store.db)
-  lift $ runReaderT f bdb
+webDB :: (MonadIO m) => (DatabaseReader -> IO a) -> ReaderT WebState m a
+webDB f = asks (.config.store.db) >>= liftIO . f
 
 -- | Ask the cache, if there is one, and the database if the cache has no
 -- answer. 'Right' is an answer of the cache; 'Left' an answer of the
@@ -3090,11 +3058,11 @@ webTxData :: (MonadIO m) => [TxHash] -> ReaderT WebState m [Maybe TxData]
 webTxData [] = return []
 webTxData ths =
   asks (.config.store.cache) >>= \case
-    Nothing -> runInWebReader (getManyTxData ths)
+    Nothing -> webDB (`Q.getManyTxData` ths)
     Just c -> do
       cached <- liftIO (cacheTxData c ths)
       let missing = [h | (h, Nothing) <- zip ths cached]
-      fromDB <- HashMap.fromList . zip missing <$> runInWebReader (getManyTxData missing)
+      fromDB <- HashMap.fromList . zip missing <$> webDB (`Q.getManyTxData` missing)
       return $
         zipWith
           (\h m -> maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m)

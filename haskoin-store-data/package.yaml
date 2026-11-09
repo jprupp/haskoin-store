@@ -20,6 +20,13 @@ tested-with: GHC == 9.12.4
 extra-doc-files:
   - README.md
   - CHANGELOG.md
+language: GHC2024
+# used by every module: records with fields of the same name, read with a dot
+default-extensions:
+  - DuplicateRecordFields
+  - NoFieldSelectors
+  - OverloadedRecordDot
+  - OverloadedStrings
 ghc-options:
   - -Wall
   - -Wcompat

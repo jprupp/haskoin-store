@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Haskoin.Store.WebSpec (spec) where
 
 import Data.ByteString (ByteString)

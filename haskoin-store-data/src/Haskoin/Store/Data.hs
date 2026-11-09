@@ -1,17 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE NoFieldSelectors #-}
 
 -- |
 -- Module      : Haskoin.Store.Data
@@ -1975,7 +1963,8 @@ instance FromJSON Event where
 
 -- | Response that wraps a single value, encoded in JSON as @{\"result\": value}@.
 newtype GenericResult a = GenericResult {get :: a}
-  deriving (Show, Eq, Generic, NFData)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (NFData)
 
 instance (Serial a) => Serial (GenericResult a) where
   serialize (GenericResult x) = serialize x
@@ -2000,7 +1989,8 @@ instance (FromJSON a) => FromJSON (GenericResult a) where
 -- | Response with a value in its peer-to-peer serialization, encoded in JSON as
 -- a hex string in @{\"result\": hex}@.
 newtype RawResult a = RawResult {get :: a}
-  deriving (Show, Eq, Generic, NFData)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (NFData)
 
 instance (Serial a) => Serial (RawResult a) where
   serialize (RawResult x) = serialize x
@@ -2031,7 +2021,8 @@ instance (Serial a) => FromJSON (RawResult a) where
 
 -- | List response. In binary, a length followed by the items.
 newtype SerialList a = SerialList {get :: [a]}
-  deriving (Show, Eq, Generic, NFData)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (NFData)
 
 instance Semigroup (SerialList a) where
   SerialList a <> SerialList b = SerialList (a <> b)
@@ -2053,7 +2044,8 @@ instance (FromJSON a) => FromJSON (SerialList a) where
 -- | List of values in their peer-to-peer serialization, encoded in JSON as a
 -- list of hex strings.
 newtype RawResultList a = RawResultList {get :: [a]}
-  deriving (Show, Eq, Generic, NFData)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (NFData)
 
 instance (Serial a) => Serial (RawResultList a) where
   serialize (RawResultList xs) =
@@ -2099,7 +2091,8 @@ instance (Serial a) => FromJSON (RawResultList a) where
 -- @{\"txid\": hash}@.
 newtype TxId
   = TxId TxHash
-  deriving (Show, Eq, Generic, NFData)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (NFData)
 
 instance Serial TxId where
   serialize (TxId h) = serialize h
@@ -2683,7 +2676,8 @@ instance MarshalJSON (Network, Ctx) BinfoUnspent where
 
 -- | Response of @\/blockchain\/unspent@.
 newtype BinfoUnspents = BinfoUnspents [BinfoUnspent]
-  deriving (Eq, Show, Generic, NFData)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 instance MarshalJSON (Network, Ctx) BinfoUnspents where
   marshalValue (net, ctx) (BinfoUnspents us) =
@@ -3382,7 +3376,8 @@ toBinfoHistory satoshi timestamp rateThen rateNow fee txid =
 -- | Date given as @DD-MM-YYYY@ or @DD\/MM\/YYYY@ in a request, as seconds
 -- since the Unix epoch.
 newtype BinfoDate = BinfoDate Word64
-  deriving (Eq, Show, Read, Generic, NFData)
+  deriving stock (Eq, Show, Read, Generic)
+  deriving anyclass (NFData)
 
 instance Parsable BinfoDate where
   parseParam t =
@@ -3552,7 +3547,7 @@ toBinfoAddrs onlyAddrs onlyXpubs xpubTxs =
               [m', n] | m == m' -> n + 1
               _ -> 0
           received = sum $ map f xs
-          bal = fromIntegral $ sum $ map g xs
+          bal = sum $ map g xs
           sent = if bal <= received then received - bal else 0
           count = HashMap.lookupDefault 0 k xpubTxs
           ax = foldl max 0 $ map (i 0) xs
@@ -3822,7 +3817,8 @@ instance FromJSON BinfoHeader where
 
 -- | Response of @\/blockchain\/unconfirmed-transactions@.
 newtype BinfoMempool = BinfoMempool {get :: [BinfoTx]}
-  deriving (Eq, Show, Generic, NFData)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 instance MarshalJSON (Network, Ctx) BinfoMempool where
   marshalValue (net, ctx) (BinfoMempool txs) =
@@ -3837,7 +3833,8 @@ instance MarshalJSON (Network, Ctx) BinfoMempool where
 
 -- | List of short block information.
 newtype BinfoBlockInfos = BinfoBlockInfos {get :: [BinfoBlockInfo]}
-  deriving (Eq, Show, Generic, NFData)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 instance ToJSON BinfoBlockInfos where
   toJSON b = A.object ["blocks" .= b.get]
