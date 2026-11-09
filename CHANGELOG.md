@@ -89,7 +89,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   received mempool transactions are one pure value
   (`Haskoin.Store.BlockStore.Pending`), with property tests, and old
   requests are forgotten on the clock tick of the block store.
-- Build against haskoin-node 2.4.0. The store stopped following the chain
+- Build against haskoin-node 2.4.0, from the head of its
+  `fix-header-sync-stall` branch. The block store reserves its syncing peer
+  as an owner of its own (`reservePeer`, `releasePeer`), so no other part of
+  the node can release it; header searches run with `chainRunHeaders`. The
+  store stopped following the chain
   when a peer announced new blocks with an inventory message instead of
   headers, which peers do when many blocks are found at once; it stayed at
   the old height until the peer reconnected.

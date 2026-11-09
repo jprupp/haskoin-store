@@ -92,6 +92,7 @@ import Control.Monad
   ( forM,
     forM_,
     unless,
+    void,
     when,
     (>=>),
   )
@@ -149,6 +150,7 @@ import Haskoin.Node
     LogLevel (..),
     Logger,
     OnlinePeer (..),
+    Owner,
     Peer (..),
     PeerMgr,
     chainBlockMain,
@@ -159,9 +161,10 @@ import Haskoin.Node
     getPeers,
     killPeer,
     logAt,
+    newOwner,
+    releasePeer,
+    reservePeer,
     sendMessage,
-    setBusy,
-    setFree,
   )
 import Haskoin.Store.BlockStore.Pending (Pending, PendingTx (..))
 import Haskoin.Store.BlockStore.Pending qualified as Pending
@@ -270,7 +273,9 @@ data BlockStore = BlockStore
     -- | StatsD metrics, if enabled
     metrics :: !(Maybe StoreMetrics),
     -- | labels of the peers whose mempool was already requested
-    syncedMempool :: !(TVar (HashSet Text))
+    syncedMempool :: !(TVar (HashSet Text)),
+    -- | who reserves the syncing peer, so that no one else releases it
+    owner :: !Owner
   }
 
 -- | StatsD metrics of the block store.
@@ -473,6 +478,7 @@ withBlockStore cfg action = do
   sy <- newTVarIO HashSet.empty
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
+  owner <- liftIO (newOwner "block store")
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -480,7 +486,8 @@ withBlockStore cfg action = do
             sync = pb,
             pending = ts,
             metrics = metrics,
-            syncedMempool = sy
+            syncedMempool = sy,
+            owner = owner
           }
   withAsync (liftIO (go r inbox)) $ \a -> do
     link a
@@ -981,7 +988,7 @@ finishPeer self p = do
   released <- transition self (Sync.release p)
   when released $ do
     logDebug self $ "Releasing peer: " <> p.label
-    setFree p
+    void (releasePeer self.owner p)
   atomically $ modifyTVar self.syncedMempool $ HashSet.delete p.label
 
 -- | Make a peer the syncing peer if there is none and the peer is not busy.
@@ -990,7 +997,7 @@ trySetPeer self p =
   isJust . Sync.syncingPeer <$> readTVarIO self.sync >>= \case
     True -> return False
     False ->
-      setBusy p >>= \case
+      reservePeer self.owner p >>= \case
         False -> return False
         True -> do
           now <- getCurrentTime
@@ -999,7 +1006,7 @@ trySetPeer self p =
             Nothing -> (False, st)
           if started
             then logDebug self ("Locked peer: " <> p.label)
-            else setFree p
+            else void (releasePeer self.owner p)
           return started
 
 -- | If not in sync and there is no syncing peer, pick the first free peer and start syncing.

@@ -84,7 +84,6 @@ import Conduit
     ($$++),
   )
 import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Reader (runReaderT)
 import Data.ByteString (ByteString)
 import Data.Default (Default (..))
 import Data.Graph qualified as G
@@ -103,7 +102,7 @@ import Data.Time.Clock.System
   )
 import Data.Word (Word32, Word64)
 import Haskoin
-import Haskoin.Node (Chain, Peer)
+import Haskoin.Node (Chain, Peer, chainRunHeaders)
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -416,11 +415,11 @@ blockAtOrAfter ::
   m (Maybe BlockData)
 blockAtOrAfter ch q = do
   net <- getNetwork
-  -- the header search of haskoin-node is a ReaderT action over the chain
-  liftIO (runReaderT (firstGreaterOrEqual net f) ch) >>= \case
+  liftIO (chainRunHeaders ch (firstGreaterOrEqual net f)) >>= \case
     Nothing -> return Nothing
     Just x -> getBlock (headerHash x.header)
   where
+    f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x =
       let t = fromIntegral x.header.timestamp
        in return $ t `compare` q
@@ -434,11 +433,11 @@ blockAtOrBefore ::
   m (Maybe BlockData)
 blockAtOrBefore ch q = do
   net <- getNetwork
-  -- the header search of haskoin-node is a ReaderT action over the chain
-  liftIO (runReaderT (lastSmallerOrEqual net f) ch) >>= \case
+  liftIO (chainRunHeaders ch (lastSmallerOrEqual net f)) >>= \case
     Nothing -> return Nothing
     Just x -> getBlock (headerHash x.header)
   where
+    f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x =
       let t = fromIntegral x.header.timestamp
        in return $ t `compare` q
@@ -452,11 +451,11 @@ blockAtOrAfterMTP ::
   m (Maybe BlockData)
 blockAtOrAfterMTP ch q = do
   net <- getNetwork
-  -- the header search of haskoin-node is a ReaderT action over the chain
-  liftIO (runReaderT (firstGreaterOrEqual net f) ch) >>= \case
+  liftIO (chainRunHeaders ch (firstGreaterOrEqual net f)) >>= \case
     Nothing -> return Nothing
     Just x -> getBlock (headerHash x.header)
   where
+    f :: (BlockHeaders n) => BlockNode -> n Ordering
     f x = do
       t <- fromIntegral <$> mtp x
       return $ t `compare` q

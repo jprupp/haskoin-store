@@ -192,7 +192,7 @@ withStore ::
   StoreConfig ->
   (Store -> m a) ->
   m a
-withStore cfg action =
+withStore cfg action = withRunInIO $ \run ->
   connectDB cfg $ \db ->
     withPublisher $ \pub ->
       withPublisher $ \node_pub ->
@@ -202,7 +202,7 @@ withStore cfg action =
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
                 withStoreCache cfg db node.chain pub $ \cache ->
-                  action
+                  run . action $
                     Store
                       { peerMgr = node.peerMgr,
                         chain = node.chain,

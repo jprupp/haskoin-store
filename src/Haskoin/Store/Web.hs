@@ -693,7 +693,7 @@ getRates logger net session url currency times = do
     return $ r ^. Wreq.responseBody
   where
     err _ = do
-      logError logger "Could not get historic prices"
+      liftIO $ logError logger "Could not get historic prices"
       return []
     body = toJSON times
     base =
@@ -712,7 +712,7 @@ price ::
   TVar (HashMap Text BinfoTicker) ->
   m ()
 price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
-  let err e = logError logger $ cs (show e)
+  let err e = liftIO . logError logger $ cs (show e)
   handleAny err $ do
     r <- liftIO $ Wreq.asJSON =<< Wreq.Session.get session u
     atomically . writeTVar v $ r ^. Wreq.responseBody
@@ -2396,7 +2396,7 @@ scottyFirstSeen =
         Just b -> return b.header.timestamp
         Nothing -> do
           logger <- askl (.config.logger)
-          logError logger $
+          liftIO . logError logger $
             "Could not get ancestor at height "
               <> cs (show h)
               <> " for block "

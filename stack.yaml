@@ -29,7 +29,7 @@ extra-deps:
   - haskoin-core-1.6.1
   # The fix of the header sync stall, until it is released.
   - git: https://github.com/jprupp/haskoin-node.git
-    commit: c2acc4c4f9859da251095abace6a61d29291b311
+    commit: 10d6a3ce22822be0a08e8b11ce909888f813ac65
   # haskoin-store-data from its repository, until it is on Hackage.
   - git: https://github.com/jprupp/haskoin-store-data.git
     commit: ba49bf99693e688ee46aa3757cdffa48d3eaf443
