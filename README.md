@@ -439,7 +439,10 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   is applied once, by the first store to see it; a store never replaces an
   entry that knows more than its database (a higher block, or a transaction
   it has not seen), and a store that is catching up does no cache work.
-  Without Redis, xpub queries read RocksDB directly.
+  Without Redis, xpub queries read RocksDB directly. The ways an entry can
+  still come to differ from the database unnoticed, such as a missed spend of
+  an output of a cached transaction, and what would rule them out, are in
+  `docs/cache-consistency.md`.
 - The **web server** (`Haskoin.Store.Web`) answers from RocksDB, and from the
   cache for cached xpubs and for transaction bodies that Redis has.
 

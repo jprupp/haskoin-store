@@ -141,6 +141,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   all. Xpubs cached together were read whole together each time: in the full
   stress test, four xpubs of tens of thousands of transactions raised the
   heap from under 100 MiB to 785 MiB for a few seconds every ten minutes.
+- `docs/cache-consistency.md` analyses how a cached xpub can differ from the
+  database without any check noticing, including spenders of cached
+  transactions that no reload repairs, and what would prevent it.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
