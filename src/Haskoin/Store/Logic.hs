@@ -44,6 +44,11 @@
 -- transactions that conflict with it are deleted together with everything that
 -- spends them. Between mempool transactions, replace-by-fee decides on networks
 -- that support it; elsewhere the first one seen stays.
+--
+-- These rules write unconfirmed transactions into the same indices as the
+-- chain. "Haskoin.Store.Logic.Layered" has the rules for a layout that keeps
+-- them apart, with the same functions; the store will move to it when that
+-- layout replaces this one.
 module Haskoin.Store.Logic
   ( ImportException (..),
     initBest,

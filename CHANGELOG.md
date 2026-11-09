@@ -167,6 +167,23 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     migrate them, and check that every query answers as before, that the
     chain's column families are those of a database that never saw a
     mempool, and that emptying the mempool area leaves the chain's answers.
+- `Haskoin.Store.Logic.Layered`: the rules that import and revert blocks
+  and add, replace and delete mempool transactions in the layered layout of
+  `docs/layered-database.md`, with the functions, results and errors of
+  `Haskoin.Store.Logic`. Blocks are written to the chain's column families
+  alone, and the mempool to its own area. The store does not use them yet.
+  - `Haskoin.Store.Database.Writer` can write the mempool area in the same
+    atomic batch as the chain; batches of today's rules write nothing there.
+  - Tests give the same random history to both sets of rules, on Bitcoin and
+    on Bitcoin Cash: payments, replacements, deletions, blocks in and out of
+    order, reorganisations, and transactions and blocks that must be
+    refused. Every operation must have the same result and move the same
+    transactions in and out of the mempool, every query must answer the same
+    after it, and at the end the database of today's rules, once migrated,
+    must equal that of the new rules key for key.
+  - One difference is on purpose: a block that spends an output of an
+    unconfirmed transaction is refused by the new rules, as that output is
+    not in the chain. Today it is imported.
 - Known issue: `--bloom` builds no Bloom filters when the store is built
   against RocksDB 6.24 or later, because of a wrong type in
   `rocksdb-haskell-jprupp` 2.6.1, fixed in its pull request 21. The README

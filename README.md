@@ -477,10 +477,15 @@ Today unconfirmed transactions are written into the same indices as the
 block chain. `docs/layered-database.md` is a design, partly built, for
 keeping them in an area of their own and applying them on top of the chain
 when a query is answered, so that nothing the mempool does changes the
-chain's data, and so that the cache can be split the same way. The
-migration from the present layout (`Haskoin.Store.Database.Migrate`) and the
-rules that put the two areas together (`Haskoin.Store.Database.Mempool`) are
-written and tested; the store does not use them yet.
+chain's data, and so that the cache can be split the same way. Three parts
+of it are written and tested, and the store does not use them yet:
+
+- the migration from the present layout (`Haskoin.Store.Database.Migrate`);
+- the rules that put the two areas together when reading
+  (`Haskoin.Store.Database.Mempool`);
+- the rules that import blocks and transactions in that layout
+  (`Haskoin.Store.Logic.Layered`), which the tests hold to the results of
+  today's rules, operation by operation and key by key.
 
 ## Monitoring
 

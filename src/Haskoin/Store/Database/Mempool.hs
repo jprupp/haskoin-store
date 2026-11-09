@@ -55,6 +55,7 @@ module Haskoin.Store.Database.Mempool
   ( -- * What a transaction contributes
     MemRecords (..),
     mempoolRecords,
+    recordEntries,
     insertRecordOps,
     deleteRecordOps,
 
@@ -154,72 +155,93 @@ import Haskoin.Store.Database.Types
 -- What a transaction contributes
 -------------------------------------------------------------------------------
 
--- | The keys and values that one mempool transaction contributes to the
--- mempool area, serialized, for each of its two column families.
+-- | What one mempool transaction contributes to the mempool area.
 data MemRecords = MemRecords
-  { -- | in the mempool column family: its place in the list of the mempool
-    -- and in the index by time, its body, and the outputs it spends
-    general :: ![(ByteString, ByteString)],
-    -- | in the column family of mempool address records: for each address
-    -- it touches, the transaction itself, the outputs of the address that
-    -- it spends and the outputs that it pays to the address
-    byAddress :: ![(ByteString, ByteString)]
+  { -- | hash of the transaction
+    txid :: !TxHash,
+    -- | time it entered the mempool: its place in the list of the mempool
+    -- and in the index by time
+    time :: !UnixTime,
+    -- | its body, without spenders and at a mempool position
+    body :: !TxData,
+    -- | the outputs it spends, each with the input that spends it
+    spends :: ![(OutPoint, Spender)],
+    -- | for each address it touches: the transaction itself, the outputs of
+    -- the address that it spends and the outputs that it pays to the
+    -- address
+    addresses :: ![(MemAddrKey, MemAddrVal)]
   }
   deriving (Eq, Show)
 
--- | The keys of a mempool transaction that entered the mempool at a time.
+-- | What a mempool transaction that entered the mempool at a time
+-- contributes to the mempool area.
 --
--- They are a function of the transaction and that time and of nothing
--- else: not of the chain, and not of the other transactions in the mempool.
--- The body is stored without spenders, which have keys of their own, and as
--- not deleted. The flag for replace-by-fee is kept as given; it is the one
+-- It is a function of the transaction and that time and of nothing else:
+-- not of the chain, and not of the other transactions in the mempool. The
+-- body is stored without spenders, which have keys of their own, and as not
+-- deleted. The flag for replace-by-fee is kept as given; it is the one
 -- thing here that can depend on other transactions, because a transaction
 -- inherits it from unconfirmed ancestors, and it is corrected when one of
 -- them is confirmed.
 mempoolRecords :: Network -> Ctx -> UnixTime -> TxData -> MemRecords
 mempoolRecords net ctx time td =
   MemRecords
-    { general =
-        [ kv (MemTxKey h) time,
-          kv (MemTimeKey time h) (),
-          kv (TxKey h) body
-        ]
-          <> [kv (MemSpenderKey op) (Spender h k) | (k, op) <- spends],
-      byAddress =
-        [kv (MemAddrTxKey a time h) MemAddrTxVal | a <- touched]
-          <> [ kv (MemAddrSpentKey a op) (MemAddrSpentVal p.value)
-             | (k, op) <- spends,
+    { txid = h,
+      time,
+      body = (td :: TxData) {block = MemRef time, deleted = False, spenders = IntMap.empty},
+      spends = [(op, Spender h k) | (k, op) <- spent],
+      addresses =
+        [(MemAddrTxKey a time h, MemAddrTxVal) | a <- touched]
+          <> [ (MemAddrSpentKey a op, MemAddrSpentVal p.value)
+             | (k, op) <- spent,
                Just p <- [IntMap.lookup (fromIntegral k) td.prevs],
                Just a <- [address p.script]
              ]
-          <> [ kv (MemAddrOutKey a time (OutPoint h i)) (MemAddrOutVal o.value o.script)
+          <> [ (MemAddrOutKey a time (OutPoint h i), MemAddrOutVal o.value o.script)
              | (i, o) <- zip [0 ..] td.tx.outputs,
                Just a <- [address o.script]
              ]
     }
   where
     h = txHash td.tx
-    body = (td :: TxData) {block = MemRef time, deleted = False, spenders = IntMap.empty}
-    spends = [(k, i.outpoint) | (k, i) <- zip [0 :: Word32 ..] td.tx.inputs, i.outpoint /= nullOutPoint]
+    spent = [(k, i.outpoint) | (k, i) <- zip [0 :: Word32 ..] td.tx.inputs, i.outpoint /= nullOutPoint]
     address = eitherToMaybe . scriptToAddressBS net ctx
     touched =
       nub' $
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)
           <> mapMaybe (address . (.script)) td.tx.outputs
+
+-- | The keys and values of a transaction, serialized, for each of the two
+-- column families of the mempool area: the mempool column family first,
+-- then the one of address entries.
+recordEntries :: MemRecords -> ([(ByteString, ByteString)], [(ByteString, ByteString)])
+recordEntries r =
+  ( [ kv (MemTxKey r.txid) r.time,
+      kv (MemTimeKey r.time r.txid) (),
+      kv (TxKey r.txid) r.body
+    ]
+      <> [kv (MemSpenderKey op) s | (op, s) <- r.spends],
+    [kv k v | (k, v) <- r.addresses]
+  )
+  where
     kv :: (Serialize k, Serialize v) => k -> v -> (ByteString, ByteString)
     kv k v = (encode k, encode v)
 
 -- | Operations that write the keys of a transaction to the mempool area.
 insertRecordOps :: DB -> MemRecords -> [BatchOp]
 insertRecordOps db r =
-  [PutCF (mempoolCF db) k v | (k, v) <- r.general]
-    <> [PutCF (mempoolAddrCF db) k v | (k, v) <- r.byAddress]
+  [PutCF (mempoolCF db) k v | (k, v) <- general]
+    <> [PutCF (mempoolAddrCF db) k v | (k, v) <- byAddress]
+  where
+    (general, byAddress) = recordEntries r
 
 -- | Operations that delete the keys of a transaction from the mempool area.
 deleteRecordOps :: DB -> MemRecords -> [BatchOp]
 deleteRecordOps db r =
-  [DelCF (mempoolCF db) k | (k, _) <- r.general]
-    <> [DelCF (mempoolAddrCF db) k | (k, _) <- r.byAddress]
+  [DelCF (mempoolCF db) k | (k, _) <- general]
+    <> [DelCF (mempoolAddrCF db) k | (k, _) <- byAddress]
+  where
+    (general, byAddress) = recordEntries r
 
 -------------------------------------------------------------------------------
 -- Reading the mempool area

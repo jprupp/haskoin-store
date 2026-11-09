@@ -41,13 +41,13 @@ that could be built and proved ahead of the switch.
 | Keys of the mempool area | `Haskoin.Store.Database.Types` | written |
 | The keys of one transaction, and the merge of the two areas | `Haskoin.Store.Database.Mempool` | written, whole lists only |
 | Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, not called by the store |
-| Tests against today's database | `test/Haskoin/Store/Database/MigrateSpec.hs` | passing |
+| Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against today's rules, not used by the store |
+| Tests against today's database and today's rules | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs` | passing |
 | Cost of the extra lookups | `docs/layered-database/` | measured |
-| Rules that import blocks and transactions | `Haskoin.Store.Logic` | not started |
 | Paged queries over both areas, the web server on them | `Haskoin.Store.Database.Query` | not started |
 | The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
 
-Three findings came out of the work, in order of how soon they matter:
+Four findings came out of the work, in order of how soon they matter:
 
 1. **Bloom filters were never built.** `--bloom` has no effect with the
    RocksDB binding as released, on RocksDB 6.24 or later. The fix is
@@ -58,7 +58,11 @@ Three findings came out of the work, in order of how soon they matter:
    reorganisations, the migrated database answers every query as the
    version 20 database did, and its chain area is that of a database that
    never saw a mempool. See [Evidence](#evidence).
-3. **The extra lookups are cheap with filters and almost free in memory.**
+3. **The new rules do what today's rules do.** Given the same random
+   history, the rules of the layered layout and today's rules followed by
+   the migration leave the same database, key for key, and every operation
+   has the same result on the way. See [Evidence](#evidence).
+4. **The extra lookups are cheap with filters and almost free in memory.**
    Between 0.5 and 1.1 microseconds to find that a transaction, an output or
    an address has nothing in the mempool area, against 0.05 to 0.1 in
    memory. See [What it costs](#what-it-costs-measurements).
@@ -195,9 +199,11 @@ keeps it in `tx`, which means that deleting a mempool transaction writes to
 the chain area. In the layered layout it goes under `MemDeletedKey`, in the
 mempool area.
 
-The coinbase of a block that is reverted goes there too. Emptying the whole
-mempool area forgets these bodies along with the mempool; an orderly wipe can
-keep them, since they have a prefix of their own.
+The coinbase of a block that is reverted goes there too. A deleted body is
+removed when its transaction comes back, into the mempool or in a block, so
+a transaction is in one place at most. Emptying the whole mempool area
+forgets these bodies along with the mempool; an orderly wipe can keep them,
+since they have a prefix of their own.
 
 Bodies that version 20 already marked as deleted stay in `tx`. Finding them
 would take a scan of the whole column family. Nothing refers to them, and
@@ -238,6 +244,11 @@ nothing the mempool does can change it.
   transactions before, as during the initial sync. The second path of today,
   which confirms transactions already in the mempool by moving their entries
   (`confTx`, `replaceAddressTx`, `adjustAddressOutput`), goes away.
+- A block that spends an output of an unconfirmed transaction is refused,
+  because that output is not in the chain. Today such a block is imported:
+  the indices do not tell a confirmed output from an unconfirmed one, and the
+  result is a confirmed transaction whose parent is still in the mempool.
+  This is the one place where the new rules differ from today's on purpose.
 - A mempool area that is wrong for any reason can be emptied. The chain area
   is untouched, and the mempool fills again from the peers.
 
@@ -328,6 +339,25 @@ Each event is still one atomic RocksDB batch across both areas.
 - **Mempool rules become adding and removing keys.** What is left of them is
   the checks: that the outputs exist and are unspent, in the chain or in the
   mempool, and what a new transaction replaces.
+
+`Haskoin.Store.Logic.Layered` has these rules, with the functions of
+`Haskoin.Store.Logic`: `importBlock`, `revertBlock`, `newMempoolTx`,
+`deleteUnconfirmedTx` and `initBest`. They give the same results and the same
+errors, so the block store can move from one module to the other.
+`Haskoin.Store.Database.Writer` gained what a batch needs to write to the
+mempool area; a batch of today's rules writes nothing there.
+
+Two details were kept as they are today, so that nothing changes for a
+store that syncs from the first block:
+
+- **A transaction that is already confirmed.** Two coinbases of 2010 appear
+  twice on Bitcoin. The later one takes the position of the earlier, with
+  the outputs that are still unspent.
+- **Replace-by-fee flags.** A mempool transaction inherits the flag from
+  unconfirmed ancestors, and it is corrected when one of them is confirmed
+  or goes back to the mempool. The comparison with today's rules found one
+  case that depended on the order of the steps of a reversal; it is the
+  same now.
 
 ## What it costs: measurements
 
@@ -637,19 +667,22 @@ migrations from versions 18 and 19 today.
 
 ## Evidence
 
+### The migration and the merge
+
 `test/Haskoin/Store/Database/MigrateSpec.hs` builds databases of version 20
 with the store's own rules, migrates them, and compares.
 
-- **Random histories.** 50 histories each time the suite runs, each of 52
-  steps chosen at random among: a payment from outputs that are unspent, in
-  a block or in the mempool, between five addresses and a script that has no
-  address, some signalling replace-by-fee; a block with part of the mempool;
-  a transaction that replaces one in the mempool; the deletion of one; and
-  the reversal of the best block. The histories differ from run to run: 350
-  of them passed over seven runs. In the last of those runs, all 50 ended
-  with ten or more mempool transactions and with ten or more of them
-  spending another mempool transaction, and 74% had deleted ten or more
-  along the way.
+- **Random histories.** 50 histories each time the suite runs, each of 57
+  operations chosen at random: payments from outputs that are unspent, in a
+  block or in the mempool, between five addresses and a script that has no
+  address, some signalling replace-by-fee; transactions that replace one in
+  the mempool; blocks with part of the mempool, in or out of order, with
+  transactions the mempool has not seen, or with one that conflicts with
+  it; deletions; reversals of the best block; and operations that are
+  refused. The histories differ from run to run: 300 of them passed over six
+  runs with the choices as they are now, after 350 with a narrower set. In
+  the last run, every history ended with ten or more mempool transactions,
+  and 98% with ten or more of them spending another mempool transaction.
 - **Every answer is kept.** After the migration, the merged queries give
   what version 20 gave: the balance, transactions and unspent outputs of
   every address, the data of every transaction ever made with its spenders,
@@ -669,13 +702,48 @@ with the store's own rules, migrates them, and compares.
 - **Refusals.** A database of another version, and one whose mempool lists a
   transaction with no body, are refused with nothing written.
 - **The tests can fail.** With one rule of the migration deliberately wrong,
-  not taking a payment off the amount received, three of the four fail.
+  not taking a payment off the amount received, three of the four failed.
 
-What this does not show: the rules that will import blocks and transactions
-in the new layout do not exist yet, so nothing here tests them. The
-migration gives the way to: for any history, the database that the new rules
-build must be key for key the one that the old rules build and the migration
-then converts.
+### The new rules against today's
+
+`test/Haskoin/Store/Logic/LayeredSpec.hs` gives the same history to both
+sets of rules, each with a database of its own, on Bitcoin and on Bitcoin
+Cash, which has no replace-by-fee.
+
+- **Histories.** 40 on each network every time the suite runs, each of 70
+  operations chosen at random as above. Those that must be refused are
+  transactions with an unknown output, an output already spent in a block,
+  the same output twice, more than their inputs, or no inputs but a
+  coinbase's; blocks with an unknown output, an output already spent, or
+  beside the best block; and deletions of confirmed transactions. Earlier
+  transactions are sent again too, whatever became of them. Over six runs,
+  240 histories passed on each network.
+- **Every operation has the same outcome.** The same result or the same
+  error, and the same transactions entering and leaving the mempool, which
+  is what the store publishes as events.
+- **Every answer is the same after every operation**, the queries of the
+  layered layout against today's.
+- **The databases are the same at the end.** Today's database is migrated
+  and compared with the one that the new rules built: every column family,
+  key for key and value for value. The only difference allowed is where the
+  bodies of deleted transactions are kept, and the bodies themselves must be
+  equal.
+- **The tests can fail.** With the correction of flags left out, with
+  deleted bodies not kept, or with conflicting mempool transactions not
+  deleted by a block, the comparison failed each time. It also found a real
+  difference while the rules were written: the flag kept in the deleted body
+  of a transaction that spent the coinbase of a reverted block.
+- **Particular cases.** A block that spends an output of the mempool is
+  refused by the new rules and leaves the database untouched. When a block
+  confirms a transaction, the keys of a mempool transaction that spends it
+  are found unchanged. And a transaction that a second block confirms again,
+  as two coinbases of 2010 are, ends in the same place under both sets of
+  rules, through the reversal of both blocks too.
+
+What this does not show: how the new rules perform, and how they behave in
+the store itself, which does not use them yet. The paged queries over both
+areas do not exist either; the comparison uses queries that return whole
+lists.
 
 ## Order of work
 
@@ -685,10 +753,10 @@ Each step ends with something that can be tested against today's behaviour.
    costs above. Independent of everything else.
 2. **A snapshot for each request.** No change of layout. It also ends the
    mixed reads of today.
-3. **New rules, beside the old.** Chain rules that import and revert blocks
-   in the chain area alone; mempool rules that add and remove keys. Test:
-   for random histories, the same database, key for key, as the old rules
-   followed by the migration.
+3. **New rules, beside the old.** Done: `Haskoin.Store.Logic.Layered`.
+   Chain rules that import and revert blocks in the chain area alone;
+   mempool rules that add and remove keys. Tested: for random histories, the
+   same database, key for key, as the old rules followed by the migration.
 4. **Paged queries over both areas.** Test: the same pages as version 20,
    for random limits, offsets and starts, on migrated databases.
 5. **The switch.** Version 21: the store opens with `mempool-addr`, runs the
@@ -700,8 +768,8 @@ Each step ends with something that can be tested against today's behaviour.
    `Haskoin.Store.Cache.Protocol` first.
 
 Steps 1 and 2 are small and useful by themselves. Steps 3 to 5 are the
-database change. Step 7 is where the concurrency problems of the cache are
-actually removed.
+database change, of which step 3 is done. Step 7 is where the concurrency
+problems of the cache are actually removed.
 
 ## Alternatives considered
 

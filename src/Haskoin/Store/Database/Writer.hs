@@ -26,6 +26,18 @@
 -- transaction of its address. Buffering collapses those into one final value per
 -- key, and a single atomic batch makes the whole import all-or-nothing. A crash
 -- or an invalid block leaves the database exactly as it was.
+--
+-- = Two layouts
+--
+-- The writes of the first groups below are to the column families that the
+-- store uses today, where the chain and the mempool share their indices.
+-- The last group is for the layered layout of @docs\/layered-database.md@,
+-- in which the mempool has an area of its own: bodies, spenders, address
+-- entries and deleted transactions of the mempool. A batch can write to
+-- both areas, and is still one atomic write. Only
+-- "Haskoin.Store.Logic.Layered" uses that group, on a database opened with
+-- 'Haskoin.Store.Database.Reader.withLayeredReader'; a batch that does not
+-- use it writes nothing there.
 module Haskoin.Store.Database.Writer
   ( -- * Batches
     Writer,
@@ -60,14 +72,32 @@ module Haskoin.Store.Database.Writer
     setBalance,
     insertUnspent,
     deleteUnspent,
+    deleteTxData,
+    deleteBalance,
+
+    -- * The mempool area of the layered layout
+    getMempoolTx,
+    getMempoolSpender,
+    getMempoolSpenders,
+    getDeletedTx,
+    insertMempoolTx,
+    deleteMempoolTx,
+    insertMempoolSpender,
+    deleteMempoolSpender,
+    insertMempoolAddr,
+    deleteMempoolAddr,
+    insertDeletedTx,
+    deleteDeletedTx,
   )
 where
 
 import Control.Monad (forM)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashTable.IO qualified as H
+import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
+import Data.Maybe (catMaybes)
 import Data.Ord (Down (..))
 import Database.RocksDB (BatchOp, DB)
 import Database.RocksDB.Query
@@ -91,6 +121,7 @@ import Haskoin
   )
 import Haskoin.Node (Logger)
 import Haskoin.Store.Data
+import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
@@ -152,6 +183,12 @@ type AddrOutTable = H.BasicHashTable (Address, BlockRef, OutPoint) (Maybe OutVal
 -- | Mempool changes in this batch: 'Nothing' for a deletion.
 type MempoolTable = H.BasicHashTable TxHash (Maybe UnixTime)
 
+-- | Changed mempool spenders of outputs: 'Nothing' for a deletion.
+type MemSpenderTable = H.BasicHashTable OutPoint (Maybe Spender)
+
+-- | Changed entries of the mempool by address: 'Nothing' for a deletion.
+type MemAddrTable = H.BasicHashTable MemAddrKey (Maybe MemAddrVal)
+
 -- | Changes made in a batch, not yet written to the database.
 data Memory = Memory
   { -- | network constants
@@ -175,7 +212,15 @@ data Memory = Memory
     -- | address unspent outputs
     outputTable :: !AddrOutTable,
     -- | mempool
-    mempoolTable :: !MempoolTable
+    mempoolTable :: !MempoolTable,
+    -- | bodies of mempool transactions, in the mempool area
+    memTxTable :: !TxTable,
+    -- | mempool spenders of outputs, in the mempool area
+    memSpenderTable :: !MemSpenderTable,
+    -- | entries of the mempool by address, in the mempool area
+    memAddrTable :: !MemAddrTable,
+    -- | bodies of transactions that left the mempool unconfirmed
+    memDeletedTable :: !TxTable
   }
 
 -- | Set the best block.
@@ -231,6 +276,47 @@ insertUnspent w u = H.insert w.memory.unspentTable (fst (unspentToVal u)) (Just 
 -- | Remove an unspent output.
 deleteUnspent :: Writer -> OutPoint -> IO ()
 deleteUnspent w p = H.insert w.memory.unspentTable p Nothing
+
+-- | Remove the data of a transaction.
+deleteTxData :: Writer -> TxHash -> IO ()
+deleteTxData w h = H.insert w.memory.txTable h Nothing
+
+-- | Remove the balance of an address, as that of one never used.
+deleteBalance :: Writer -> Address -> IO ()
+deleteBalance w a = H.insert w.memory.balanceTable a Nothing
+
+-- | Add or replace the body of a mempool transaction in the mempool area.
+insertMempoolTx :: Writer -> TxData -> IO ()
+insertMempoolTx w t = H.insert w.memory.memTxTable (txHash t.tx) (Just t)
+
+-- | Remove the body of a mempool transaction from the mempool area.
+deleteMempoolTx :: Writer -> TxHash -> IO ()
+deleteMempoolTx w h = H.insert w.memory.memTxTable h Nothing
+
+-- | Record the mempool input that spends an output.
+insertMempoolSpender :: Writer -> OutPoint -> Spender -> IO ()
+insertMempoolSpender w p s = H.insert w.memory.memSpenderTable p (Just s)
+
+-- | Forget the mempool input that spends an output.
+deleteMempoolSpender :: Writer -> OutPoint -> IO ()
+deleteMempoolSpender w p = H.insert w.memory.memSpenderTable p Nothing
+
+-- | Add an entry of the mempool by address.
+insertMempoolAddr :: Writer -> MemAddrKey -> MemAddrVal -> IO ()
+insertMempoolAddr w k v = H.insert w.memory.memAddrTable k (Just v)
+
+-- | Remove an entry of the mempool by address.
+deleteMempoolAddr :: Writer -> MemAddrKey -> IO ()
+deleteMempoolAddr w k = H.insert w.memory.memAddrTable k Nothing
+
+-- | Keep the body of a transaction that left the mempool unconfirmed.
+insertDeletedTx :: Writer -> TxData -> IO ()
+insertDeletedTx w t = H.insert w.memory.memDeletedTable (txHash t.tx) (Just t)
+
+-- | Forget the body of a transaction that left the mempool unconfirmed, as
+-- when it comes back.
+deleteDeletedTx :: Writer -> TxHash -> IO ()
+deleteDeletedTx w h = H.insert w.memory.memDeletedTable h Nothing
 
 -- | Read a value from the changes of the batch, or from the database if the
 -- batch did not change it.
@@ -292,7 +378,11 @@ hashMapOps db Memory {..} =
         balOps db balanceTable,
         addrTxOps db addressTable,
         addrOutOps db outputTable,
-        unspentOps db unspentTable
+        unspentOps db unspentTable,
+        memTxOps db memTxTable,
+        memSpenderOps db memSpenderTable,
+        memAddrOps db memAddrTable,
+        memDeletedOps db memDeletedTable
       ]
 
 -- | Operation for the change of the best block, if any.
@@ -378,6 +468,36 @@ mempoolOps db t = do
       | o == n = []
       | otherwise = deleteOpCF cf (MemTimeKey o h) : mempoolInsertOps db h n
 
+-- | Operations for changed bodies of mempool transactions.
+memTxOps :: DB -> TxTable -> IO [BatchOp]
+memTxOps db t = map (uncurry f) <$> H.toList t
+  where
+    f h (Just td) = insertOpCF (mempoolCF db) (TxKey h) td
+    f h Nothing = deleteOpCF (mempoolCF db) (TxKey h)
+
+-- | Operations for changed mempool spenders.
+memSpenderOps :: DB -> MemSpenderTable -> IO [BatchOp]
+memSpenderOps db t = map (uncurry f) <$> H.toList t
+  where
+    f p (Just s) = insertOpCF (mempoolCF db) (MemSpenderKey p) s
+    f p Nothing = deleteOpCF (mempoolCF db) (MemSpenderKey p)
+
+-- | Operations for changed entries of the mempool by address. Their column
+-- family is only looked up if there are any, as a database of the layout in
+-- use today does not have it.
+memAddrOps :: DB -> MemAddrTable -> IO [BatchOp]
+memAddrOps db t = map (uncurry f) <$> H.toList t
+  where
+    f k (Just v) = insertOpCF (mempoolAddrCF db) k v
+    f k Nothing = deleteOpCF (mempoolAddrCF db) k
+
+-- | Operations for changed bodies of deleted transactions.
+memDeletedOps :: DB -> TxTable -> IO [BatchOp]
+memDeletedOps db t = map (uncurry f) <$> H.toList t
+  where
+    f h (Just td) = insertOpCF (mempoolCF db) (MemDeletedKey h) td
+    f h Nothing = deleteOpCF (mempoolCF db) (MemDeletedKey h)
+
 -- | Operations for changed unspent outputs.
 unspentOps :: DB -> UnspentTable -> IO [BatchOp]
 unspentOps db t = map (uncurry f) <$> (H.toList t)
@@ -416,6 +536,36 @@ getBalance w a = getLayered w (getBalanceH a) (`Q.getBalance` a)
 getUnspent :: Writer -> OutPoint -> IO (Maybe Unspent)
 getUnspent w op = getLayered w (getUnspentH op) (`Q.getUnspent` op)
 
+-- | Body of a transaction in the mempool area, without its spenders, with
+-- the changes of the batch applied.
+getMempoolTx :: Writer -> TxHash -> IO (Maybe TxData)
+getMempoolTx w h = getLayered w (\s -> H.lookup s.memTxTable h) (`M.getMempoolTx` h)
+
+-- | Mempool input that spends an output, with the changes of the batch
+-- applied.
+getMempoolSpender :: Writer -> OutPoint -> IO (Maybe Spender)
+getMempoolSpender w p = getLayered w (\s -> H.lookup s.memSpenderTable p) stored
+  where
+    stored r = retrieveCF r.db (mempoolCF r.db) (MemSpenderKey p)
+
+-- | Mempool inputs that spend the outputs of a transaction, by output
+-- index, with the changes of the batch applied. The second argument is the
+-- number of outputs of the transaction: what the database has for it is
+-- read with one scan, and the changes of the batch are looked up for each
+-- output.
+getMempoolSpenders :: Writer -> TxHash -> Int -> IO (IntMap Spender)
+getMempoolSpenders w h outputs = do
+  stored <- M.getMempoolSpenders w.reader h
+  changed <- catMaybes <$> mapM change [0 .. outputs - 1]
+  return $ IntMap.mapMaybe id (IntMap.union (IntMap.fromList changed) (IntMap.map Just stored))
+  where
+    change i = fmap (i,) <$> H.lookup w.memory.memSpenderTable (OutPoint h (fromIntegral i))
+
+-- | Body of a transaction that left the mempool unconfirmed, with the
+-- changes of the batch applied.
+getDeletedTx :: Writer -> TxHash -> IO (Maybe TxData)
+getDeletedTx w h = getLayered w (\s -> H.lookup s.memDeletedTable h) (`M.getDeletedTx` h)
+
 -- | The mempool in the database with the changes of this batch applied,
 -- newest first.
 getMempool :: Writer -> IO [(UnixTime, TxHash)]
@@ -442,6 +592,10 @@ newMemory net ctx = do
   addressTable <- liftIO H.new
   outputTable <- liftIO H.new
   mempoolTable <- liftIO H.new
+  memTxTable <- liftIO H.new
+  memSpenderTable <- liftIO H.new
+  memAddrTable <- liftIO H.new
+  memDeletedTable <- liftIO H.new
   return Memory {..}
 
 -- | Read the best block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.
