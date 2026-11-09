@@ -11,7 +11,7 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- REST API server of Haskoin Store, built with Scotty.
+-- REST API server of Haskoin Store, running directly on WAI and Warp.
 --
 -- 'runWeb' serves the endpoints described in "Haskoin.Store.WebCommon" and a
 -- set of endpoints compatible with the Blockchain.info API under
@@ -46,14 +46,17 @@
 --   follow the Blockchain.info API so that existing wallets can switch to a
 --   self-hosted server with few changes.
 --
--- * __Handlers take their state as an argument.__ Every handler runs in
---   Scotty's 'ActionT' over 'IO' and gets the 'WebState' as its first
---   argument, with the queries to answer with in 'query' ('webQuery': the
---   database, with the cache in front of the queries about xpubs).
---   @nocache=true@ is the same handler given a state whose queries read only
---   the database ('cacheOr'). A reader monad under 'ActionT' would hide the
---   state, and made every query a method of a class with an instance per
---   layer of the stack.
+-- * __Handlers are plain functions.__ A handler takes the 'WebState' and
+--   the request ('Req'), and returns a response in 'IO'. The state holds the
+--   queries to answer with in 'query' ('webQuery': the database, with the
+--   cache in front of the queries about xpubs); @nocache=true@ is the same
+--   handler given a state whose queries read only the database ('cacheOr').
+--   Routes, parameters and the passing of a request to the next route are
+--   in "Haskoin.Store.Web.Router", a few dozen lines over WAI. A handler
+--   stops early by throwing an 'Except', which becomes the response
+--   ('guarded'). There is no web framework and no monad transformer: a
+--   framework runs every handler in a stack of its own, and a reader monad
+--   in it would hide the state.
 module Haskoin.Store.Web
   ( -- * Web
     WebConfig (..),
@@ -141,6 +144,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
+import Data.Text.Lazy.Encoding qualified as TL
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import Database.RocksDB
@@ -183,6 +187,8 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Manager
+import Haskoin.Store.Web.Router hiding (header)
+import Haskoin.Store.Web.Router qualified as Router
 import Haskoin.Store.WebCommon
 import Haskoin.Transaction
 import Haskoin.Util
@@ -197,6 +203,9 @@ import NQE
   )
 import Network.HTTP.Types
   ( Status (..),
+    hContentType,
+    renderStdMethod,
+    status200,
     status400,
     status404,
     status409,
@@ -209,13 +218,20 @@ import Network.HTTP.Types
   )
 import Network.Socket (Socket)
 import Network.Wai
-  ( Middleware,
+  ( Application,
+    Middleware,
     Request (..),
     Response,
+    mapResponseHeaders,
+    modifyResponse,
+    responseLBS,
     responseStatus,
+    responseStream,
   )
 import Network.Wai.Handler.Warp
   ( defaultSettings,
+    runSettings,
+    runSettingsSocket,
     setHost,
     setPort,
   )
@@ -239,32 +255,27 @@ import Network.Wreq.Session as Wreq (Session)
 import Network.Wreq.Session qualified as Wreq.Session
 import Numeric.Natural (Natural)
 import System.Metrics.StatsD
+import Text.Read (readMaybe)
 import UnliftIO
   ( TVar,
     async,
     atomically,
     bracket,
     bracket_,
+    catchAny,
     checkSTM,
+    fromException,
     handleAny,
-    liftIO,
     newTVarIO,
     orElse,
     race_,
     readTVar,
     readTVarIO,
+    throwIO,
     withAsync,
-    withRunInIO,
     writeTVar,
   )
 import UnliftIO.Concurrent (threadDelay)
-import Web.Scotty.Trans qualified as S
-
--- | Scotty application. Handlers get the 'WebState' as an argument.
-type ScottyT = S.ScottyT IO
-
--- | Scotty request handler.
-type ActionT = S.ActionT IO
 
 -- | Limits of the API. A value of @0@ means no limit.
 data WebLimits = WebLimits
@@ -427,7 +438,7 @@ data WebMetrics = WebMetrics
 
 -- | Register the web server metrics with a StatsD client.
 createMetrics :: Stats -> IO WebMetrics
-createMetrics s = liftIO $ do
+createMetrics s = do
   -- Addresses
   addressTx <- d "address_transactions"
   addressTxFull <- d "address_transactions_full"
@@ -508,23 +519,23 @@ withGaugeIO g = bracket_ (incrementGauge g 1) (decrementGauge g 1)
 withGaugeIncrease ::
   WebState ->
   (WebMetrics -> StatGauge) ->
-  ActionT a ->
-  ActionT a
+  IO a ->
+  IO a
 withGaugeIncrease st gf go =
   case st.metrics of
     Nothing -> go
-    Just m -> withRunInIO $ \run -> withGaugeIO (gf m) (run go)
+    Just m -> withGaugeIO (gf m) go
 
 -- | Record how long a handler takes in a timing of the web metrics.
 withMetrics ::
   WebState ->
   (WebMetrics -> StatTiming) ->
-  ActionT a ->
-  ActionT a
+  IO a ->
+  IO a
 withMetrics st df go =
   case st.metrics of
     Nothing -> go
-    Just m -> withRunInIO $ \run -> bracket time (stop m) (const (run go))
+    Just m -> bracket time (stop m) (const go)
   where
     time = round . (* 1000) <$> getPOSIXTime
     stop m t1 = do
@@ -549,26 +560,22 @@ data SerialAs
 -- Also starts a thread that updates prices, unless the Blockchain.info
 -- endpoints are disabled, and a thread that runs health checks.
 runWeb :: WebConfig -> IO ()
-runWeb config = serveWeb config (S.scottyOptsT opts)
+runWeb config = serveWeb config (runSettings settings)
   where
-    opts = S.defaultOptions {S.settings = settings defaultSettings}
-    settings = setPort config.port . setHost (fromString config.host)
+    settings = setPort config.port . setHost (fromString config.host) $ defaultSettings
 
 -- | Like 'runWeb', on a socket that already listens; the host and port of the
 -- configuration are ignored. Binding port 0 and passing the socket gives a
 -- free port with no window in which another program can take it, which
 -- finding a free port first and binding it later has.
 runWebSocket :: WebConfig -> Socket -> IO ()
-runWebSocket config sock = serveWeb config (S.scottySocketT S.defaultOptions sock)
+runWebSocket config sock = serveWeb config (runSettingsSocket defaultSettings sock)
 
--- | Run the web server with a function of Scotty that serves it.
-serveWeb ::
-  WebConfig ->
-  ( (IO Response -> IO Response) ->
-    ScottyT () ->
-    IO ()
-  ) ->
-  IO ()
+-- | Run the web server with a function of Warp that serves an application.
+-- The application is the router ("Haskoin.Store.Web.Router") with the
+-- routes of 'handlePaths', behind the middleware for WebSocket events, for
+-- logs and for the header that lets any origin make requests.
+serveWeb :: WebConfig -> (Application -> IO ()) -> IO ()
 serveWeb config serve = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
@@ -576,13 +583,11 @@ serveWeb config serve = do
   health <- runHealthCheck >>= newTVarIO
   let query = webQuery config.store
       st = WebState {..}
+      app = router (map (guarded st) (handlePaths st config)) notFound
+      notFound _ = errorResponse st ThingNotFound
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health) $ \_a2 ->
-      serve id $ do
-        S.middleware $ webSocketEvents st
-        S.middleware (logIt config.logger)
-        handlePaths st config
-        S.notFound $ raise st ThingNotFound
+      serve . webSocketEvents st . logIt config.logger . anyOrigin $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -596,6 +601,31 @@ serveWeb config serve = do
     healthCheckLoop v = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
+    anyOrigin = modifyResponse (mapResponseHeaders (("Access-Control-Allow-Origin", "*") :))
+
+-- | Answer the errors of the handler of a route: an 'Except' with its
+-- status and JSON, any other error as a server error, after logging it. A
+-- request passed on to the next route goes on.
+guarded :: WebState -> Route -> Route
+guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
+  where
+    answer req e
+      | Just Next <- fromException e = throwIO Next
+      | Just x <- fromException e = errorResponse st x
+      | otherwise = do
+          logError st.config.logger $ fmtReq req.wai <> ": " <> cs (show e)
+          errorResponse st ServerError
+
+-- | The response to an error, counted in the metrics.
+errorResponse :: WebState -> Except -> IO Response
+errorResponse st e = do
+  forM_ st.metrics $ \m ->
+    mapM_ (`incrementCounter` 1) $
+      if
+        | statusIsClientError (errStatus e) -> Just m.clientErrors
+        | statusIsServerError (errStatus e) -> Just m.serverErrors
+        | otherwise -> Nothing
+  return $ responseLBS (errStatus e) [(hContentType, "application/json")] (A.encode e)
 
 -- | Historical prices of the coin of the network in a currency at several times. Returns an empty list on failure.
 getRates ::
@@ -609,13 +639,12 @@ getRates ::
 getRates logger net session url currency times = do
   handleAny err $ do
     r <-
-      liftIO $
-        Wreq.asJSON
-          =<< Wreq.Session.postWith opts session url body
+      Wreq.asJSON
+        =<< Wreq.Session.postWith opts session url body
     return $ r ^. Wreq.responseBody
   where
     err _ = do
-      liftIO $ logError logger "Could not get historic prices"
+      logError logger "Could not get historic prices"
       return []
     body = toJSON times
     base =
@@ -633,9 +662,9 @@ price ::
   TVar (HashMap Text BinfoTicker) ->
   IO ()
 price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
-  let err e = liftIO . logError logger $ cs (show e)
+  let err e = logError logger $ cs (show e)
   handleAny err $ do
-    r <- liftIO $ Wreq.asJSON =<< Wreq.Session.get session u
+    r <- Wreq.asJSON =<< Wreq.Session.get session u
     atomically . writeTVar v $ r ^. Wreq.responseBody
   threadDelay pget
   where
@@ -648,20 +677,9 @@ price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
           | net == bch = Just "bch"
           | otherwise = Nothing
 
--- | Respond with an error and stop handling the request.
-raise :: WebState -> Except -> ActionT a
-raise st e = do
-  pure st.metrics >>= mapM_ \m -> do
-    liftIO $
-      mapM_ (`incrementCounter` 1) $
-        if
-          | statusIsClientError (errStatus e) -> Just m.clientErrors
-          | statusIsServerError (errStatus e) -> Just m.serverErrors
-          | otherwise -> Nothing
-  setHeaders
-  S.status $ errStatus e
-  S.json e
-  S.finish
+-- | Stop handling the request, and answer with an error ('guarded').
+raise :: WebState -> Except -> IO a
+raise _ = throwIO
 
 -- | HTTP status of an error.
 errStatus :: Except -> Status
@@ -674,282 +692,153 @@ errStatus TxIndexConflict {} = status409
 errStatus ServerTimeout = status500
 errStatus RequestTooLarge = status413
 
--- | Register the handlers of every endpoint, except those disabled in the configuration.
-handlePaths ::
-  WebState ->
-  WebConfig ->
-  ScottyT ()
-handlePaths st cfg = do
-  -- Block Paths
-  pathCompact
-    (GetBlockBest <$> paramDef st)
-    (scottyBlockBest st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetBlockHeight <$> paramCapture st <*> paramDef st)
-    (fmap SerialList . scottyBlockHeight st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetBlockTime <$> paramCapture st <*> paramDef st)
-    (scottyBlockTime st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetBlockMTP <$> paramCapture st <*> paramDef st)
-    (scottyBlockMTP st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetBlock <$> paramCapture st <*> paramDef st)
-    (scottyBlock st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetTx <$> paramCapture st)
-    (scottyTx st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetTxRaw <$> paramCapture st)
-    (scottyTxRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (PostTx <$> parseTxBody st)
-    (scottyPostTx st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetAddrTxs <$> paramCapture st <*> parseLimits st)
-    (fmap SerialList . scottyAddrTxs st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetAddrBalance <$> paramCapture st)
-    (scottyAddrBalance st)
-    (marshalEncoding net)
-    (marshalValue net)
-  pathCompact
-    (GetAddrUnspent <$> paramCapture st <*> parseLimits st)
-    (fmap SerialList . scottyAddrUnspent st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetPeers & return)
-    (fmap SerialList . scottyPeers st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetHealth & return)
-    (scottyHealth st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetMempool <$> paramOptional st <*> parseOffset st)
-    (fmap SerialList . scottyMempool st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetBlocks <$> paramRequired st <*> paramDef st)
-    (fmap SerialList . scottyBlocks st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetBlockRaw <$> paramCapture st)
-    (scottyBlockRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetBlockBestRaw & return)
-    (scottyBlockBestRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetBlockLatest <$> paramDef st)
-    (fmap SerialList . scottyBlockLatest st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetBlockHeights <$> paramRequired st <*> paramDef st)
-    (fmap SerialList . scottyBlockHeights st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetBlockHeightRaw <$> paramCapture st)
-    (scottyBlockHeightRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetBlockTimeRaw <$> paramCapture st)
-    (scottyBlockTimeRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetBlockMTPRaw <$> paramCapture st)
-    (scottyBlockMTPRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetTxs <$> paramRequired st)
-    (fmap SerialList . scottyTxs st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetTxsRaw <$> paramRequired st)
-    (scottyTxsRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetTxsBlock <$> paramCapture st)
-    (fmap SerialList . scottyTxsBlock st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetTxsBlockRaw <$> paramCapture st)
-    (scottyTxsBlockRaw st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetTxAfter <$> paramCapture st <*> paramCapture st)
-    (scottyTxAfter st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetAddrsTxs <$> paramRequired st <*> parseLimits st)
-    (fmap SerialList . scottyAddrsTxs st)
-    toEncoding
-    toJSON
-  pathCompact
-    (GetAddrTxsFull <$> paramCapture st <*> parseLimits st)
-    (fmap SerialList . scottyAddrTxsFull st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetAddrsTxsFull <$> paramRequired st <*> parseLimits st)
-    (fmap SerialList . scottyAddrsTxsFull st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetAddrsBalance <$> paramRequired st)
-    (fmap SerialList . scottyAddrsBalance st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  pathCompact
-    (GetAddrsUnspent <$> paramRequired st <*> parseLimits st)
-    (fmap SerialList . scottyAddrsUnspent st)
-    (list (marshalEncoding net) . (.get))
-    (json_list (marshalValue net) . (.get))
-  S.get "/events" (scottyEvents st)
-  S.get "/dbstats" (scottyDbStats st)
-  unless cfg.noXPub $ do
-    pathCompact
-      (GetXPub <$> paramCapture st <*> paramDef st <*> paramDef st)
-      (scottyXPub st)
-      toEncoding
-      toJSON
-    pathCompact
-      (GetXPubTxs <$> paramCapture st <*> paramDef st <*> parseLimits st <*> paramDef st)
-      (fmap SerialList . scottyXPubTxs st)
-      toEncoding
-      toJSON
-    pathCompact
-      (GetXPubTxsFull <$> paramCapture st <*> paramDef st <*> parseLimits st <*> paramDef st)
-      (fmap SerialList . scottyXPubTxsFull st)
-      (list (marshalEncoding net) . (.get))
-      (json_list (marshalValue net) . (.get))
-    pathCompact
-      (GetXPubBalances <$> paramCapture st <*> paramDef st <*> paramDef st)
-      (fmap SerialList . scottyXPubBalances st)
-      (list (marshalEncoding net) . (.get))
-      (json_list (marshalValue net) . (.get))
-    pathCompact
-      (GetXPubUnspent <$> paramCapture st <*> paramDef st <*> parseLimits st <*> paramDef st)
-      (fmap SerialList . scottyXPubUnspent st)
-      (list (marshalEncoding net) . (.get))
-      (json_list (marshalValue net) . (.get))
-    pathCompact
-      (DelCachedXPub <$> paramCapture st <*> paramDef st)
-      (scottyDelXPub st)
-      toEncoding
-      toJSON
-  unless cfg.noBlockchainInfo $ do
-    S.post "/blockchain/multiaddr" (scottyMultiAddr st)
-    S.get "/blockchain/multiaddr" (scottyMultiAddr st)
-    S.get "/blockchain/balance" (scottyShortBal st)
-    S.post "/blockchain/balance" (scottyShortBal st)
-    S.get "/blockchain/rawaddr/:addr" (scottyRawAddr st)
-    S.get "/blockchain/address/:addr" (scottyRawAddr st)
-    S.get "/blockchain/xpub/:addr" (scottyRawAddr st)
-    S.post "/blockchain/unspent" (scottyBinfoUnspent st)
-    S.get "/blockchain/unspent" (scottyBinfoUnspent st)
-    S.get "/blockchain/rawtx/:txid" (scottyBinfoTx st)
-    S.get "/blockchain/rawblock/:block" (scottyBinfoBlock st)
-    S.get "/blockchain/latestblock" (scottyBinfoLatest st)
-    S.get "/blockchain/unconfirmed-transactions" (scottyBinfoMempool st)
-    S.get "/blockchain/block-height/:height" (scottyBinfoBlockHeight st)
-    S.get "/blockchain/blocks/:milliseconds" (scottyBinfoBlocksDay st)
-    S.get "/blockchain/export-history" (scottyBinfoHistory st)
-    S.post "/blockchain/export-history" (scottyBinfoHistory st)
-    S.get "/blockchain/q/addresstohash/:addr" (scottyBinfoAddrToHash st)
-    S.get "/blockchain/q/hashtoaddress/:hash" (scottyBinfoHashToAddr st)
-    S.get "/blockchain/q/addrpubkey/:pubkey" (scottyBinfoAddrPubkey st)
-    S.get "/blockchain/q/pubkeyaddr/:addr" (scottyBinfoPubKeyAddr st)
-    S.get "/blockchain/q/hashpubkey/:pubkey" (scottyBinfoHashPubkey st)
-    S.get "/blockchain/q/getblockcount" (scottyBinfoGetBlockCount st)
-    S.get "/blockchain/q/latesthash" (scottyBinfoLatestHash st)
-    S.get "/blockchain/q/bcperblock" (scottyBinfoSubsidy st)
-    S.get "/blockchain/q/txtotalbtcoutput/:txid" (scottyBinfoTotalOut st)
-    S.get "/blockchain/q/txtotalbtcinput/:txid" (scottyBinfoTotalInput st)
-    S.get "/blockchain/q/txfee/:txid" (scottyBinfoTxFees st)
-    S.get "/blockchain/q/txresult/:txid/:addr" (scottyBinfoTxResult st)
-    S.get "/blockchain/q/getreceivedbyaddress/:addr" (scottyBinfoReceived st)
-    S.get "/blockchain/q/getsentbyaddress/:addr" (scottyBinfoSent st)
-    S.get "/blockchain/q/addressbalance/:addr" (scottyBinfoAddrBalance st)
-    S.get "/blockchain/q/addressfirstseen/:addr" (scottyFirstSeen st)
+-- | The routes of every endpoint, except those disabled in the configuration.
+handlePaths :: WebState -> WebConfig -> [Route]
+handlePaths st cfg =
+  [ pathCompact st (\req -> GetBlockBest <$> paramDef st req) (handleBlockBest st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetBlockHeight <$> paramCapture st req <*> paramDef st req) (fmap SerialList . handleBlockHeight st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetBlockTime <$> paramCapture st req <*> paramDef st req) (handleBlockTime st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetBlockMTP <$> paramCapture st req <*> paramDef st req) (handleBlockMTP st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetBlock <$> paramCapture st req <*> paramDef st req) (handleBlock st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetTx <$> paramCapture st req) (handleTx st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetTxRaw <$> paramCapture st req) (handleTxRaw st) toEncoding toJSON,
+    pathCompact st (\req -> PostTx <$> parseTxBody st req) (handlePostTx st) toEncoding toJSON,
+    pathCompact st (\req -> GetAddrTxs <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrTxs st) toEncoding toJSON,
+    pathCompact st (\req -> GetAddrBalance <$> paramCapture st req) (handleAddrBalance st) (marshalEncoding net) (marshalValue net),
+    pathCompact st (\req -> GetAddrUnspent <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\_ -> return GetPeers) (fmap SerialList . handlePeers st) toEncoding toJSON,
+    pathStatus st (\_ -> return GetHealth) (handleHealth st) (\h -> if isOK h then status200 else status503) toEncoding toJSON,
+    pathCompact st (\req -> GetMempool <$> paramOptional st req <*> parseOffset st req) (fmap SerialList . handleMempool st) toEncoding toJSON,
+    pathCompact st (\req -> GetBlocks <$> paramRequired st req <*> paramDef st req) (fmap SerialList . handleBlocks st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetBlockRaw <$> paramCapture st req) (handleBlockRaw st) toEncoding toJSON,
+    pathCompact st (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetBlockLatest <$> paramDef st req) (fmap SerialList . handleBlockLatest st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetBlockHeights <$> paramRequired st req <*> paramDef st req) (fmap SerialList . handleBlockHeights st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetBlockHeightRaw <$> paramCapture st req) (handleBlockHeightRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetBlockTimeRaw <$> paramCapture st req) (handleBlockTimeRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetBlockMTPRaw <$> paramCapture st req) (handleBlockMTPRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetTxs <$> paramRequired st req) (fmap SerialList . handleTxs st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetTxsRaw <$> paramRequired st req) (handleTxsRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetTxsBlock <$> paramCapture st req) (fmap SerialList . handleTxsBlock st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetTxsBlockRaw <$> paramCapture st req) (handleTxsBlockRaw st) toEncoding toJSON,
+    pathCompact st (\req -> GetTxAfter <$> paramCapture st req <*> paramCapture st req) (handleTxAfter st) toEncoding toJSON,
+    pathCompact st (\req -> GetAddrsTxs <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsTxs st) toEncoding toJSON,
+    pathCompact st (\req -> GetAddrTxsFull <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetAddrsTxsFull <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetAddrsBalance <$> paramRequired st req) (fmap SerialList . handleAddrsBalance st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    pathCompact st (\req -> GetAddrsUnspent <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+    get "/events" (handleEvents st),
+    get "/dbstats" (handleDbStats st)
+  ]
+    <> (if cfg.noXPub then [] else xpubRoutes)
+    <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
   where
     json_list f = toJSONList . map f
     net = cfg.store.net
+    xpubRoutes =
+      [ pathCompact st (\req -> GetXPub <$> paramCapture st req <*> paramDef st req <*> paramDef st req) (handleXPub st) toEncoding toJSON,
+        pathCompact st (\req -> GetXPubTxs <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubTxs st) toEncoding toJSON,
+        pathCompact st (\req -> GetXPubTxsFull <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+        pathCompact st (\req -> GetXPubBalances <$> paramCapture st req <*> paramDef st req <*> paramDef st req) (fmap SerialList . handleXPubBalances st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+        pathCompact st (\req -> GetXPubUnspent <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+        pathCompact st (\req -> DelCachedXPub <$> paramCapture st req <*> paramDef st req) (handleDelXPub st) toEncoding toJSON
+      ]
+    binfoRoutes =
+      [ post "/blockchain/multiaddr" (handleMultiAddr st),
+        get "/blockchain/multiaddr" (handleMultiAddr st),
+        get "/blockchain/balance" (handleShortBal st),
+        post "/blockchain/balance" (handleShortBal st),
+        get "/blockchain/rawaddr/:addr" (handleRawAddr st),
+        get "/blockchain/address/:addr" (handleRawAddr st),
+        get "/blockchain/xpub/:addr" (handleRawAddr st),
+        post "/blockchain/unspent" (handleBinfoUnspent st),
+        get "/blockchain/unspent" (handleBinfoUnspent st),
+        get "/blockchain/rawtx/:txid" (handleBinfoTx st),
+        get "/blockchain/rawblock/:block" (handleBinfoBlock st),
+        get "/blockchain/latestblock" (handleBinfoLatest st),
+        get "/blockchain/unconfirmed-transactions" (handleBinfoMempool st),
+        get "/blockchain/block-height/:height" (handleBinfoBlockHeight st),
+        get "/blockchain/blocks/:milliseconds" (handleBinfoBlocksDay st),
+        get "/blockchain/export-history" (handleBinfoHistory st),
+        post "/blockchain/export-history" (handleBinfoHistory st),
+        get "/blockchain/q/addresstohash/:addr" (handleBinfoAddrToHash st),
+        get "/blockchain/q/hashtoaddress/:hash" (handleBinfoHashToAddr st),
+        get "/blockchain/q/addrpubkey/:pubkey" (handleBinfoAddrPubkey st),
+        get "/blockchain/q/pubkeyaddr/:addr" (handleBinfoPubKeyAddr st),
+        get "/blockchain/q/hashpubkey/:pubkey" (handleBinfoHashPubkey st),
+        get "/blockchain/q/getblockcount" (handleBinfoGetBlockCount st),
+        get "/blockchain/q/latesthash" (handleBinfoLatestHash st),
+        get "/blockchain/q/bcperblock" (handleBinfoSubsidy st),
+        get "/blockchain/q/txtotalbtcoutput/:txid" (handleBinfoTotalOut st),
+        get "/blockchain/q/txtotalbtcinput/:txid" (handleBinfoTotalInput st),
+        get "/blockchain/q/txfee/:txid" (handleBinfoTxFees st),
+        get "/blockchain/q/txresult/:txid/:addr" (handleBinfoTxResult st),
+        get "/blockchain/q/getreceivedbyaddress/:addr" (handleBinfoReceived st),
+        get "/blockchain/q/getsentbyaddress/:addr" (handleBinfoSent st),
+        get "/blockchain/q/addressbalance/:addr" (handleBinfoAddrBalance st),
+        get "/blockchain/q/addressfirstseen/:addr" (handleFirstSeen st)
+      ]
 
 -- | Register a handler for an API resource, with compact JSON by default.
 pathCompact ::
   (ApiResource a b) =>
-  ActionT a ->
-  (a -> ActionT b) ->
+  WebState ->
+  (Req -> IO a) ->
+  (a -> IO b) ->
   (b -> Encoding) ->
   (b -> Value) ->
-  ScottyT ()
-pathCompact parser action encJson encValue =
-  pathCommon parser action encJson encValue False
+  Route
+pathCompact st parser action encJson encValue =
+  pathCommon st parser action (const status200) encJson encValue False
 
--- | Register a handler for an API resource: parse the request, run the handler,
--- and encode the response as JSON or binary, as the client asked.
+-- | Like 'pathCompact', with the status of the response depending on it, as
+-- the health check answers 503 when the store is not healthy.
+pathStatus ::
+  (ApiResource a b) =>
+  WebState ->
+  (Req -> IO a) ->
+  (a -> IO b) ->
+  (b -> Status) ->
+  (b -> Encoding) ->
+  (b -> Value) ->
+  Route
+pathStatus st parser action status encJson encValue =
+  pathCommon st parser action status encJson encValue False
+
+-- | The route of an API resource: parse the request, run the handler, and
+-- encode the response as JSON or binary, as the client asked.
 pathCommon ::
   (ApiResource a b) =>
-  ActionT a ->
-  (a -> ActionT b) ->
+  WebState ->
+  (Req -> IO a) ->
+  (a -> IO b) ->
+  (b -> Status) ->
   (b -> Encoding) ->
   (b -> Value) ->
   Bool ->
-  ScottyT ()
-pathCommon parser action encJson encValue pretty =
-  S.addroute (resourceMethod proxy) (capturePath proxy) $ do
-    setHeaders
-    proto <- setupContentType pretty
-    apiRes <- parser
-    res <- action apiRes
-    S.raw $ protoSerial proto encJson encValue res
+  Route
+pathCommon _ parser action status encJson encValue pretty =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) $ \req -> do
+    let proto = serialAs req pretty
+    res <- action =<< parser req
+    return $
+      responseLBS (status res) [(hContentType, serialType proto)] (protoSerial proto encJson encValue res)
   where
-    toProxy :: ActionT a -> Proxy a
+    toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
     proxy = toProxy parser
 
 -- | Respond with JSON.
-streamEncoding :: Encoding -> ActionT ()
-streamEncoding e = do
-  S.setHeader "Content-Type" "application/json; charset=utf-8"
-  S.raw (encodingToLazyByteString e)
+streamEncoding :: Encoding -> IO Response
+streamEncoding e =
+  return $
+    responseLBS status200 [(hContentType, "application/json; charset=utf-8")] (encodingToLazyByteString e)
+
+-- | Respond with text.
+textResponse :: TL.Text -> IO Response
+textResponse t =
+  return $
+    responseLBS status200 [(hContentType, "text/plain; charset=utf-8")] (TL.encodeUtf8 t)
 
 -- | Encode a response in binary, JSON or pretty JSON.
 protoSerial ::
@@ -964,41 +853,29 @@ protoSerial SerialAsJSON f _ = encodingToLazyByteString . f
 protoSerial SerialAsPrettyJSON _ g =
   encodePretty' defConfig {confTrailingNewline = True} . g
 
--- | Allow requests from any origin.
-setHeaders :: ActionT ()
-setHeaders = S.setHeader "Access-Control-Allow-Origin" "*"
+-- | The content type of an encoding.
+serialType :: SerialAs -> C.ByteString
+serialType SerialAsBinary = "application/octet-stream"
+serialType _ = "application/json"
 
--- | Respond with JSON, pretty if the @pretty@ parameter or the default says so.
-setupJSON :: Bool -> ActionT SerialAs
-setupJSON pretty = do
-  S.setHeader "Content-Type" "application/json"
-  p <- param "pretty" `rescue` return pretty
-  return $ if p then SerialAsPrettyJSON else SerialAsJSON
-
--- | Respond with binary.
-setupBinary :: ActionT SerialAs
-setupBinary = do
-  S.setHeader "Content-Type" "application/octet-stream"
-  return SerialAsBinary
-
--- | Choose the encoding of the response from the @Accept@ header of the request.
-setupContentType :: Bool -> ActionT SerialAs
-setupContentType pretty = do
-  accept <- S.header "accept"
-  maybe (setupJSON pretty) setType accept
-  where
-    setType "application/octet-stream" = setupBinary
-    setType _ = setupJSON pretty
+-- | The encoding that a request asks for: binary with the header
+-- @Accept: application\/octet-stream@, else JSON, pretty if the @pretty@
+-- parameter or the default says so.
+serialAs :: Req -> Bool -> SerialAs
+serialAs req pretty
+  | Router.header req "accept" == Just "application/octet-stream" = SerialAsBinary
+  | paramOr req readBool "pretty" pretty = SerialAsPrettyJSON
+  | otherwise = SerialAsJSON
 
 -- GET Block / GET Blocks --
 
 -- | Handler for @GET \/block\/:block@: a block by hash.
-scottyBlock ::
+handleBlock ::
   WebState ->
   GetBlock ->
-  ActionT BlockData
-scottyBlock st (GetBlock h (NoTx noTx)) = withMetrics st (.block) $ do
-  getBlock st h >>= \case
+  IO BlockData
+handleBlock st (GetBlock h (NoTx noTx)) = withMetrics st (.block) $ do
+  st.query.getBlock h >>= \case
     Nothing ->
       raise st ThingNotFound
     Just b -> do
@@ -1009,16 +886,16 @@ getBlocks ::
   WebState ->
   [H.BlockHash] ->
   Bool ->
-  ActionT [BlockData]
+  IO [BlockData]
 getBlocks st hs notx =
-  (pruneTx notx <$>) . catMaybes <$> mapM (getBlock st) (nub hs)
+  (pruneTx notx <$>) . catMaybes <$> mapM (st.query.getBlock) (nub hs)
 
 -- | Handler for @GET \/blocks?blocks=…@: several blocks by hash.
-scottyBlocks ::
+handleBlocks ::
   WebState ->
   GetBlocks ->
-  ActionT [BlockData]
-scottyBlocks st (GetBlocks hs (NoTx notx)) =
+  IO [BlockData]
+handleBlocks st (GetBlocks hs (NoTx notx)) =
   withMetrics st (.block) $
     getBlocks st hs notx
 
@@ -1030,11 +907,11 @@ pruneTx True BlockData {..} = BlockData {txs = take 1 txs, ..}
 -- GET BlockRaw --
 
 -- | Handler for @GET \/block\/:block\/raw@: a block by hash, serialized as in the peer-to-peer protocol.
-scottyBlockRaw ::
+handleBlockRaw ::
   WebState ->
   GetBlockRaw ->
-  ActionT (RawResult H.Block)
-scottyBlockRaw st (GetBlockRaw h) =
+  IO (RawResult H.Block)
+handleBlockRaw st (GetBlockRaw h) =
   withMetrics st (.blockRaw) $
     RawResult <$> getRawBlock st h
 
@@ -1042,9 +919,9 @@ scottyBlockRaw st (GetBlockRaw h) =
 getRawBlock ::
   WebState ->
   H.BlockHash ->
-  ActionT H.Block
+  IO H.Block
 getRawBlock st h =
-  getBlock st h >>= maybe (raise st ThingNotFound) return >>= lift . toRawBlock st.query
+  st.query.getBlock h >>= maybe (raise st ThingNotFound) return >>= toRawBlock st.query
 
 -- | Rebuild a block from its data and its transactions.
 toRawBlock :: StoreRead -> BlockData -> IO H.Block
@@ -1055,200 +932,200 @@ toRawBlock q b = do
 -- GET BlockBest / BlockBestRaw --
 
 -- | Handler for @GET \/block\/best@: the best block.
-scottyBlockBest ::
+handleBlockBest ::
   WebState ->
   GetBlockBest ->
-  ActionT BlockData
-scottyBlockBest st (GetBlockBest (NoTx notx)) =
+  IO BlockData
+handleBlockBest st (GetBlockBest (NoTx notx)) =
   withMetrics st (.block) $
-    liftIO (bestBlock st.query) >>= maybe (raise st ThingNotFound) (return . pruneTx notx)
+    (bestBlock st.query) >>= maybe (raise st ThingNotFound) (return . pruneTx notx)
 
 -- | Handler for @GET \/block\/best\/raw@: the best block, serialized.
-scottyBlockBestRaw ::
+handleBlockBestRaw ::
   WebState ->
   GetBlockBestRaw ->
-  ActionT (RawResult H.Block)
-scottyBlockBestRaw st _ =
+  IO (RawResult H.Block)
+handleBlockBestRaw st _ =
   withMetrics st (.blockRaw) $
-    getBestBlock st >>= \case
+    st.query.getBestBlock >>= \case
       Nothing -> raise st ThingNotFound
       Just h -> RawResult <$> getRawBlock st h
 
 -- GET BlockLatest --
 
 -- | Handler for @GET \/block\/latest@: the best block and its ancestors, up to 100 blocks.
-scottyBlockLatest ::
+handleBlockLatest ::
   WebState ->
   GetBlockLatest ->
-  ActionT [BlockData]
-scottyBlockLatest st (GetBlockLatest (NoTx noTx)) =
+  IO [BlockData]
+handleBlockLatest st (GetBlockLatest (NoTx noTx)) =
   withMetrics st (.block) $
-    getBestBlock st >>= maybe (raise st ThingNotFound) (go [] <=< getBlock st)
+    st.query.getBestBlock >>= maybe (raise st ThingNotFound) (go [] <=< st.query.getBlock)
   where
     go acc Nothing = return $ reverse acc
     go acc (Just b)
       | b.height <= 0 = return $ reverse acc
       | length acc == 99 = return . reverse $ pruneTx noTx b : acc
-      | otherwise = go (pruneTx noTx b : acc) =<< getBlock st b.header.prev
+      | otherwise = go (pruneTx noTx b : acc) =<< st.query.getBlock b.header.prev
 
 -- GET BlockHeight / BlockHeights / BlockHeightRaw --
 
 -- | Handler for @GET \/block\/height\/:height@: the blocks at a height.
-scottyBlockHeight ::
+handleBlockHeight ::
   WebState ->
   GetBlockHeight ->
-  ActionT [BlockData]
-scottyBlockHeight st (GetBlockHeight h (NoTx notx)) =
+  IO [BlockData]
+handleBlockHeight st (GetBlockHeight h (NoTx notx)) =
   withMetrics st (.block) $
-    getBlocksAtHeight st (fromIntegral h)
+    st.query.getBlocksAtHeight (fromIntegral h)
       >>= (\hs -> getBlocks st hs notx)
 
 -- | Handler for @GET \/block\/heights?heights=…@: the blocks at several heights.
-scottyBlockHeights ::
+handleBlockHeights ::
   WebState ->
   GetBlockHeights ->
-  ActionT [BlockData]
-scottyBlockHeights st (GetBlockHeights (HeightsParam heights) (NoTx notx)) =
+  IO [BlockData]
+handleBlockHeights st (GetBlockHeights (HeightsParam heights) (NoTx notx)) =
   withMetrics st (.block) $
-    mapM (getBlocksAtHeight st . fromIntegral) heights
+    mapM (st.query.getBlocksAtHeight . fromIntegral) heights
       >>= (\hs -> getBlocks st hs notx) . concat
 
 -- | Handler for @GET \/block\/height\/:height\/raw@: the blocks at a height, serialized.
-scottyBlockHeightRaw ::
+handleBlockHeightRaw ::
   WebState ->
   GetBlockHeightRaw ->
-  ActionT (RawResultList H.Block)
-scottyBlockHeightRaw st (GetBlockHeightRaw h) =
+  IO (RawResultList H.Block)
+handleBlockHeightRaw st (GetBlockHeightRaw h) =
   withMetrics st (.blockRaw) $
     fmap RawResultList $
-      mapM (getRawBlock st) =<< getBlocksAtHeight st (fromIntegral h)
+      mapM (getRawBlock st) =<< st.query.getBlocksAtHeight (fromIntegral h)
 
 -- GET BlockTime / BlockTimeRaw --
 
 -- | Handler for @GET \/block\/time\/:time@: the last block with a timestamp at or before a time.
-scottyBlockTime ::
+handleBlockTime ::
   WebState ->
   GetBlockTime ->
-  ActionT BlockData
-scottyBlockTime st (GetBlockTime (TimeParam t) (NoTx notx)) =
+  IO BlockData
+handleBlockTime st (GetBlockTime (TimeParam t) (NoTx notx)) =
   withMetrics st (.block) $ do
     let ch = st.config.store.chain
-    blockAtOrBefore st ch t >>= \case
+    C.blockAtOrBefore st.query ch t >>= \case
       Nothing -> raise st ThingNotFound
       Just b -> return $ pruneTx notx b
 
 -- | Handler for @GET \/block\/mtp\/:time@: the first block with a median time past at or after a time.
-scottyBlockMTP ::
+handleBlockMTP ::
   WebState ->
   GetBlockMTP ->
-  ActionT BlockData
-scottyBlockMTP st (GetBlockMTP (TimeParam t) (NoTx notx)) =
+  IO BlockData
+handleBlockMTP st (GetBlockMTP (TimeParam t) (NoTx notx)) =
   withMetrics st (.block) $ do
     let ch = st.config.store.chain
-    blockAtOrAfterMTP st ch t >>= \case
+    C.blockAtOrAfterMTP st.query ch t >>= \case
       Nothing -> raise st ThingNotFound
       Just b -> return $ pruneTx notx b
 
 -- | Handler for @GET \/block\/time\/:time\/raw@: the last block with a timestamp at or before a time, serialized.
-scottyBlockTimeRaw ::
+handleBlockTimeRaw ::
   WebState ->
   GetBlockTimeRaw ->
-  ActionT (RawResult H.Block)
-scottyBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
+  IO (RawResult H.Block)
+handleBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
   withMetrics st (.blockRaw) $ do
     let ch = st.config.store.chain
-    blockAtOrBefore st ch t >>= \case
+    C.blockAtOrBefore st.query ch t >>= \case
       Nothing -> raise st ThingNotFound
-      Just b -> RawResult <$> lift (toRawBlock st.query b)
+      Just b -> RawResult <$> (toRawBlock st.query b)
 
 -- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time past at or after a time, serialized.
-scottyBlockMTPRaw ::
+handleBlockMTPRaw ::
   WebState ->
   GetBlockMTPRaw ->
-  ActionT (RawResult H.Block)
-scottyBlockMTPRaw st (GetBlockMTPRaw (TimeParam t)) =
+  IO (RawResult H.Block)
+handleBlockMTPRaw st (GetBlockMTPRaw (TimeParam t)) =
   withMetrics st (.blockRaw) $ do
     let ch = st.config.store.chain
-    blockAtOrAfterMTP st ch t >>= \case
+    C.blockAtOrAfterMTP st.query ch t >>= \case
       Nothing -> raise st ThingNotFound
-      Just b -> RawResult <$> lift (toRawBlock st.query b)
+      Just b -> RawResult <$> (toRawBlock st.query b)
 
 -- GET Transactions --
 
 -- | Handler for @GET \/transaction\/:txid@: a transaction.
-scottyTx :: WebState -> GetTx -> ActionT Transaction
-scottyTx st (GetTx txid) =
+handleTx :: WebState -> GetTx -> IO Transaction
+handleTx st (GetTx txid) =
   withMetrics st (.tx) $
-    getTransaction st txid >>= maybe (raise st ThingNotFound) return
+    C.getTransaction st.query txid >>= maybe (raise st ThingNotFound) return
 
 -- | Handler for @GET \/transactions?txids=…@: several transactions.
-scottyTxs ::
+handleTxs ::
   WebState ->
   GetTxs ->
-  ActionT [Transaction]
-scottyTxs st (GetTxs txids) =
+  IO [Transaction]
+handleTxs st (GetTxs txids) =
   withMetrics st (.tx) $
-    catMaybes <$> getTransactions st (nub txids)
+    catMaybes <$> C.getTransactions st.query (nub txids)
 
 -- | Handler for @GET \/transaction\/:txid\/raw@: a transaction, serialized.
-scottyTxRaw ::
+handleTxRaw ::
   WebState ->
   GetTxRaw ->
-  ActionT (RawResult Tx)
-scottyTxRaw st (GetTxRaw txid) =
+  IO (RawResult Tx)
+handleTxRaw st (GetTxRaw txid) =
   withMetrics st (.txRaw) $
-    getTransaction st txid
+    C.getTransaction st.query txid
       >>= \case
         Nothing -> raise st ThingNotFound
         Just tx -> return $ RawResult (transactionData tx)
 
 -- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized.
-scottyTxsRaw ::
+handleTxsRaw ::
   WebState ->
   GetTxsRaw ->
-  ActionT (RawResultList Tx)
-scottyTxsRaw st (GetTxsRaw txids) =
+  IO (RawResultList Tx)
+handleTxsRaw st (GetTxsRaw txids) =
   withMetrics st (.txRaw) $
     RawResultList . map transactionData . catMaybes
-      <$> getTransactions st (nub txids)
+      <$> C.getTransactions st.query (nub txids)
 
 -- | Transactions of a block. Responds with an error if not found.
 getTxsBlock ::
   WebState ->
   H.BlockHash ->
-  ActionT [Transaction]
+  IO [Transaction]
 getTxsBlock st h =
-  getBlock st h >>= \case
+  st.query.getBlock h >>= \case
     Nothing -> raise st ThingNotFound
-    Just b -> catMaybes <$> getTransactions st b.txs
+    Just b -> catMaybes <$> C.getTransactions st.query b.txs
 
 -- | Handler for @GET \/transactions\/block\/:block@: the transactions of a block.
-scottyTxsBlock ::
+handleTxsBlock ::
   WebState ->
   GetTxsBlock ->
-  ActionT [Transaction]
-scottyTxsBlock st (GetTxsBlock h) =
+  IO [Transaction]
+handleTxsBlock st (GetTxsBlock h) =
   withMetrics st (.txBlock) $ getTxsBlock st h
 
 -- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized.
-scottyTxsBlockRaw ::
+handleTxsBlockRaw ::
   WebState ->
   GetTxsBlockRaw ->
-  ActionT (RawResultList Tx)
-scottyTxsBlockRaw st (GetTxsBlockRaw h) =
+  IO (RawResultList Tx)
+handleTxsBlockRaw st (GetTxsBlockRaw h) =
   withMetrics st (.txBlockRaw) $
     RawResultList . map transactionData <$> getTxsBlock st h
 
 -- GET TransactionAfterHeight --
 
 -- | Handler for @GET \/transaction\/:txid\/after\/:height@: whether any ancestor of a transaction is a coinbase confirmed after a height.
-scottyTxAfter ::
+handleTxAfter ::
   WebState ->
   GetTxAfter ->
-  ActionT (GenericResult (Maybe Bool))
-scottyTxAfter st (GetTxAfter txid height) =
+  IO (GenericResult (Maybe Bool))
+handleTxAfter st (GetTxAfter txid height) =
   withMetrics st (.txAfter) $
-    GenericResult . fst <$> liftIO (cbAfterHeight st.query (fromIntegral height) txid)
+    GenericResult . fst <$> (cbAfterHeight st.query (fromIntegral height) txid)
 
 -- | Check if any of the ancestors of this transaction is a coinbase after the
 -- specified height. Returns 'Nothing' if answer cannot be computed before
@@ -1291,11 +1168,11 @@ cbAfterHeight q height txid =
 -- POST Transaction --
 
 -- | Handler for @POST \/transactions@: broadcast a transaction to half of the peers and return its hash.
-scottyPostTx :: WebState -> PostTx -> ActionT TxId
-scottyPostTx st (PostTx tx) =
+handlePostTx :: WebState -> PostTx -> IO TxId
+handlePostTx st (PostTx tx) =
   withMetrics st (.txPost) $ do
     let cfg = st.config
-    lift (publishTx cfg tx)
+    (publishTx cfg tx)
     return (TxId (txHash tx))
 
 -- | Send transaction to all connected peers.
@@ -1304,29 +1181,29 @@ publishTx ::
   Tx ->
   IO ()
 publishTx cfg tx = do
-  ps <- liftIO $ getPeers cfg.store.peerMgr
+  ps <- getPeers cfg.store.peerMgr
   let c = max 1 (length ps `div` 2)
   forM_ (take c ps) $ \p -> do
-    liftIO $ sendMessage (MTx tx) p.mailbox
+    sendMessage (MTx tx) p.mailbox
     void . async $ do
       threadDelay (5 * 1000 * 1000)
       let v = if cfg.store.net.segWit then InvWitnessTx else InvTx
           g = MGetData (GetData [InvVector v (txHash tx).get])
-      liftIO $ sendMessage g p.mailbox
+      sendMessage g p.mailbox
 
 -- GET Mempool / Events --
 
 -- | Handler for @GET \/mempool@: hashes of mempool transactions, newest first.
-scottyMempool ::
+handleMempool ::
   WebState ->
   GetMempool ->
-  ActionT [TxHash]
-scottyMempool st (GetMempool limitM (OffsetParam o)) =
+  IO [TxHash]
+handleMempool st (GetMempool limitM (OffsetParam o)) =
   withMetrics st (.mempool) $ do
     WebLimits {..} <- pure st.config.limits
     let wl' = WebLimits {maxItemCount = 0, ..}
         l = Limits (validateLimit wl' False limitM) (fromIntegral o) Nothing
-    map snd <$> getMempoolPage st l
+    map snd <$> st.query.getMempoolPage l
 
 -- | Middleware that serves @\/events@ over a WebSocket: each new block or mempool
 -- transaction is sent as a JSON message. Clients that do not answer pings, or
@@ -1344,14 +1221,14 @@ webSocketEvents s =
     events pending = do
       let path = requestPath $ pendingRequest pending
       if path == "/events"
-        then withEventSubscription pub $ \next -> do
+        then withEventSubscription pub $ \nextEvent -> do
           conn <- acceptRequest pending
           -- Drop clients that stop answering pings, and clients that fall
           -- so far behind that their event queue fills up.
           -- websockets only sees pongs while reading, hence the reader.
           withPingPong pingPong conn $ \c ->
             let send_events =
-                  next >>= \case
+                  nextEvent >>= \case
                     Nothing ->
                       WebSockets.sendClose c ("Event queue full" :: Text)
                     Just event -> do
@@ -1375,20 +1252,19 @@ webSocketEvents s =
               }
 
 -- | Handler for @GET \/events@: stream of new blocks and mempool transactions, one per line in JSON, until the client falls more than 10000 events behind.
-scottyEvents :: WebState -> ActionT ()
-scottyEvents st =
+handleEvents :: WebState -> Req -> IO Response
+handleEvents st req =
   withGaugeIncrease st (.events) $ do
-    setHeaders
-    proto <- setupContentType False
-    let pub = st.config.store.pub
-    S.stream $ \io flush' ->
-      withEventSubscription pub $ \next ->
+    let proto = serialAs req False
+        pub = st.config.store.pub
+    return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
+      withEventSubscription pub $ \nextEvent ->
         -- ends the response when the client falls too far behind
         let send_events = do
               flush'
-              next >>= \case
+              nextEvent >>= \case
                 Nothing -> return ()
-                Just msg -> io (serial proto msg) >> send_events
+                Just msg -> write (serial proto msg) >> send_events
          in send_events
   where
     serial proto e =
@@ -1417,11 +1293,11 @@ withEventSubscription pub f = do
         mailboxFullSTM inbox >>= \case
           True -> writeTVar overflow True
           False -> sendSTM ev inbox
-      next =
+      nextEvent =
         atomically $
           (readTVar overflow >>= checkSTM >> return Nothing)
             `orElse` (Just <$> receiveSTM inbox)
-  bracket (subscribe pub listen) (unsubscribe pub) $ \_ -> f next
+  bracket (subscribe pub listen) (unsubscribe pub) $ \_ -> f nextEvent
   where
     toEvent = \case
       StoreBestBlock b -> Just (EventBlock b)
@@ -1432,95 +1308,95 @@ withEventSubscription pub f = do
 -- GET Address Transactions --
 
 -- | Handler for @GET \/address\/:address\/transactions@: transactions of an address.
-scottyAddrTxs ::
+handleAddrTxs ::
   WebState ->
   GetAddrTxs ->
-  ActionT [TxRef]
-scottyAddrTxs st (GetAddrTxs addr pLimits) =
+  IO [TxRef]
+handleAddrTxs st (GetAddrTxs addr pLimits) =
   withMetrics st (.addressTx) $
-    getAddressTxs st addr =<< paramToLimits st False pLimits
+    st.query.getAddressTxs addr =<< paramToLimits st False pLimits
 
 -- | Handler for @GET \/address\/transactions?addresses=…@: transactions of several addresses.
-scottyAddrsTxs ::
+handleAddrsTxs ::
   WebState ->
   GetAddrsTxs ->
-  ActionT [TxRef]
-scottyAddrsTxs st (GetAddrsTxs addrs pLimits) =
+  IO [TxRef]
+handleAddrsTxs st (GetAddrsTxs addrs pLimits) =
   withMetrics st (.addressTx) $
-    getAddressesTxs st addrs =<< paramToLimits st False pLimits
+    st.query.getAddressesTxs addrs =<< paramToLimits st False pLimits
 
 -- | Handler for @GET \/address\/:address\/transactions\/full@: full transactions of an address.
-scottyAddrTxsFull ::
+handleAddrTxsFull ::
   WebState ->
   GetAddrTxsFull ->
-  ActionT [Transaction]
-scottyAddrTxsFull st (GetAddrTxsFull addr pLimits) =
+  IO [Transaction]
+handleAddrTxsFull st (GetAddrTxsFull addr pLimits) =
   withMetrics st (.addressTxFull) $ do
-    txs <- getAddressTxs st addr =<< paramToLimits st True pLimits
-    catMaybes <$> getTransactions st (map (.txid) txs)
+    txs <- st.query.getAddressTxs addr =<< paramToLimits st True pLimits
+    catMaybes <$> C.getTransactions st.query (map (.txid) txs)
 
 -- | Handler for @GET \/address\/transactions\/full?addresses=…@: full transactions of several addresses.
-scottyAddrsTxsFull ::
+handleAddrsTxsFull ::
   WebState ->
   GetAddrsTxsFull ->
-  ActionT [Transaction]
-scottyAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) =
+  IO [Transaction]
+handleAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) =
   withMetrics st (.addressTxFull) $ do
-    txs <- getAddressesTxs st addrs =<< paramToLimits st True pLimits
-    catMaybes <$> getTransactions st (map (.txid) txs)
+    txs <- st.query.getAddressesTxs addrs =<< paramToLimits st True pLimits
+    catMaybes <$> C.getTransactions st.query (map (.txid) txs)
 
 -- | Handler for @GET \/address\/:address\/balance@: balance of an address.
-scottyAddrBalance :: WebState -> GetAddrBalance -> ActionT Balance
-scottyAddrBalance st (GetAddrBalance addr) =
-  withMetrics st (.addressBalance) $ getDefaultBalance st addr
+handleAddrBalance :: WebState -> GetAddrBalance -> IO Balance
+handleAddrBalance st (GetAddrBalance addr) =
+  withMetrics st (.addressBalance) $ C.getDefaultBalance st.query addr
 
 -- | Handler for @GET \/address\/balances?addresses=…@: balances of several addresses.
-scottyAddrsBalance ::
+handleAddrsBalance ::
   WebState ->
   GetAddrsBalance ->
-  ActionT [Balance]
-scottyAddrsBalance st (GetAddrsBalance addrs) =
-  withMetrics st (.addressBalance) $ getBalances st addrs
+  IO [Balance]
+handleAddrsBalance st (GetAddrsBalance addrs) =
+  withMetrics st (.addressBalance) $ st.query.getBalances addrs
 
 -- | Handler for @GET \/address\/:address\/unspent@: unspent outputs of an address.
-scottyAddrUnspent ::
+handleAddrUnspent ::
   WebState ->
   GetAddrUnspent ->
-  ActionT [Unspent]
-scottyAddrUnspent st (GetAddrUnspent addr pLimits) =
+  IO [Unspent]
+handleAddrUnspent st (GetAddrUnspent addr pLimits) =
   withMetrics st (.addressUnspent) $
-    getAddressUnspents st addr =<< paramToLimits st False pLimits
+    st.query.getAddressUnspents addr =<< paramToLimits st False pLimits
 
 -- | Handler for @GET \/address\/unspent?addresses=…@: unspent outputs of several addresses.
-scottyAddrsUnspent ::
+handleAddrsUnspent ::
   WebState ->
   GetAddrsUnspent ->
-  ActionT [Unspent]
-scottyAddrsUnspent st (GetAddrsUnspent addrs pLimits) =
+  IO [Unspent]
+handleAddrsUnspent st (GetAddrsUnspent addrs pLimits) =
   withMetrics st (.addressUnspent) $
-    getAddressesUnspents st addrs =<< paramToLimits st False pLimits
+    st.query.getAddressesUnspents addrs =<< paramToLimits st False pLimits
 
 -- GET XPubs --
 
 -- | Handler for @GET \/xpub\/:xpub@: summary of an extended public key.
-scottyXPub ::
+handleXPub ::
   WebState ->
   GetXPub ->
-  ActionT XPubSummary
-scottyXPub st (GetXPub xpub deriv (NoCache noCache)) =
+  IO XPubSummary
+handleXPub st (GetXPub xpub deriv (NoCache noCache)) =
   withMetrics st (.xpub) $
     let xs = XPubSpec xpub deriv
-     in xPubSummary xs <$> xPubBals (cacheOr noCache st) xs
+     in xPubSummary xs <$> (cacheOr noCache st).query.xPubBals xs
 
 -- | Handler for @DELETE \/xpub\/:xpub@: remove an extended public key from the cache. Returns 'True' if it was cached.
-scottyDelXPub ::
+handleDelXPub ::
   WebState ->
   DelCachedXPub ->
-  ActionT (GenericResult Bool)
-scottyDelXPub st (DelCachedXPub xpub deriv) =
+  IO (GenericResult Bool)
+handleDelXPub st (DelCachedXPub xpub deriv) =
   withMetrics st (.xpubDelete) $ do
     let c = st.config.store.cache
-    r <- liftIO $ maybe (return False) (`cacheDelete` XPubSpec xpub deriv) c
+    r <- maybe (return False) (`cacheDelete` XPubSpec xpub deriv) c
     return $ GenericResult r
 
 -- | Transactions of an extended public key, optionally without the cache.
@@ -1530,55 +1406,55 @@ getXPubTxs ::
   DeriveType ->
   LimitsParam ->
   Bool ->
-  ActionT [TxRef]
+  IO [TxRef]
 getXPubTxs st xpub deriv plimits nocache = do
   limits <- paramToLimits st False plimits
   let xs = XPubSpec xpub deriv
       st' = cacheOr nocache st
-  xbals <- xPubBals st' xs
-  xPubTxs st' xs xbals limits
+  xbals <- st'.query.xPubBals xs
+  st'.query.xPubTxs xs xbals limits
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions@: transactions of an extended public key.
-scottyXPubTxs ::
+handleXPubTxs ::
   WebState ->
   GetXPubTxs ->
-  ActionT [TxRef]
-scottyXPubTxs st (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
+  IO [TxRef]
+handleXPubTxs st (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
   withMetrics st (.xpubTx) $
     getXPubTxs st xpub deriv plimits nocache
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions\/full@: full transactions of an extended public key.
-scottyXPubTxsFull ::
+handleXPubTxsFull ::
   WebState ->
   GetXPubTxsFull ->
-  ActionT [Transaction]
-scottyXPubTxsFull st (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
+  IO [Transaction]
+handleXPubTxsFull st (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
   withMetrics st (.xpubTxFull) $
     fmap catMaybes $
-      getTransactions (cacheOr nocache st) . map (.txid)
+      C.getTransactions (cacheOr nocache st).query . map (.txid)
         =<< getXPubTxs st xpub deriv plimits nocache
 
 -- | Handler for @GET \/xpub\/:xpub\/balances@: balances of the used addresses of an extended public key.
-scottyXPubBalances ::
+handleXPubBalances ::
   WebState ->
   GetXPubBalances ->
-  ActionT [XPubBal]
-scottyXPubBalances st (GetXPubBalances xpub deriv (NoCache noCache)) =
+  IO [XPubBal]
+handleXPubBalances st (GetXPubBalances xpub deriv (NoCache noCache)) =
   withMetrics st (.xpubBalance) $
-    xPubBals (cacheOr noCache st) (XPubSpec xpub deriv)
+    (cacheOr noCache st).query.xPubBals (XPubSpec xpub deriv)
 
 -- | Handler for @GET \/xpub\/:xpub\/unspent@: unspent outputs of an extended public key.
-scottyXPubUnspent ::
+handleXPubUnspent ::
   WebState ->
   GetXPubUnspent ->
-  ActionT [XPubUnspent]
-scottyXPubUnspent st (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
+  IO [XPubUnspent]
+handleXPubUnspent st (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
   withMetrics st (.xpubUnspent) $ do
     limits <- paramToLimits st False pLimits
     let xspec = XPubSpec xpub deriv
         st' = cacheOr noCache st
-    xbals <- xPubBals st' xspec
-    xPubUnspents st' xspec xbals limits
+    xbals <- st'.query.xPubBals xspec
+    st'.query.xPubUnspents xspec xbals limits
 
 ---------------------------------------
 -- Blockchain.info API Compatibility --
@@ -1636,12 +1512,13 @@ binfoTickerToSymbol code t =
 -- | Addresses and xpubs in a request parameter, separated by pipes or commas.
 getBinfoAddrsParam ::
   WebState ->
+  Req ->
   Text ->
-  ActionT (HashSet BinfoAddr)
-getBinfoAddrsParam st name = do
+  IO (HashSet BinfoAddr)
+getBinfoAddrsParam st req name = do
   let net = st.config.store.net
   let ctx = st.config.store.ctx
-  p <- param name `rescue` return ""
+  let p = fromMaybe "" (param req name)
   if T.null p
     then return HashSet.empty
     else case parseBinfoAddr net ctx p of
@@ -1653,11 +1530,12 @@ getBinfoAddrsParam st name = do
 -- SegWit addresses.
 getBinfoActive ::
   WebState ->
-  ActionT (HashSet XPubSpec, HashSet Address)
-getBinfoActive st = do
-  active <- getBinfoAddrsParam st "active"
-  p2sh <- getBinfoAddrsParam st "activeP2SH"
-  bech32 <- getBinfoAddrsParam st "activeBech32"
+  Req ->
+  IO (HashSet XPubSpec, HashSet Address)
+getBinfoActive st req = do
+  active <- getBinfoAddrsParam st req "active"
+  p2sh <- getBinfoAddrsParam st req "activeP2SH"
+  bech32 <- getBinfoAddrsParam st req "activeBech32"
   let xspec d b = (`XPubSpec` d) <$> xpub b
       xspecs =
         HashSet.fromList $
@@ -1675,36 +1553,35 @@ getBinfoActive st = do
     xpub (BinfoAddr _) = Nothing
 
 -- | Whether to identify transactions by short number, unless @txidindex@ is false.
-getNumTxId :: ActionT Bool
-getNumTxId = fmap not $ param "txidindex" `rescue` return False
+getNumTxId :: Req -> Bool
+getNumTxId req = not (paramOr req readBool "txidindex" False)
 
 -- | Height of the best header.
-getChainHeight :: WebState -> ActionT H.BlockHeight
+getChainHeight :: WebState -> IO H.BlockHeight
 getChainHeight st =
-  fmap (.height) $ liftIO . chainGetBest =<< pure st.config.store.chain
+  fmap (.height) $ chainGetBest =<< pure st.config.store.chain
 
 -- | Handler for @GET\/POST \/blockchain\/unspent@: unspent outputs of addresses and xpubs, as Blockchain.info.
-scottyBinfoUnspent :: WebState -> ActionT ()
-scottyBinfoUnspent st =
+handleBinfoUnspent :: WebState -> Req -> IO Response
+handleBinfoUnspent st req =
   withMetrics st (.binfoUnspent) $ do
-    (xspecs, addrs) <- getBinfoActive st
-    numtxid <- getNumTxId
+    (xspecs, addrs) <- getBinfoActive st req
+    let numtxid = getNumTxId req
     limit <- get_limit
     min_conf <- get_min_conf
     let net = st.config.store.net
     let ctx = st.config.store.ctx
     height <- getChainHeight st
     let mn u = min_conf > u.confirmations
-    xbals <- lift $ getXBals st.query xspecs
+    xbals <- getXBals st.query xspecs
     bus <-
-      lift . runConduit $
+      runConduit $
         getBinfoUnspents st.query numtxid height xbals xspecs addrs
           .| (dropWhileC mn >> takeC limit .| sinkList)
-    setHeaders
     streamEncoding (marshalEncoding (net, ctx) (BinfoUnspents bus))
   where
-    get_limit = fmap (min 1000) $ param "limit" `rescue` return 250
-    get_min_conf = param "confirmations" `rescue` return 0
+    get_limit = return (min 1000 (paramOr req readNum "limit" 250))
+    get_min_conf = return (paramOr req readNum "confirmations" 0)
 
 -- | Stream the unspent outputs of xpubs and addresses, newest first, in the
 -- Blockchain.info format.
@@ -1871,11 +1748,11 @@ pageFor :: Int -> Int -> Word32
 pageFor offset n = fromIntegral (max 16 (min 1000 (offset + n)))
 
 -- | Whether to show addresses in CashAddr format (@cashaddr@).
-getCashAddr :: ActionT Bool
-getCashAddr = param "cashaddr" `rescue` return False
+getCashAddr :: Req -> Bool
+getCashAddr req = paramOr req readBool "cashaddr" False
 
 -- | Parse an address. Responds with not found if invalid.
-getAddress :: WebState -> Text -> ActionT Address
+getAddress :: WebState -> Text -> IO Address
 getAddress st txt = do
   let net = st.config.store.net
   case textToAddr net txt of
@@ -1883,42 +1760,40 @@ getAddress st txt = do
     Just a -> return a
 
 -- | Address or xpub in a path parameter. Passes to the next route if invalid.
-getBinfoAddr :: WebState -> Text -> ActionT BinfoAddr
-getBinfoAddr st param' = do
-  txt <- S.captureParam param'
+getBinfoAddr :: WebState -> Req -> Text -> IO BinfoAddr
+getBinfoAddr st req param' = do
+  txt <- capture req param'
   let net = st.config.store.net
   let ctx = st.config.store.ctx
   let addr = BinfoAddr <$> textToAddr net txt
       xpub = BinfoXpub <$> xPubImport net ctx txt
-  maybe S.next return (addr <|> xpub)
+  maybe next return (addr <|> xpub)
 
 -- | Handler for @GET\/POST \/blockchain\/export-history@: daily history of the balance of addresses and xpubs with prices, as Blockchain.info.
-scottyBinfoHistory :: WebState -> ActionT ()
-scottyBinfoHistory st =
+handleBinfoHistory :: WebState -> Req -> IO Response
+handleBinfoHistory st req =
   withMetrics st (.binfoExportHistory) $ do
-    (xspecs, addrs) <- getBinfoActive st
+    (xspecs, addrs) <- getBinfoActive st req
     (startM, endM) <- get_dates
-    (code, price') <- getPrice st
-    xbals <- liftIO (getXBals st.query xspecs)
+    (code, price') <- getPrice st req
+    xbals <- (getXBals st.query xspecs)
     let xaddrs = HashSet.fromList $ concatMap (map get_addr) (HashMap.elems xbals)
         aaddrs = xaddrs <> addrs
         cur = price'.fifteen
         cs' = conduits (HashMap.toList xbals) addrs endM
     txs <-
-      lift $
-        runConduit $
-          joinDescStreams txRefKey cs'
-            .| takeWhileC (is_newer startM)
-            .| concatMapMC get_transaction
-            .| sinkList
+      runConduit $
+        joinDescStreams txRefKey cs'
+          .| takeWhileC (is_newer startM)
+          .| concatMapMC get_transaction
+          .| sinkList
     let times = map (\Transaction {..} -> timestamp) txs
     let net = st.config.store.net
     let url = st.config.priceHistoryURL
     let session = st.session
     let logger = st.config.logger
-    rates <- map (.price) <$> lift (getRates logger net session url code times)
+    rates <- map (.price) <$> (getRates logger net session url code times)
     let hs = zipWith (convert cur aaddrs) txs (rates <> repeat 0.0)
-    setHeaders
     streamEncoding $ toEncoding hs
   where
     is_newer
@@ -1949,12 +1824,12 @@ scottyBinfoHistory st =
       a `HashSet.member` addrs'
     output_addr _ _ = False
     get_dates = do
-      BinfoDate start <- param "start"
-      BinfoDate end' <- param "end"
+      BinfoDate start <- requireParam st req parseBinfoDate "start"
+      BinfoDate end' <- requireParam st req parseBinfoDate "end"
       let end = end' + 24 * 60 * 60
       let ch = st.config.store.chain
-      startM <- blockAtOrAfter st ch start
-      endM <- blockAtOrBefore st ch end
+      startM <- C.blockAtOrAfter st.query ch start
+      endM <- C.blockAtOrBefore st.query ch end
       return (startM, endM)
     conduits xpubs addrs endM =
       map (uncurry (xpub_c endM)) xpubs
@@ -1971,9 +1846,9 @@ scottyBinfoHistory st =
       streamThings (st.query.xPubTxs x bs) (Just (.txid)) (lim endM)
 
 -- | Currency code in the @currency@ parameter, USD by default, and its latest price.
-getPrice :: WebState -> ActionT (Text, BinfoTicker)
-getPrice st = do
-  code <- T.toUpper <$> param "currency" `rescue` return "USD"
+getPrice :: WebState -> Req -> IO (Text, BinfoTicker)
+getPrice st req = do
+  let code = T.toUpper (paramOr req Just "currency" "USD")
   let ticker = st.ticker
   prices <- readTVarIO ticker
   case HashMap.lookup code prices of
@@ -1981,16 +1856,16 @@ getPrice st = do
     Just p -> return (code, p)
 
 -- | Symbol of the currency in the @currency@ parameter.
-getSymbol :: WebState -> ActionT BinfoSymbol
-getSymbol st = uncurry binfoTickerToSymbol <$> getPrice st
+getSymbol :: WebState -> Req -> IO BinfoSymbol
+getSymbol st req = uncurry binfoTickerToSymbol <$> getPrice st req
 
 -- | Handler for @GET \/blockchain\/blocks\/:milliseconds@: the blocks of the day before a time in milliseconds, as Blockchain.info.
-scottyBinfoBlocksDay :: WebState -> ActionT ()
-scottyBinfoBlocksDay st =
+handleBinfoBlocksDay :: WebState -> Req -> IO Response
+handleBinfoBlocksDay st req =
   withMetrics st (.binfoBlock) $ do
-    t <- min h . (`div` 1000) <$> S.captureParam "milliseconds"
+    t <- min h . (`div` 1000) <$> captureWith req readNum "milliseconds"
     let ch = st.config.store.chain
-    m <- blockAtOrBefore st ch t
+    m <- C.blockAtOrBefore st.query ch t
     bs <- go (d t) m
     streamEncoding $ toEncoding $ map toBinfoBlockInfo bs
   where
@@ -2001,22 +1876,22 @@ scottyBinfoBlocksDay st =
       | b.header.timestamp <= fromIntegral t =
           return []
       | otherwise = do
-          b' <- getBlock st b.header.prev
+          b' <- st.query.getBlock b.header.prev
           (b :) <$> go t b'
 
 -- | Handler for @GET\/POST \/blockchain\/multiaddr@: balances and transactions of addresses and xpubs, as Blockchain.info.
-scottyMultiAddr :: WebState -> ActionT ()
-scottyMultiAddr st =
+handleMultiAddr :: WebState -> Req -> IO Response
+handleMultiAddr st req =
   withMetrics st (.binfoMultiaddr) $ do
     (addrs', _, saddrs, sxpubs, xspecs) <- get_addrs
-    numtxid <- getNumTxId
-    cashaddr <- getCashAddr
-    local' <- getSymbol st
-    offset <- getBinfoOffset st
-    n <- getBinfoCount st "n"
+    let numtxid = getNumTxId req
+    let cashaddr = getCashAddr req
+    local' <- getSymbol st req
+    offset <- getBinfoOffset st req
+    n <- getBinfoCount st req "n"
     prune <- get_prune
     fltr <- get_filter
-    xbals <- liftIO (getXBals st.query xspecs)
+    xbals <- (getXBals st.query xspecs)
     xtxns <- get_xpub_tx_count xbals xspecs
     let sxbals = only_show_xbals sxpubs xbals
         xabals = compute_xabals xbals
@@ -2034,7 +1909,7 @@ scottyMultiAddr st =
         bal = compute_bal allbals
         ibal = fromIntegral sbal
     ftxs <-
-      lift . runConduit $
+      runConduit $
         getBinfoTxs
           st.query
           (pageFor offset n)
@@ -2054,11 +1929,11 @@ scottyMultiAddr st =
     -- database counts the distinct transactions of all their addresses
     ntx <- case (HashSet.toList sxspecs, HashSet.null saddrs) of
       ([x], True) -> return (HashMap.findWithDefault 0 x xtxns)
-      _ -> fromIntegral <$> liftIO (Q.getAddressesTxCount st.config.store.db (HashSet.toList salladdrs))
+      _ -> fromIntegral <$> (Q.getAddressesTxCount st.config.store.db (HashSet.toList salladdrs))
     nfiltered <- case fltr of
       BinfoFilterAll -> return ntx
       _ ->
-        lift . runConduit $
+        runConduit $
           getBinfoTxs
             st.query
             1000
@@ -2113,7 +1988,6 @@ scottyMultiAddr st =
               recommendFee = True,
               cashAddr = cashaddr
             }
-    setHeaders
     streamEncoding $ marshalEncoding (net, ctx) multiaddr
   where
     get_xpub_tx_count xbals =
@@ -2122,22 +1996,20 @@ scottyMultiAddr st =
           ( \x ->
               (x,)
                 . fromIntegral
-                <$> xPubTxCount st x (xBals x xbals)
+                <$> st.query.xPubTxCount x (xBals x xbals)
           )
         . HashSet.toList
-    get_filter = param "filter" `rescue` return BinfoFilterAll
+    get_filter = return (paramOr req parseBinfoFilter "filter" BinfoFilterAll)
     get_best_block =
-      getBestBlock st >>= \case
+      st.query.getBestBlock >>= \case
         Nothing -> raise st ThingNotFound
         Just bh ->
-          getBlock st bh >>= \case
+          st.query.getBlock bh >>= \case
             Nothing -> raise st ThingNotFound
             Just b -> return b
     get_prune =
-      fmap not $
-        param "noCompact"
-          `rescue` param "no_compact"
-          `rescue` return False
+      return . not $
+        paramOr req readBool "noCompact" (paramOr req readBool "no_compact" False)
     only_show_xbals sxpubs =
       HashMap.filterWithKey (\k _ -> k.key `HashSet.member` sxpubs)
     only_show_xspecs sxpubs =
@@ -2149,8 +2021,8 @@ scottyMultiAddr st =
     xpub (BinfoXpub x) = Just x
     xpub (BinfoAddr _) = Nothing
     get_addrs = do
-      (xspecs, addrs) <- getBinfoActive st
-      sh <- getBinfoAddrsParam st "onlyShow"
+      (xspecs, addrs) <- getBinfoActive st req
+      sh <- getBinfoAddrsParam st req "onlyShow"
       let xpubs = HashSet.map (.key) xspecs
           actives =
             HashSet.map BinfoAddr addrs
@@ -2162,9 +2034,9 @@ scottyMultiAddr st =
     get_abals =
       let f b = (b.address, b)
           g = HashMap.fromList . map f
-       in fmap g . getBalances st . HashSet.toList
+       in fmap g . st.query.getBalances . HashSet.toList
     get_peers = do
-      ps <- lift $ getPeersInformation st.config.store.peerMgr
+      ps <- getPeersInformation st.config.store.peerMgr
       return (fromIntegral (length ps))
     compute_xabals =
       let f b = (b.balance.address, b.balance)
@@ -2191,20 +2063,21 @@ scottyMultiAddr st =
        in HashSet.fromList . concatMap f . HashMap.elems
 
 -- | Number of items requested in a parameter, within the limits.
-getBinfoCount :: WebState -> Text -> ActionT Int
-getBinfoCount st str = do
+getBinfoCount :: WebState -> Req -> Text -> IO Int
+getBinfoCount st req str = do
   let d = st.config.limits.defItemCount
   let x = st.config.limits.maxFullItemCount
-  i <- min x <$> (param str `rescue` return d)
+  let i = min x (paramOr req readNum str d)
   return (fromIntegral i :: Int)
 
 -- | Offset requested in the @offset@ parameter. Responds with an error if above the maximum.
 getBinfoOffset ::
   WebState ->
-  ActionT Int
-getBinfoOffset st = do
+  Req ->
+  IO Int
+getBinfoOffset st req = do
   let x = st.config.limits.maxOffset
-  o <- param "offset" `rescue` return 0
+  let o = paramOr req readNum "offset" 0
   when (o > x) $
     raise st $
       UserError $
@@ -2212,20 +2085,20 @@ getBinfoOffset st = do
   return (fromIntegral o :: Int)
 
 -- | Handler for @GET \/blockchain\/rawaddr\/:addr@: balance and transactions of an address or xpub, as Blockchain.info; also at @\/blockchain\/address\/:addr@ and @\/blockchain\/xpub\/:addr@.
-scottyRawAddr :: WebState -> ActionT ()
-scottyRawAddr st =
+handleRawAddr :: WebState -> Req -> IO Response
+handleRawAddr st req =
   withMetrics st (.binfoAddressRaw) $
-    getBinfoAddr st "addr" >>= \case
+    getBinfoAddr st req "addr" >>= \case
       BinfoAddr addr -> do_addr addr
       BinfoXpub xpub -> do_xpub xpub
   where
     do_xpub xpub = do
-      numtxid <- getNumTxId
-      derive <- param "derive" `rescue` return DeriveNormal
+      let numtxid = getNumTxId req
+      let derive = paramOr req textToDeriveType "derive" DeriveNormal
       let xspec = XPubSpec xpub derive
-      n <- getBinfoCount st "limit"
-      off <- getBinfoOffset st
-      xbals <- liftIO (getXBals st.query (HashSet.singleton xspec))
+      n <- getBinfoCount st req "limit"
+      off <- getBinfoOffset st req
+      xbals <- (getXBals st.query (HashSet.singleton xspec))
       let net = st.config.store.net
       let summary = xPubSummary xspec (xBals xspec xbals)
           abook = compute_abook xpub (xBals xspec xbals)
@@ -2235,24 +2108,23 @@ scottyRawAddr st =
           bfilter = BinfoFilterAll
           amnt = summary.confirmed + summary.unconfirmed
       txs <-
-        lift $
-          runConduit $
-            getBinfoTxs
-              st.query
-              (pageFor off n)
-              xbals
-              abook
-              xspecs
-              saddrs
-              baddrs
-              bfilter
-              numtxid
-              False
-              (fromIntegral amnt)
-              .| (dropC off >> takeC n .| sinkList)
+        runConduit $
+          getBinfoTxs
+            st.query
+            (pageFor off n)
+            xbals
+            abook
+            xspecs
+            saddrs
+            baddrs
+            bfilter
+            numtxid
+            False
+            (fromIntegral amnt)
+            .| (dropC off >> takeC n .| sinkList)
       -- n_tx is every transaction of the xpub, as for an address, not the
       -- number on this page
-      ntx <- xPubTxCount st xspec (xBals xspec xbals)
+      ntx <- st.query.xPubTxCount xspec (xBals xspec xbals)
       let ra =
             BinfoRawAddr
               { address = BinfoXpub xpub,
@@ -2263,7 +2135,6 @@ scottyRawAddr st =
                 sent = fromIntegral summary.received - fromIntegral amnt,
                 txs = txs
               }
-      setHeaders
       let ctx = st.config.store.ctx
       streamEncoding $ marshalEncoding (net, ctx) ra
     compute_abook xpub xbals =
@@ -2275,10 +2146,10 @@ scottyRawAddr st =
              in (a, Just (BinfoXPubPath xpub m))
        in HashMap.fromList $ map f xbals
     do_addr addr = do
-      numtxid <- getNumTxId
-      n <- getBinfoCount st "limit"
-      off <- getBinfoOffset st
-      bal <- fromMaybe (zeroBalance addr) <$> getBalance st addr
+      let numtxid = getNumTxId req
+      n <- getBinfoCount st req "limit"
+      off <- getBinfoOffset st req
+      bal <- fromMaybe (zeroBalance addr) <$> st.query.getBalance addr
       let net = st.config.store.net
       let abook = HashMap.singleton addr Nothing
           xspecs = HashSet.empty
@@ -2286,7 +2157,7 @@ scottyRawAddr st =
           bfilter = BinfoFilterAll
           balance = bal.confirmed + bal.unconfirmed
       txs <-
-        lift . runConduit $
+        runConduit $
           getBinfoTxs
             st.query
             (pageFor off n)
@@ -2310,49 +2181,44 @@ scottyRawAddr st =
                 sent = fromIntegral bal.received - fromIntegral balance,
                 txs
               }
-      setHeaders
       let ctx = st.config.store.ctx
       streamEncoding $ marshalEncoding (net, ctx) ra
 
 -- | Handler for @GET \/blockchain\/q\/getreceivedbyaddress\/:addr@: total received by an address.
-scottyBinfoReceived :: WebState -> ActionT ()
-scottyBinfoReceived st =
+handleBinfoReceived :: WebState -> Req -> IO Response
+handleBinfoReceived st req =
   withMetrics st (.binfoQgetreceivedbyaddress) $ do
-    a <- getAddress st =<< S.captureParam "addr"
-    b <- fromMaybe (zeroBalance a) <$> getBalance st a
-    setHeaders
-    S.text $ cs $ show b.received
+    a <- getAddress st =<< capture req "addr"
+    b <- fromMaybe (zeroBalance a) <$> st.query.getBalance a
+    textResponse $ cs $ show b.received
 
 -- | Handler for @GET \/blockchain\/q\/getsentbyaddress\/:addr@: total sent by an address.
-scottyBinfoSent :: WebState -> ActionT ()
-scottyBinfoSent st =
+handleBinfoSent :: WebState -> Req -> IO Response
+handleBinfoSent st req =
   withMetrics st (.binfoQgetsentbyaddress) $ do
-    a <- getAddress st =<< S.captureParam "addr"
-    b <- fromMaybe (zeroBalance a) <$> getBalance st a
-    setHeaders
-    S.text $ cs $ show $ b.received - b.confirmed - b.unconfirmed
+    a <- getAddress st =<< capture req "addr"
+    b <- fromMaybe (zeroBalance a) <$> st.query.getBalance a
+    textResponse $ cs $ show $ b.received - b.confirmed - b.unconfirmed
 
 -- | Handler for @GET \/blockchain\/q\/addressbalance\/:addr@: balance of an address.
-scottyBinfoAddrBalance :: WebState -> ActionT ()
-scottyBinfoAddrBalance st =
+handleBinfoAddrBalance :: WebState -> Req -> IO Response
+handleBinfoAddrBalance st req =
   withMetrics st (.binfoQaddressbalance) $ do
-    a <- getAddress st =<< S.captureParam "addr"
-    b <- fromMaybe (zeroBalance a) <$> getBalance st a
-    setHeaders
-    S.text $ cs $ show $ b.confirmed + b.unconfirmed
+    a <- getAddress st =<< capture req "addr"
+    b <- fromMaybe (zeroBalance a) <$> st.query.getBalance a
+    textResponse $ cs $ show $ b.confirmed + b.unconfirmed
 
 -- | Handler for @GET \/blockchain\/q\/addressfirstseen\/:addr@: time of the first block with a transaction of an address.
-scottyFirstSeen :: WebState -> ActionT ()
-scottyFirstSeen st =
+handleFirstSeen :: WebState -> Req -> IO Response
+handleFirstSeen st req =
   withMetrics st (.binfoQaddressfirstseen) $ do
-    a <- getAddress st =<< S.captureParam "addr"
+    a <- getAddress st =<< capture req "addr"
     let ch = st.config.store.chain
-    bb <- liftIO $ chainGetBest ch
+    bb <- chainGetBest ch
     let top = bb.height
         bot = 0
     i <- go ch bb a bot top
-    setHeaders
-    S.text $ cs $ show i
+    textResponse $ cs $ show i
   where
     go ch bb a bot top = do
       let mid = bot + (top - bot) `div` 2
@@ -2367,11 +2233,11 @@ scottyFirstSeen st =
         | z -> go ch bb a mid top
         | otherwise -> return 0
     getblocktime ch bb h =
-      liftIO (chainGetAncestor ch h bb) >>= \case
+      (chainGetAncestor ch h bb) >>= \case
         Just b -> return b.header.timestamp
         Nothing -> do
           let logger = st.config.logger
-          liftIO . logError logger $
+          logError logger $
             "Could not get ancestor at height "
               <> cs (show h)
               <> " for block "
@@ -2379,19 +2245,18 @@ scottyFirstSeen st =
           error "Block ancestor retreival error"
     hasone a h = do
       let l = Limits 1 0 (Just (AtBlock h))
-      not . null <$> getAddressTxs st a l
+      not . null <$> st.query.getAddressTxs a l
 
 -- | Handler for @GET\/POST \/blockchain\/balance@: short balances of addresses and xpubs, as Blockchain.info.
-scottyShortBal :: WebState -> ActionT ()
-scottyShortBal st =
+handleShortBal :: WebState -> Req -> IO Response
+handleShortBal st req =
   withMetrics st (.binfoBalance) $ do
-    (xspecs, addrs) <- getBinfoActive st
-    cashaddr <- getCashAddr
+    (xspecs, addrs) <- getBinfoActive st req
+    let cashaddr = getCashAddr req
     let net = st.config.store.net
     abals <- catMaybes <$> mapM (getabal net cashaddr) (HashSet.toList addrs)
     xbals <- mapM (getxbal net) (HashSet.toList xspecs)
     let res = HashMap.fromList (abals <> xbals)
-    setHeaders
     streamEncoding $ toEncoding res
   where
     shorten bal =
@@ -2411,12 +2276,12 @@ scottyShortBal st =
        in case addrToText net' a of
             Nothing -> return Nothing
             Just a' ->
-              getBalance st a >>= \case
+              st.query.getBalance a >>= \case
                 Nothing -> return $ Just (a', shorten (zeroBalance a))
                 Just b -> return $ Just (a', shorten b)
     getxbal net xpub = do
-      xbals <- xPubBals st xpub
-      ntx <- fromIntegral <$> xPubTxCount st xpub xbals
+      xbals <- st.query.xPubBals xpub
+      ntx <- fromIntegral <$> st.query.xPubTxCount xpub xbals
       let val = sum $ map (.balance.confirmed) xbals
           zro = sum $ map (.balance.unconfirmed) xbals
           exs = [x | x@XPubBal {path = 0 : _} <- xbals]
@@ -2427,36 +2292,35 @@ scottyShortBal st =
       return (xPubExport net ctx xpub.key, sbl)
 
 -- | Whether to respond with hex (@format=hex@).
-getBinfoHex :: ActionT Bool
-getBinfoHex = (== ("hex" :: Text)) <$> param "format" `rescue` return "json"
+getBinfoHex :: Req -> Bool
+getBinfoHex req = param req "format" == Just "hex"
 
 -- | Handler for @GET \/blockchain\/block-height\/:height@: the blocks at a height, as Blockchain.info.
-scottyBinfoBlockHeight :: WebState -> ActionT ()
-scottyBinfoBlockHeight st =
+handleBinfoBlockHeight :: WebState -> Req -> IO Response
+handleBinfoBlockHeight st req =
   withMetrics st (.binfoBlockHeight) $ do
-    numtxid <- getNumTxId
-    height <- S.captureParam "height"
-    bs <- fmap catMaybes $ getBlocksAtHeight st height >>= mapM (getBlock st)
-    ns <- fmap catMaybes $ getBlocksAtHeight st (height + 1) >>= mapM (getBlock st)
+    let numtxid = getNumTxId req
+    height <- captureWith req readNum "height"
+    bs <- fmap catMaybes $ st.query.getBlocksAtHeight height >>= mapM (st.query.getBlock)
+    ns <- fmap catMaybes $ st.query.getBlocksAtHeight (height + 1) >>= mapM (st.query.getBlock)
     is <- mapM (get_binfo_blocks numtxid ns) bs
-    setHeaders
     let net = st.config.store.net
     let ctx = st.config.store.ctx
     streamEncoding $ marshalEncoding (net, ctx) is
   where
     get_binfo_blocks numtxid ns b = do
-      txs <- catMaybes <$> getTransactions st b.txs
+      txs <- catMaybes <$> C.getTransactions st.query b.txs
       let h x = H.headerHash x.header
           nbs = [h n | n <- ns, n.header.prev == h b]
           bts = map (toBinfoTxSimple numtxid) txs
       return $ toBinfoBlock b bts nbs
 
 -- | Handler for @GET \/blockchain\/latestblock@: the best block, as Blockchain.info.
-scottyBinfoLatest :: WebState -> ActionT ()
-scottyBinfoLatest st =
+handleBinfoLatest :: WebState -> Req -> IO Response
+handleBinfoLatest st req =
   withMetrics st (.binfoBlockLatest) $ do
-    numtxid <- getNumTxId
-    b <- liftIO (bestBlock st.query) >>= maybe (raise st ThingNotFound) return
+    let numtxid = getNumTxId req
+    b <- (bestBlock st.query) >>= maybe (raise st ThingNotFound) return
     streamEncoding $
       toEncoding
         BinfoHeader
@@ -2468,33 +2332,31 @@ scottyBinfoLatest st =
           }
 
 -- | Handler for @GET \/blockchain\/rawblock\/:block@: a block with its transactions, as Blockchain.info.
-scottyBinfoBlock :: WebState -> ActionT ()
-scottyBinfoBlock st =
+handleBinfoBlock :: WebState -> Req -> IO Response
+handleBinfoBlock st req =
   withMetrics st (.binfoBlockRaw) $ do
-    numtxid <- getNumTxId
-    hex <- getBinfoHex
-    S.captureParam "block" >>= \case
+    let numtxid = getNumTxId req
+    let hex = getBinfoHex req
+    captureWith req parseBinfoBlockId "block" >>= \case
       BinfoBlockHash bh -> go numtxid hex bh
       BinfoBlockIndex i ->
-        getBlocksAtHeight st i >>= \case
+        st.query.getBlocksAtHeight i >>= \case
           [] -> raise st ThingNotFound
           bh : _ -> go numtxid hex bh
   where
     go numtxid hex bh = do
-      b <- maybe (raise st ThingNotFound) return =<< getBlock st bh
-      txs <- catMaybes <$> getTransactions st b.txs
-      nhs <- fmap catMaybes $ getBlocksAtHeight st (b.height + 1) >>= mapM (getBlock st)
+      b <- maybe (raise st ThingNotFound) return =<< st.query.getBlock bh
+      txs <- catMaybes <$> C.getTransactions st.query b.txs
+      nhs <- fmap catMaybes $ st.query.getBlocksAtHeight (b.height + 1) >>= mapM (st.query.getBlock)
       let h x = H.headerHash x.header
           nxt = [h n | n <- nhs, n.header.prev == h b]
       if hex
         then do
           let x = H.Block b.header (map transactionData txs)
-          setHeaders
-          S.text . encodeHexLazy . runPutL $ serialize x
+          textResponse . encodeHexLazy . runPutL $ serialize x
         else do
           let bts = map (toBinfoTxSimple numtxid) txs
               y = toBinfoBlock b bts nxt
-          setHeaders
           let net = st.config.store.net
           let ctx = st.config.store.ctx
           streamEncoding $ marshalEncoding (net, ctx) y
@@ -2503,11 +2365,11 @@ scottyBinfoBlock st =
 getBinfoTx ::
   WebState ->
   BinfoTxId ->
-  ActionT (Either Except Transaction)
+  IO (Either Except Transaction)
 getBinfoTx st txid = do
   tx <- case txid of
-    BinfoTxIdHash h -> maybeToList <$> getTransaction st h
-    BinfoTxIdIndex i -> getNumTransaction st i
+    BinfoTxIdHash h -> maybeToList <$> C.getTransaction st.query h
+    BinfoTxIdIndex i -> C.getNumTransaction st.query i
   case tx of
     [t] -> return $ Right t
     [] -> return $ Left ThingNotFound
@@ -2516,12 +2378,12 @@ getBinfoTx st txid = do
        in return $ Left (TxIndexConflict tids)
 
 -- | Handler for @GET \/blockchain\/rawtx\/:txid@: a transaction, as Blockchain.info.
-scottyBinfoTx :: WebState -> ActionT ()
-scottyBinfoTx st =
+handleBinfoTx :: WebState -> Req -> IO Response
+handleBinfoTx st req =
   withMetrics st (.binfoTxRaw) $ do
-    numtxid <- getNumTxId
-    hex <- getBinfoHex
-    txid <- S.captureParam "txid"
+    let numtxid = getNumTxId req
+    let hex = getBinfoHex req
+    txid <- captureWith req parseBinfoTxId "txid"
     tx <-
       getBinfoTx st txid >>= \case
         Right t -> return t
@@ -2531,52 +2393,50 @@ scottyBinfoTx st =
     js numtxid t = do
       let net = st.config.store.net
       let ctx = st.config.store.ctx
-      setHeaders
       streamEncoding $ marshalEncoding (net, ctx) $ toBinfoTxSimple numtxid t
     hx t = do
-      setHeaders
-      S.text . encodeHexLazy . runPutL . serialize $ transactionData t
+      textResponse . encodeHexLazy . runPutL . serialize $ transactionData t
 
 -- | Handler for @GET \/blockchain\/q\/txtotalbtcoutput\/:txid@: total value of the outputs of a transaction.
-scottyBinfoTotalOut :: WebState -> ActionT ()
-scottyBinfoTotalOut st =
+handleBinfoTotalOut :: WebState -> Req -> IO Response
+handleBinfoTotalOut st req =
   withMetrics st (.binfoQtxtotalbtcoutput) $ do
-    txid <- S.captureParam "txid"
+    txid <- captureWith req parseBinfoTxId "txid"
     tx <-
       getBinfoTx st txid >>= \case
         Right t -> return t
         Left e -> raise st e
-    S.text $ cs $ show $ sum $ map (.value) tx.outputs
+    textResponse $ cs $ show $ sum $ map (.value) tx.outputs
 
 -- | Handler for @GET \/blockchain\/q\/txfee\/:txid@: fee of a transaction.
-scottyBinfoTxFees :: WebState -> ActionT ()
-scottyBinfoTxFees st =
+handleBinfoTxFees :: WebState -> Req -> IO Response
+handleBinfoTxFees st req =
   withMetrics st (.binfoQtxfee) $ do
-    txid <- S.captureParam "txid"
+    txid <- captureWith req parseBinfoTxId "txid"
     tx <-
       getBinfoTx st txid >>= \case
         Right t -> return t
         Left e -> raise st e
     let i = sum $ map (.value) $ filter f tx.inputs
         o = sum $ map (.value) tx.outputs
-    S.text . cs . show $ i - o
+    textResponse . cs . show $ i - o
   where
     f StoreInput {} = True
     f StoreCoinbase {} = False
 
 -- | Handler for @GET \/blockchain\/q\/txresult\/:txid\/:addr@: net amount that a transaction sends to an address.
-scottyBinfoTxResult :: WebState -> ActionT ()
-scottyBinfoTxResult st =
+handleBinfoTxResult :: WebState -> Req -> IO Response
+handleBinfoTxResult st req =
   withMetrics st (.binfoQtxresult) $ do
-    txid <- S.captureParam "txid"
-    addr <- getAddress st =<< S.captureParam "addr"
+    txid <- captureWith req parseBinfoTxId "txid"
+    addr <- getAddress st =<< capture req "addr"
     tx <-
       getBinfoTx st txid >>= \case
         Right t -> return t
         Left e -> raise st e
     let i = toInteger $ sum $ map (.value) $ filter (f addr) tx.inputs
         o = toInteger $ sum $ map (.value) $ filter (g addr) tx.outputs
-    S.text $ cs $ show $ o - i
+    textResponse $ cs $ show $ o - i
   where
     f addr StoreInput {address = Just a} = a == addr
     f _ _ = False
@@ -2584,67 +2444,63 @@ scottyBinfoTxResult st =
     g _ _ = False
 
 -- | Handler for @GET \/blockchain\/q\/txtotalbtcinput\/:txid@: total value of the inputs of a transaction.
-scottyBinfoTotalInput :: WebState -> ActionT ()
-scottyBinfoTotalInput st =
+handleBinfoTotalInput :: WebState -> Req -> IO Response
+handleBinfoTotalInput st req =
   withMetrics st (.binfoQtxtotalbtcinput) $ do
-    txid <- S.captureParam "txid"
+    txid <- captureWith req parseBinfoTxId "txid"
     tx <-
       getBinfoTx st txid >>= \case
         Right t -> return t
         Left e -> raise st e
-    S.text $ cs $ show $ sum $ map (.value) $ filter f $ tx.inputs
+    textResponse $ cs $ show $ sum $ map (.value) $ filter f $ tx.inputs
   where
     f StoreInput {} = True
     f StoreCoinbase {} = False
 
 -- | Handler for @GET \/blockchain\/unconfirmed-transactions@: mempool transactions, as Blockchain.info.
-scottyBinfoMempool :: WebState -> ActionT ()
-scottyBinfoMempool st =
+handleBinfoMempool :: WebState -> Req -> IO Response
+handleBinfoMempool st req =
   withMetrics st (.binfoMempool) $ do
-    numtxid <- getNumTxId
-    offset <- getBinfoOffset st
-    n <- getBinfoCount st "limit"
-    -- a limit of 0 would mean no limit to getMempoolPage st
+    let numtxid = getNumTxId req
+    offset <- getBinfoOffset st req
+    n <- getBinfoCount st req "limit"
+    -- a limit of 0 would mean no limit to st.query.getMempoolPage
     txids <-
       if n <= 0
         then return []
         else
           map snd
-            <$> getMempoolPage st (Limits (fromIntegral n) (fromIntegral offset) Nothing)
-    txs <- catMaybes <$> getTransactions st txids
+            <$> st.query.getMempoolPage (Limits (fromIntegral n) (fromIntegral offset) Nothing)
+    txs <- catMaybes <$> C.getTransactions st.query txids
     let net = st.config.store.net
-    setHeaders
     let mem = BinfoMempool $ map (toBinfoTxSimple numtxid) txs
     let ctx = st.config.store.ctx
     streamEncoding $ marshalEncoding (net, ctx) mem
 
 -- | Handler for @GET \/blockchain\/q\/getblockcount@: height of the best header.
-scottyBinfoGetBlockCount :: WebState -> ActionT ()
-scottyBinfoGetBlockCount st =
+handleBinfoGetBlockCount :: WebState -> Req -> IO Response
+handleBinfoGetBlockCount st _ =
   withMetrics st (.binfoQgetblockcount) $ do
     let ch = st.config.store.chain
-    bn <- liftIO $ chainGetBest ch
-    setHeaders
-    S.text $ TL.pack $ show bn.height
+    bn <- chainGetBest ch
+    textResponse $ TL.pack $ show bn.height
 
 -- | Handler for @GET \/blockchain\/q\/latesthash@: hash of the best header.
-scottyBinfoLatestHash :: WebState -> ActionT ()
-scottyBinfoLatestHash st =
+handleBinfoLatestHash :: WebState -> Req -> IO Response
+handleBinfoLatestHash st _ =
   withMetrics st (.binfoQlatesthash) $ do
     let ch = st.config.store.chain
-    bn <- liftIO $ chainGetBest ch
-    setHeaders
-    S.text $ TL.fromStrict $ H.blockHashToHex $ H.headerHash bn.header
+    bn <- chainGetBest ch
+    textResponse $ TL.fromStrict $ H.blockHashToHex $ H.headerHash bn.header
 
 -- | Handler for @GET \/blockchain\/q\/bcperblock@: block subsidy at the next height.
-scottyBinfoSubsidy :: WebState -> ActionT ()
-scottyBinfoSubsidy st =
+handleBinfoSubsidy :: WebState -> Req -> IO Response
+handleBinfoSubsidy st _ =
   withMetrics st (.binfoQbcperblock) $ do
     let ch = st.config.store.chain
     let net = st.config.store.net
-    bn <- liftIO $ chainGetBest ch
-    setHeaders
-    S.text $
+    bn <- chainGetBest ch
+    textResponse $
       cs $
         show $
           (/ (100 * 1000 * 1000 :: Double)) $
@@ -2652,50 +2508,47 @@ scottyBinfoSubsidy st =
               H.computeSubsidy net (bn.height + 1)
 
 -- | Handler for @GET \/blockchain\/q\/addresstohash\/:addr@: hash160 of an address in hex.
-scottyBinfoAddrToHash :: WebState -> ActionT ()
-scottyBinfoAddrToHash st =
+handleBinfoAddrToHash :: WebState -> Req -> IO Response
+handleBinfoAddrToHash st req =
   withMetrics st (.binfoQaddresstohash) $ do
-    addr <- getAddress st =<< S.captureParam "addr"
-    setHeaders
+    addr <- getAddress st =<< capture req "addr"
     if
       | Just h <- addressHash160 addr ->
-          S.text $ encodeHexLazy $ runPutL $ serialize h
+          textResponse $ encodeHexLazy $ runPutL $ serialize h
       | Just h <- addressHash256 addr ->
-          S.text $ encodeHexLazy $ runPutL $ serialize h
+          textResponse $ encodeHexLazy $ runPutL $ serialize h
       | otherwise ->
-          return ()
+          textResponse ""
 
 -- | Handler for @GET \/blockchain\/q\/hashtoaddress\/:hash@: pay-to-public-key-hash address of a hash160.
-scottyBinfoHashToAddr :: WebState -> ActionT ()
-scottyBinfoHashToAddr st =
+handleBinfoHashToAddr :: WebState -> Req -> IO Response
+handleBinfoHashToAddr st req =
   withMetrics st (.binfoQhashtoaddress) $ do
-    bs <- maybe S.next return . decodeHex =<< S.captureParam "hash"
+    bs <- maybe next return . decodeHex =<< capture req "hash"
     let net = st.config.store.net
-    hash <- either (const S.next) return $ decode bs
-    addr <- maybe S.next return $ addrToText net $ PubKeyAddress hash
-    setHeaders
-    S.text $ TL.fromStrict addr
+    hash <- either (const next) return $ decode bs
+    addr <- maybe next return $ addrToText net $ PubKeyAddress hash
+    textResponse $ TL.fromStrict addr
 
 -- | Handler for @GET \/blockchain\/q\/addrpubkey\/:pubkey@: address of a public key.
-scottyBinfoAddrPubkey :: WebState -> ActionT ()
-scottyBinfoAddrPubkey st =
+handleBinfoAddrPubkey :: WebState -> Req -> IO Response
+handleBinfoAddrPubkey st req =
   withMetrics st (.binfoQaddrpubkey) $ do
-    hex <- S.captureParam "pubkey"
+    hex <- capture req "pubkey"
     let ctx = st.config.store.ctx
     pubkey <-
-      maybe S.next (return . pubKeyAddr ctx) $
+      maybe next (return . pubKeyAddr ctx) $
         eitherToMaybe . unmarshal ctx =<< decodeHex hex
     let net = st.config.store.net
-    setHeaders
     case addrToText net pubkey of
       Nothing -> raise st ThingNotFound
-      Just a -> S.text $ TL.fromStrict a
+      Just a -> textResponse $ TL.fromStrict a
 
 -- | Handler for @GET \/blockchain\/q\/pubkeyaddr\/:addr@: public key of an address, found in a transaction input that spends from it.
-scottyBinfoPubKeyAddr :: WebState -> ActionT ()
-scottyBinfoPubKeyAddr st =
+handleBinfoPubKeyAddr :: WebState -> Req -> IO Response
+handleBinfoPubKeyAddr st req =
   withMetrics st (.binfoQpubkeyaddr) $ do
-    addr <- getAddress st =<< S.captureParam "addr"
+    addr <- getAddress st =<< capture req "addr"
     mi <- strm addr
     i <- case mi of
       Nothing -> raise st ThingNotFound
@@ -2703,14 +2556,13 @@ scottyBinfoPubKeyAddr st =
     pk <- case extr addr i of
       Left e -> raise st $ UserError e
       Right t -> return t
-    setHeaders
-    S.text $ encodeHexLazy $ L.fromStrict pk
+    textResponse $ encodeHexLazy $ L.fromStrict pk
   where
     strm addr = do
       runConduit $ do
         let l = Limits {limit = 8, offset = 0, start = Nothing}
-        streamThings (getAddressTxs st addr) (Just (.txid)) l
-          .| concatMapMC (getTransaction st . (.txid))
+        streamThings (st.query.getAddressTxs addr) (Just (.txid)) l
+          .| concatMapMC (C.getTransaction st.query . (.txid))
           .| concatMapC (filter (inp addr) . (.inputs))
           .| headC
     inp addr StoreInput {address = Just a} = a == addr
@@ -2737,42 +2589,41 @@ scottyBinfoPubKeyAddr st =
     extr _ _ = Left "Incorrect input type"
 
 -- | Handler for @GET \/blockchain\/q\/hashpubkey\/:pubkey@: hash160 of a public key in hex.
-scottyBinfoHashPubkey :: WebState -> ActionT ()
-scottyBinfoHashPubkey st =
+handleBinfoHashPubkey :: WebState -> Req -> IO Response
+handleBinfoHashPubkey st req =
   withMetrics st (.binfoQhashpubkey) $ do
     let ctx = st.config.store.ctx
     pkm <-
       fmap
         (eitherToMaybe . unmarshal ctx <=< decodeHex)
-        (S.captureParam "pubkey")
+        (capture req "pubkey")
     addr <- case pkm of
       Nothing -> raise st $ UserError "Could not decode public key"
       Just pk -> return $ pubKeyAddr ctx pk
-    setHeaders
     if
       | Just h <- addressHash160 addr ->
-          S.text $ encodeHexLazy $ runPutL $ serialize h
+          textResponse $ encodeHexLazy $ runPutL $ serialize h
       | Just h <- addressHash256 addr ->
-          S.text $ encodeHexLazy $ runPutL $ serialize h
+          textResponse $ encodeHexLazy $ runPutL $ serialize h
       | otherwise ->
-          return ()
+          textResponse ""
 
 -- GET Network Information --
 
 -- | Handler for @GET \/peers@: connected peers.
-scottyPeers ::
+handlePeers ::
   WebState ->
   GetPeers ->
-  ActionT [PeerInfo]
-scottyPeers st _ =
+  IO [PeerInfo]
+handlePeers st _ =
   withMetrics st (.peers) $ do
-    lift . getPeersInformation =<< pure st.config.store.peerMgr
+    getPeersInformation =<< pure st.config.store.peerMgr
 
 -- | Obtain information about connected peers from peer manager process.
 getPeersInformation ::
   PeerMgr -> IO [PeerInfo]
 getPeersInformation mgr =
-  mapMaybe toInfo <$> liftIO (getPeers mgr)
+  mapMaybe toInfo <$> (getPeers mgr)
   where
     toInfo op = do
       ver <- op.version
@@ -2787,15 +2638,13 @@ getPeersInformation mgr =
           }
 
 -- | Handler for @GET \/health@: health of the store.
-scottyHealth ::
+handleHealth ::
   WebState ->
   GetHealth ->
-  ActionT HealthCheck
-scottyHealth st _ =
+  IO HealthCheck
+handleHealth st _ =
   withMetrics st (.health) $ do
-    h <- pure st.health >>= readTVarIO
-    unless (isOK h) $ S.status status503
-    return h
+    readTVarIO st.health
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth
@@ -2817,8 +2666,8 @@ blockHealthCheck cfg = do
 -- | Age of the best header and the maximum allowed.
 lastBlockHealthCheck :: Chain -> WebLimits -> IO TimeHealth
 lastBlockHealthCheck ch WebLimits {blockTimeout} = do
-  n <- round <$> liftIO getPOSIXTime
-  t <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
+  n <- round <$> getPOSIXTime
+  t <- fromIntegral . (.header.timestamp) <$> (chainGetBest ch)
   return
     TimeHealth
       { age = n - t,
@@ -2828,8 +2677,8 @@ lastBlockHealthCheck ch WebLimits {blockTimeout} = do
 -- | Age of the newest mempool transaction or best header, and the maximum allowed.
 lastTxHealthCheck :: WebConfig -> IO TimeHealth
 lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
-  n <- round <$> liftIO getPOSIXTime
-  b <- fromIntegral . (.header.timestamp) <$> liftIO (chainGetBest ch)
+  n <- round <$> getPOSIXTime
+  b <- fromIntegral . (.header.timestamp) <$> (chainGetBest ch)
   t <-
     Q.getMempoolPage store'.db (Limits 1 0 Nothing) >>= \case
       t : _ ->
@@ -2861,7 +2710,7 @@ pendingTxsHealthCheck cfg = do
 -- | Online peers and the minimum required.
 peerHealthCheck :: WebConfig -> IO CountHealth
 peerHealthCheck cfg = do
-  count <- fromIntegral . length <$> liftIO (getPeers cfg.store.peerMgr)
+  count <- fromIntegral . length <$> (getPeers cfg.store.peerMgr)
   return CountHealth {min = fromIntegral cfg.minPeers, count}
 
 -- | Run every health check.
@@ -2872,7 +2721,7 @@ healthCheck cfg = do
   lastTx <- lastTxHealthCheck cfg
   pendingTxs <- pendingTxsHealthCheck cfg
   peers <- peerHealthCheck cfg
-  time <- round <$> liftIO getPOSIXTime
+  time <- round <$> getPOSIXTime
   return
     HealthCheck
       { network = cfg.store.net.name,
@@ -2881,14 +2730,13 @@ healthCheck cfg = do
       }
 
 -- | Handler for @GET \/dbstats@: RocksDB memory use and statistics, as text.
-scottyDbStats :: WebState -> ActionT ()
-scottyDbStats st =
+handleDbStats :: WebState -> Req -> IO Response
+handleDbStats st _ =
   withMetrics st (.db) $ do
-    setHeaders
     let db = st.config.store.db.db
-    memory <- liftIO (memoryReport db)
-    statsM <- liftIO (getProperty db Stats)
-    S.text . cs $ memory <> maybe "Could not get stats" cs statsM
+    memory <- (memoryReport db)
+    statsM <- (getProperty db Stats)
+    textResponse . cs $ memory <> maybe "Could not get stats" cs statsM
 
 -----------------------
 -- Parameter Parsing --
@@ -2896,11 +2744,11 @@ scottyDbStats st =
 
 -- | Returns @Nothing@ if the parameter is not supplied. Raises an exception on
 -- parse failure.
-paramOptional :: forall a. (Param a) => WebState -> ActionT (Maybe a)
-paramOptional st = do
+paramOptional :: forall a. (Param a) => WebState -> Req -> IO (Maybe a)
+paramOptional st req = do
   let net = st.config.store.net
   let ctx = st.config.store.ctx
-  fmap Just (param label) `rescue` return Nothing >>= \case
+  case T.splitOn "," <$> param req label of
     Nothing -> return Nothing -- Parameter was not supplied
     Just ts -> maybe (raise st err) (return . Just) (parseParam net ctx ts)
   where
@@ -2908,34 +2756,33 @@ paramOptional st = do
     err = UserError $ "Unable to parse param " <> T.unpack label
 
 -- | Raises an exception if the parameter is not supplied
-paramRequired :: forall a. (Param a) => WebState -> ActionT a
-paramRequired st = maybe (raise st err) return =<< paramOptional st
+paramRequired :: forall a. (Param a) => WebState -> Req -> IO a
+paramRequired st req = maybe (raise st err) return =<< paramOptional st req
   where
     label = T.unpack (proxyLabel (Proxy :: Proxy a))
     err = UserError $ "Param " <> label <> " not defined"
 
 -- | Returns the default value of a parameter if it is not supplied. Raises an
 -- exception on parse failure.
-paramDef :: (Default a, Param a) => WebState -> ActionT a
-paramDef st = fromMaybe def <$> paramOptional st
+paramDef :: (Default a, Param a) => WebState -> Req -> IO a
+paramDef st req = fromMaybe def <$> paramOptional st req
 
--- | Does not raise exceptions. Will call @Scotty.next@ if the parameter is
+-- | Does not raise exceptions. Passes the request to the next route ('next') if the parameter is
 -- not supplied or if parsing fails.
-paramCapture :: forall a. (Param a) => WebState -> ActionT a
-paramCapture st = do
+paramCapture :: forall a. (Param a) => WebState -> Req -> IO a
+paramCapture st req = do
   let net = st.config.store.net
   let ctx = st.config.store.ctx
-  p <- S.captureParam label `rescue` S.next
-  maybe S.next return (parseParam net ctx p)
+  p <- capture req label
+  maybe next return (parseParam net ctx (T.splitOn "," p))
   where
     label = proxyLabel (Proxy :: Proxy a)
 
 -- | Read the transaction that a request carries in its body.
-parseTxBody :: WebState -> ActionT Tx
-parseTxBody st = do
+parseTxBody :: WebState -> Req -> IO Tx
+parseTxBody st req = do
   let net = st.config.store.net
-  b <- L.toStrict <$> S.body
-  case decodeTxBody net b of
+  case decodeTxBody net (L.toStrict req.body) of
     Left _ -> raise st $ UserError "Failed to parse request body"
     Right tx -> return tx
 
@@ -2963,9 +2810,9 @@ decodeTxBody net body = fromHex <> fromBytes body
         Left e -> Left (cs e)
 
 -- | Offset in the @offset@ parameter. Responds with an error if above the maximum.
-parseOffset :: WebState -> ActionT OffsetParam
-parseOffset st = do
-  res@(OffsetParam o) <- paramDef st
+parseOffset :: WebState -> Req -> IO OffsetParam
+parseOffset st req = do
+  res@(OffsetParam o) <- paramDef st req
   let limits = st.config.limits
   when (limits.maxOffset > 0 && fromIntegral o > limits.maxOffset) $
     raise st . UserError $
@@ -2981,9 +2828,9 @@ bestBlock q = q.getBestBlock >>= maybe (return Nothing) q.getBlock
 parseStart ::
   WebState ->
   Maybe StartParam ->
-  ActionT (Maybe Start)
+  IO (Maybe Start)
 parseStart _ Nothing = return Nothing
-parseStart st (Just s) = liftIO $ case s of
+parseStart st (Just s) = case s of
   -- a transaction if there is one with that hash, else a block
   StartParamHash {hash = h} ->
     st.query.getTxData (TxHash h) >>= \case
@@ -2994,15 +2841,15 @@ parseStart st (Just s) = liftIO $ case s of
     fmap (AtBlock . (.height)) <$> C.blockAtOrBefore st.query st.config.store.chain q
 
 -- | Limit, offset and start in the parameters of a request.
-parseLimits :: WebState -> ActionT LimitsParam
-parseLimits st = LimitsParam <$> paramOptional st <*> parseOffset st <*> paramOptional st
+parseLimits :: WebState -> Req -> IO LimitsParam
+parseLimits st req = LimitsParam <$> paramOptional st req <*> parseOffset st req <*> paramOptional st req
 
 -- | Pagination of a query from request parameters, within the limits for full or short items.
 paramToLimits ::
   WebState ->
   Bool ->
   LimitsParam ->
-  ActionT Limits
+  IO Limits
 paramToLimits st full (LimitsParam limitM o startM) = do
   let wl = st.config.limits
   Limits (validateLimit wl full limitM) (fromIntegral o) <$> parseStart st startM
@@ -3019,77 +2866,6 @@ validateLimit wl full limitM =
     f a 0 = a
     f 0 b = b
     f a b = min a b
-
--------------------------------------------------------------------------------
--- Reads in handlers
--------------------------------------------------------------------------------
-
--- $reads
--- The queries of the store as actions of a handler, with the state of the
--- web server: @getBlock st h@ is @liftIO (st.query.getBlock h)@.
-
-getBestBlock :: WebState -> ActionT (Maybe H.BlockHash)
-getBestBlock st = liftIO st.query.getBestBlock
-
-getBlocksAtHeight :: WebState -> H.BlockHeight -> ActionT [H.BlockHash]
-getBlocksAtHeight st = liftIO . st.query.getBlocksAtHeight
-
-getBlock :: WebState -> H.BlockHash -> ActionT (Maybe BlockData)
-getBlock st = liftIO . st.query.getBlock
-
-getBalance :: WebState -> Address -> ActionT (Maybe Balance)
-getBalance st = liftIO . st.query.getBalance
-
-getMempoolPage :: WebState -> Limits -> ActionT [(UnixTime, TxHash)]
-getMempoolPage st = liftIO . st.query.getMempoolPage
-
-getAddressesTxs :: WebState -> [Address] -> Limits -> ActionT [TxRef]
-getAddressesTxs st = \as -> liftIO . st.query.getAddressesTxs as
-
-getAddressesUnspents :: WebState -> [Address] -> Limits -> ActionT [Unspent]
-getAddressesUnspents st = \as -> liftIO . st.query.getAddressesUnspents as
-
-getBalances :: WebState -> [Address] -> ActionT [Balance]
-getBalances st = liftIO . st.query.getBalances
-
-getAddressTxs :: WebState -> Address -> Limits -> ActionT [TxRef]
-getAddressTxs st = \a -> liftIO . st.query.getAddressTxs a
-
-getAddressUnspents :: WebState -> Address -> Limits -> ActionT [Unspent]
-getAddressUnspents st = \a -> liftIO . st.query.getAddressUnspents a
-
-xPubBals :: WebState -> XPubSpec -> ActionT [XPubBal]
-xPubBals st = liftIO . st.query.xPubBals
-
-xPubUnspents :: WebState -> XPubSpec -> [XPubBal] -> Limits -> ActionT [XPubUnspent]
-xPubUnspents st = \x b -> liftIO . st.query.xPubUnspents x b
-
-xPubTxs :: WebState -> XPubSpec -> [XPubBal] -> Limits -> ActionT [TxRef]
-xPubTxs st = \x b -> liftIO . st.query.xPubTxs x b
-
-xPubTxCount :: WebState -> XPubSpec -> [XPubBal] -> ActionT Word32
-xPubTxCount st = \x -> liftIO . st.query.xPubTxCount x
-
-getTransaction :: WebState -> TxHash -> ActionT (Maybe Transaction)
-getTransaction st = liftIO . C.getTransaction st.query
-
-getTransactions :: WebState -> [TxHash] -> ActionT [Maybe Transaction]
-getTransactions st = liftIO . C.getTransactions st.query
-
-getNumTransaction :: WebState -> Word64 -> ActionT [Transaction]
-getNumTransaction st = liftIO . C.getNumTransaction st.query
-
-getDefaultBalance :: WebState -> Address -> ActionT Balance
-getDefaultBalance st = liftIO . C.getDefaultBalance st.query
-
-blockAtOrAfter :: WebState -> Chain -> UnixTime -> ActionT (Maybe BlockData)
-blockAtOrAfter st = \ch -> liftIO . C.blockAtOrAfter st.query ch
-
-blockAtOrBefore :: WebState -> Chain -> UnixTime -> ActionT (Maybe BlockData)
-blockAtOrBefore st = \ch -> liftIO . C.blockAtOrBefore st.query ch
-
-blockAtOrAfterMTP :: WebState -> Chain -> UnixTime -> ActionT (Maybe BlockData)
-blockAtOrAfterMTP st = \ch -> liftIO . C.blockAtOrAfterMTP st.query ch
 
 ---------------
 -- Utilities --
@@ -3171,16 +2947,24 @@ fmtReq req =
 fmtStatus :: Status -> Text
 fmtStatus s = cs (show (statusCode s)) <> " " <> cs (statusMessage s)
 
--- | Run a handler, or another if the first one fails.
-rescue ::
-  ActionT a ->
-  ActionT a ->
-  ActionT a
-x `rescue` y = x `S.catch` \(_ :: S.ScottyException) -> y
+-- | A parameter read with a parser, or the default if there is none or it
+-- does not parse.
+paramOr :: Req -> (Text -> Maybe a) -> Text -> a -> a
+paramOr req f name d = fromMaybe d (param req name >>= f)
 
--- | Read a request parameter from the path, query string or form.
-param ::
-  (S.Parsable a) =>
-  Text ->
-  ActionT a
-param t = S.queryParam t `rescue` S.formParam t
+-- | A parameter read with a parser. Answers with an error if there is none or
+-- it does not parse.
+requireParam :: WebState -> Req -> (Text -> Maybe a) -> Text -> IO a
+requireParam st req f name =
+  maybe (raise st (UserError ("Missing or invalid param " <> T.unpack name))) return (param req name >>= f)
+
+-- | @true@ or @false@, in any case.
+readBool :: Text -> Maybe Bool
+readBool t = case T.toLower t of
+  "true" -> Just True
+  "false" -> Just False
+  _ -> Nothing
+
+-- | A number in decimal.
+readNum :: (Read a) => Text -> Maybe a
+readNum = readMaybe . T.unpack

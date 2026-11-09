@@ -67,8 +67,8 @@
 -- * __Plain functions in 'IO'.__ Queries take the database reader, or a
 --   'StoreRead' record of them, which the web server builds with the Redis
 --   cache in front of the queries about xpubs. Nothing runs in a stack of
---   monad transformers, except the conduits that merge sorted streams and
---   the handlers of Scotty.
+--   monad transformers, except the conduits that merge sorted streams. The
+--   web server runs on WAI with a router of its own.
 --
 -- * __The mempool is a first-class citizen.__ Unconfirmed transactions are indexed
 --   like confirmed ones, ordered before them, and kept across restarts, because
