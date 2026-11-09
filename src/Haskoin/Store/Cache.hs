@@ -142,6 +142,8 @@ module Haskoin.Store.Cache
     xpubId,
     blockRefScore,
     scoreBlockRef,
+    fullReloadEvery,
+    fullReloadAfter,
   )
 where
 
@@ -685,7 +687,7 @@ cacheEvict c n = do
 --
 -- * the entry is in the current format, stamped with the best block of this
 --   store or the one before it (a larger gap means blocks it may have
---   missed), and was fully reloaded less than 'fullReloadEvery' ago;
+--   missed), and was fully reloaded less than 'fullReloadAfter' ago;
 --
 -- * the balances of every address of the xpub are read from the database,
 --   which is cheap, a read per address; an address that no changed
@@ -757,7 +759,7 @@ cacheRefresh c x changed =
       m.ver == "3"
         && not (HashSet.null changed)
         && maybe False (\s -> toInteger height - s <= 1) m.stamp
-        && maybe False (\f -> now - f < fullReloadEvery) m.full
+        && maybe False (\f -> now - f < fullReloadAfter x) m.full
     behind = do
       count c (.stale) 1
       atomicModifyIORef' c.counters (\k -> (k {behind = k.behind + 1} :: CacheCounters, ()))
@@ -770,11 +772,30 @@ cacheRefresh c x changed =
       return r
 
 -- | Longest time, in milliseconds, between full reloads of an entry: ten
--- minutes. A full reload of the largest xpubs of the stress test takes a few
--- seconds, so this costs little, and it bounds how long a change that the
--- checks of the incremental path cannot see stays out of the cache.
+-- minutes; each xpub has its own interval up to this ('fullReloadAfter'). It
+-- bounds how long a change that the checks of the incremental path cannot
+-- see stays out of the cache. A full reload of the largest xpubs of the
+-- stress test takes a few seconds and holds the xpub in memory while it
+-- runs, so it is kept rare.
 fullReloadEvery :: Integer
 fullReloadEvery = 10 * 60 * 1000
+
+-- | Time, in milliseconds, after its last full reload when an entry is read
+-- whole again: between half of 'fullReloadEvery' and all of it, the same for
+-- an xpub on every store, and different from one xpub to the next.
+--
+-- With one interval for every entry, entries cached together are reloaded
+-- whole together, every time. In the full stress test the four xpubs did so
+-- every ten minutes, and the heap of the server went from under 100 MiB to
+-- 785 MiB for a few seconds, holding all four at once. Each xpub gets its own
+-- interval instead, so such entries drift apart from their first scheduled
+-- full reload. It comes from the hash of the xpub, not from a random number,
+-- so that it needs no state and every store sharing Redis agrees on it.
+fullReloadAfter :: XPubSpec -> Integer
+fullReloadAfter x = half + spread `mod` half
+  where
+    half = fullReloadEvery `div` 2
+    spread = BS.foldl' (\a w -> a * 256 + toInteger w) 0 (BS.take 4 (encode (sha256 (encode x))))
 
 -- | What to write to bring an entry up to date. Members of the sets are
 -- serialized: addresses, transaction hashes, and unspent outputs, which go

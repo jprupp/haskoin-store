@@ -422,12 +422,14 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   cannot be sure the entry has every earlier change: when the entry is more
   than a block behind, when an address with transactions enters or leaves
   the gap, when the balance of an address that no change touched differs
-  from Redis's and its newest transactions do not explain why, and at least
-  every ten minutes. Under load the database is often a little ahead of the
-  events being applied, so a reload first adds the transactions that the
-  database has for such an address since the block the entry was written
-  at, and the mempool transactions of the entry that have since been
-  confirmed or dropped. The script
+  from Redis's and its newest transactions do not explain why, and on a
+  schedule, every five to ten minutes. The interval depends on the xpub, so
+  that xpubs cached together are not all read whole at the same moment,
+  which would hold them all in memory at once. Under load the database is
+  often a little ahead of the events being applied, so a reload first adds
+  the transactions that the database has for such an address since the
+  block the entry was written at, and the mempool transactions of the entry
+  that have since been confirmed or dropped. The script
   writes nothing if the entry changed since it was read, so the entry is
   always what the database says; and Redis, which answers one client at a
   time, is held for the size of the change, not of the xpub. A page of a

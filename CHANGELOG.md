@@ -136,6 +136,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   script, instead of in it. The commit of a block that confirms a thousand
   transactions of an xpub had about 8,000 arguments and held Redis for 10 to
   30 ms, the only commands of the stress test that took that long.
+- The scheduled full reload of a cached xpub comes every five to ten
+  minutes, an interval that depends on the xpub, instead of every ten for
+  all. Xpubs cached together were read whole together each time: in the full
+  stress test, four xpubs of tens of thousands of transactions raised the
+  heap from under 100 MiB to 785 MiB for a few seconds every ten minutes.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.

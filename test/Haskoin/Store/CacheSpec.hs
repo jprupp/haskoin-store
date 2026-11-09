@@ -1,11 +1,12 @@
 module Haskoin.Store.CacheSpec (spec) where
 
 import Data.ByteString qualified as BS
-import Data.List (sort)
-import Haskoin (bch, btc)
-import Haskoin.Store.Cache (blockRefScore, cachePrefix, scoreBlockRef)
-import Haskoin.Store.Data (BlockRef (..))
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Data.ByteString.Char8 qualified as C8
+import Data.List (nub, sort)
+import Haskoin (bch, btc, deriveXPubKey, makeXPrvKey, prepareContext)
+import Haskoin.Store.Cache (blockRefScore, cachePrefix, fullReloadAfter, fullReloadEvery, scoreBlockRef)
+import Haskoin.Store.Data (BlockRef (..), DeriveType (..), XPubSpec (..))
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Gen, choose, forAll, listOf, oneof)
 
@@ -29,6 +30,17 @@ spec = do
       let old = ["head", "max", "mempool", "lock", "xlock-", "b", "t", "u", "a", "i"]
           p = cachePrefix btc
       filter (\o -> o `BS.isPrefixOf` p || p `BS.isPrefixOf` o) old `shouldBe` []
+
+  prepareContext $ \ctx ->
+    describe "Scheduled full reloads" $
+      it "come every five to ten minutes, at intervals spread over xpubs" $ do
+        let seed i = C8.pack ("seed of the test xpub " <> show i)
+            xpub i = XPubSpec (deriveXPubKey ctx (makeXPrvKey (seed i))) DeriveNormal
+            after = map (fullReloadAfter . xpub) [1 .. 200 :: Int]
+            half = fullReloadEvery `div` 2
+        after `shouldSatisfy` all (\a -> a >= half && a < fullReloadEvery)
+        -- each of the five minutes of the range has some of them
+        sort (nub [(a - half) `div` 60000 | a <- after]) `shouldBe` [0 .. 4]
 
 arbitraryBlockRefs :: Gen [BlockRef]
 arbitraryBlockRefs = listOf arbitraryBlockRef
