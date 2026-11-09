@@ -540,13 +540,13 @@ record env x ref txid = do
   tx <- getRawTx env.node txid
   let ins =
         [ (t, fromIntegral (sats' n))
-        | i <- arr (fromMaybe Null (field "vin" tx)),
+        | i <- arr ((tx ! "vin")),
           Just t <- [textField "txid" i],
           Just n <- [field "vout" i]
         ]
       outs =
         [ (fromIntegral (sats' n), h, sats v)
-        | o <- arr (fromMaybe Null (field "vout" tx)),
+        | o <- arr ((tx ! "vout")),
           Just n <- [field "n" o],
           Just v <- [field "value" o],
           Just h <- [textField "hex" =<< field "scriptPubKey" o]
@@ -650,8 +650,8 @@ checkXPub env x ref = do
   let b = "/xpub/" <> x.text
       q = "?derive=" <> deriveParam x
   summary <- plainJSON env (b <> q)
-  let bal = fromMaybe Null (field "balance" summary)
-      idx = fromMaybe Null (field "indices" summary)
+  let bal = (summary ! "balance")
+      idx = (summary ! "indices")
   (num "confirmed" bal + num "unconfirmed" bal) `shouldBe` e.balance
   num "utxo" bal `shouldBe` fromIntegral (length e.utxos)
   num "external" idx `shouldBe` fromIntegral e.external
@@ -758,6 +758,10 @@ blockOf v = case field "block" v of
 newestFirst :: [BlockRef] -> IO ()
 newestFirst bs = bs `shouldBe` sortOn Down bs
 
+-- | Field of a JSON object, or null.
+(!) :: Value -> Text -> Value
+v ! k = fromMaybe Null (field k v)
+
 arr :: Value -> [Value]
 arr (Array a) = toList a
 arr v = error ("Not an array: " <> take 500 (show v))
@@ -850,10 +854,10 @@ noteTest env = do
   e.balance `shouldBe` sum [10000 + i | i <- [0 .. 35]]
   checkXPub env x ref
   ma <- plainJSON env ("/blockchain/multiaddr?active=" <> x.text)
-  let w = fromMaybe Null (field "wallet" ma)
+  let w = (ma ! "wallet")
   num "final_balance" w `shouldBe` e.balance
   num "n_tx" w `shouldBe` 1
-  case arr (fromMaybe Null (field "addresses" ma)) of
+  case arr ((ma ! "addresses")) of
     [a] -> do
       num "account_index" a `shouldBe` 36
       num "change_index" a `shouldBe` 0
@@ -948,17 +952,17 @@ multiaddrTest env = do
   let active = xa.text <> "|" <> xb.text <> "|" <> cs q
       m = "/blockchain/multiaddr?active=" <> active
   w1 <- plainJSON env (m <> "&n=1")
-  length (arr (fromMaybe Null (field "txs" w1))) `shouldBe` 1
-  let wallet1 = fromMaybe Null (field "wallet" w1)
+  length (arr ((w1 ! "txs"))) `shouldBe` 1
+  let wallet1 = (w1 ! "wallet")
   num "n_tx" wallet1 `shouldBe` 4
   num "n_tx_filtered" wallet1 `shouldBe` 4
   num "final_balance" wallet1 `shouldBe` (100000 + 200000 + 300000 + 110000 + 120000 + 130000)
   w2 <- plainJSON env (m <> "&onlyShow=" <> cs q)
-  num "n_tx" (fromMaybe Null (field "wallet" w2)) `shouldBe` 2
-  length (arr (fromMaybe Null (field "txs" w2))) `shouldBe` 2
+  num "n_tx" ((w2 ! "wallet")) `shouldBe` 2
+  length (arr ((w2 ! "txs"))) `shouldBe` 2
   w3 <- plainJSON env (m <> "&n=2&offset=1")
-  length (arr (fromMaybe Null (field "txs" w3))) `shouldBe` 2
-  forM_ (arr (fromMaybe Null (field "addresses" w1))) $ \a ->
+  length (arr ((w3 ! "txs"))) `shouldBe` 2
+  forM_ (arr ((w1 ! "addresses"))) $ \a ->
     case textField "address" a of
       Just t
         | t == cs xa.text -> num "account_index" a `shouldBe` 2
@@ -1233,8 +1237,8 @@ spenderTest env = do
   w <- getNewAddress env.node
   raw <- rpc env.node "createrawtransaction" [toJSON ([] :: [Value]), object [Key.fromText (at env x [0, 0]) .= btc 200000, Key.fromText w .= btc 300000]]
   funded <- rpc env.node "fundrawtransaction" [raw]
-  signed <- rpc env.node "signrawtransactionwithwallet" [fromMaybe Null (field "hex" funded)]
-  txT <- rpc env.node "sendrawtransaction" [fromMaybe Null (field "hex" signed)] >>= \case
+  signed <- rpc env.node "signrawtransactionwithwallet" [(funded ! "hex")]
+  txT <- rpc env.node "sendrawtransaction" [(signed ! "hex")] >>= \case
     String t -> return t
     v -> fail (show v)
   record env x ref txT
@@ -1244,7 +1248,7 @@ spenderTest env = do
   tx <- getRawTx env.node txT
   let wScript = textField "scriptPubKey" info
   vout <- case [ numV n
-               | o <- arr (fromMaybe Null (field "vout" tx)),
+               | o <- arr ((tx ! "vout")),
                  Just n <- [field "n" o],
                  (textField "hex" =<< field "scriptPubKey" o) == wScript
                ] of
@@ -1253,7 +1257,7 @@ spenderTest env = do
   w2 <- getNewAddress env.node
   raw2 <- rpc env.node "createrawtransaction" [toJSON [object ["txid" .= txT, "vout" .= vout]], object [Key.fromText w2 .= btc 290000]]
   signed2 <- rpc env.node "signrawtransactionwithwallet" [raw2]
-  txU <- rpc env.node "sendrawtransaction" [fromMaybe Null (field "hex" signed2)] >>= \case
+  txU <- rpc env.node "sendrawtransaction" [(signed2 ! "hex")] >>= \case
     String t -> return t
     v -> fail (show v)
   waitSynced env

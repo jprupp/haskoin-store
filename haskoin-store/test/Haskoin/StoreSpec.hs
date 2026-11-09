@@ -4,7 +4,6 @@ module Haskoin.StoreSpec (spec) where
 
 import Conduit
 import Control.Monad
-import Control.Monad.Reader
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Base64

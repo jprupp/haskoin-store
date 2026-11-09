@@ -3,6 +3,8 @@ module Haskoin.Store.CommonSpec (spec) where
 import Conduit (runConduit, runConduitPure, sinkList, takeC, yieldMany, (.|))
 import Control.Monad.State.Strict (State, evalState, execState, modify', runState)
 import Data.ByteString.Char8 qualified as C8
+import Data.HashMap.Strict qualified as HashMap
+import Data.HashSet qualified as HashSet
 import Data.IntSet qualified as IntSet
 import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
@@ -44,8 +46,8 @@ spec = do
     it "reads a number of rows in proportion to the rows taken" $
       property $ \(NonNegative n) ->
         let xs = [1 .. 100000 :: Int]
-            (ys, reads) = paged 16 xs (Just n)
-         in ys === take n xs .&&. counterexample (show reads) (reads <= 4 * n + 2048)
+            (ys, rowsRead) = paged 16 xs (Just n)
+         in ys === take n xs .&&. counterexample (show rowsRead) (rowsRead <= 4 * n + 2048)
   describe "mergeDescGroups" $ do
     it "pages like sorting the first offset plus limit items of every stream" $
       property $ \(Streams ss) ->
@@ -130,9 +132,9 @@ chain m = [(n, fakeAddr m n) | n <- [0 ..]]
 balancesOf :: [Int] -> [Int] -> [Address] -> [Balance]
 balancesOf ext chg = map f
   where
-    used = [fakeAddr 0 (fromIntegral n) | n <- ext] <> [fakeAddr 1 (fromIntegral n) | n <- chg]
+    used = HashSet.fromList ([fakeAddr 0 (fromIntegral n) | n <- ext] <> [fakeAddr 1 (fromIntegral n) | n <- chg])
     f a
-      | a `elem` used = (zeroBalance a) {txs = 1, received = 1}
+      | a `HashSet.member` used = (zeroBalance a) {txs = 1, received = 1}
       | otherwise = zeroBalance a
 
 scan :: Word32 -> Word32 -> [Int] -> [Int] -> [XPubBal]
@@ -142,9 +144,12 @@ scan igap gap ext chg =
 -- | Read balances, recording the paths read.
 countReads :: [Int] -> [Int] -> [Address] -> State [(Word32, Int)] [Balance]
 countReads ext chg as = do
-  let paths = [(m, fromIntegral n) | a <- as, m <- [0, 1], n <- [0 .. 400], fakeAddr m n == a]
-  modify' (paths <>)
+  modify' ([p | a <- as, Just p <- [HashMap.lookup a pathOf]] <>)
   return (balancesOf ext chg as)
+
+-- | Path of each fake address, derived once.
+pathOf :: HashMap.HashMap Address (Word32, Int)
+pathOf = HashMap.fromList [(fakeAddr m n, (m, fromIntegral n)) | m <- [0, 1], n <- [0 .. 400]]
 
 -- | Last used index that a wallet following the gap reaches, or -1.
 lastReached :: Word32 -> Word32 -> [Int] -> Int

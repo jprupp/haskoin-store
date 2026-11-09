@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Tests of haskoin-store-data checked by law for every type: binary
+  encodings round-trip and agree between Serial, cereal and binary; JSON
+  round-trips and the fast encoders write the same JSON as `toJSON`; the
+  wire format of the basic types is pinned. The suite runs in about 25
+  seconds instead of nearly four minutes.
 - Integration tests against regtest chains of Bitcoin Core and Bitcoin Cash
   Node, with Valkey, in Podman containers built from Ubuntu 26.04 and
   release tarballs checked against pinned hashes, one cached layer per
