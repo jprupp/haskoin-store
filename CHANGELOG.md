@@ -99,6 +99,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   of this one; `store/` and `data/` are gone. haskoin-store depends on
   `haskoin-store-data ^>= 1.9`. The package has a full description, PVP
   upper bounds on every dependency, and no `Setup.hs`.
+- `swagger.yaml` explains the API, not only lists it: an introduction to its
+  conventions (amounts, ordering, paging, formats, errors, unconfirmed
+  transactions, reorganisations, xpubs, live events, Blockchain.info
+  compatibility) and the reasons for them, and a description of every
+  endpoint, parameter and field. It documents `/dbstats`, the WebSocket at
+  `/events` and the `time` field of the health check, which were missing,
+  and corrects the health check examples and the version.
+- The README tutorial pages with `height`, the parameter the server reads;
+  it said `start`, which the server ignores.
 - Every line of code is shorter than 120 columns, `swagger.yaml` included,
   whose long hexadecimal and xpub examples are split into equal pieces that
   parse to the same values. `scripts/format` formats `integration/` and

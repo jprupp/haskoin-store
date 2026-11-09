@@ -12,7 +12,7 @@ servers:
   - url: 'https://api.haskoin.com/btctest4/'
 
 info:
-  version: &version 1.8.0
+  version: &version 1.8.1
   title: Haskoin
   contact:
     name: JP Rupp
@@ -22,20 +22,211 @@ info:
     name: MIT
     url: https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE
   description: |
-    Rich and fast API to query indexed block chain data for Bitcoin and Bitcoin
-    Cash.
+    Haskoin Store indexes the Bitcoin (BTC) and Bitcoin Cash (BCH) block chains
+    and answers the questions that a node cannot answer on its own: what is the
+    balance of this address, which transactions belong to this wallet, which
+    outputs can it spend. It connects to the peer-to-peer network itself, keeps
+    its indices up to date with every block and every unconfirmed transaction,
+    and serves them here.
+
+    The servers of this reference are the public instance at api.haskoin.com, one per
+    network: `btc`, `bch`, and their test networks `btctest4` and `bchtest4`. The
+    same API is served by any Haskoin Store you run yourself.
+
+    ## The basics
+
+    - **Amounts** of coins are whole numbers of satoshis (1 coin is 100,000,000
+      satoshis), never decimal numbers of coins: floating-point numbers cannot
+      hold every satoshi amount exactly, and a balance that is off by one
+      satoshi is a bug that is hard to find. Only prices in other currencies,
+      in the Blockchain.info endpoints, are decimal.
+    - **Hashes** of blocks and transactions are hexadecimal, in the byte order
+      that nodes and block explorers display, so they can be copied between them
+      and this API.
+    - **Scripts and serialized data** are hexadecimal.
+    - **Times** are Unix timestamps, in seconds.
+    - **Addresses** are written as the network writes them: Base58 or Bech32 on
+      BTC, CashAddr on BCH.
+
+    ## Lists are newest first
+
+    Every list of transactions or unspent outputs starts with the newest:
+    unconfirmed transactions first, by the time this server first saw them, then
+    confirmed ones, from the highest block down, and within a block from the last
+    transaction to the first.
+
+    This is the order in which wallets and explorers show activity, and the
+    database is laid out in that order, so the first page of any list is a single
+    lookup however long the history is.
+
+    ## Paging
+
+    Lists take three parameters:
+
+    - `limit`: how many items to return. Without it the server returns its
+      default number (100, unless the operator changed it). There is a maximum,
+      lower for lists of full transactions, which are much larger; `limit=0`
+      asks for that maximum.
+    - `height`: where the page starts. It can be:
+      - a **transaction id**: the page starts at that transaction, which is
+        included;
+      - a **block hash**: the page starts at that block;
+      - a **block height**: the page starts at transactions confirmed at or below
+        that height;
+      - a **Unix time**: the page starts at the last block mined at or before
+        that time.
+
+      Numbers up to 1,230,768,000 are heights and larger ones are times. That
+      number is midnight on 1 January 2009, before the first block, so no time
+      of a block is mistaken for a height, and no chain will reach that height.
+    - `offset`: how many items to skip after the start. The server has a
+      maximum (50,000, unless the operator changed it).
+
+    **To get the next page, pass the id of the last transaction you received as
+    `height`, and `offset=1` to skip it.** An offset counts from the newest item,
+    so every new transaction shifts every page by one, and a deep offset makes the
+    server step over all the items before it. A transaction id is a fixed point:
+    pages do not shift, and the server finds the start with one lookup however
+    far back it is. The maximum offset is there because deep offsets are slow.
+
+    ## Formats
+
+    - **JSON** by default, without spaces, to keep responses small.
+    - **Pretty JSON** with `pretty=true`, indented for people to read.
+    - **Binary** with the header `Accept: application/octet-stream`: the compact
+      serialization that the Haskell client in
+      [haskoin-store-data](https://github.com/jprupp/haskoin-store-data)
+      decodes. It is smaller and faster to decode than JSON, and meant for
+      programs written with Haskoin.
+
+    Endpoints that end in `/raw` return data serialized as in the peer-to-peer
+    protocol, in hexadecimal inside JSON (`{"result": "0100…"}`), or as bytes
+    with the binary format.
+
+    ## Errors
+
+    An error is a JSON object with a stable `error` code, for programs, and a
+    `message`, for people:
+
+    ```json
+    {"error": "user-error", "message": "Unable to parse param limit"}
+    ```
+
+    | Status | `error` | When |
+    | --- | --- | --- |
+    | 400 | `user-error`, `bad-request` | A parameter or the body is wrong; the message says which. |
+    | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
+    | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
+    | 500 | `server-error` | Something went wrong on the server; it is logged there. |
+    | 503 | | Only from `/health`: the server is not ready. |
+
+    A value in the path that does not parse, such as a misspelt address, gives
+    404 rather than 400. Paths are matched by the shape of what is in them, and
+    a segment that does not parse may belong to another endpoint (`/block/best`
+    and `/block/{block}` share a prefix), so the server tries the others, and
+    when none matches it answers that there is nothing there. Query parameters
+    are not ambiguous, so a bad one gives 400, with its name in the message.
+
+    A 409 comes only from the Blockchain.info endpoints, which can name a
+    transaction by a short number; the error lists the matching ids in `txids`.
+
+    The codes `server-timeout` and `request-too-large` are part of the format, for
+    clients that decode it, but this version of the server does not send them.
+
+    ## Unconfirmed transactions
+
+    The mempool is indexed like the chain. A payment shows up in balances and
+    histories as soon as this server sees it on the network, with
+    `"block": {"mempool": <time first seen>}` instead of a block height.
+
+    A transaction can leave the mempool without being confirmed: when a block
+    confirms another transaction that spends the same coins, or, on BTC, when a
+    replacement that pays a higher fee arrives (replace-by-fee). It is then
+    removed from every balance and history, together with any transaction that
+    spends its outputs. It can still be fetched by its id, with
+    `"deleted": true`, so a wallet that showed a payment can tell its user what
+    became of it instead of the payment silently disappearing.
+
+    ## Reorganisations
+
+    When the network switches to a chain with more work, the server undoes the
+    blocks that are no longer in it, puts their transactions back in the
+    mempool, and applies the new blocks. Every answer reflects the chain with
+    the most work at the time of the request. Blocks of an abandoned chain keep
+    answering by hash, with `"mainchain": false`.
+
+    ## What the server trusts
+
+    The server follows the chain with the most proof of work, as the network
+    reports it, and checks what it needs to keep its indices consistent: that
+    inputs exist and are not spent twice. It does not validate scripts or every
+    consensus rule, as a full node does. Its answers are what the network says;
+    for payments where a mistake would be costly, wait for confirmations, as with
+    any wallet.
+
+    ## Extended public keys
+
+    Most wallets are an extended public key (xpub) from which they derive their
+    addresses. The `/xpub` endpoints answer for all of them at once: the server
+    derives the receiving chain (`0`) and the change chain (`1`), and looks at
+    every address up to the last used one of each chain and then a gap of unused
+    addresses after it (32, unless the operator changed it), and always at least
+    the first 20 addresses. A payment to an address further away is not seen,
+    as a wallet that follows BIP 44 with the same gap would not see it either.
+
+    The `derive` parameter says which kind of address the wallet derives. An
+    xpub does not say it, and the same key gives different addresses for each
+    kind, so asking for the wrong kind gives an empty wallet.
+
+    Servers with a Redis cache keep large wallets ready: their first query reads
+    the database and caches the result, and later ones are answered from memory.
+    A cached answer is always the same as the database's; `nocache=true` skips
+    the cache.
+
+    ## Live updates
+
+    Instead of polling, keep `/events` open: it sends a line for every new block
+    and every change to the mempool, as a stream of JSON lines or over a
+    WebSocket. Events carry only the hash; fetch what you need from it. A client
+    that falls more than 10,000 events behind is disconnected, so that one slow
+    client cannot make the server hold an ever-growing queue for it.
+
+    ## Blockchain.info compatibility
+
+    The endpoints under `/blockchain/` answer like those of Blockchain.info, with
+    the same parameters, field names and conventions, so that software written
+    for it can switch by changing its base URL. They are documented here where
+    they differ or where the original is unclear. An operator may turn them off.
+
+    ## Browsers
+
+    Every response has the header `Access-Control-Allow-Origin: *`, so web
+    applications can call the API directly from a browser. The API needs no
+    credentials and keeps no sessions, so there is nothing for another site to
+    abuse.
 
 tags:
   - name: Address
-    description: Operations on addresses and extended public keys.
+    description: |
+      Balances, transactions and unspent outputs of addresses, one at a time or
+      many at once, and of extended public keys (xpubs), which stand for every
+      address of a wallet.
   - name: Transaction
-    description: Operations related to transactions.
+    description: |
+      Transactions by id, the transactions of a block, the mempool, and
+      broadcasting new transactions to the network.
   - name: Block
-    description: Operations related to blocks.
+    description: |
+      Blocks by hash, height or time, the newest blocks, and their serialized
+      form.
   - name: Network
-    description: Network statistics and other miscelaneous operations.
+    description: |
+      The state of the server and the network: health, peers, and a live stream of
+      new blocks and transactions.
   - name: Blockchain
-    description: Blockchain.info compatibility. May be disabled.
+    description: |
+      Endpoints that answer like those of Blockchain.info, for software written
+      for it. An operator may turn them off, in which case they answer 404.
 
 paths:
   '/health':
@@ -43,6 +234,17 @@ paths:
       tags:
         - Network
       summary: Health Check
+      description: |
+        Whether this server is ready to answer, for load balancers and monitoring.
+
+        The status is **200** when every check passes and **503** when one fails;
+        the body is the same either way and says which check failed. A server that is
+        still catching up with the network answers 503, so a load balancer stops
+        sending it traffic until its answers are current.
+
+        The checks are run in the background every 30 seconds (unless the operator
+        changed it), and this endpoint returns the latest result. It does no work of
+        its own, so it is safe to call as often as a load balancer likes.
       operationId: healthCheck
       parameters:
         - $ref: '#/components/parameters/prettyParam'
@@ -79,6 +281,7 @@ paths:
                   ok: true
                   count: 20
                   min: 1
+                time: '2021-06-14 10:21:43 UTC'
             application/octet-stream:
               schema:
                 type: string
@@ -102,7 +305,7 @@ paths:
                   ok: true
                   max: 100
                   count: 0
-                version: 0.52.14
+                version: *version
                 last-tx:
                   ok: true
                   max: 300
@@ -113,14 +316,26 @@ paths:
                   age: 3279
                 peers:
                   ok: false
-                  count: 20
-                  min: 0
-                
+                  count: 0
+                  min: 1
+                time: '2021-06-14 10:21:43 UTC'
+
   '/address/{address}/transactions':
     get:
       tags:
         - Address
       summary: Transactions for Address
+      description: |
+        The transactions that pay to or spend from an address, newest first, as
+        transaction ids with their place in the chain.
+
+        This is the light way to follow an address: fetch the transactions you do not
+        have yet with `/transactions`. Use `/transactions/full` to get them in one
+        call when you need them all. See *Paging* at the top for `limit`, `offset`
+        and `height`.
+
+        An address with no transactions gives an empty list. An address that does
+        not parse for this network gives 404.
       operationId: getAddressTxs
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -156,12 +371,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/address/{address}/transactions/full':
     get:
       tags:
         - Address
       summary: Detailed Address Transactions
+      description: |
+        Like `/address/{address}/transactions`, with the full transactions instead
+        of their ids.
+
+        Full transactions are much larger, so the most that one call returns is
+        lower (5,000, unless the operator changed it).
       operationId: getAddressTxsFull
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -271,6 +492,12 @@ paths:
       tags:
         - Address
       summary: Multiple Address Transactions
+      description: |
+        The transactions of several addresses, merged into one list, newest first.
+        A transaction that touches several of the addresses appears once.
+
+        This is how to follow a wallet that is a list of addresses rather than an
+        xpub: one call, and one consistent page, instead of one call per address.
       operationId: getMultipleAddressTxs
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -320,6 +547,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Detailed Transactions
+      description: |
+        Like `/address/transactions`, with the full transactions instead of their
+        ids, and the lower maximum of full transactions.
       operationId: getMultipleAddressTxsFull
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -506,6 +736,12 @@ paths:
         - Address
       operationId: getBalance
       summary: Address Balance
+      description: |
+        The balance of an address: confirmed and unconfirmed amounts, the number of
+        unspent outputs and of transactions, and the total ever received.
+
+        An address that has never been used has a balance of zero rather than giving
+        404: every valid address exists, it just has not received anything yet.
       parameters:
         - $ref: '#/components/parameters/addressParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -539,6 +775,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Balances
+      description: |
+        The balances of several addresses, in one call. Every address in the request
+        has a balance in the response, unused ones with zeros.
       operationId: getMultipleAddressBalances
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -581,6 +820,13 @@ paths:
       tags:
         - Address
       summary: Address Unspent Outputs
+      description: |
+        The outputs paid to an address that are not spent yet, newest first: the
+        coins a wallet can spend.
+
+        Outputs spent by an unconfirmed transaction are left out, because spending
+        them again would conflict with it. Unconfirmed outputs are included, with
+        `"block": {"mempool": …}`; whether to spend them is the wallet's choice.
       operationId: getAddressUnspent
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -646,6 +892,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Unspent Outputs
+      description: |
+        The unspent outputs of several addresses, merged into one list, newest
+        first.
       operationId: getMultipleAddressUnspent
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -719,6 +968,12 @@ paths:
       tags:
         - Block
       summary: Block Chain Head
+      description: |
+        The newest block of the chain with the most work that this server has
+        imported.
+
+        It can be a block or two behind the network while the server imports a new
+        one; `/health` says how far behind it is.
       operationId: getBlockHead
       parameters:
         - $ref: '#/components/parameters/notxParam'
@@ -797,6 +1052,9 @@ paths:
       tags:
         - Block
       summary: Raw Block Chain Head
+      description: |
+        The newest block, serialized as in the peer-to-peer protocol, with all its
+        transactions.
       operationId: getRawBlockHead
       responses:
         '200':
@@ -829,6 +1087,10 @@ paths:
       tags:
         - Block
       summary: Most Recent Blocks
+      description: |
+        The newest block and the ones before it, up to 100 blocks, newest first. For
+        explorers that show recent blocks; use `notx=true` when you do not need the
+        transaction ids, as blocks can have thousands of them.
       operationId: getLatestBlocks
       parameters:
         - $ref: '#/components/parameters/notxParam'
@@ -895,13 +1157,18 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/block/{block}':
     get:
       tags:
         - Block
       operationId: getBlock
       summary: Block Information
+      description: |
+        A block by its hash, with the ids of its transactions.
+
+        Blocks that are no longer in the main chain after a reorganisation keep
+        answering, with `"mainchain": false`, so a link to a block never breaks.
       parameters:
         - $ref: '#/components/parameters/notxParam'
         - $ref: '#/components/parameters/blockParam'
@@ -943,13 +1210,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/block/{block}/raw':
     get:
       tags:
         - Block
       operationId: getRawBlock
       summary: Raw Block
+      description: |
+        A block by its hash, serialized as in the peer-to-peer protocol, with all
+        its transactions.
       parameters:
         - $ref: '#/components/parameters/blockParam'
       responses:
@@ -1013,6 +1283,10 @@ paths:
         - Block
       operationId: getBlocks
       summary: Information for Multiple Blocks
+      description: |
+        Several blocks by hash, in one call. Hashes that are not known are left out
+        of the response rather than failing the whole request, and repeated hashes
+        are answered once.
       parameters:
         - $ref: '#/components/parameters/notxParam'
         - $ref: '#/components/parameters/blocksParam'
@@ -1070,6 +1344,10 @@ paths:
         - Block
       operationId: getBlocksAtHeight
       summary: Blocks at Height
+      description: |
+        The blocks at a height. It is a list because the server keeps the blocks of
+        chains that were abandoned in a reorganisation; the one in the main chain
+        has `"mainchain": true`.
       parameters:
         - $ref: '#/components/parameters/blockHeightParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1117,6 +1395,8 @@ paths:
         - Block
       operationId: getRawBlocksAtHeight
       summary: Raw Blocks at Height
+      description: |
+        The blocks at a height, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/blockHeightParam'
       responses:
@@ -1154,6 +1434,14 @@ paths:
         - Block
       operationId: getBlockAtTime
       summary: Block Mined at Time
+      description: |
+        The last block of the main chain whose timestamp is at or before a time:
+        the block that was the newest at that moment, as far as the timestamps of
+        blocks tell.
+
+        Timestamps of blocks are set by miners and are only roughly right; they can
+        even go backwards from one block to the next. For a time that only goes
+        forward, use `/block/mtp/{time}`.
       parameters:
         - $ref: '#/components/parameters/timeParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1199,6 +1487,8 @@ paths:
         - Block
       operationId: getRawBlockAtTime
       summary: Raw Block Mined at Time
+      description: |
+        Like `/block/time/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
       responses:
@@ -1240,7 +1530,15 @@ paths:
       tags:
         - Block
       operationId: getBlockMTP
-      summary: Block Mined at Time
+      summary: Block at Median Time Past
+      description: |
+        The first block of the main chain whose median time past is at or after a
+        time.
+
+        The median time past of a block is the median of the timestamps of the 11
+        blocks up to it. Unlike the timestamps themselves, it never goes backwards,
+        and it is the time that the consensus rules use for time locks, so it is the
+        right one to answer "from which block on is this lock time reached".
       parameters:
         - $ref: '#/components/parameters/timeParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1286,6 +1584,8 @@ paths:
         - Block
       operationId: getRawBlockMTP
       summary: Raw Block at Median Time Past
+      description: |
+        Like `/block/mtp/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
       responses:
@@ -1326,6 +1626,8 @@ paths:
         - Block
       operationId: getBlocksAtHeights
       summary: Blocks at Multiple Heights
+      description: |
+        The blocks at several heights, in one call, all of them for each height.
       parameters:
         - $ref: '#/components/parameters/blockHeightsParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1405,6 +1707,14 @@ paths:
         - Transaction
       operationId: getTransaction
       summary: Detailed Transaction
+      description: |
+        A transaction, with what this server knows about it beyond its raw form:
+        where it is in the chain, the fee, the address and amount of every output it
+        spends, and which transaction spends each of its outputs.
+
+        Unconfirmed transactions are here too. A transaction that was removed from
+        the mempool, or whose block was abandoned, still answers, with
+        `"deleted": true`.
       parameters:
         - $ref: '#/components/parameters/txidParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1471,6 +1781,9 @@ paths:
         - Transaction
       operationId: getRawTransaction
       summary: Raw Transaction
+      description: |
+        A transaction serialized as in the peer-to-peer protocol, as a node would
+        send it.
       parameters:
         - $ref: '#/components/parameters/txidParam'
       responses:
@@ -1506,6 +1819,17 @@ paths:
         - Transaction
       operationId: cbAfterHeight
       summary: Hard Fork Safety Check
+      description: |
+        Whether any ancestor of a transaction is a coinbase mined after a height.
+
+        This answers a question that matters after a chain split, such as the one
+        between BTC and BCH: coins created by miners after the split exist on one
+        chain only, so a transaction that descends from them cannot be replayed on
+        the other chain. The server follows the inputs of the transaction back
+        through its ancestors, and answers `true` as soon as it finds such a
+        coinbase, `false` when every path ends in older blocks, and `null` when it
+        gives up after looking at 10,000 transactions, so that one request cannot
+        keep the server busy for long.
       parameters:
         - $ref: '#/components/parameters/txidParam'
         - $ref: '#/components/parameters/blockHeightParam'
@@ -1536,13 +1860,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/transactions':
     get:
       tags:
         - Transaction
       operationId: getTransactions
       summary: Multiple Detailed Transactions
+      description: |
+        Several transactions by id, in one call. Ids that are not known are left out
+        of the response rather than failing the whole request, and repeated ids are
+        answered once.
       parameters:
         - $ref: '#/components/parameters/txidsParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1646,6 +1974,24 @@ paths:
     post:
       tags:
         - Transaction
+      summary: Broadcast Transaction
+      description: |
+        Send a signed transaction to the network, and get its id back.
+
+        The body is the transaction in hexadecimal (white space is ignored) or as
+        raw bytes. It must be in the format that nodes of the network read: on BCH,
+        which has no SegWit, the format without witness data.
+
+        **A 200 means the transaction was sent, not that the network accepted it.**
+        The server does not validate transactions; it gives the transaction to half
+        of its peers, which check it as they would any other. If they accept it, they
+        relay it back, and it appears in the mempool and in balances within seconds.
+        To know whether it was accepted, look for it with `/transaction/{txid}` or
+        watch `/events`.
+
+        Five seconds later the server asks those peers for the transaction back. A
+        peer that accepted it sends it, and the server imports it like any other
+        transaction it hears about; a peer that refused it has nothing to send.
       operationId: postTransaction
       requestBody:
         description: >-
@@ -1709,6 +2055,8 @@ paths:
         - Block
       operationId: getBlockTransactions
       summary: Transactions for Block
+      description: |
+        The full transactions of a block, in the order of the block.
       parameters:
         - $ref: '#/components/parameters/blockParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1888,6 +2236,9 @@ paths:
         - Block
       operationId: getRawBlockTransactions
       summary: Raw Block Transactions
+      description: |
+        The transactions of a block, serialized as in the peer-to-peer protocol, in
+        the order of the block.
       parameters:
         - $ref: '#/components/parameters/blockParam'
       responses:
@@ -1950,6 +2301,9 @@ paths:
         - Transaction
       operationId: getRawTransactions
       summary: Raw Transactions
+      description: |
+        Several transactions by id, serialized as in the peer-to-peer protocol. Ids
+        that are not known are left out.
       parameters:
         - $ref: '#/components/parameters/txidsParam'
       responses:
@@ -1995,6 +2349,12 @@ paths:
         - Transaction
       operationId: getMempool
       summary: Mempool Transaction Hashes
+      description: |
+        The ids of the unconfirmed transactions, newest first, by the time this
+        server first saw them.
+
+        There is no maximum `limit` here: the mempool is bounded by the network, and
+        ids are small.
       parameters:
         - $ref: '#/components/parameters/limitParam'
         - $ref: '#/components/parameters/offsetParam'
@@ -2016,7 +2376,7 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/events':
     get:
       tags:
@@ -2026,6 +2386,24 @@ paths:
       parameters:
         - $ref: '#/components/parameters/prettyParam'
       summary: Stream Blocks and Transactions
+      description: |
+        A stream of what happens on the network: one event per new block and per
+        transaction that enters or leaves the mempool, as one line of JSON each.
+
+        ```
+        {"type":"tx","id":"9a5c…"}
+        {"type":"block","id":"0000000000000000000a1b…"}
+        ```
+
+        The same events are sent over a **WebSocket** at the same path, one JSON
+        message each, for browsers. The server pings WebSocket clients every 30
+        seconds and drops those that do not answer within 60.
+
+        An event names what changed and nothing else, which keeps the stream small
+        and the same for everyone; fetch the block or transaction if you need it. A
+        client that falls more than 10,000 events behind is disconnected rather than
+        having the server queue events for it without limit; reconnect, and catch up
+        with the normal endpoints.
       responses:
         '200':
           description: Events stream each on one line.
@@ -2040,7 +2418,7 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/peers':
     get:
       tags:
@@ -2049,6 +2427,10 @@ paths:
       parameters:
         - $ref: '#/components/parameters/prettyParam'
       summary: Connected Network Peers
+      description: |
+        The nodes of the peer-to-peer network that this server is connected to. It
+        is where blocks and transactions come from, and where broadcast transactions
+        go.
       responses:
         '200':
           description: List of peer objects.
@@ -2078,7 +2460,7 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/xpub/{xpub}':
     get:
       tags:
@@ -2086,13 +2468,13 @@ paths:
       operationId: getXPubSummary
       summary: Extended Public Key Summary
       description: |
-        Addresses of each chain of the key are derived up to an exact gap:
-        every address up to the last used one, then exactly as many unused
-        ones as the gap of the server (32 by default), and always the first
-        addresses up to the initial gap (20 by default). A payment to an
-        address further away is not seen, as a wallet using the same gap
-        would not see it. The same addresses are used by every endpoint of
-        extended public keys.
+        The summary of a wallet: its balance, and the index of the last used address
+        of the receiving and of the change chain, so the wallet knows where to derive
+        its next address.
+
+        It is the cheapest way to check a wallet: it does not list transactions or
+        outputs. See *Extended public keys* at the top for how the addresses are
+        found.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2130,8 +2512,13 @@ paths:
       operationId: deleteCachedXPub
       summary: Delete Cached Extended Key
       description: |
-        Remove the key from the Redis cache, if the server has one. Answers
-        true if it was cached. A later query caches it again.
+        Remove a wallet from the Redis cache of this server, if it has one. The
+        answer says whether it was cached.
+
+        There is rarely a reason to call this: cached wallets are kept up to date
+        with every block and transaction, and the least recently used ones are
+        evicted when the cache is full. It is there to free memory, or to rule out
+        the cache when looking into a problem.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2167,6 +2554,9 @@ paths:
         - Address
       operationId: getXPubTransactionsFull
       summary: Detailed Extended Public Key Transactions
+      description: |
+        Like `/xpub/{xpub}/transactions`, with the full transactions instead of
+        their ids, and the lower maximum of full transactions.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2410,6 +2800,10 @@ paths:
         - Address
       operationId: getXPubTransactions
       summary: Extended Public Key Transaction List
+      description: |
+        The transactions of every address of a wallet, merged into one list, newest
+        first, as transaction ids with their place in the chain. A transaction
+        between two addresses of the wallet appears once.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2457,6 +2851,11 @@ paths:
         - Address
       operationId: getXPubBalances
       summary: Extended Public Key Balances
+      description: |
+        The balance of every address of a wallet that the server looked at, with its
+        derivation path: each used address, and the unused ones of the gap, with
+        zeros, so a wallet can see which addresses it may still hand out. For the
+        total, use `/xpub/{xpub}`.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2519,6 +2918,9 @@ paths:
         - Address
       operationId: getXPubUnspent
       summary: Extended Public Key Unspent Outputs
+      description: |
+        The unspent outputs of a wallet, newest first, each with the derivation path
+        of its address, so the wallet knows which key signs for it.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2590,6 +2992,9 @@ paths:
         - Blockchain
       operationId: getBinfoBalance
       summary: Address or XPub Balances
+      description: |
+        Short balances of addresses and wallets, keyed by the address or xpub as it
+        was given, as Blockchain.info answers.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -2622,6 +3027,9 @@ paths:
         - Blockchain
       operationId: postBinfoBalance
       summary: Address or XPub Balances
+      description: |
+        Like the `GET`, with the parameters in a form in the body, for requests with
+        too many addresses to fit in a URL.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -2656,6 +3064,10 @@ paths:
         - Blockchain
       operationId: getBinfoRawAddr
       summary: Address Balance & Transactions
+      description: |
+        The balance and transactions of an address or an xpub, as Blockchain.info
+        answers. Also served at `/blockchain/address/{address}` and
+        `/blockchain/xpub/{address}`, for clients that use those paths.
       parameters:
         - $ref: '#/components/parameters/binfoAddr'
         - $ref: '#/components/parameters/binfoLimit'
@@ -2800,6 +3212,8 @@ paths:
         - Blockchain
       operationId: getBinfoMempool
       summary: Mempool Transactions
+      description: |
+        Unconfirmed transactions, newest first, as Blockchain.info answers.
       parameters:
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoOffset'
@@ -2923,6 +3337,15 @@ paths:
         - Blockchain
       operationId: getBinfoMultiAddr
       summary: Wallet Data
+      description: |
+        The balances and transactions of a wallet made of addresses and xpubs, as
+        Blockchain.info answers, with the current price of the coin in a currency
+        of your choice.
+
+        Transactions show the change to the balance of the wallet as a whole, and,
+        by default, incoming transactions leave out outputs to other addresses
+        (`noCompact` keeps them): a payment from an exchange can have hundreds of
+        outputs to other people, which the wallet has no use for.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -2953,6 +3376,9 @@ paths:
         - Blockchain
       operationId: postBinfoMultiAddr
       summary: Wallet Data
+      description: |
+        Like the `GET`, with the parameters in a form in the body, for wallets with
+        too many addresses to fit in a URL.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -3251,6 +3677,9 @@ paths:
         - Blockchain
       operationId: getBinfoBlock
       summary: Raw Block
+      description: |
+        A block with its transactions, by hash or height, as Blockchain.info answers.
+        With `format=hex`, the block serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/binfoBlockId'
         - $ref: '#/components/parameters/binfoFormat'
@@ -3336,6 +3765,9 @@ paths:
         - Blockchain
       operationId: getBinfoLatest
       summary: Latest Block
+      description: |
+        The newest block, as Blockchain.info answers, with the ids of its
+        transactions.
       parameters:
         - $ref: '#/components/parameters/binfoTxIdIndex'
       responses:
@@ -3489,6 +3921,9 @@ paths:
         - Blockchain
       operationId: getBinfoBlocksDay
       summary: Blocks for a Day
+      description: |
+        The blocks of the 24 hours before a time, newest first, as Blockchain.info
+        answers. The time is in **milliseconds**, as Blockchain.info takes it.
       parameters:
         - name: milliseconds
           in: path
@@ -4269,6 +4704,8 @@ paths:
         - Blockchain
       operationId: getBinfoBlockHeight
       summary: Blocks at Height
+      description: |
+        The blocks at a height, with their transactions, as Blockchain.info answers.
       parameters:
         - name: height
           in: path
@@ -4348,6 +4785,11 @@ paths:
         - Blockchain
       operationId: getBinfoRawTx
       summary: Transaction Data
+      description: |
+        A transaction by id or by short number, as Blockchain.info answers. With
+        `format=hex`, the transaction serialized as in the peer-to-peer protocol.
+
+        A short number that matches several transactions gives 409 with their ids.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
         - $ref: '#/components/parameters/binfoFormat'
@@ -4421,6 +4863,9 @@ paths:
         - Blockchain
       operationId: getBinfoUnspent
       summary: Unspent Outputs
+      description: |
+        The unspent outputs of addresses and xpubs, newest first, as Blockchain.info
+        answers. At most 1,000 per call, 250 by default.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -4494,6 +4939,8 @@ paths:
         - Blockchain
       operationId: postBinfoUnspent
       summary: Unspent Outputs
+      description: |
+        Like the `GET`, with the parameters in a form in the body.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -4555,6 +5002,13 @@ paths:
         - Blockchain
       operationId: getBinfoHistory
       summary: Transaction History
+      description: |
+        The history of a wallet between two dates, one entry per transaction, with
+        its value in a currency at the time and now, for accounting.
+
+        Prices come from the price service that the operator configured
+        (Blockchain.info by default). If it cannot be reached, the prices are zero
+        and the rest of the history is still there.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -4601,6 +5055,8 @@ paths:
         - Blockchain
       operationId: postBinfoHistory
       summary: Transaction History
+      description: |
+        Like the `GET`, with the parameters in a form in the body.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -4647,6 +5103,12 @@ paths:
         - Blockchain
       operationId: getAddressHash
       summary: Address Hash
+      description: |
+        The hash160 of an address, in hexadecimal, as plain text.
+
+        The `/blockchain/q/` endpoints answer in plain text rather than JSON, as
+        those of Blockchain.info do, so that a shell script can use the answer as it
+        is.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4670,6 +5132,8 @@ paths:
         - Blockchain
       operationId: getHashAddress
       summary: Hash Address
+      description: |
+        The pay-to-public-key-hash address of a hash160, as plain text.
       parameters:
         - $ref: '#/components/parameters/hashParam'
       responses:
@@ -4693,6 +5157,8 @@ paths:
         - Blockchain
       operationId: getPubKeyAddress
       summary: Public Key Address
+      description: |
+        The pay-to-public-key-hash address of a public key, as plain text.
       parameters:
         - $ref: '#/components/parameters/pubKeyParam'
       responses:
@@ -4716,6 +5182,13 @@ paths:
         - Blockchain
       operationId: getAddressPubKey
       summary: Address Public Key
+      description: |
+        The public key of an address, in hexadecimal, as plain text.
+
+        An address is a hash of its public key, so the key can only be found once the
+        address has spent something: the server looks for an input that spends from
+        the address among its recent transactions, and reads the key from it. An
+        address that has never spent gives 404.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4739,6 +5212,8 @@ paths:
         - Blockchain
       operationId: getPubKeyHash
       summary: Public Key Hash
+      description: |
+        The hash160 of a public key, in hexadecimal, as plain text.
       parameters:
         - $ref: '#/components/parameters/pubKeyParam'
       responses:
@@ -4762,6 +5237,9 @@ paths:
         - Blockchain
       operationId: getBlockCount
       summary: Block Count
+      description: |
+        The height of the newest block header, as plain text. Headers arrive before
+        blocks, so it can be ahead of `/block/best`.
       responses:
         '200':
           description: Height of block chain.
@@ -4777,6 +5255,8 @@ paths:
         - Blockchain
       operationId: getLatestHash
       summary: Latest Block Hash
+      description: |
+        The hash of the newest block header, as plain text.
       responses:
         '200':
           description: Latest block hash.
@@ -4792,6 +5272,9 @@ paths:
         - Blockchain
       operationId: getBlockSubsidy
       summary: Block Subsidy
+      description: |
+        The subsidy of the next block, in satoshis, as plain text: the new coins its
+        miner will create, which halve every 210,000 blocks.
       responses:
         '200':
           description: Block subsidy for next block.
@@ -4807,6 +5290,8 @@ paths:
         - Blockchain
       operationId: getTotalOutput
       summary: Total Output
+      description: |
+        The total value of the outputs of a transaction, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4830,6 +5315,9 @@ paths:
         - Blockchain
       operationId: getTotalInput
       summary: Total Spent
+      description: |
+        The total value of the outputs that a transaction spends, in satoshis, as
+        plain text.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4853,6 +5341,9 @@ paths:
         - Blockchain
       operationId: getTxFee
       summary: Transaction Fee
+      description: |
+        The fee of a transaction, in satoshis, as plain text: what it spends minus
+        what it pays out.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4876,6 +5367,9 @@ paths:
         - Blockchain
       operationId: getTxResult
       summary: Transaction Address Amount
+      description: |
+        How much a transaction changes the balance of an address, in satoshis, as
+        plain text: what it pays to the address minus what it spends from it.
       parameters:
         - $ref: '#/components/parameters/addressParam'
         - $ref: '#/components/parameters/binfoTxId'
@@ -4900,6 +5394,8 @@ paths:
         - Blockchain
       operationId: getReceivedByAddress
       summary: Total Received by Address
+      description: |
+        The total ever received by an address, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4923,6 +5419,8 @@ paths:
         - Blockchain
       operationId: getSentByAddress
       summary: Total Sent by Address
+      description: |
+        The total ever sent from an address, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4946,6 +5444,9 @@ paths:
         - Blockchain
       operationId: getAddressBalance
       summary: Balance for Address
+      description: |
+        The balance of an address, confirmed and unconfirmed, in satoshis, as plain
+        text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4969,6 +5470,9 @@ paths:
         - Blockchain
       operationId: getAddressFirstSeen
       summary: Address First Seen
+      description: |
+        The time of the first block with a transaction of an address, as a Unix
+        timestamp in plain text, or `0` if it has none.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4985,41 +5489,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-    
+
+
+  '/dbstats':
+    get:
+      tags:
+        - Network
+      summary: Database Statistics
+      operationId: getDbStats
+      description: |
+        How the database of this server uses memory, by column family, and the
+        statistics that RocksDB keeps, as plain text for the operator to read. The
+        format is that of RocksDB and may change between versions, so do not parse
+        it.
+      responses:
+        '200':
+          description: Memory use and statistics of RocksDB.
+          content:
+            text/plain:
+              schema:
+                type: string
 
 components:
   schemas:
-  
+
     BlockRef:
+      description: |
+        Where a transaction or output is: in a block, with its height and position,
+        or in the mempool, with the time this server first saw it. A transaction
+        moves from one form to the other when it is confirmed, or back after a
+        reorganisation.
       oneOf:
         - $ref: '#/components/schemas/Block'
         - $ref: '#/components/schemas/Mempool'
 
     Block:
       type: object
+      description: |
+        A place in a block.
       required:
         - height
         - position
       properties:
         height:
-          description: Block height.
           type: integer
+          description: |
+            Height of the block.
         position:
-          description: Position of transaction within block.
           type: integer
+          description: |
+            Position of the transaction in the block, from 0.
 
     Mempool:
       type: object
+      description: |
+        A place in the mempool.
       required:
         - mempool
       properties:
         mempool:
-          description: Time when transaction was accepted in local mempool.
           type: integer
+          description: |
+            Unix time when this server first saw the transaction. Other servers may
+            have seen it at another time; it orders the unconfirmed transactions.
           format: int64
 
     XPubBalance:
       type: object
+      description: |
+        The balance of one address of a wallet, with its derivation path below the
+        extended public key.
       required:
         - path
         - balance
@@ -5031,12 +5570,18 @@ components:
 
     XPubPath:
       type: array
-      description: Extended public key derivation path for an address.
+      description: |
+        Derivation path of an address below the extended public key: the chain
+        (`0` receiving, `1` change) and the index of the address in it, so `[1, 4]`
+        is the fifth change address.
       items:
         type: integer
 
     XPubUnspent:
       type: object
+      description: |
+        An unspent output of a wallet, with the derivation path of its address, so
+        the wallet knows which key signs for it.
       required:
         - path
         - unspent
@@ -5048,13 +5593,18 @@ components:
 
     XPubSummary:
       type: object
+      description: |
+        The balance of a wallet and how far it has used its addresses.
       required:
         - balance
         - indices
       properties:
         balance:
           type: object
-          description: Aggregate balance for all addresses in extended public key.
+          description: |
+            Totals over every address of the wallet, in satoshis: `confirmed`,
+            `unconfirmed` and `received` as in an address balance, and `utxo`, the
+            number of unspent outputs.
           required:
             - confirmed
             - unconfirmed
@@ -5075,9 +5625,9 @@ components:
               type: integer
         indices:
           type: object
-          description: >-
-            Highest derivation indices used on extended public key.
-            See: [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)
+          description: |
+            Index of the last used address of the receiving chain (`external`) and of
+            the change chain (`change`). The next unused address is one past it.
           required:
             - external
             - change
@@ -5089,7 +5639,10 @@ components:
 
     TxRef:
       type: object
-      description: Transaction hash and blockchain position or mempool timestamp.
+      description: |
+        A transaction id and where the transaction is. Lists of transactions return
+        these rather than full transactions, which are much larger; fetch the ones
+        you need.
       required:
         - block
         - txid
@@ -5098,9 +5651,15 @@ components:
           $ref: '#/components/schemas/BlockRef'
         txid:
           type: string
+          description: |
+            Transaction id.
 
     Balance:
       type: object
+      description: |
+        The balance of an address. `confirmed` plus `unconfirmed` is what the address
+        holds now, counting unconfirmed transactions; `confirmed` alone is what it
+        holds in coins that are in blocks and are not being spent.
       required:
         - address
         - confirmed
@@ -5111,30 +5670,41 @@ components:
       properties:
         address:
           type: string
+          description: |
+            The address.
         confirmed:
           type: integer
+          description: |
+            Sum of the unspent outputs of the address that are confirmed, in satoshis.
+            An output spent by an unconfirmed transaction no longer counts.
           format: int64
-          description: Sum of confirmed unspent output values.
         unconfirmed:
           type: integer
+          description: |
+            Sum of the unspent outputs of the address that are not confirmed yet, in
+            satoshis.
           format: int64
-          description: Sum of unconfirmed unspent output values.
         utxo:
-          description: Total number of unspent outputs.
           type: integer
+          description: |
+            Number of unspent outputs.
           format: int64
         received:
-          description: Total received by this address including spent.
           type: integer
+          description: |
+            Total ever paid to the address, spent or not, confirmed or not, in
+            satoshis.
           format: int64
         txs:
-          description: Number of transactions affecting this address.
           type: integer
+          description: |
+            Number of transactions that pay to or spend from the address.
           format: int64
 
     Unspent:
       type: object
-      description: Information about unspent output.
+      description: |
+        An output that is not spent yet: a coin that can be spent.
       required:
         - address
         - block
@@ -5145,23 +5715,34 @@ components:
       properties:
         address:
           type: string
+          description: |
+            Address of the output. Null for scripts that have no address, such as
+            data outputs or bare multisig.
           nullable: true
-          description: Null when the script has no address on the network.
         block:
           $ref: '#/components/schemas/BlockRef'
         txid:
           type: string
+          description: |
+            Id of the transaction that created the output.
         index:
           type: integer
+          description: |
+            Position of the output in that transaction, from 0.
         pkscript:
           type: string
+          description: |
+            Output script in hexadecimal, needed to sign a spend.
         value:
           type: integer
+          description: |
+            Value in satoshis.
           format: int64
-          description: Value in satoshi.
 
     BlockData:
       type: object
+      description: |
+        A block, with its header and what the server computed from it.
       required:
         - hash
         - height
@@ -5181,57 +5762,85 @@ components:
       properties:
         hash:
           type: string
+          description: |
+            Block hash.
         size:
           type: integer
-          description: >-
-            Raw size of a block, including witness data. This is not the virtual
-            size and does not compute segwit discounts.
+          description: |
+            Size of the serialized block, in bytes, witness data included.
         height:
           type: integer
+          description: |
+            Height in its chain.
         mainchain:
           type: boolean
-          description: This block is part of the main chain.
+          description: |
+            Whether the block is in the chain with the most work. Blocks of chains
+            abandoned in a reorganisation are kept, with `false`.
         previous:
           type: string
+          description: |
+            Hash of the previous block.
         time:
           type: integer
+          description: |
+            Timestamp set by the miner, as a Unix time. Only roughly right.
           format: int64
         version:
           type: integer
+          description: |
+            Block version.
           format: int64
         bits:
           type: integer
+          description: |
+            Proof-of-work target, in compact form.
           format: int64
         nonce:
           type: integer
+          description: |
+            Nonce found by the miner.
           format: int64
         tx:
           type: array
+          description: |
+            Ids of the transactions, in order; the first is the coinbase.
           items:
             type: string
         merkle:
           type: string
+          description: |
+            Merkle root of the transactions.
         subsidy:
           type: integer
+          description: |
+            New coins created by the block, in satoshis.
           format: int64
-          description: Total block subsidy in satoshi.
         fees:
           type: integer
+          description: |
+            Sum of the fees of its transactions, in satoshis.
           format: int64
-          description: Total transaction fees in satoshi.
         outputs:
           type: integer
+          description: |
+            Sum of the outputs of its transactions, in satoshis.
           format: int64
-          description: Total outputs from this block, including spent.
         weight:
           type: integer
-          description: Segwit block weight. Only on segwit networks.
+          description: |
+            Block weight, on networks with SegWit only.
         work:
           type: integer
-          description: Accumulated proof-of-work.
+          description: |
+            Proof of work accumulated by the chain up to this block.
 
     Input:
       type: object
+      description: |
+        An input of a transaction, with the address and value of the output it
+        spends, which the raw transaction does not contain and which the server
+        looks up.
       required:
         - coinbase
         - txid
@@ -5245,47 +5854,69 @@ components:
       properties:
         coinbase:
           type: boolean
+          description: |
+            Whether this is the input of a coinbase, which spends nothing.
         txid:
           type: string
+          description: |
+            Id of the transaction whose output is spent.
         output:
           type: integer
+          description: |
+            Position of that output in its transaction.
         sigscript:
           type: string
+          description: |
+            Input script in hexadecimal.
         value:
           type: integer
+          description: |
+            Value of the output spent, in satoshis.
           format: int64
           nullable: true
         sequence:
           type: integer
+          description: |
+            Sequence number.
           format: int64
         address:
           type: string
+          description: |
+            Address of the output spent; null if it has none.
           nullable: true
-          description: Null when the script has no address on the network.
         pkscript:
           type: string
+          description: |
+            Script of the output spent, in hexadecimal.
           nullable: true
         witness:
-          description: Witness Data if applies.
           type: array
+          description: |
+            Witness stack, each item in hexadecimal; empty without SegWit.
           items:
             type: string
 
     Spender:
       type: object
-      description: Reference to a transaction input.
+      description: |
+        The input that spends an output.
       required:
         - txid
         - input
       properties:
         txid:
           type: string
+          description: |
+            Id of the spending transaction.
         input:
           type: integer
+          description: |
+            Position of the input in that transaction.
 
     Output:
       type: object
-      description: Transactiotn output data.
+      description: |
+        An output of a transaction, with whether and by what it is spent.
       required:
         - address
         - pkscript
@@ -5294,21 +5925,34 @@ components:
       properties:
         address:
           type: string
+          description: |
+            Address of the output; null for scripts without one.
           nullable: true
-          description: Null when the script has no address on the network.
         pkscript:
           type: string
+          description: |
+            Output script in hexadecimal.
         value:
           type: integer
+          description: |
+            Value in satoshis.
           format: int64
         spent:
           type: boolean
+          description: |
+            Whether a transaction spends it, confirmed or not.
         spender:
-          $ref: '#/components/schemas/Spender'
+          description: |
+            The input that spends it, if any.
+          allOf:
+            - $ref: '#/components/schemas/Spender'
 
     Transaction:
       type: object
-      description: Detailed transaction information.
+      description: |
+        A transaction with what the server knows about it beyond its raw form: its
+        place in the chain, its fee, and, for each input and output, the address and
+        value involved.
       required:
         - txid
         - size
@@ -5325,19 +5969,26 @@ components:
       properties:
         txid:
           type: string
+          description: |
+            Transaction id.
         size:
           type: integer
-          description: >-
-            Raw transaction size including witness data but excluding segwit
-            discount calculations.
+          description: |
+            Size of the serialized transaction, in bytes, witness data included.
         version:
           type: integer
+          description: |
+            Transaction version.
           format: int64
         locktime:
           type: integer
+          description: |
+            Lock time.
           format: int64
         fee:
           type: integer
+          description: |
+            Fee in satoshis: inputs minus outputs; 0 for a coinbase.
           format: int64
         inputs:
           type: array
@@ -5351,34 +6002,53 @@ components:
           $ref: '#/components/schemas/BlockRef'
         deleted:
           type: boolean
-          description: This transaction is no longer valid.
+          description: |
+            Whether the transaction was removed: replaced by fee, double-spent by a
+            confirmed transaction, or the coinbase of a block that left the main chain
+            in a reorganisation. Deleted
+            transactions count in no balance or history, but still answer by id, so a
+            wallet can say what became of them.
         time:
           type: integer
+          description: |
+            Timestamp of its block, or, if unconfirmed, the Unix time this server first
+            saw it.
           format: int64
         rbf:
           type: boolean
-          description: Vulnerable to replace-by-fee.
+          description: |
+            Whether the transaction can still be replaced by one paying a higher fee:
+            it signals replace-by-fee (BIP 125), or spends an unconfirmed transaction
+            that does. Only meaningful while unconfirmed, and on BTC.
         weight:
           type: integer
-          description: Segwit transaction weight.
+          description: |
+            Transaction weight, as SegWit counts it.
 
     Event:
       type: object
+      description: |
+        Something that happened, as `/events` sends it.
       required:
         - type
         - id
       properties:
         type:
           type: string
+          description: |
+            `block` for a new best block, `tx` for a mempool change.
           enum:
             - tx
             - block
         id:
           type: string
-          description: Block or transaction hash
+          description: |
+            Hash of the block or id of the transaction.
 
     Peer:
       type: object
+      description: |
+        A node of the peer-to-peer network that the server is connected to.
       required:
         - useragent
         - address
@@ -5388,23 +6058,30 @@ components:
       properties:
         useragent:
           type: string
+          description: |
+            Software of the peer, as it announces itself.
         address:
           type: string
+          description: |
+            Network address of the peer.
         version:
           type: integer
+          description: |
+            Protocol version from the version message of the peer.
           format: int32
-          description: >-
-            Protocol version from the peer's version message. It is a signed
-            number, so it is negative for a peer that sends a version above
-            2147483647.
         services:
           type: string
+          description: |
+            Services the peer offers, as a bit field in hexadecimal.
         relay:
           type: boolean
-          description: This peer will relay transactions.
+          description: |
+            Whether the peer relays transactions.
 
     BlockHealth:
       type: object
+      description: |
+        Whether the blocks are caught up with the headers.
       required:
         - headers
         - blocks
@@ -5414,17 +6091,29 @@ components:
       properties:
         headers:
           type: integer
+          description: |
+            Height of the newest header.
         blocks:
           type: integer
+          description: |
+            Height of the newest imported block.
         diff:
           type: integer
+          description: |
+            Headers minus blocks.
         max:
           type: integer
+          description: |
+            Most blocks the server may be behind and still be healthy.
         ok:
           type: boolean
+          description: |
+            Whether `diff` is at most `max`.
 
     TimeHealth:
       type: object
+      description: |
+        Whether something happened recently enough.
       required:
         - age
         - max
@@ -5432,13 +6121,21 @@ components:
       properties:
         age:
           type: integer
+          description: |
+            Seconds since it happened.
         max:
           type: integer
+          description: |
+            Most seconds allowed.
         ok:
           type: boolean
+          description: |
+            Whether `age` is at most `max`.
 
     CountHealth:
       type: object
+      description: |
+        Whether there are enough of something.
       required:
         - count
         - min
@@ -5446,13 +6143,21 @@ components:
       properties:
         count:
           type: integer
+          description: |
+            How many there are.
         min:
           type: integer
+          description: |
+            How many are needed.
         ok:
           type: boolean
+          description: |
+            Whether `count` is at least `min`.
 
     MaxHealth:
       type: object
+      description: |
+        Whether there are not too many of something.
       required:
         - count
         - max
@@ -5460,13 +6165,22 @@ components:
       properties:
         count:
           type: integer
+          description: |
+            How many there are.
         max:
           type: integer
+          description: |
+            Most allowed.
         ok:
           type: boolean
+          description: |
+            Whether `count` is at most `max`.
 
     HealthCheck:
       type: object
+      description: |
+        The result of the latest health check. `ok` is true when every check passes.
+        The limits are set by the operator of the server.
       required:
         - blocks
         - last-block
@@ -5478,40 +6192,78 @@ components:
         - ok
       properties:
         blocks:
-          $ref: '#/components/schemas/BlockHealth'
+          description: |
+            Whether the imported blocks have caught up with the headers.
+          allOf:
+            - $ref: '#/components/schemas/BlockHealth'
         last-block:
-          $ref: '#/components/schemas/TimeHealth'
+          description: |
+            Age of the newest header. A network that has found no block for hours
+            usually means the server lost touch with it.
+          allOf:
+            - $ref: '#/components/schemas/TimeHealth'
         last-tx:
-          $ref: '#/components/schemas/TimeHealth'
+          description: |
+            Age of the newest unconfirmed transaction (or block, if newer). A busy
+            network sends transactions all the time, so silence means trouble.
+          allOf:
+            - $ref: '#/components/schemas/TimeHealth'
         pending-txs:
-          $ref: '#/components/schemas/MaxHealth'
+          description: |
+            Transactions received but not imported yet.
+          allOf:
+            - $ref: '#/components/schemas/MaxHealth'
         peers:
-          $ref: '#/components/schemas/CountHealth'
+          description: |
+            Connected peers.
+          allOf:
+            - $ref: '#/components/schemas/CountHealth'
         net:
           type: string
+          description: |
+            Network of the server.
         version:
           type: string
+          description: |
+            Version of Haskoin Store.
         ok:
           type: boolean
+          description: |
+            Whether every check passed.
+        time:
+          type: string
+          description: |
+            When the check ran.
 
     Error:
       type: object
+      description: |
+        An error. `error` is a stable code for programs to test; `message` is for
+        people and may change. See *Errors* at the top.
       required:
         - error
       properties:
         error:
           type: string
+          description: |
+            Error code, such as `not-found-or-invalid-arg` or `user-error`.
           example: not-found-or-invalid-arg
         message:
           type: string
+          description: |
+            What went wrong, for people.
           example: Item not found or argument invalid
     TxId:
       type: object
+      description: |
+        The id of a transaction.
       required:
         - txid
       properties:
         txid:
           type: string
+          description: |
+            Transaction id.
 
     BinfoTxIdHash:
       type: string
@@ -5520,6 +6272,9 @@ components:
       type: integer
 
     BinfoTxId:
+      description: |
+        A transaction id in hexadecimal, or its short number (see the `txidindex`
+        parameter).
       oneOf:
         - $ref: '#/components/schemas/BinfoTxIdHash'
         - $ref: '#/components/schemas/BinfoTxIdIndex'
@@ -6164,6 +6919,8 @@ components:
     pubKeyParam:
       name: pubkey
       in: path
+      description: |
+        A public key in hexadecimal, compressed or not.
       required: true
       schema:
         type: string
@@ -6172,6 +6929,9 @@ components:
     addressParam:
       name: address
       in: path
+      description: |
+        An address of the network of the server. An address that does not parse,
+        or is of another network, gives 404.
       required: true
       schema:
         type: string
@@ -6180,6 +6940,8 @@ components:
     hashParam:
       name: hash
       in: path
+      description: |
+        A hash160 (20 bytes) in hexadecimal.
       required: true
       schema:
         type: string
@@ -6188,6 +6950,10 @@ components:
     addressesParam:
       name: addresses
       in: query
+      description: |
+        Addresses, separated by commas. Every address must be valid: one that is not
+        fails the whole request with 400, rather than giving an answer that silently
+        leaves it out.
       explode: false
       required: true
       schema:
@@ -6201,64 +6967,72 @@ components:
     limitParam:
       name: limit
       in: query
+      description: |
+        How many items to return at most. Without it, the server's default (100
+        unless the operator changed it). `0` asks for the server's maximum. A
+        larger number is lowered to the maximum rather than refused. See *Paging* at
+        the top.
       required: false
       schema:
         type: integer
-      description: Maximum number of entries to return.
 
     heightParam:
       name: height
       in: query
+      description: |
+        Where the page starts: a transaction id (included), a block hash, a block
+        height (transactions confirmed at or below it), or a Unix time (the last
+        block at or before it). Numbers up to 1,230,768,000 are heights, larger ones
+        times. Unconfirmed transactions come first in every list, so a height below
+        the best block leaves them out.
+
+        To get the next page, pass the id of the last transaction you received here,
+        with `offset=1`. See *Paging* at the top for why this is better than a large
+        offset.
       required: false
       schema:
         oneOf:
           - type: integer
           - type: string
-      description: |
-        * If a block height is specified, only entities confirmed at or below
-          that height will be returned.
-
-        * If a block hash is specified, only entities confirmed at or below that
-          block's height will be returned. No filtering will be done if the
-          block cannot be found.
-
-        * If a Unix timestamp is specified, find the last block mined at or
-          before that time and return entries confirmed up to that block's
-          height. No filtering will be done if the block cannot be found.
-
-        * If a transaction hash is specified, only entries at or below that
-          transaction's place in the block chain will be returned. No filtering
-          will be done if the transaction cannot be found or is not confirmed.
 
     offsetParam:
       name: offset
       in: query
+      description: |
+        How many items to skip after the start. Above the server's maximum (50,000
+        unless the operator changed it), the request fails with 400; use `height` to
+        go further back.
       required: false
       schema:
         type: integer
-      description: Skip this many entries at the start of the result set.
 
     nocacheParam:
       name: nocache
       in: query
+      description: |
+        Answer from the database of this server, without reading the Redis cache and
+        without caching the wallet. The answer is the same; this is for comparing,
+        and for servers whose cache is shared with others that may be ahead of or
+        behind this one.
       required: false
       schema:
         type: boolean
-      description: |
-        Answer from the database of this server, without reading the Redis
-        cache and without caching the extended public key.
 
     notxParam:
       name: notx
       in: query
+      description: |
+        Leave out the transaction ids, except the first (the coinbase). A block can
+        have thousands of transactions, and pages that list blocks rarely need them.
       required: false
       schema:
         type: boolean
-      description: Do not include transactions other than coinbase.
 
     blockParam:
       name: block
       in: path
+      description: |
+        A block hash in hexadecimal.
       required: true
       schema:
         type: string
@@ -6267,6 +7041,8 @@ components:
     blocksParam:
       name: blocks
       in: query
+      description: |
+        Block hashes in hexadecimal, separated by commas.
       explode: false
       required: true
       schema:
@@ -6280,6 +7056,8 @@ components:
     blockHeightParam:
       name: height
       in: path
+      description: |
+        A block height. The first block is at height 0.
       required: true
       schema:
         type: integer
@@ -6288,6 +7066,8 @@ components:
     blockHeightsParam:
       name: heights
       in: query
+      description: |
+        Block heights, separated by commas.
       explode: false
       required: true
       schema:
@@ -6302,6 +7082,8 @@ components:
     txidParam:
       name: txid
       in: path
+      description: |
+        A transaction id in hexadecimal.
       required: true
       schema:
         type: string
@@ -6310,6 +7092,8 @@ components:
     timeParam:
       name: time
       in: path
+      description: |
+        A Unix timestamp, in seconds.
       required: true
       schema:
         type: integer
@@ -6318,6 +7102,8 @@ components:
     txidsParam:
       name: txids
       in: query
+      description: |
+        Transaction ids in hexadecimal, separated by commas.
       explode: false
       required: true
       schema:
@@ -6331,6 +7117,11 @@ components:
     xpubParam:
       name: xpub
       in: path
+      description: |
+        An extended public key of the network of the server: `xpub` on BTC and BCH,
+        `tpub` on test networks. Keys that wallets export as `ypub` or `zpub` are
+        not accepted; export them as `xpub` and say the kind of address with
+        `derive`.
       required: true
       schema:
         type: string
@@ -6340,193 +7131,230 @@ components:
     xpubDerive:
       name: derive
       in: query
+      description: |
+        The kind of address the wallet derives from the key:
+
+        - `normal`: pay-to-public-key-hash (P2PKH), addresses starting with `1`
+          on BTC; the default, and the only kind on networks without SegWit, such as
+          BCH;
+        - `compat`: SegWit nested in pay-to-script-hash (P2SH-P2WPKH), addresses
+          starting with `3`, as BIP 49 wallets use;
+        - `segwit`: native SegWit (P2WPKH), addresses starting with `bc1q`, as BIP
+          84 wallets use.
+
+        An xpub does not record which kind its wallet uses, and each kind gives
+        different addresses from the same key, so the wrong kind gives an empty
+        wallet rather than an error.
       required: false
       schema:
         type: string
         enum: [segwit, compat, normal]
-      description: |
-        * `normal`: derive regular P2PKH addresses.
-        * `segwit`: derive segwit P2WPKH addresses.
-        * `compat`: derive P2SH-P2WPKH backwards-compatible segwit addresses.
 
     prettyParam:
       name: pretty
       in: query
+      description: |
+        Indent the JSON, for people to read. Responses are compact by default to
+        save bandwidth.
       required: false
       schema:
         type: boolean
-      description: Pretty-print JSON output.
 
     binfoAddr:
       name: address
       in: path
+      description: |
+        An address or an extended public key.
       required: true
       schema:
         type: string
-      description: >
-        Address or extended public key.
       example: qqmaqu9nceck5ct5pqrjy4ulhhw66wdlkv2s7f2l9u
 
     binfoActive:
       name: active
       in: query
+      description: |
+        Addresses and extended public keys of the wallet, separated by `|` or `,`.
+        Extended public keys here derive legacy (P2PKH) addresses.
       required: false
       schema:
         type: string
         example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
                  ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
-      description: >
-        Addresses or extended public keys.
-        Separate by vertical line `|` or comma `,`.
-  
+
     binfoActiveP2SH:
       name: activeP2SH
       in: query
+      description: |
+        Extended public keys that derive SegWit addresses nested in
+        pay-to-script-hash (P2SH-P2WPKH), separated by `|` or `,`.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys for P2WPKH-on-P2SH address derivation.
-        Separate by vertical line `|` or comma `,`.
-  
+
     binfoActiveBech32:
       name: activeBech32
       in: query
+      description: |
+        Extended public keys that derive native SegWit (P2WPKH) addresses, separated
+        by `|` or `,`.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys for P2WPKH Bech32 address derivation.
-        Separate by vertical line `|` or comma `,`.
-  
+
     binfoOnlyShow:
       name: onlyShow
       in: query
+      description: |
+        The addresses and extended public keys, among the active ones, whose
+        balances to list and from whose point of view to compute the result of each
+        transaction, separated by `|` or `,`. All the active ones if left out.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys and addresses for computing balances in transactions
-        and showing in the address section of the wallet.
-        If omitted use all active* addresses.
-        Separate by vertical line `|` or comma `,`.
 
     binfoFilter:
       name: filter
       in: query
+      description: |
+        Which transactions to list (`0` or `6` for all of them):
+
+        - `1`: those that send coins out of the wallet;
+        - `2`: those that bring coins into the wallet;
+        - `3`: those that move coins within the wallet, changing its balance by
+          the fee only;
+        - `5`: confirmed ones;
+        - `7`: unconfirmed ones.
       required: false
       schema:
         type: integer
         enum: [0,1,2,3,5,7]
-      description: |
-        Filter only these types of transaction with respect to active addresses
-        (0 for no filtering):
-
-        1. Only outgoing transactions (sent) (result + fee < 0)
-        2. Only incoming transactions (received) (result + fee > 0)
-        3. Only internal transfers (result + fee = 0)
-        4. No filtering
-        5. Only confirmed transactions
-        6. No filtering
-        7. Only unconfirmed transactions
       example: 5
-  
+
     binfoLimit:
       name: limit
       in: query
+      description: |
+        How many items to return at most. The default and maximum are those of the
+        server.
       required: false
       schema:
         type: integer
         example: 2
-      description: Only retrieve up to this many items.
-  
+
     binfoCount:
       name: n
       in: query
+      description: |
+        How many transactions to return at most. The default and maximum are those
+        of the server for full transactions.
       required: false
       schema:
         type: integer
         example: 2
-      description: Only retrieve up to this many items.
-  
+
     binfoOffset:
       name: offset
       in: query
+      description: |
+        How many items to skip at the start. Above the server's maximum, the request
+        fails with 400.
       required: false
       schema:
         type: integer
-      description: Skip this many items at the beginning.
 
     binfoConfirmations:
       name: confirmations
       in: query
+      description: |
+        Only return outputs with at least this many confirmations. `0`, the default,
+        includes unconfirmed ones.
       required: false
       schema:
         type: integer
-      description: Only return items with at least this many confirmations.
-  
+
     binfoNoCompact:
       name: noCompact
       in: query
+      description: |
+        Keep the outputs of incoming transactions that pay to other addresses. They
+        are left out by default, as they belong to other people and can be many.
       required: false
       schema:
         type: boolean
         example: false
-      description: >
-        Filter out outputs not going to this wallet on incoming transactions.
-  
+
     binfoCurrency:
       name: currency
       in: query
+      description: |
+        The currency for the `info` section, such as `USD`, `EUR` or `GBP`, in any
+        case. `USD` by default.
       required: false
       schema:
         type: string
         example: eur
-      description: Local currency to display in info section.
-  
+
     binfoCashAddr:
       name: cashaddr
       in: query
+      description: |
+        Write Bitcoin Cash addresses in CashAddr format. They are in the legacy
+        format by default, as Blockchain.info writes them, so that software written
+        for it reads them.
       required: false
       schema:
         type: boolean
         example: true
-      description: Show Bitcoin Cash addresses in CashAddr format.
-  
+
     binfoTxIdIndex:
       name: txidindex
       in: query
+      description: |
+        Identify transactions by their id (`true`) rather than by a short number
+        (the default).
+
+        Blockchain.info identifies transactions by a number, and software written
+        for it expects one. The server derives it from the transaction id: the first
+        64 bits, shifted right by 11, so that it fits in the 53 bits that numbers in
+        JavaScript hold exactly. Two transactions can share a number, rarely; the
+        ids never collide, so use them when you can.
       required: false
       schema:
         type: boolean
         example: true
-      description: Use string with hex-encoded txid in tx_index field.
 
     binfoBlockId:
       name: block
       in: path
+      description: |
+        A block hash in hexadecimal, or a block height.
       required: true
       schema:
         oneOf:
           - type: string
           - type: integer
-      description: Hex-encoded txid or integer block height.
       example: 50000
-  
+
     binfoTxId:
       name: txid
       in: path
+      description: |
+        A transaction id in hexadecimal, or the short number of a transaction (see
+        `txidindex`).
       required: true
       schema:
         oneOf:
           - type: string
           - type: integer
-      description: Hex-encoded txid or integer from tx_index.
       example: 369c2a28fc84b060e4423e26ac898fa4ce9eda8943a36d0a48df66e6a6275aa6
-  
+
     binfoFormat:
       name: format
       in: query
+      description: |
+        `json`, the default, or `hex` for the data serialized as in the peer-to-peer
+        protocol.
       required: false
       schema:
         type: string
@@ -6537,6 +7365,8 @@ components:
     binfoStart:
       name: start
       in: query
+      description: |
+        The first day of the history, as `dd-mm-yyyy` or `dd/mm/yyyy`.
       required: true
       schema:
         type: string
@@ -6545,6 +7375,8 @@ components:
     binfoEnd:
       name: end
       in: query
+      description: |
+        The last day of the history, included, as `dd-mm-yyyy` or `dd/mm/yyyy`.
       required: true
       schema:
         type: string

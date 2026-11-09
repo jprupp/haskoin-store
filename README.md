@@ -200,7 +200,7 @@ Results are newest first, unconfirmed ones on top. To get the next page, start
 from the last transaction you received instead of using an offset:
 
 ```sh
-curl 'localhost:3000/xpub/xpub6C.../transactions?derive=segwit&limit=50&offset=1&start=<last txid>'
+curl 'localhost:3000/xpub/xpub6C.../transactions?derive=segwit&limit=50&offset=1&height=<last txid>'
 ```
 
 `offset=1` skips the transaction you already have. Paging by starting point
@@ -345,7 +345,9 @@ the Haskell heap. `/dbstats` shows where it goes.
 ## API
 
 Full reference: [`swagger.yaml`](swagger.yaml), also served at
-[api.haskoin.com](https://api.haskoin.com/).
+[api.haskoin.com](https://api.haskoin.com/). It explains the conventions of
+the API (amounts, ordering, paging, formats, errors, unconfirmed transactions
+and reorganisations) and the reasons for them, as well as every endpoint.
 
 ```sh
 curl localhost:3000/address/bc1q…/balance
@@ -357,8 +359,9 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 - Add `?pretty=true` for indented JSON.
 - Send `Accept: application/octet-stream` for the binary encoding, which
   the Haskell client in `haskoin-store-data` decodes.
-- Lists are paged with `limit` and `offset`, newest first. `start` begins
-  a page at a transaction hash, a block height or a Unix time instead.
+- Lists are paged with `limit` and `offset`, newest first. `height` begins
+  a page at a transaction hash, a block hash, a block height or a Unix time
+  instead.
 - Errors come back as JSON with an HTTP status: 400 for bad input, 404 for
   unknown things, 409 when a short transaction number is ambiguous, 413 for
   requests that ask for too much.
