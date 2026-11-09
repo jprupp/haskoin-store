@@ -102,7 +102,7 @@ import Haskoin.Store.Cache
     cacheXPubBals,
     xpubId,
   )
-import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), XPubBal)
+import Haskoin.Store.Data (Balance (..), BlockRef (..), Spender (..), TxData (..), XPubBal (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
@@ -143,6 +143,7 @@ chainSpec kind = do
   it "refuses unknown parameters and values it cannot read" strictTest
   it "does not use or fill the cache when asked not to" noCacheTest
   it "recovers from damaged entries and keeps newer data" damagedTest
+  it "updates cached xpubs from what changed, and reads them whole when unsure" incrementalTest
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
@@ -1282,6 +1283,61 @@ damagedTest env = do
   gen1 <- redisRun env $ Redis.hget (xpubKey env x "meta") "gen"
   (read . C8.unpack <$> gen1) `shouldBe` ((+ (1 :: Int)) . read . C8.unpack <$> gen0)
   checkXPub env x ref
+
+-- | Changes of a cached xpub are applied from the transactions that make
+-- them, without a full reload: the time of the last full reload in the entry
+-- stays, and the answers stay those of the database. When Redis has a balance
+-- that no changed transaction explains, a change was missed, and the next
+-- reload reads the xpub whole, which repairs it.
+incrementalTest :: Env -> IO ()
+incrementalTest env = do
+  let x = newXPub env "incremental" DeriveNormal
+      meta k = redisRun env (Redis.hget (xpubKey env x "meta") k)
+  ref <- newLedger
+  void $ pay env x ref [([0, 0], 100000), ([0, 1], 200000), ([1, 0], 300000)]
+  void $ mine env 1
+  checkXPub env x ref
+  full0 <- meta "full"
+  full0 `shouldSatisfy` isJust
+  meta "ver" `shouldReturn` Just "3"
+  -- a payment in the mempool, its confirmation, and a spend
+  void $ pay env x ref [([0, 2], 400000)]
+  waitSynced env
+  checkXPub env x ref
+  void $ mine env 1
+  checkXPub env x ref
+  out <- getNewAddress env.node
+  l <- readIORef ref
+  void $ spend env x ref [coinAt l [0, 1]] [(out, 50000), (at env x [1, 1], 140000)]
+  waitSynced env
+  checkXPub env x ref
+  void $ mine env 1
+  checkXPub env x ref
+  meta "full" `shouldReturn` full0
+  -- the index of outputs by outpoint matches the outputs
+  nu <- redisRun env (Redis.zcard (xpubKey env x "utxo"))
+  no <- redisRun env (Redis.hlen (xpubKey env x "uop"))
+  no `shouldBe` nu
+  -- a balance that Redis has wrong, at an address the next change does not
+  -- touch, as if a change had been missed
+  Just blob <- redisRun env (Redis.get (xpubKey env x "bal"))
+  bals <- either fail return (decode blob :: Either String [XPubBal])
+  let target = addrOf env x [0, 0]
+      wrong :: XPubBal -> XPubBal
+      wrong b
+        | b.balance.address == target =
+            XPubBal {path = b.path, balance = (b.balance :: Balance) {received = b.balance.received + 1}}
+        | otherwise = b
+  void . redisRun env $ Redis.set (xpubKey env x "bal") (encode (map wrong bals))
+  void $ pay env x ref [([0, 3], 500000)]
+  waitSynced env
+  checkXPub env x ref
+  full1 <- meta "full"
+  (full1 > full0) `shouldBe` True
+  -- the wrong balance is gone: Redis has the balances of the database
+  fromDB <- Q.xPubBals env.store.db x.spec
+  Just blob' <- redisRun env (Redis.get (xpubKey env x "bal"))
+  decode blob' `shouldBe` Right fromDB
 
 -- | An output of a cached transaction that pays an address outside the xpub
 -- is spent by a transaction that does not touch the xpub. The xpub is not

@@ -408,12 +408,18 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   back on the main chain of headers.
 - The **cache** (`Haskoin.Store.Cache`) keeps xpubs with many used addresses
   or many transactions in Redis: their balances, transactions, unspent
-  outputs and the bodies of their transactions. It never patches an entry
+  outputs and the bodies of their transactions. It never computes an entry
   from what it guesses changed: when a block, a mempool transaction or a
-  reorganisation touches a cached xpub, the store reads the whole xpub again
-  from RocksDB, with the same queries that answer uncached requests,
-  compares it with the entry in Redis, and writes the differences in one Lua
-  script, together with every transaction body the entry needs. The script
+  reorganisation touches a cached xpub, the store reads from RocksDB, with
+  the same queries that answer uncached requests, the transactions that
+  changed and the outputs they create and spend, and writes the differences
+  in one Lua script, together with every transaction body the entry needs.
+  The time of a reload no longer grows with the size of the xpub. The store
+  reads the whole xpub instead when it first caches it, and whenever it
+  cannot be sure the entry has every earlier change: when the entry is more
+  than a block behind, when an address with transactions enters or leaves
+  the gap, when the balance of an address that no change touched differs
+  from Redis's, and at least every ten minutes. The script
   writes nothing if the entry changed since it was read, so the entry is
   always what the database says; and Redis, which answers one client at a
   time, is held for the size of the change, not of the xpub. A page of a
@@ -451,7 +457,8 @@ The database layout is described in `Haskoin.Store.Database.Types`.
   the headers, age of the last block and of the last transaction, transactions
   waiting to be imported, and connected peers. Point your load balancer at it.
 - **StatsD**: with `--statsd`, the store reports the timing of every kind of
-  request (`web.*`), database reads (`db.*`), cache hits and misses (`cache.*`),
+  request (`web.*`), database reads (`db.*`), cache hits, misses, reloads and
+  full reloads (`cache.*`),
   and block store gauges such as block and header heights and mempool size
   (`store.*`).
 - **`/dbstats`** returns RocksDB memory use per column family and RocksDB's own
@@ -558,8 +565,9 @@ and over, while wrk asks the server about the xpubs on five endpoints
 (summary, balances, transactions, unspent outputs and multiaddr) the whole
 time. At the end it compares the cached answers with those of the database,
 and `scripts/stress-report.py` writes `OUT_DIR/report.md`: how fast the
-transactions went in, how many reloads the cache did and how long they took
-as the xpubs grew, how far the server fell behind, its CPU and memory, the
+transactions went in, how many reloads the cache did, how many of them read
+the whole xpub, and how long they took as the xpubs grew, how far the server
+fell behind, its CPU and memory, the
 memory of Valkey, the commands that blocked Redis for 10 ms or more (from
 its slow log), and the latencies of each endpoint over time.
 

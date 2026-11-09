@@ -7,7 +7,8 @@ local meta = xk .. 'meta'
 local oh = redis.call('HGET', meta, 'height')
 if oh and h < tonumber(oh) then return {'stale'} end
 if (redis.call('HGET', meta, 'gen') or '') ~= ARGV[7] then return {'changed'} end
-local i = 8
+local full = ARGV[8]
+local i = 9
 local function list(width)
   local n = tonumber(ARGV[i])
   local s = i + 1
@@ -18,8 +19,8 @@ local aa, naa = list(1)
 local ad, nad = list(1)
 local ta, nta = list(2)
 local td, ntd = list(1)
-local ua, nua = list(2)
-local ud, nud = list(1)
+local ua, nua = list(3)
+local ud, nud = list(2)
 local bi, nb = list(2)
 local si, ns = list(3)
 local given = {}
@@ -56,9 +57,21 @@ for j = 0, nta - 1 do
   redis.call('ZADD', xk .. 'txs', ARGV[ta + 2 * j + 1], t)
   redis.call('SADD', p .. 'txref:' .. t, id)
 end
-for j = 0, nud - 1 do redis.call('ZREM', xk .. 'utxo', ARGV[ud + j]) end
+-- unspent outputs by outpoint: uop maps each to its member, which changes
+-- with the block of the output, so that one can go by its outpoint alone
+local uop = xk .. 'uop'
+for j = 0, nud - 1 do
+  local op, m = ARGV[ud + 2 * j], ARGV[ud + 2 * j + 1]
+  if m == '' then m = redis.call('HGET', uop, op) end
+  if m then redis.call('ZREM', xk .. 'utxo', m) end
+  redis.call('HDEL', uop, op)
+end
 for j = 0, nua - 1 do
-  redis.call('ZADD', xk .. 'utxo', ARGV[ua + 2 * j + 1], ARGV[ua + 2 * j])
+  local op, m = ARGV[ua + 3 * j], ARGV[ua + 3 * j + 1]
+  local old = redis.call('HGET', uop, op)
+  if old and old ~= m then redis.call('ZREM', xk .. 'utxo', old) end
+  redis.call('ZADD', xk .. 'utxo', ARGV[ua + 3 * j + 2], m)
+  redis.call('HSET', uop, op, m)
 end
 for j = 0, nb - 1 do
   local t = ARGV[bi + 2 * j]
@@ -72,7 +85,8 @@ for j = 0, ns - 1 do
   end
 end
 redis.call('SET', xk .. 'bal', ARGV[6])
-redis.call('HSET', meta, 'spec', ARGV[5], 'height', ARGV[3], 'ver', '2')
+redis.call('HSET', meta, 'spec', ARGV[5], 'height', ARGV[3], 'ver', '3')
+if full ~= '' then redis.call('HSET', meta, 'full', full) end
 redis.call('HINCRBY', meta, 'gen', 1)
 redis.call('ZADD', p .. 'lru', ARGV[4], id)
 return {'ok'}

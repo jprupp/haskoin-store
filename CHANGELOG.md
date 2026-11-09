@@ -103,6 +103,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `normal`, the name they had, is still accepted, so old URLs keep working;
   it said nothing about the kind of address. Error messages use the new
   name. Built with haskoin-store-data at commit `b304acd2`.
+- The cache brings an entry up to date from what changed, instead of reading
+  the whole xpub from RocksDB and Redis on every change, which the stress test
+  showed was almost all the time of a reload, growing to seconds at 100,000
+  transactions per xpub. A reload reads the changed transactions, the outputs
+  they create and spend at addresses of the xpub, and the balances of its
+  addresses, which are compared with Redis's to catch a change the entry
+  missed. The whole xpub is still read when it is first cached, when the
+  entry is more than a block behind, when an address with transactions enters
+  or leaves the gap, when a balance does not match, and every ten minutes.
+  Entries keep an index of their unspent outputs by outpoint
+  (`x:<id>:uop`), in format version 3; entries of version 2 are upgraded by
+  their next reload. New metric `cache.full_reloads`.
 - Breaking: parameters are checked. A request with a parameter that its
   endpoint does not accept, such as a misspelt `limt=10` or `pretty` on the
   Blockchain.info endpoints, which never honoured it, gives 400

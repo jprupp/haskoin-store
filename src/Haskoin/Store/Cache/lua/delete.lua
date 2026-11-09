@@ -13,6 +13,6 @@ for _, t in ipairs(redis.call('ZRANGE', xk .. 'txs', 0, -1)) do
     redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)
   end
 end
-local existed = redis.call('DEL', xk .. 'meta', xk .. 'bal', xk .. 'txs', xk .. 'utxo', xk .. 'addrs')
+local existed = redis.call('DEL', xk .. 'meta', xk .. 'bal', xk .. 'txs', xk .. 'utxo', xk .. 'addrs', xk .. 'uop')
 redis.call('ZREM', p .. 'lru', id)
 if existed > 0 then return 1 else return 0 end

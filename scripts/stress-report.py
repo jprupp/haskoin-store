@@ -127,6 +127,7 @@ def main():
 
     # Cache
     reloads = sum(counter(s, "stats.counters.cache.reloads.count") for s in samples)
+    full = sum(counter(s, "stats.counters.cache.full_reloads.count") for s in samples)
     count_ms = sum(counter(s, "stats.timers.cache.reload.count") for s in samples)
     sum_ms = sum(timing(s, "stats.timers.cache.reload.sum", "sum") or 0 for s in samples)
     maxes = [timing(s, "stats.timers.cache.reload.upper", "max") for s in samples]
@@ -138,6 +139,7 @@ def main():
     w("## Cache\n")
     w("| | |\n|---|---|")
     w(f"| Reloads of an xpub | {fmt(int(reloads))} |")
+    w(f"| Of which full, reading the whole xpub | {fmt(int(full))} |")
     if gen_end:
         w(f"| Reloads per second while making transactions | {fmt(reloads / gen_end)} |")
     w(f"| Mean milliseconds per reload | {fmt(sum_ms / count_ms if count_ms else None)} |")

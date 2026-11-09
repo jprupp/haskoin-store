@@ -21,17 +21,20 @@
 --
 -- = One source of truth
 --
--- The data of a cached xpub is never patched. Whenever a block or a mempool
--- transaction touches one of its addresses, or a reorganisation changes one
--- of its transactions, the store that saw it reads everything about the xpub
--- again from its database, with the same functions that answer uncached
--- queries ("Haskoin.Store.Database.Query"), and replaces the whole entry in
--- Redis in one atomic step. A cached answer is therefore always an answer the
--- database gave, and the cache cannot drift from it, as the cache it replaces
--- did when it applied each change by itself. The price is more work per
--- change: a payment to a large xpub reloads all of it. Reloads of one xpub are
--- coalesced, so a burst of payments costs at most one reload in progress and
--- one waiting.
+-- The data of a cached xpub always comes from the database, read with the
+-- same functions that answer uncached queries
+-- ("Haskoin.Store.Database.Query"), and is never computed from what the
+-- cache guesses a change did, as the cache that this one replaced did, and
+-- drifted. Whenever a block or a mempool transaction touches one of its
+-- addresses, or a reorganisation changes one of its transactions, the store
+-- that saw it reads from the database what that change affects, the
+-- transactions and the outputs they create and spend, and writes the
+-- differences in one atomic step ('cacheRefresh'). It reads the whole xpub
+-- instead when it caches it, and whenever it cannot be sure that the entry
+-- has every earlier change: checks against the balances of every address of
+-- the xpub, and a full reload every ten minutes, keep a missed change from
+-- staying. Reloads of one xpub are coalesced, so a burst of payments costs at
+-- most one reload in progress and one waiting.
 --
 -- Everything a response needs is in Redis, including the bodies of the
 -- transactions: a store that has not yet seen a transaction of a cached xpub
@@ -83,13 +86,19 @@
 -- and with stores of other networks.
 --
 -- * @x:\<id\>:meta@: hash with the serialized xpub (@spec@), the height of
---   the best block it was read at (@height@), the format version (@ver@) and
---   the generation of the entry (@gen@), which every reload increments.
+--   the best block it was read at (@height@), the format version (@ver@,
+--   now 3), the generation of the entry (@gen@), which every reload
+--   increments, and the time of its last full reload in milliseconds
+--   (@full@).
 --   @\<id\>@ is the hexadecimal of the first 16 bytes of the SHA-256 of the
 --   serialized xpub.
 -- * @x:\<id\>:bal@: balances of the addresses up to the gap, serialized.
 -- * @x:\<id\>:txs@: sorted set of transaction hashes, scored by 'blockRefScore'.
 -- * @x:\<id\>:utxo@: sorted set of serialized unspent outputs, scored the same.
+-- * @x:\<id\>:uop@: hash of serialized outpoint to its member of @utxo@, so
+--   that an output can be removed by its outpoint alone, though its member
+--   changes with its block. Entries of version 2 have none; their next full
+--   reload builds it.
 -- * @x:\<id\>:addrs@: set of the addresses of the balances.
 -- * @a:\<address\>@: set of the ids of the cached xpubs with this address.
 -- * @tx:\<txid\>@: transaction body, serialized 'TxData' without spenders.
@@ -132,7 +141,7 @@ module Haskoin.Store.Cache
   )
 where
 
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.Bits (shift, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -245,6 +254,9 @@ data CacheMetrics = CacheMetrics
     stale :: !StatCounter,
     -- | xpubs evicted (@cache.evictions@)
     evictions :: !StatCounter,
+    -- | reloads that read the whole xpub rather than what changed
+    -- (@cache.full_reloads@)
+    fullReloads :: !StatCounter,
     -- | milliseconds to reload an xpub (@cache.reload@)
     reloadTime :: !StatTiming
   }
@@ -257,6 +269,7 @@ newCacheMetrics s = do
   reloads <- c "reloads"
   stale <- c "stale"
   evictions <- c "evictions"
+  fullReloads <- c "full_reloads"
   reloadTime <- newStatTiming s "cache.reload" 10
   return CacheMetrics {..}
   where
@@ -287,7 +300,9 @@ data CacheCounters = CacheCounters
   { -- | xpubs read again from the database and written
     reloads :: !Int,
     -- | reloads given up because Redis knew more
-    behind :: !Int
+    behind :: !Int,
+    -- | reloads that read the whole xpub rather than what changed
+    fullReloads :: !Int
   }
   deriving (Eq, Show)
 
@@ -324,7 +339,7 @@ withCache cfg db chain pub logger action = do
       else either fail return (R.parseConnectInfo cfg.url)
   conn <- R.checkedConnect info
   jobs <- newTVarIO []
-  counters <- newIORef (CacheCounters 0 0)
+  counters <- newIORef (CacheCounters 0 0 0)
   touched <- newIORef HashMap.empty
   metrics <- mapM newCacheMetrics cfg.stats
   let cache =
@@ -624,86 +639,115 @@ cacheEvict c n = do
   count c (.evictions) evicted
   return evicted
 
--- | Reload an xpub from the database and replace its entry in Redis, unless
+-- | Bring the entry of an xpub in Redis up to date with the database, unless
 -- another store holds its lock or Redis knows more than this store (see
 -- 'Reload'). The transactions given are the ones that changed it: their
 -- bodies are written again even if Redis has them.
 --
 -- A store never writes data that knows less than what is in Redis, so stores
 -- that see the chain and the mempool at slightly different times do not undo
--- each other's work. Every body that the new entry refers to is in Redis
--- before the entry is: the entry and the missing bodies are written in one
--- Lua script, which writes nothing if a body is missing, so a store that is
--- behind never finds a cached transaction that it cannot serve.
+-- each other's work. Every body that the entry refers to is in Redis before
+-- the entry is: the changes and the missing bodies are written in one Lua
+-- script, which writes nothing if a body is missing, so a store that is
+-- behind never finds a cached transaction that it cannot serve. Only the
+-- differences are written, and the script writes nothing if the entry
+-- changed since it was read (its generation), so Redis is held for the size
+-- of the change, not of the xpub.
 --
--- The xpub is read in full from the database, but only the differences
--- with the entry in Redis are written: the transactions, unspent outputs
--- and addresses that are new, moved or gone, and the bodies of the new and
--- moved transactions. The entry is read first ('readStored'), and the
--- script writes nothing if it changed since, so the result is exactly what
--- a full rewrite would give. A full rewrite of a large xpub took Redis tens
--- of milliseconds, during which it answered no one, every other server
--- included; the differences of one block or transaction take a moment.
+-- = Reading only what changed
+--
+-- Working out the differences can take one of two paths.
+--
+-- * __Incremental__ ('incrementalDiff'): only the transactions that changed
+--   are read, with the outputs that they create and spend at addresses of
+--   the xpub. The stress test (@stress\/results@) showed that reading the
+--   whole xpub from both the database and Redis was almost all the time of a
+--   reload, growing with the size of the xpub to seconds at 100,000
+--   transactions; the changes of one block or transaction are a few reads,
+--   whatever the size of the xpub.
+--
+-- * __Full__: the whole xpub is read from the database and from Redis, and
+--   compared. This is what a first caching does, and the fallback whenever
+--   the incremental path cannot be sure of its answer.
+--
+-- The incremental path relies on every change of the xpub having been
+-- applied to the entry, which is what the claims of events are for, but a
+-- store can miss events: while it catches up, after a restart, or after an
+-- error. So it is only taken when the entry shows no sign of having missed
+-- one, and it checks its own result:
+--
+-- * the entry is in the current format, stamped with the best block of this
+--   store or the one before it (a larger gap means blocks it may have
+--   missed), and was fully reloaded less than 'fullReloadEvery' ago;
+--
+-- * the balances of every address of the xpub are read from the database,
+--   which is cheap, a read per address; an address that no changed
+--   transaction touches must have the balance that Redis has, or a change
+--   was missed;
+--
+-- * no address with transactions enters or leaves the gap, as its history
+--   would have to be read whole.
+--
+-- Otherwise the full path runs. A missed change that leaves every balance
+-- as it was, such as the confirmation of a transaction that only spends from
+-- the xpub, is the one thing the checks cannot see, and the regular full
+-- reload bounds how long it can last.
 cacheRefresh :: Cache -> XPubSpec -> HashSet TxHash -> IO Reload
 cacheRefresh c x changed =
   fromMaybe Locked <$> withLock c x (timed (go (3 :: Int) []))
   where
-    def' = Limits {limit = 0, offset = 0, start = Nothing}
     go tries extra = do
-      st <- readStored c x
+      m <- readMeta c x
       height <- bestHeight c
-      if not (mayReplace st.stamp height False)
+      now <- nowMs
+      if not (mayReplace m.stamp height False)
         then behind
         else do
           bals <- Q.xPubBals c.db x
-          txs <- Q.xPubTxs c.db bals def'
-          let newTxs = [(encode t.txid, blockRefScore t.block) | t <- txs]
-              newTxSet = HashSet.fromList (map fst newTxs)
-              txDel = [m | m <- HashMap.keys st.txs, not (HashSet.member m newTxSet)]
-          -- a transaction that Redis has and this store has never seen
-          known <- Q.getManyTxData c.db [h | m <- txDel, Right h <- [decode m]]
-          if not (mayReplace st.stamp height (any isNothing known))
-            then behind
-            else do
-              utxos <- Q.xPubUnspents c.db bals def'
-              now <- nowMs
-              let txAdd = [(m, sc) | (m, sc) <- newTxs, HashMap.lookup m st.txs /= Just sc]
-                  newUs = [(encode u.unspent, blockRefScore u.unspent.block) | u <- utxos]
-                  newUSet = HashSet.fromList (map fst newUs)
-                  utxoAdd = [(m, sc) | (m, sc) <- newUs, not (HashSet.member m st.utxos)]
-                  utxoDel = [m | m <- HashSet.toList st.utxos, not (HashSet.member m newUSet)]
-                  newAs = HashSet.fromList [encode b.balance.address | b <- bals]
-                  addrAdd = [a | a <- HashSet.toList newAs, not (HashSet.member a st.addrs)]
-                  addrDel = [a | a <- HashSet.toList st.addrs, not (HashSet.member a newAs)]
-                  -- bodies of the transactions that are new or moved, or
-                  -- that changed, and of those the script found missing;
-                  -- the others are in Redis, kept there by this entry
-                  wanted =
-                    HashSet.toList . HashSet.fromList $
-                      extra
-                        <> [h | (m, _) <- txAdd, Right h <- [decode m]]
-                        <> [t.txid | t <- txs, t.txid `HashSet.member` changed]
-              bodies <- catMaybes <$> Q.getManyTxData c.db wanted
-              let args =
-                    [c.prefix, xpubId x, num height, num now, encode x, encode bals, st.gen]
-                      <> counted addrAdd
-                      <> counted addrDel
-                      <> counted2 [(m, num' sc) | (m, sc) <- txAdd]
-                      <> counted txDel
-                      <> counted2 [(m, num' sc) | (m, sc) <- utxoAdd]
-                      <> counted utxoDel
-                      <> bodyArgs bodies
-              run c (R.eval commitScript [] args) >>= \case
-                ["ok"] -> do
-                  void (cacheEvict c c.maxXPubs)
-                  count c (.reloads) 1
-                  atomicModifyIORef' c.counters (\k -> (k {reloads = k.reloads + 1} :: CacheCounters, ()))
-                  return Reloaded
-                ("missing" : missing)
-                  | tries > 0 -> go (tries - 1) (rights (map decode missing))
-                ["changed"]
-                  | tries > 0 -> go (tries - 1) extra
-                _ -> behind
+          fast <-
+            if incremental m height now
+              then incrementalDiff c x changed m bals
+              else return Fallback
+          diff <- case fast of
+            Apply d -> return (Just d)
+            KnowsMore -> return Nothing
+            Fallback -> fullDiff c x changed m height bals now
+          case diff of
+            Nothing -> behind
+            Just d -> commit tries extra m height now bals d
+    commit tries extra m height now bals d = do
+      bodies <- catMaybes <$> Q.getManyTxData c.db (nub (extra <> d.wanted))
+      let args =
+            [c.prefix, xpubId x, num height, num now, encode x, encode bals, m.gen]
+              <> [if d.full then num now else ""]
+              <> counted d.addrAdd
+              <> counted d.addrDel
+              <> counted2 [(t, num' sc) | (t, sc) <- d.txAdd]
+              <> counted d.txDel
+              <> counted3 [(op, u, num' sc) | (op, u, sc) <- d.utxoAdd]
+              <> counted2 d.utxoDel
+              <> bodyArgs bodies
+      run c (R.eval commitScript [] args) >>= \case
+        ["ok"] -> do
+          void (cacheEvict c c.maxXPubs)
+          count c (.reloads) 1
+          when d.full $ count c (.fullReloads) 1
+          atomicModifyIORef' c.counters $ \k ->
+            ( k {reloads = k.reloads + 1, fullReloads = k.fullReloads + fromEnum d.full} :: CacheCounters,
+              ()
+            )
+          return Reloaded
+        ("missing" : missing)
+          | tries > 0 -> go (tries - 1) (rights (map decode missing))
+        ["changed"]
+          | tries > 0 -> go (tries - 1) extra
+        _ -> behind
+    -- whether the entry may be brought up to date incrementally
+    incremental m height now =
+      m.ver == "3"
+        && not (HashSet.null changed)
+        && maybe False (\s -> toInteger height - s <= 1) m.stamp
+        && maybe False (\f -> now - f < fullReloadEvery) m.full
     behind = do
       count c (.stale) 1
       atomicModifyIORef' c.counters (\k -> (k {behind = k.behind + 1} :: CacheCounters, ()))
@@ -715,36 +759,206 @@ cacheRefresh c x changed =
       forM_ c.metrics $ \m -> addTiming m.reloadTime (fromInteger (end - start))
       return r
 
--- | The entry of an xpub in Redis, as a reload finds it: the height it is
--- stamped with, its generation, which every commit increments, and the
--- members of its sets.
-data Stored = Stored
+-- | Longest time, in milliseconds, between full reloads of an entry: ten
+-- minutes. A full reload of the largest xpubs of the stress test takes a few
+-- seconds, so this costs little, and it bounds how long a change that the
+-- checks of the incremental path cannot see stays out of the cache.
+fullReloadEvery :: Integer
+fullReloadEvery = 10 * 60 * 1000
+
+-- | What to write to bring an entry up to date. Members of the sets are
+-- serialized: addresses, transaction hashes, and unspent outputs, which go
+-- with their outpoints.
+data Diff = Diff
+  { addrAdd :: ![ByteString],
+    addrDel :: ![ByteString],
+    -- | transactions to add or move, with their scores
+    txAdd :: ![(ByteString, Double)],
+    txDel :: ![ByteString],
+    -- | unspent outputs to add, with their outpoints and scores
+    utxoAdd :: ![(ByteString, ByteString, Double)],
+    -- | outpoints of unspent outputs to remove, with the member if known; the
+    -- script finds it by its outpoint otherwise
+    utxoDel :: ![(ByteString, ByteString)],
+    -- | transactions whose bodies to write
+    wanted :: ![TxHash],
+    -- | whether the whole xpub was read, which the entry records
+    full :: !Bool
+  }
+
+-- | The outcome of trying the incremental path.
+data Incremental
+  = -- | these are the differences
+    Apply !Diff
+  | -- | Redis has a changed transaction that this store has never seen
+    KnowsMore
+  | -- | the incremental path cannot be sure; read the whole xpub
+    Fallback
+
+-- | The differences of an entry from the transactions that changed and the
+-- balances of the xpub, without reading its history; see 'cacheRefresh'.
+incrementalDiff :: Cache -> XPubSpec -> HashSet TxHash -> Meta -> [XPubBal] -> IO Incremental
+incrementalDiff c x changed m bals =
+  case decode m.bal :: Either String [XPubBal] of
+    Left _ -> return Fallback
+    Right old -> do
+      let hashes = HashSet.toList changed
+      tds <- Q.getManyTxData c.db hashes
+      let newMap = HashMap.fromList [(b.balance.address, b.balance) | b <- bals]
+          oldMap = HashMap.fromList [(b.balance.address, b.balance) | b <- old]
+          entering = [b | (a, b) <- HashMap.toList newMap, not (HashMap.member a oldMap)]
+          leaving = [b | (a, b) <- HashMap.toList oldMap, not (HashMap.member a newMap)]
+          known = catMaybes tds
+          unknown = [h | (h, Nothing) <- zip hashes tds]
+          ours a = HashMap.member a newMap
+          touched = HashSet.fromList [a | td <- known, a <- txAddresses c td, ours a]
+          missed =
+            [ a
+            | (a, b) <- HashMap.toList newMap,
+              Just o <- [HashMap.lookup a oldMap],
+              o /= b,
+              not (HashSet.member a touched)
+            ]
+      if any (\b -> b.txs > 0) (entering <> leaving) || not (null missed)
+        then return Fallback
+        else do
+          inRedis <- run c (sequence <$> mapM (R.zscore (xkey c x "txs") . encode) unknown)
+          if any isJust inRedis
+            then return KnowsMore
+            else do
+              let active td = not td.deleted && any ours (txAddresses c td)
+                  ops = nub (concatMap (outpointsAt c ours) known)
+              us <- mapM (Q.getUnspent c.db) ops
+              return . Apply $
+                Diff
+                  { addrAdd = [encode b.address | b <- entering],
+                    addrDel = [encode b.address | b <- leaving],
+                    txAdd = [(encode (txHash td.tx), blockRefScore td.block) | td <- known, active td],
+                    txDel = [encode (txHash td.tx) | td <- known, not (active td)],
+                    utxoAdd = [(encode op, encode u, blockRefScore u.block) | (op, Just u) <- zip ops us],
+                    utxoDel = [(encode op, "") | (op, Nothing) <- zip ops us],
+                    wanted = [txHash td.tx | td <- known, active td],
+                    full = False
+                  }
+
+-- | The differences of an entry from the whole xpub, read from the database
+-- and from Redis. 'Nothing' if Redis has a transaction of the xpub that this
+-- store has never seen.
+fullDiff :: Cache -> XPubSpec -> HashSet TxHash -> Meta -> Word32 -> [XPubBal] -> Integer -> IO (Maybe Diff)
+fullDiff c x changed m height bals _ = do
+  st <- readStored c x
+  txs <- Q.xPubTxs c.db bals def'
+  let newTxs = [(encode t.txid, blockRefScore t.block) | t <- txs]
+      newTxSet = HashSet.fromList (map fst newTxs)
+      txDel = [t | t <- HashMap.keys st.txs, not (HashSet.member t newTxSet)]
+  -- a transaction that Redis has and this store has never seen
+  known <- Q.getManyTxData c.db [h | t <- txDel, Right h <- [decode t]]
+  if not (mayReplace m.stamp height (any isNothing known))
+    then return Nothing
+    else do
+      utxos <- Q.xPubUnspents c.db bals def'
+      let txAdd = [(t, sc) | (t, sc) <- newTxs, HashMap.lookup t st.txs /= Just sc]
+          newUs = [(encode u.unspent.outpoint, encode u.unspent, blockRefScore u.unspent.block) | u <- utxos]
+          newUSet = HashSet.fromList [u | (_, u, _) <- newUs]
+          -- an entry of an older format has no index of outpoints yet, so
+          -- every output is written, to build it
+          utxoAdd
+            | m.ver == "3" = [n | n@(_, u, _) <- newUs, not (HashSet.member u st.utxos)]
+            | otherwise = newUs
+          utxoDel =
+            [ (either (const "") (encode . (.outpoint)) (decode u :: Either String Unspent), u)
+            | u <- HashSet.toList st.utxos,
+              not (HashSet.member u newUSet)
+            ]
+          newAs = HashSet.fromList [encode b.balance.address | b <- bals]
+      return . Just $
+        Diff
+          { addrAdd = [a | a <- HashSet.toList newAs, not (HashSet.member a st.addrs)],
+            addrDel = [a | a <- HashSet.toList st.addrs, not (HashSet.member a newAs)],
+            txAdd,
+            txDel,
+            utxoAdd,
+            utxoDel,
+            -- bodies of the transactions that are new or moved, and of those
+            -- that changed; the others are in Redis, kept there by this entry
+            wanted =
+              nub $
+                [h | (t, _) <- txAdd, Right h <- [decode t]]
+                  <> [t.txid | t <- txs, t.txid `HashSet.member` changed],
+            full = True
+          }
+  where
+    def' = Limits {limit = 0, offset = 0, start = Nothing}
+
+-- | Addresses that a transaction spends from or pays to.
+txAddresses :: Cache -> TxData -> [Address]
+txAddresses c td =
+  nub . rights $
+    map (scriptToAddressBS c.db.net c.db.ctx . (.script)) (IntMap.elems td.prevs)
+      <> map (scriptToAddressBS c.db.net c.db.ctx . (.script)) td.tx.outputs
+
+-- | Outpoints whose unspent output a transaction may change at addresses that
+-- pass a test: those it creates, and those it spends.
+outpointsAt :: Cache -> (Address -> Bool) -> TxData -> [OutPoint]
+outpointsAt c ours td =
+  [OutPoint (txHash td.tx) i | (i, o) <- zip [0 ..] td.tx.outputs, at o.script]
+    <> [ inp.outpoint
+       | (i, inp) <- zip [0 :: Int ..] td.tx.inputs,
+         Just prev <- [IntMap.lookup i td.prevs],
+         at prev.script
+       ]
+  where
+    at s = either (const False) ours (scriptToAddressBS c.db.net c.db.ctx s)
+
+-- | What a reload needs to know of an entry first: the height it is stamped
+-- with, its generation, which every commit increments, the version of its
+-- format, the time of its last full reload, and its balances, serialized.
+data Meta = Meta
   { stamp :: !(Maybe Integer),
     gen :: !ByteString,
-    txs :: !(HashMap ByteString Double),
+    ver :: !ByteString,
+    full :: !(Maybe Integer),
+    bal :: !ByteString
+  }
+
+-- | Read what a reload needs to know of an entry, in one round trip.
+readMeta :: Cache -> XPubSpec -> IO Meta
+readMeta c x = do
+  (fs, b) <- run c $ do
+    fs <- R.hmget (xkey c x "meta") ("height" NonEmpty.:| ["gen", "ver", "full"])
+    b <- R.get (xkey c x "bal")
+    return ((,) <$> fs <*> b)
+  let field k = join (lookup k (zip [0 :: Int ..] fs))
+      number = (readMaybe . C8.unpack =<<)
+  return
+    Meta
+      { stamp = number (field 0),
+        gen = fromMaybe "" (field 1),
+        ver = fromMaybe "" (field 2),
+        full = number (field 3),
+        bal = fromMaybe "" b
+      }
+
+-- | The sets of an entry, as a full reload compares them with the database.
+data Stored = Stored
+  { txs :: !(HashMap ByteString Double),
     utxos :: !(HashSet ByteString),
     addrs :: !(HashSet ByteString)
   }
 
--- | Read the entry of an xpub. The sorted sets are read in chunks, so that
+-- | Read the sets of an entry. The sorted sets are read in chunks, so that
 -- no command holds Redis for long however large the xpub. The chunks are not
 -- read atomically, but nothing changes the entry while this store holds its
 -- lock except deleting or evicting it, which changes its generation, and the
 -- commit checks the generation.
 readStored :: Cache -> XPubSpec -> IO Stored
 readStored c x = do
-  (h, g, as) <- run c $ do
-    h <- R.hget (xkey c x "meta") "height"
-    g <- R.hget (xkey c x "meta") "gen"
-    a <- R.smembers (xkey c x "addrs")
-    return ((,,) <$> h <*> g <*> a)
+  as <- run c (R.smembers (xkey c x "addrs"))
   ts <- chunks (\i j -> R.zrangeWithscores (xkey c x "txs") i j)
   us <- chunks (\i j -> R.zrange (xkey c x "utxo") i j)
   return
     Stored
-      { stamp = readMaybe . C8.unpack =<< h,
-        gen = fromMaybe "" g,
-        txs = HashMap.fromList ts,
+      { txs = HashMap.fromList ts,
         utxos = HashSet.fromList us,
         addrs = HashSet.fromList as
       }

@@ -16,7 +16,7 @@ while redis.call('ZCARD', p .. 'lru') > max do
       redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)
     end
   end
-  redis.call('DEL', xk .. 'meta', xk .. 'bal', xk .. 'txs', xk .. 'utxo', xk .. 'addrs')
+  redis.call('DEL', xk .. 'meta', xk .. 'bal', xk .. 'txs', xk .. 'utxo', xk .. 'addrs', xk .. 'uop')
   redis.call('ZREM', p .. 'lru', id)
   n = n + 1
 end
