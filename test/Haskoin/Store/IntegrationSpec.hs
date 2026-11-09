@@ -34,7 +34,7 @@
 module Haskoin.Store.IntegrationSpec (spec) where
 
 import Control.Lens ((&), (?~), (^.))
-import Control.Monad (forM_, replicateM_, unless, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -1135,11 +1135,8 @@ reorgTest env = do
                 "amount" .= btc cbValue
               ]
           ]
-  -- 99 blocks on top: the coinbase may be spent in the next block. They are
-  -- mined in batches, waiting for the store after each: haskoin-node can lose
-  -- track of the headers announced when a node mines dozens of blocks in a
-  -- second, and this test is about the reorganisation, not that.
-  replicateM_ 9 (mine env 11)
+  -- 99 blocks on top: the coinbase may be spent in the next block
+  void $ mine env 99
   txA <- coinbaseSpend (at env x [0, 0]) (cbValue - 100000)
   record env x ref txA
   [blockX] <- mine env 1
@@ -1168,11 +1165,7 @@ reorgTest env = do
 
 -- | Try a check for up to 30 seconds.
 waitFor :: String -> IO Bool -> IO ()
-waitFor = waitForSeconds 30
-
--- | Like 'waitFor', with a limit in seconds.
-waitForSeconds :: Int -> String -> IO Bool -> IO ()
-waitForSeconds secs what check = go (secs * 4)
+waitFor what check = go (120 :: Int)
   where
     go n =
       check >>= \case
@@ -1340,12 +1333,10 @@ oldKeysTest env =
 withOther :: Env -> (Store -> IO a) -> IO a
 withOther env f = withRamDir $ \dir -> withStore (env.configIn dir) f
 
--- | Wait until a store has the best block of the node. A store that starts
--- late has the whole chain to sync, about 300 blocks by the end of the suite,
--- which takes the best part of a minute.
+-- | Wait until a store has the best block of the node.
 waitStore :: Env -> Store -> IO ()
 waitStore env st =
-  waitForSeconds 180 "the second store to sync" $ do
+  waitFor "the second store to sync" $ do
     best <- bestBlockHash env.node
     ours <- Q.getBestBlock st.db
     return (fmap blockHashToHex ours == Just best)

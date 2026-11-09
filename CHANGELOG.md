@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Build against haskoin-node 2.4.0. The store stopped following the chain
+  when a peer announced new blocks with an inventory message instead of
+  headers, which peers do when many blocks are found at once; it stayed at
+  the old height until the peer reconnected.
 - Mempool transactions that entered the mempool in the same second could be
   listed twice in the transactions of an xpub or a multiaddr wallet, and
   their order differed from page to page. Every merge now orders them as the
