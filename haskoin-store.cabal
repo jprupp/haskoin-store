@@ -51,6 +51,8 @@ library
       Haskoin.Store.Cache
       Haskoin.Store.Cache.Protocol
       Haskoin.Store.Common
+      Haskoin.Store.Database.Mempool
+      Haskoin.Store.Database.Migrate
       Haskoin.Store.Database.Query
       Haskoin.Store.Database.Reader
       Haskoin.Store.Database.Types
@@ -251,6 +253,7 @@ test-suite spec
       Haskoin.Store.Cache.ProtocolSpec
       Haskoin.Store.CacheSpec
       Haskoin.Store.CommonSpec
+      Haskoin.Store.Database.MigrateSpec
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.TestBlocks

@@ -39,6 +39,7 @@ module Haskoin.Store.Database.Reader
     derivedAddrs,
     createDataMetrics,
     withDatabaseReader,
+    withLayeredReader,
     memoryReport,
     addrTxCF,
     addrOutCF,
@@ -48,6 +49,7 @@ module Haskoin.Store.Database.Reader
     heightCF,
     balanceCF,
     mempoolCF,
+    mempoolAddrCF,
     mempoolInsertOps,
   )
 where
@@ -209,8 +211,61 @@ withDatabaseReader ::
   Maybe DataMetrics ->
   (DatabaseReader -> IO a) ->
   IO a
-withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal blockCache stats m =
-  withDBCF dir cfg (columnFamilyConfig bloom (isJust blockCache)) $ \db -> do
+withDatabaseReader = withReader columnFamilyConfig initRocksDB
+
+-- | Open a database with the column families of the layered layout of
+-- @docs\/layered-database.md@: those of 'withDatabaseReader' and one more,
+-- for what the mempool does at each address. The arguments are those of
+-- 'withDatabaseReader'.
+--
+-- It neither checks nor sets the version of the database. It is for
+-- "Haskoin.Store.Database.Migrate", which moves a database of version 20 to
+-- that layout, and for reading the result with
+-- "Haskoin.Store.Database.Mempool". The store itself does not use it yet.
+--
+-- Opening a database this way adds the column family to it. RocksDB only
+-- opens a database when given all its column families, so a store that does
+-- not know this one, such as this version through 'withDatabaseReader', can
+-- no longer open the database afterwards. That is the point of no return of
+-- the migration, and the reason why nothing calls this by itself.
+withLayeredReader ::
+  Network ->
+  Ctx ->
+  Word32 ->
+  Word32 ->
+  FilePath ->
+  Bool ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe DataMetrics ->
+  (DatabaseReader -> IO a) ->
+  IO a
+withLayeredReader = withReader layeredFamilyConfig (\_ -> return ())
+
+-- | Open a database with these column families, given whether to use Bloom
+-- filters and whether there is a shared block cache, and run a check on it
+-- before anything else. The other arguments are those of
+-- 'withDatabaseReader'.
+withReader ::
+  (Bool -> Bool -> [(String, Config)]) ->
+  (DatabaseReader -> IO ()) ->
+  Network ->
+  Ctx ->
+  Word32 ->
+  Word32 ->
+  FilePath ->
+  Bool ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe DataMetrics ->
+  (DatabaseReader -> IO a) ->
+  IO a
+withReader families check net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal blockCache stats m =
+  withDBCF dir cfg (families bloom (isJust blockCache)) $ \db -> do
     derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
     let bdb =
           DatabaseReader
@@ -222,7 +277,7 @@ withDatabaseReader net ctx igap gap dir bloom maxOpenFiles writeBuffers maxWal b
               ctx = ctx,
               derived = derived
             }
-    initRocksDB bdb
+    check bdb
     m bdb
   where
     cfg =
@@ -289,6 +344,35 @@ columnFamilyConfig bloom cached =
   where
     c p = def {prefixLength = p, bloomFilter = bloom, cacheIndexAndFilterBlocks = cached}
 
+-- | Column families of the layered layout: those of 'columnFamilyConfig',
+-- and one for the entries of the mempool by address ('MemAddrKey').
+--
+-- The two column families of the mempool always have Bloom filters, whatever
+-- the setting for the others. Almost every lookup in them is for something
+-- that is not there: a confirmed transaction, an output that no mempool
+-- transaction spends, an address with nothing in the mempool. A filter
+-- answers those without reading a block, and for column families this small
+-- it takes a few megabytes; on the column families of the chain the same
+-- filters would take gigabytes, which is why they are optional there. (With
+-- rocksdb-haskell-jprupp 2.6.1 on RocksDB 6.24 or later no filter is built at
+-- all, whatever is asked for; see @--bloom@ in the README.)
+--
+-- The entries by address are in a column family of their own because their
+-- filter is on the first 22 bytes of the key, the kind of key and the
+-- address, as in the column families of addresses of the chain: a scan of an
+-- address with nothing in the mempool then stops at the filter. The mempool
+-- column family is read by whole keys and scanned across prefixes, for the
+-- index by time, so it cannot have a filter by prefix.
+layeredFamilyConfig :: Bool -> Bool -> [(String, Config)]
+layeredFamilyConfig bloom cached =
+  map mempool (columnFamilyConfig bloom cached)
+    <> [("mempool-addr", c (Just 22))]
+  where
+    c p = def {prefixLength = p, bloomFilter = True, cacheIndexAndFilterBlocks = cached}
+    mempool (name, cfg)
+      | name == "mempool" = (name, c Nothing)
+      | otherwise = (name, cfg)
+
 -- | Column family for transactions by address ('AddrTxKey').
 addrTxCF :: DB -> ColumnFamily
 addrTxCF db = columnFamilies db !! 0
@@ -318,8 +402,16 @@ balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
 -- | Column family for mempool transactions ('MemTxKey' and 'MemTimeKey').
+-- In the layered layout it also has their bodies, under t'TxKey', their
+-- spenders, under t'MemSpenderKey', and the deleted ones, under
+-- t'MemDeletedKey'.
 mempoolCF :: DB -> ColumnFamily
 mempoolCF db = columnFamilies db !! 8
+
+-- | Column family for what the mempool does at each address ('MemAddrKey').
+-- Only a database opened with 'withLayeredReader' has it.
+mempoolAddrCF :: DB -> ColumnFamily
+mempoolAddrCF db = columnFamilies db !! 9
 
 -- | Set the version of a new database, migrate an old one, or call 'error' if the version is not supported.
 initRocksDB :: DatabaseReader -> IO ()

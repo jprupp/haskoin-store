@@ -43,6 +43,32 @@
 -- +-----------+--------------+----------------------------------------+
 -- | 0x0b      | 'MemTimeKey' | nothing                                |
 -- +-----------+--------------+----------------------------------------+
+--
+-- = Keys of the layered layout
+--
+-- The store does not write these yet. They belong to the layout of
+-- @docs\/layered-database.md@, version 21, in which the column families of
+-- the chain hold nothing from the mempool and everything about the mempool
+-- is in two column families of its own. t'TxKey' is used there too, for the
+-- bodies of mempool transactions. "Haskoin.Store.Database.Mempool" reads
+-- and writes them, and "Haskoin.Store.Database.Migrate" moves a database of
+-- version 20 to that layout.
+--
+-- +-----------+------------------+-------------------------------------------+
+-- | Prefix    | Key              | Value                                     |
+-- +===========+==================+===========================================+
+-- | 0x0c      | t'MemSpenderKey' | 'Spender': mempool input that spends an   |
+-- |           |                  | output                                    |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x0d      | 'MemAddrKey'     | 'MemAddrVal': what the mempool does at an |
+-- |           |                  | address                                   |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x0e      | t'MemDeletedKey' | 'TxData' of a transaction that left the   |
+-- |           |                  | mempool unconfirmed                       |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x0f      | t'MigrationKey'  | version a migration in progress started   |
+-- |           |                  | from                                      |
+-- +-----------+------------------+-------------------------------------------+
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),
@@ -53,6 +79,11 @@ module Haskoin.Store.Database.Types
     MemKey (..),
     MemTxKey (..),
     MemTimeKey (..),
+    MemSpenderKey (..),
+    MemAddrKey (..),
+    MemAddrVal (..),
+    MemDeletedKey (..),
+    MigrationKey (..),
     TxKey (..),
     decodeTxKey,
     UnspentKey (..),
@@ -108,6 +139,7 @@ import Haskoin.Store.Data
   ( Balance (..),
     BlockData,
     BlockRef,
+    Spender,
     TxData,
     TxRef (..),
     UnixTime,
@@ -353,6 +385,187 @@ instance Serialize MemTimeKey where
 instance Key MemTimeKey
 
 instance KeyValue MemTimeKey ()
+
+-- | Key of the input of a mempool transaction that spends an output, in the
+-- mempool column family of the layered layout. The output may be one of a
+-- confirmed transaction or of another mempool transaction: the key is the
+-- same, so nothing has to change here when the transaction that created the
+-- output is confirmed.
+--
+-- Spenders in the chain's column families are part of the body of the
+-- transaction whose output they spend. A mempool spender cannot be: writing
+-- it there would let the mempool change the data of the chain.
+data MemSpenderKey
+  = -- | key of the mempool spender of an output
+    MemSpenderKey !OutPoint
+  | -- | short key that matches the mempool spenders of the outputs of a
+    -- transaction
+    MemSpenderKeyS !TxHash
+  | -- | short key that matches every mempool spender
+    MemSpenderKeyB
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize MemSpenderKey where
+  -- 0x0c · TxHash · Index
+  put (MemSpenderKey OutPoint {hash = h, index = i}) = do
+    put (MemSpenderKeyS h)
+    put i
+  -- 0x0c · TxHash
+  put (MemSpenderKeyS h) = do
+    put MemSpenderKeyB
+    put h
+  -- 0x0c
+  put MemSpenderKeyB = putWord8 0x0c
+  get = do
+    guard . (== 0x0c) =<< getWord8
+    h <- get
+    i <- get
+    return $ MemSpenderKey OutPoint {hash = h, index = i}
+
+instance Key MemSpenderKey
+
+instance KeyValue MemSpenderKey Spender
+
+-- | Key of something that the mempool does at an address, in the column
+-- family of mempool address records of the layered layout. There are three
+-- kinds, and all those of an address are read with one scan of its prefix.
+--
+-- Every entry depends on one mempool transaction alone: on its inputs, with
+-- the outputs they spend, and on its outputs. None says whether an output
+-- that is spent was created by a confirmed transaction or by another
+-- mempool transaction, nor whether an output that is created is spent. So
+-- a transaction is added by writing its entries and removed by deleting
+-- them, whatever else is in the mempool, and nothing here changes when a
+-- block confirms some transactions and not others. What a query needs is
+-- worked out from the entries of the address when it is answered; see
+-- "Haskoin.Store.Database.Mempool".
+--
+-- Times are stored complemented, as in a mempool 'BlockRef', so that entries
+-- come out newest first, which is the order of the API.
+data MemAddrKey
+  = -- | a mempool transaction that spends from or pays to the address, by
+    -- the time it entered the mempool
+    MemAddrTxKey !Address !UnixTime !TxHash
+  | -- | an output of the address that a mempool transaction spends
+    MemAddrSpentKey !Address !OutPoint
+  | -- | an output that a mempool transaction pays to the address, spent or
+    -- not, by the time the transaction entered the mempool
+    MemAddrOutKey !Address !UnixTime !OutPoint
+  | -- | short key that matches every entry of an address
+    MemAddrKeyA !Address
+  | -- | short key that matches the entries of every address
+    MemAddrKeyS
+  deriving (Show, Eq, Ord, Generic, Hashable)
+
+instance Serialize MemAddrKey where
+  -- 0x0d · Address · 0x00 · time · TxHash
+  put (MemAddrTxKey a t h) = do
+    put (MemAddrKeyA a)
+    putWord8 0x00
+    putWord64be (maxBound - t)
+    put h
+  -- 0x0d · Address · 0x01 · OutPoint
+  put (MemAddrSpentKey a p) = do
+    put (MemAddrKeyA a)
+    putWord8 0x01
+    put p
+  -- 0x0d · Address · 0x02 · time · OutPoint
+  put (MemAddrOutKey a t p) = do
+    put (MemAddrKeyA a)
+    putWord8 0x02
+    putWord64be (maxBound - t)
+    put p
+  -- 0x0d · Address
+  put (MemAddrKeyA a) = do
+    put MemAddrKeyS
+    put a
+  -- 0x0d
+  put MemAddrKeyS = putWord8 0x0d
+  get = do
+    guard . (== 0x0d) =<< getWord8
+    a <- get
+    getWord8 >>= \case
+      0x00 -> MemAddrTxKey a . (maxBound -) <$> getWord64be <*> get
+      0x01 -> MemAddrSpentKey a <$> get
+      0x02 -> MemAddrOutKey a . (maxBound -) <$> getWord64be <*> get
+      _ -> fail "Cannot decode MemAddrKey"
+
+instance Key MemAddrKey
+
+-- | Value of a 'MemAddrKey': nothing for a transaction, the amount in
+-- satoshi of an output that is spent, and the amount and script of an output
+-- that is created. The first byte says which, so that a value can be decoded
+-- without its key.
+data MemAddrVal
+  = -- | value of a 'MemAddrTxKey'
+    MemAddrTxVal
+  | -- | value of a 'MemAddrSpentKey': amount of the output
+    MemAddrSpentVal !Word64
+  | -- | value of a 'MemAddrOutKey': amount and script of the output
+    MemAddrOutVal !Word64 !ByteString
+  deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
+
+instance Serialize MemAddrVal where
+  put MemAddrTxVal = putWord8 0x00
+  put (MemAddrSpentVal v) = putWord8 0x01 >> putWord64be v
+  put (MemAddrOutVal v s) = putWord8 0x02 >> putWord64be v >> put s
+  get =
+    getWord8 >>= \case
+      0x00 -> return MemAddrTxVal
+      0x01 -> MemAddrSpentVal <$> getWord64be
+      0x02 -> MemAddrOutVal <$> getWord64be <*> get
+      _ -> fail "Cannot decode MemAddrVal"
+
+instance KeyValue MemAddrKey MemAddrVal
+
+-- | Key of the body of a transaction that left the mempool without being
+-- confirmed, in the mempool column family of the layered layout: it was
+-- replaced, it conflicted with a block, or it was too old. The store keeps
+-- such bodies, marked as deleted, so that the API can go on saying what
+-- became of a transaction that it once showed.
+--
+-- Version 20 keeps them in the column family of transactions, under
+-- t'TxKey'. There, deleting a mempool transaction writes to the data of the
+-- chain, which the layered layout does not allow.
+data MemDeletedKey
+  = -- | key of a deleted transaction
+    MemDeletedKey !TxHash
+  | -- | short key that matches every deleted transaction
+    MemDeletedKeyS
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize MemDeletedKey where
+  -- 0x0e · TxHash
+  put (MemDeletedKey h) = do
+    put MemDeletedKeyS
+    put h
+  -- 0x0e
+  put MemDeletedKeyS = putWord8 0x0e
+  get = do
+    guard . (== 0x0e) =<< getWord8
+    MemDeletedKey <$> get
+
+instance Key MemDeletedKey
+
+instance KeyValue MemDeletedKey TxData
+
+-- | Key that is present while a migration of the database is under way,
+-- with the version that it started from. A migration that works in several
+-- batches sets it with the first and removes it with the last, so that a
+-- store that finds it knows to carry on, whatever the version says.
+data MigrationKey = MigrationKey
+  deriving (Eq, Show, Read, Ord, Generic, Hashable)
+
+instance Serialize MigrationKey where
+  -- 0x0f
+  put MigrationKey = putWord8 0x0f
+  get = do
+    guard . (== 0x0f) =<< getWord8
+    return MigrationKey
+
+instance Key MigrationKey
+
+instance KeyValue MigrationKey Word32
 
 -- | Block entry database key.
 newtype BlockKey = BlockKey BlockHash

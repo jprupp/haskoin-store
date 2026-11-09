@@ -347,6 +347,16 @@ versions are gone.
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
 
+`--bloom` builds no filters at present when the store is built against
+RocksDB 6.24 or later: `rocksdb-haskell-jprupp` 2.6.1 passes the size of the
+filter to RocksDB with the wrong type, and RocksDB builds none, without an
+error. The fix is
+[pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21) of the
+binding. Once the store is built with it, the option will work, for the
+table files written from then on, and the filters will need about 1.25 bytes
+for each key, held in the block cache: on a chain with billions of keys, size
+that before turning it on.
+
 ## API
 
 Full reference: [`swagger.yaml`](swagger.yaml), also served at
@@ -462,6 +472,15 @@ look empty, and not at all on networks without SegWit, which have one kind of
 address.
 
 The database layout is described in `Haskoin.Store.Database.Types`.
+
+Today unconfirmed transactions are written into the same indices as the
+block chain. `docs/layered-database.md` is a design, partly built, for
+keeping them in an area of their own and applying them on top of the chain
+when a query is answered, so that nothing the mempool does changes the
+chain's data, and so that the cache can be split the same way. The
+migration from the present layout (`Haskoin.Store.Database.Migrate`) and the
+rules that put the two areas together (`Haskoin.Store.Database.Mempool`) are
+written and tested; the store does not use them yet.
 
 ## Monitoring
 
@@ -620,6 +639,17 @@ with the size of a commit), and the latencies of each endpoint over time.
     --server-rts '-N4 -M2g -T -hT -i10 -po/tmp/heap'
   scripts/heap-profile-summary.py /tmp/heap.hp
   ```
+
+### Measurements for the layered database
+
+`docs/layered-database/` has the two programs behind the numbers in
+`docs/layered-database.md`, with their output. They are not part of the
+package; each says in its header how to build and run it.
+
+- `OverlayCost.hs` times the lookups that reading the mempool from an area
+  of its own adds to a query, in RocksDB and in memory.
+- `MigrateBench.hs` times the migration to the layered layout against
+  wiping the same mempool.
 
 ### Contributing
 

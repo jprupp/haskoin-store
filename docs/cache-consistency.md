@@ -244,3 +244,13 @@ up or reads the xpub whole.
 A timer-driven full reload, rather than one on the first change after its
 time, would only shorten how long an error lasts. It would not prevent it,
 and it would not repair spenders at all.
+
+## Since then: a layered database
+
+All four holes come from one thing: the database, and the cache that copies
+it, mix what the mempool says into what the chain says, so every value can
+change at any moment and every change has to be heard of. A later design,
+`docs/layered-database.md`, removes the cause instead of closing the holes.
+The chain's data changes only block by block, the mempool is kept apart and
+applied when a query is answered, and the cache is split the same way. Its
+section on the cache says what becomes of each hole above.

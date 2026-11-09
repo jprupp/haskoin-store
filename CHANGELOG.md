@@ -144,6 +144,33 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `docs/cache-consistency.md` analyses how a cached xpub can differ from the
   database without any check noticing, including spenders of cached
   transactions that no reload repairs, and what would prevent it.
+- `docs/layered-database.md`: a design for keeping the mempool out of the
+  chain's indices, in an area of its own that is applied on top when a query
+  is answered, with the measurements behind it and what it means for the
+  cache. The store still runs on the layout of version 20; this adds the
+  parts that could be proved ahead of the switch:
+  - `Haskoin.Store.Database.Types` has the keys of the mempool area
+    (`MemSpenderKey`, `MemAddrKey`, `MemDeletedKey`) and a marker for
+    migrations that work in several writes (`MigrationKey`).
+  - `Haskoin.Store.Database.Mempool` has the keys that one mempool
+    transaction contributes, and the rules that put the mempool on top of
+    the chain for transactions, spenders, unspent outputs, address
+    transactions and balances.
+  - `Haskoin.Store.Database.Migrate` moves a database of version 20 to the
+    layered layout without a resync: it takes every mempool transaction out
+    of the chain's indices and writes it to the mempool area, in atomic
+    batches that can be interrupted. Nothing calls it yet.
+  - `withLayeredReader` opens a database with the extra column family,
+    `mempool-addr`, that the layout needs.
+  - Tests build databases with the store's own rules from random histories
+    of payments, blocks, replacements, deletions and reorganisations,
+    migrate them, and check that every query answers as before, that the
+    chain's column families are those of a database that never saw a
+    mempool, and that emptying the mempool area leaves the chain's answers.
+- Known issue: `--bloom` builds no Bloom filters when the store is built
+  against RocksDB 6.24 or later, because of a wrong type in
+  `rocksdb-haskell-jprupp` 2.6.1, fixed in its pull request 21. The README
+  says what to expect when the fix is picked up.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
