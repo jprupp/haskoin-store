@@ -1821,18 +1821,20 @@ xBals = HashMap.findWithDefault []
 
 -- | Stream the references to the transactions of xpubs and addresses, newest
 -- first, without duplicates. Each xpub and address is read page by page, only
--- as far as the consumer needs.
+-- as far as the consumer needs, in pages of the given size: about as many as
+-- the consumer is expected to take, as every page is a query of its own.
 binfoTxRefs ::
   (StoreReadExtra m, MonadIO m) =>
+  Word32 ->
   HashMap XPubSpec [XPubBal] ->
   HashSet XPubSpec ->
   HashSet Address ->
   ConduitT () TxRef m ()
-binfoTxRefs xbals sxspecs saddrs =
+binfoTxRefs pageSize xbals sxspecs saddrs =
   joinDescStreams txRefKey $
     map xpub_c (HashSet.toList sxspecs) <> map addr_c (HashSet.toList saddrs)
   where
-    l = Limits {limit = 16, offset = 0, start = Nothing}
+    l = Limits {limit = pageSize, offset = 0, start = Nothing}
     xpub_c x = streamThings (xPubTxs x (xBals x xbals)) (Just (.txid)) l
     addr_c a = streamThings (getAddressTxs a) (Just (.txid)) l
 
@@ -1841,6 +1843,7 @@ binfoTxRefs xbals sxspecs saddrs =
 -- each, keeping only those that pass the filter.
 getBinfoTxs ::
   (StoreReadExtra m, MonadIO m) =>
+  Word32 -> -- page size of the references, as for 'binfoTxRefs'
   HashMap XPubSpec [XPubBal] -> -- xpub balances
   HashMap Address (Maybe BinfoXPubPath) -> -- address book
   HashSet XPubSpec -> -- show xpubs
@@ -1852,6 +1855,7 @@ getBinfoTxs ::
   Int64 -> -- starting balance
   ConduitT () BinfoTx m ()
 getBinfoTxs
+  pageSize
   xbals
   abook
   sxspecs
@@ -1861,7 +1865,7 @@ getBinfoTxs
   numtxid
   prune
   bal =
-    binfoTxRefs xbals sxspecs saddrs .| go bal
+    binfoTxRefs pageSize xbals sxspecs saddrs .| bodies .| go bal
     where
       binfo_tx = toBinfoTx numtxid abook prune
       compute_bal_change t =
@@ -1876,36 +1880,46 @@ getBinfoTxs
                           if b then val else negate val
                       | otherwise -> 0
          in sum $ map (f False) ins <> map (f True) out
+      -- the bodies, read a page at a time, which is one round trip to Redis
+      -- or one multi-get of the database instead of one per transaction
+      bodies = do
+        refs <- takeC (fromIntegral pageSize) .| sinkList
+        unless (null refs) $ do
+          lift (getTransactions (map (.txid) refs)) >>= mapM_ yield
+          bodies
       go b =
         await >>= \case
           Nothing -> return ()
-          Just (TxRef _ t) ->
-            lift (getTransaction t) >>= \case
-              Nothing -> go b
-              Just x -> do
-                let a = binfo_tx b x
-                    b' = b - compute_bal_change a
-                    c = isJust a.blockHeight
-                    d = fst (fromJust a.balance)
-                    r = d + fromIntegral a.fee
-                case bfilter of
-                  BinfoFilterAll ->
-                    yield a >> go b'
-                  BinfoFilterSent
-                    | 0 > r -> yield a >> go b'
-                    | otherwise -> go b'
-                  BinfoFilterReceived
-                    | r > 0 -> yield a >> go b'
-                    | otherwise -> go b'
-                  BinfoFilterMoved
-                    | r == 0 -> yield a >> go b'
-                    | otherwise -> go b'
-                  BinfoFilterConfirmed
-                    | c -> yield a >> go b'
-                    | otherwise -> go b'
-                  BinfoFilterMempool
-                    | c -> return ()
-                    | otherwise -> yield a >> go b'
+          Just Nothing -> go b
+          Just (Just x) -> do
+            let a = binfo_tx b x
+                b' = b - compute_bal_change a
+                c = isJust a.blockHeight
+                d = fst (fromJust a.balance)
+                r = d + fromIntegral a.fee
+            case bfilter of
+              BinfoFilterAll ->
+                yield a >> go b'
+              BinfoFilterSent
+                | 0 > r -> yield a >> go b'
+                | otherwise -> go b'
+              BinfoFilterReceived
+                | r > 0 -> yield a >> go b'
+                | otherwise -> go b'
+              BinfoFilterMoved
+                | r == 0 -> yield a >> go b'
+                | otherwise -> go b'
+              BinfoFilterConfirmed
+                | c -> yield a >> go b'
+                | otherwise -> go b'
+              BinfoFilterMempool
+                | c -> return ()
+                | otherwise -> yield a >> go b'
+
+-- | Page size to read the references of the transactions in, to show this
+-- many after this offset: all of them in one page if they fit in 1000.
+pageFor :: Int -> Int -> Word32
+pageFor offset n = fromIntegral (max 16 (min 1000 (offset + n)))
 
 -- | Whether to show addresses in CashAddr format (@cashaddr@).
 getCashAddr :: (MonadUnliftIO m) => ActionT m Bool
@@ -2073,6 +2087,7 @@ scottyMultiAddr =
     ftxs <-
       lift . runConduit $
         getBinfoTxs
+          (pageFor offset n)
           xbals
           abook
           sxspecs
@@ -2083,14 +2098,19 @@ scottyMultiAddr =
           prune
           ibal
           .| (dropC offset >> takeC n .| sinkList)
-    ntx <-
-      lift . runConduit $
-        binfoTxRefs xbals sxspecs saddrs .| lengthC
+    -- counted without reading the transactions, which takes seconds for
+    -- xpubs with tens of thousands of them: one xpub has its own count, from
+    -- the cache when it is cached; for several xpubs and addresses, the
+    -- database counts the distinct transactions of all their addresses
+    ntx <- case (HashSet.toList sxspecs, HashSet.null saddrs) of
+      ([x], True) -> return (HashMap.findWithDefault 0 x xtxns)
+      _ -> fromIntegral <$> lift (webDB (`Q.getAddressesTxCount` HashSet.toList salladdrs))
     nfiltered <- case fltr of
       BinfoFilterAll -> return ntx
       _ ->
         lift . runConduit $
           getBinfoTxs
+            1000
             xbals
             abook
             sxspecs
@@ -2267,6 +2287,7 @@ scottyRawAddr =
         lift $
           runConduit $
             getBinfoTxs
+              (pageFor off n)
               xbals
               abook
               xspecs
@@ -2315,6 +2336,7 @@ scottyRawAddr =
       txs <-
         lift . runConduit $
           getBinfoTxs
+            (pageFor off n)
             HashMap.empty
             abook
             xspecs

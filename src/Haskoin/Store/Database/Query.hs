@@ -52,6 +52,7 @@ module Haskoin.Store.Database.Query
     xPubUnspents,
     xPubTxs,
     xPubTxCount,
+    getAddressesTxCount,
   )
 where
 
@@ -453,7 +454,16 @@ xPubTxs r xbals limits = do
 xPubTxCount :: DatabaseReader -> [XPubBal] -> IO Word32
 xPubTxCount r xbals = do
   count r $ \s -> incrementCounter s.dataXPubTxCount 1
-  let as = usedAddresses xbals
+  getAddressesTxCount r (usedAddresses xbals)
+
+-- | Number of distinct transactions of a set of addresses: each transaction
+-- is counted once even when it touches several of them. It reads only the
+-- keys of the index, once each, as 'xPubTxCount' does, so it costs about as
+-- much as reading the references of the transactions once, and much less
+-- than paging through them.
+getAddressesTxCount :: DatabaseReader -> [Address] -> IO Word32
+getAddressesTxCount _ [] = return 0
+getAddressesTxCount r as =
   withManyIters r (addrTxCF r.db) (length as) $ \its ->
     fromIntegral <$> countDistinctSuffixes (zip (map (encode . AddrTxKeyA) as) its)
 

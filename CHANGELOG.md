@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `/blockchain/multiaddr` no longer reads every transaction of the wallet to
+  count them. `n_tx` of one xpub is its count (a `ZCARD` when it is cached);
+  for several xpubs and addresses, the database counts the distinct
+  transactions of all their addresses from the keys of its index. The
+  transactions of a page are read in pages of about the size asked for, and
+  their bodies a page at a time, instead of one by one; `/blockchain/rawaddr`
+  does the same. In the stress test, with xpubs of about 15,000
+  transactions, the median time of a multiaddr request went from 3.2 seconds
+  to 36 milliseconds, and it no longer grows with the wallet.
 - Containers left by an integration test run that was killed are removed
   by the next run, as intended: listing them used a template that Podman
   refuses, so they were never found.
