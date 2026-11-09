@@ -472,7 +472,9 @@ The database layout is described in `Haskoin.Store.Database.Types`.
   needs it, and the heap looks as if it never shrinks after a peak, such as
   the full reload of a large cached xpub. Pass `+RTS
   --disable-delayed-os-memory-return -RTS` yourself if you build the store
-  some other way.
+  some other way. To tell such memory from a leak, see
+  `stress/results/2026-11-09-memory/README.md`: how to read `smaps`, and a
+  heap profile of a busy store, with live data flat at about 10 MiB.
 - **Logs** go to standard error, one line per message, tagged with the
   component, such as `[Info#BlockStore] Best block: ...`.
 
@@ -595,6 +597,15 @@ its slow log), and the latencies of each endpoint over time.
   the report, the measurements (without the server log), and a README with
   the commits, the machine and what the run found. A new run worth keeping
   goes there too.
+- To look for a leak, run the server with a heap profile by type, which needs
+  no profiling build, and summarise it: the live heap over time and the types
+  of closure that grew most.
+
+  ```sh
+  scripts/stress-cache.sh /tmp/run -- --txs 60000 \
+    --server-rts '-N4 -M2g -T -hT -i10 -po/tmp/heap'
+  scripts/heap-profile-summary.py /tmp/heap.hp
+  ```
 
 ### Contributing
 
