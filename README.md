@@ -413,7 +413,10 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   reorganisation touches a cached xpub, the store reads from RocksDB, with
   the same queries that answer uncached requests, the transactions that
   changed and the outputs they create and spend, and writes the differences
-  in one Lua script, together with every transaction body the entry needs.
+  in one Lua script, together with every transaction body the entry needs
+  that Redis does not have yet (bodies it has, such as those of the
+  transactions a block confirms, are rewritten just before, in small
+  scripts, so that a large block does not hold Redis for long).
   The time of a reload no longer grows with the size of the xpub. The store
   reads the whole xpub instead when it first caches it, and whenever it
   cannot be sure the entry has every earlier change: when the entry is more

@@ -68,15 +68,18 @@
 -- * __No entry refers to what Redis does not have.__ An entry is written in
 --   one Lua script together with the bodies it needs, and the script writes
 --   nothing if a body would be missing. A store that is behind can serve a
---   cached xpub in full, transactions it has not imported included.
+--   cached xpub in full, transactions it has not imported included. Bodies
+--   that Redis already has are rewritten just before, in small scripts, so
+--   that a large block does not hold Redis for long; a body may so be a
+--   moment newer than an entry that has it, never older.
 --
 -- The first two rules are the pure decisions of
 -- "Haskoin.Store.Cache.Protocol", where a model test checks them with several
 -- stores catching up in random interleavings.
 --
 -- A lock per xpub keeps two stores from reloading it at the same time, and
--- every change of several keys is a Lua script, so readers never see half of
--- one. Stores that answer from Redis serve the same data; stores whose
+-- every change of several keys of an entry is a Lua script, so readers never
+-- see half of one. Stores that answer from Redis serve the same data; stores whose
 -- databases disagree can still give different answers for xpubs that are not
 -- cached.
 --
@@ -653,7 +656,10 @@ cacheEvict c n = do
 -- behind never finds a cached transaction that it cannot serve. Only the
 -- differences are written, and the script writes nothing if the entry
 -- changed since it was read (its generation), so Redis is held for the size
--- of the change, not of the xpub.
+-- of the change, not of the xpub. Bodies that Redis already has, such as
+-- those of the transactions that a block confirms, are rewritten first, in
+-- small scripts ('rewriteBodies'), so that the confirmation of a large block
+-- does not hold Redis in one long script.
 --
 -- = Reading only what changed
 --
@@ -720,7 +726,7 @@ cacheRefresh c x changed =
             Nothing -> behind
             Just d -> commit tries extra m height now bals d
     commit tries extra m height now bals d = do
-      bodies <- catMaybes <$> Q.getManyTxData c.db (nub (extra <> d.wanted))
+      bodies <- catMaybes <$> Q.getManyTxData c.db (nub (extra <> d.wanted)) >>= rewriteBodies c
       let args =
             [c.prefix, xpubId x, num height, num now, encode x, encode bals, m.gen]
               <> [if d.full then num now else ""]
@@ -1060,6 +1066,35 @@ readStored c x = do
           xs <- run c (f i (i + size - 1))
           if toInteger (length xs) < size then return xs else (xs <>) <$> loop (i + size)
 
+-- | Rewrite the bodies that Redis already has, in scripts of 'bodyChunk'
+-- bodies each, and give back the others, for the commit to write.
+--
+-- A block confirms many transactions of a busy xpub at once, and each needs
+-- its body written again, with its block and spenders. In one script, with
+-- the scores and outputs of the entry, that held Redis for 10 to 30 ms at
+-- the confirmation of each block in the stress test, while every other
+-- client waited. Bodies are shared by every entry that has the transaction,
+-- and are written whole from the database, so writing them before the entry
+-- is safe: a body is never older than the entry that refers to it, which is
+-- what matters (see 'cacheRefresh'), and other entries already see bodies
+-- written by commits of other xpubs before their own. Only bodies that are
+-- there are rewritten, so that a commit that then fails leaves nothing
+-- behind; and if one goes between these scripts and the commit, the commit
+-- reports it missing and is retried with it.
+rewriteBodies :: Cache -> [TxData] -> IO [TxData]
+rewriteBodies c tds =
+  fmap concat . forM (chunks tds) $ \ch -> do
+    absent <- HashSet.fromList <$> run c (R.eval bodiesScript [] (c.prefix : bodyArgs ch))
+    return [td | td <- ch, encode (txHash td.tx) `HashSet.member` absent]
+  where
+    chunks [] = []
+    chunks xs = let (a, b) = splitAt bodyChunk xs in a : chunks b
+
+-- | Bodies rewritten by one script of 'rewriteBodies': each is a few
+-- commands, so a chunk holds Redis for a millisecond or two.
+bodyChunk :: Int
+bodyChunk = 200
+
 -- | Arguments for bodies and their spenders: the number of bodies, the hash
 -- and body of each, the number of spenders, and the transaction, output index
 -- and spender of each.
@@ -1383,6 +1418,14 @@ pageScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/page.lua" >>= 
 -- xpubs, and its body goes when no cached xpub has it any more.
 commitScript :: ByteString
 commitScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/commit.lua" >>= embedFile)
+
+-- | Rewrite bodies that Redis has, with their spenders; see 'rewriteBodies'.
+-- Arguments: prefix, then as at the end of 'commitScript': the number of
+-- bodies, the hash and body of each, the number of spenders, and the
+-- transaction, output index and spender of each. Returns the hashes of the
+-- bodies that Redis does not have, which it does not write.
+bodiesScript :: ByteString
+bodiesScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/bodies.lua" >>= embedFile)
 
 -- | Record or forget spenders of outputs of cached transactions. Arguments:
 -- prefix, number of entries, then for each: hash of the transaction that

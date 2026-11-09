@@ -26,6 +26,7 @@ build-type:     Simple
 tested-with:
     GHC == 9.12.4
 extra-source-files:
+    src/Haskoin/Store/Cache/lua/bodies.lua
     src/Haskoin/Store/Cache/lua/commit.lua
     src/Haskoin/Store/Cache/lua/delete.lua
     src/Haskoin/Store/Cache/lua/evict.lua

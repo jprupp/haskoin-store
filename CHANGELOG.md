@@ -131,6 +131,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   entry that have since been confirmed or dropped, up to 1,000. Under load the
   database is often ahead of the events being applied, which made about one
   reload in ten of the stress test a full one.
+- Bodies that Redis already has, such as those of the transactions that a
+  block confirms, are rewritten before the commit of a reload, 200 to a
+  script, instead of in it. The commit of a block that confirms a thousand
+  transactions of an xpub had about 8,000 arguments and held Redis for 10 to
+  30 ms, the only commands of the stress test that took that long.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
