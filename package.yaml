@@ -100,10 +100,17 @@ executables:
   haskoin-store:
     main: Main.hs
     source-dirs: app
+    # --disable-delayed-os-memory-return: give memory that the heap no longer
+    # needs back to the system at once (MADV_DONTNEED), rather than marking it
+    # free for the kernel to take when it runs short (MADV_FREE), which keeps
+    # it counted as resident. With the default, the heap of a busy store looked
+    # like it grew without end in the stress test, from 45 to 260 MiB in six
+    # minutes with 10 MiB live, most of it given back already; with the flag
+    # it stayed between 50 and 90 MiB, and memory figures mean what they say.
     ghc-options:
       - -threaded
       - -rtsopts
-      - -with-rtsopts=-N
+      - '"-with-rtsopts=-N --disable-delayed-os-memory-return"'
     dependencies:
       - haskoin-store
       - filepath ^>= 1.5.5.0

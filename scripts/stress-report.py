@@ -188,6 +188,7 @@ def main():
         "Most blocks behind",
         "Server CPU %",
         "Server MiB",
+        "GHC heap MiB",
         "Valkey MiB",
     ]
     w("| " + " | ".join(columns) + " |")
@@ -208,6 +209,7 @@ def main():
         ]
         cpu = [s["cpu_percent"] for s in g]
         rss = [s["rss_mb"] for s in g]
+        heap = [s["heap_mb"] for s in g if s.get("heap_mb") is not None]
         vm = [s["valkey_mb"] for s in g if s.get("valkey_mb") is not None]
         mean = sm / c if c else None
         series["reloads"].append(rl)
@@ -217,7 +219,8 @@ def main():
         w(
             f"| {fmt(g[0]['t'], 0)}–{fmt(g[-1]['t'], 0)} | {fmt(int(rl))} | {fmt(mean)} | "
             f"{fmt(max(mx) if mx else None)} | {fmt(max(lags) if lags else None)} | "
-            f"{fmt(statistics.mean(cpu))} | {fmt(max(rss))} | {fmt(max(vm) if vm else None)} |"
+            f"{fmt(statistics.mean(cpu))} | {fmt(max(rss))} | {fmt(max(heap) if heap else None)} | "
+            f"{fmt(max(vm) if vm else None)} |"
         )
     w("")
     w("```")

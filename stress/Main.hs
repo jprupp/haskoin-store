@@ -81,6 +81,7 @@ import Haskoin.Store.Integration.Valkey (redisContainer, waitRedis)
 import Network.Socket qualified as Socket
 import Network.Socket.ByteString qualified as SocketB
 import Network.Wreq qualified as Wreq
+import Numeric (readHex)
 import Options.Applicative
 import System.Exit (ExitCode (..))
 import System.IO (Handle, IOMode (..), hFlush, hPutStrLn, stderr, withFile)
@@ -676,6 +677,7 @@ sampler start node srv redisURL stats stop h = do
           now <- getCurrentTime
           ticks <- cpuTicks srv.pid
           rss <- rssKb srv.pid
+          (heap, lazyFree) <- ghcHeapKb srv.pid
           nh <- either (const Nothing) Just <$> tryAny (nodeHeight node)
           sh <- serverHeight srv
           vm <- valkeyMemory conn
@@ -689,6 +691,8 @@ sampler start node srv redisURL stats stop h = do
                 "server_height" .= sh,
                 "cpu_percent" .= cpu,
                 "rss_mb" .= (fromIntegral rss / 1024 :: Double),
+                "heap_mb" .= (fromIntegral heap / 1024 :: Double),
+                "heap_lazy_free_mb" .= (fromIntegral lazyFree / 1024 :: Double),
                 "valkey_mb" .= ((/ (1024 * 1024)) . fromIntegral <$> vm :: Maybe Double),
                 "counters" .= m.counters,
                 "gauges" .= m.gauges,
@@ -732,6 +736,34 @@ rssKb pid = do
   return $ case r of
     Right s | (v : _) <- [w | l <- lines s, ("VmRSS:" : w : _) <- [words l]], Just n <- readMaybe v -> n
     _ -> 0
+
+-- | Resident memory of the GHC heap of a process, in KiB: what is resident of
+-- the address range that the runtime reserves for its heap, 1 TiB from
+-- @0x4200000000@. The rest of the resident memory is outside the heap:
+-- RocksDB, buffers of C libraries, stacks and the program itself. A heap that
+-- grows while its live data does not is memory the runtime took for a peak
+-- and kept, which a heap profile, made of live data, does not show.
+--
+-- Also gives how much of it the runtime has given back to the system with
+-- @MADV_FREE@ (@LazyFree@): free for the kernel to take when it needs memory,
+-- but counted as resident until it does.
+ghcHeapKb :: Int -> IO (Int, Int)
+ghcHeapKb pid = do
+  r <- tryAny (readFile ("/proc/" <> show pid <> "/smaps"))
+  return $ case r of
+    Left _ -> (0, 0)
+    Right s -> (go "Rss:" False 0 (lines s), go "LazyFree:" False 0 (lines s))
+  where
+    base = 0x4200000000 :: Integer
+    top = base + 2 ^ (40 :: Int)
+    go _ _ n [] = n
+    go key inHeap n (l : ls)
+      | (range : _) <- words l,
+        (a, '-' : _) <- break (== '-') range,
+        [(start, "")] <- readHex a =
+          go key (start >= base && start < top) n ls
+      | inHeap, (k : v : _) <- words l, k == key, Just x <- readMaybe v = go key inHeap (n + x) ls
+      | otherwise = go key inHeap n ls
 
 -- | Memory used by Valkey, in bytes.
 valkeyMemory :: Redis.Connection -> IO (Maybe Integer)

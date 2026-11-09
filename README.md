@@ -463,6 +463,16 @@ The database layout is described in `Haskoin.Store.Database.Types`.
   (`store.*`).
 - **`/dbstats`** returns RocksDB memory use per column family and RocksDB's own
   statistics, as text.
+- **Memory.** The resident memory of the store is its GHC heap plus RocksDB:
+  the block cache and memtables fill up to `--block-cache-mb` and
+  `--write-buffer-mb`, then stay there. The executable is built with
+  `--disable-delayed-os-memory-return`, so memory that the heap no longer
+  needs goes back to the system at once. Without it, Linux keeps counting
+  returned memory as resident (`LazyFree` in `/proc/<pid>/smaps`) until it
+  needs it, and the heap looks as if it never shrinks after a peak, such as
+  the full reload of a large cached xpub. Pass `+RTS
+  --disable-delayed-os-memory-return -RTS` yourself if you build the store
+  some other way.
 - **Logs** go to standard error, one line per message, tagged with the
   component, such as `[Info#BlockStore] Best block: ...`.
 

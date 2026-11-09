@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `normal`, the name they had, is still accepted, so old URLs keep working;
   it said nothing about the kind of address. Error messages use the new
   name. Built with haskoin-store-data at commit `b304acd2`.
+- The executable gives memory back to the system as soon as its heap no
+  longer needs it (`--disable-delayed-os-memory-return` in its default RTS
+  options). By default GHC marks such memory free for the kernel to take when
+  it runs short, and Linux counts it as resident until then, so the heap of a
+  busy store seemed to grow without end, by the size of each peak, with little
+  live data. The stress test records the resident GHC heap and how much of it
+  is lazily freed.
 - The cache brings an entry up to date from what changed, instead of reading
   the whole xpub from RocksDB and Redis on every change, which the stress test
   showed was almost all the time of a reload, growing to seconds at 100,000
