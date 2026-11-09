@@ -162,13 +162,28 @@ def main():
         if not slow:
             w("None.\n")
         else:
+            # scripts by name, and commits of full reloads apart from the
+            # others; older runs recorded only the command
+            def kind(x):
+                name = x.get("script") or x["command"] or "?"
+                if "full" in x:
+                    name += " (full reload)" if x["full"] else " (incremental)"
+                return name
+
             by = {}
             for x in slow:
-                by.setdefault(x["command"] or "?", []).append(x["ms"])
-            w("| Command | Count | Total ms | Median ms | Longest ms |")
-            w("|---|---|---|---|---|")
-            for cmd, ms in sorted(by.items(), key=lambda kv: -sum(kv[1])):
-                w(f"| {cmd} | {len(ms)} | {fmt(sum(ms))} | {fmt(statistics.median(ms))} | {fmt(max(ms))} |")
+                by.setdefault(kind(x), []).append(x)
+            w("| Command | Count | Total ms | Median ms | Longest ms | Median arguments | Most arguments |")
+            w("|---|---|---|---|---|---|---|")
+            for cmd, xs in sorted(by.items(), key=lambda kv: -sum(x["ms"] for x in kv[1])):
+                ms = [x["ms"] for x in xs]
+                args = [x["args"] for x in xs if "args" in x]
+                med = fmt(statistics.median(args)) if args else "–"
+                most = fmt(max(args)) if args else "–"
+                w(
+                    f"| {cmd} | {len(ms)} | {fmt(sum(ms))} | {fmt(statistics.median(ms))} | {fmt(max(ms))} "
+                    f"| {med} | {most} |"
+                )
             w("")
 
     # Over time

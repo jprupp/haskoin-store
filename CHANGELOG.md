@@ -124,6 +124,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   Entries keep an index of their unspent outputs by outpoint
   (`x:<id>:uop`), in format version 3; entries of version 2 are upgraded by
   their next reload. New metric `cache.full_reloads`.
+- A reload whose balances show changes it was not told of first looks for
+  them, instead of reading the whole xpub: the transactions that the database
+  has for the addresses whose balances moved, in the mempool or in blocks
+  after the one the entry was written at, and the mempool transactions of the
+  entry that have since been confirmed or dropped, up to 1,000. Under load the
+  database is often ahead of the events being applied, which made about one
+  reload in ten of the stress test a full one.
+- The stress report breaks the commands that blocked Redis down by script,
+  and commits by full and incremental reloads, with their numbers of
+  arguments.
 - Breaking: parameters are checked. A request with a parameter that its
   endpoint does not accept, such as a misspelt `limt=10` or `pretty` on the
   Blockchain.info endpoints, which never honoured it, gives 400

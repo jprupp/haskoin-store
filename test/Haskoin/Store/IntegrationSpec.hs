@@ -47,6 +47,7 @@ import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sort, sortOn)
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Ord (Down (..))
@@ -60,6 +61,7 @@ import Haskoin
   ( Address,
     Ctx,
     Network,
+    OutPoint (..),
     TxHash (..),
     XPrvKey,
     addrToText,
@@ -144,6 +146,7 @@ chainSpec kind = do
   it "does not use or fill the cache when asked not to" noCacheTest
   it "recovers from damaged entries and keeps newer data" damagedTest
   it "updates cached xpubs from what changed, and reads them whole when unsure" incrementalTest
+  it "catches up with changes that the database has before their events" catchUpTest
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
@@ -1338,6 +1341,45 @@ incrementalTest env = do
   fromDB <- Q.xPubBals env.store.db x.spec
   Just blob' <- redisRun env (Redis.get (xpubKey env x "bal"))
   decode blob' `shouldBe` Right fromDB
+
+-- | Under load, the database can have transactions whose events the cache has
+-- not applied yet, and the balances that a reload reads include them. The
+-- reload finds them from the addresses whose balances moved, without reading
+-- the xpub whole. Here the entry is wound back to before a payment, as if
+-- its event had not come, and a reload is told only of an older change.
+catchUpTest :: Env -> IO ()
+catchUpTest env = do
+  let x = newXPub env "catch-up" DeriveNormal
+      key = xpubKey env x
+      meta k = redisRun env (Redis.hget (key "meta") k)
+  ref <- newLedger
+  old <- pay env x ref [([0, 0], 100000)]
+  void $ mine env 1
+  checkXPub env x ref
+  full0 <- meta "full"
+  Just blob0 <- redisRun env (Redis.get (key "bal"))
+  -- a payment in the mempool, applied by the cache
+  newT <- pay env x ref [([0, 1], 200000)]
+  waitSynced env
+  checkXPub env x ref
+  let new = fromMaybe (error "bad txid") (hexToTxHash newT)
+      oldH = fromMaybe (error "bad txid") (hexToTxHash old)
+  -- wind the entry back: balances, transaction and outputs of the payment
+  uop <- redisRun env (Redis.hgetall (key "uop"))
+  let paidBy o = either (const False) (\p -> p.hash == new) (decode o :: Either String OutPoint)
+      ours = [(op, u) | (op, u) <- uop, paidBy op]
+  outs <- maybe (fail "no outputs of the payment in the entry") return (NonEmpty.nonEmpty ours)
+  void . redisRun env $ Redis.set (key "bal") blob0
+  void . redisRun env $ Redis.zrem (key "txs") (NonEmpty.singleton (encode new))
+  void . redisRun env $ Redis.zrem (key "utxo") (snd <$> outs)
+  void . redisRun env $ Redis.hdel (key "uop") (fst <$> outs)
+  cacheRefresh env.redisCache x.spec (HashSet.singleton oldH) `shouldReturn` Reloaded
+  meta "full" `shouldReturn` full0
+  redisRun env (Redis.zscore (key "txs") (encode new)) >>= (`shouldSatisfy` isJust)
+  checkXPub env x ref
+  fromDB <- Q.xPubBals env.store.db x.spec
+  Just blob1 <- redisRun env (Redis.get (key "bal"))
+  decode blob1 `shouldBe` Right fromDB
 
 -- | An output of a cached transaction that pays an address outside the xpub
 -- is spent by a transaction that does not touch the xpub. The xpub is not

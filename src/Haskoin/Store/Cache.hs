@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
@@ -682,8 +683,11 @@ cacheEvict c n = do
 --
 -- * the balances of every address of the xpub are read from the database,
 --   which is cheap, a read per address; an address that no changed
---   transaction touches must have the balance that Redis has, or a change
---   was missed;
+--   transaction touches must have the balance that Redis has. Under load it
+--   often does not, because the database is already ahead of the events
+--   being applied, so the newer transactions of those addresses are added to
+--   the changes first ('catchUp'), and only a balance that they do not
+--   explain means a change was missed;
 --
 -- * no address with transactions enters or leaves the gap, as its history
 --   would have to be read whole.
@@ -797,49 +801,134 @@ data Incremental
 
 -- | The differences of an entry from the transactions that changed and the
 -- balances of the xpub, without reading its history; see 'cacheRefresh'.
+--
+-- When the balances show that the database knows of changes beyond the ones
+-- given, the newest transactions of the addresses whose balances moved are
+-- added to them ('catchUp'), and the differences are worked out again; only
+-- if that does not account for every balance does it fall back.
 incrementalDiff :: Cache -> XPubSpec -> HashSet TxHash -> Meta -> [XPubBal] -> IO Incremental
 incrementalDiff c x changed m bals =
-  case decode m.bal :: Either String [XPubBal] of
-    Left _ -> return Fallback
-    Right old -> do
-      let hashes = HashSet.toList changed
-      tds <- Q.getManyTxData c.db hashes
-      let newMap = HashMap.fromList [(b.balance.address, b.balance) | b <- bals]
-          oldMap = HashMap.fromList [(b.balance.address, b.balance) | b <- old]
-          entering = [b | (a, b) <- HashMap.toList newMap, not (HashMap.member a oldMap)]
-          leaving = [b | (a, b) <- HashMap.toList oldMap, not (HashMap.member a newMap)]
-          known = catMaybes tds
-          unknown = [h | (h, Nothing) <- zip hashes tds]
-          ours a = HashMap.member a newMap
-          touched = HashSet.fromList [a | td <- known, a <- txAddresses c td, ours a]
-          missed =
-            [ a
-            | (a, b) <- HashMap.toList newMap,
-              Just o <- [HashMap.lookup a oldMap],
-              o /= b,
-              not (HashSet.member a touched)
-            ]
-      if any (\b -> b.txs > 0) (entering <> leaving) || not (null missed)
-        then return Fallback
-        else do
-          inRedis <- run c (sequence <$> mapM (R.zscore (xkey c x "txs") . encode) unknown)
-          if any isJust inRedis
-            then return KnowsMore
-            else do
-              let active td = not td.deleted && any ours (txAddresses c td)
-                  ops = nub (concatMap (outpointsAt c ours) known)
-              us <- mapM (Q.getUnspent c.db) ops
-              return . Apply $
-                Diff
-                  { addrAdd = [encode b.address | b <- entering],
-                    addrDel = [encode b.address | b <- leaving],
-                    txAdd = [(encode (txHash td.tx), blockRefScore td.block) | td <- known, active td],
-                    txDel = [encode (txHash td.tx) | td <- known, not (active td)],
-                    utxoAdd = [(encode op, encode u, blockRefScore u.block) | (op, Just u) <- zip ops us],
-                    utxoDel = [(encode op, "") | (op, Nothing) <- zip ops us],
-                    wanted = [txHash td.tx | td <- known, active td],
-                    full = False
-                  }
+  case (decode m.bal :: Either String [XPubBal], m.stamp) of
+    (Right old, Just stamp) ->
+      incrementalFrom c x old bals changed >>= \case
+        Missed missed ->
+          catchUp c x stamp missed >>= \case
+            Just extra
+              | not (extra `HashSet.isSubsetOf` changed) ->
+                  incrementalFrom c x old bals (changed <> extra) <&> \case
+                    Missed _ -> Fallback
+                    Settled r -> r
+            _ -> return Fallback
+        Settled r -> return r
+    _ -> return Fallback
+
+-- | The outcome of working out the differences from a set of changes.
+data Attempt
+  = -- | the balances of these addresses moved, but no change touches them
+    Missed ![Address]
+  | Settled !Incremental
+
+-- | The differences of an entry from its old balances, its new ones, and the
+-- transactions that changed it.
+incrementalFrom :: Cache -> XPubSpec -> [XPubBal] -> [XPubBal] -> HashSet TxHash -> IO Attempt
+incrementalFrom c x old bals changed = do
+  let hashes = HashSet.toList changed
+  tds <- Q.getManyTxData c.db hashes
+  let newMap = HashMap.fromList [(b.balance.address, b.balance) | b <- bals]
+      oldMap = HashMap.fromList [(b.balance.address, b.balance) | b <- old]
+      entering = [b | (a, b) <- HashMap.toList newMap, not (HashMap.member a oldMap)]
+      leaving = [b | (a, b) <- HashMap.toList oldMap, not (HashMap.member a newMap)]
+      known = catMaybes tds
+      unknown = [h | (h, Nothing) <- zip hashes tds]
+      ours a = HashMap.member a newMap
+      touched = HashSet.fromList [a | td <- known, a <- txAddresses c td, ours a]
+      missed =
+        [ a
+        | (a, b) <- HashMap.toList newMap,
+          Just o <- [HashMap.lookup a oldMap],
+          o /= b,
+          not (HashSet.member a touched)
+        ]
+  if
+    | any (\b -> b.txs > 0) (entering <> leaving) -> return (Settled Fallback)
+    | not (null missed) -> return (Missed missed)
+    | otherwise -> do
+        inRedis <- run c (sequence <$> mapM (R.zscore (xkey c x "txs") . encode) unknown)
+        if any isJust inRedis
+          then return (Settled KnowsMore)
+          else do
+            let active td = not td.deleted && any ours (txAddresses c td)
+                ops = nub (concatMap (outpointsAt c ours) known)
+            us <- mapM (Q.getUnspent c.db) ops
+            return . Settled . Apply $
+              Diff
+                { addrAdd = [encode b.address | b <- entering],
+                  addrDel = [encode b.address | b <- leaving],
+                  txAdd = [(encode (txHash td.tx), blockRefScore td.block) | td <- known, active td],
+                  txDel = [encode (txHash td.tx) | td <- known, not (active td)],
+                  utxoAdd = [(encode op, encode u, blockRefScore u.block) | (op, Just u) <- zip ops us],
+                  utxoDel = [(encode op, "") | (op, Nothing) <- zip ops us],
+                  wanted = [txHash td.tx | td <- known, active td],
+                  full = False
+                }
+
+-- | Changes of an entry that the database has and that it was not told of:
+-- what a store finds when its database runs ahead of the events it is
+-- applying, as it does under load, when the balances it reads after a batch
+-- already include the transactions of the next. 'Nothing' if there are more
+-- than 'catchUpMost', when reading the whole xpub is as cheap.
+--
+-- The entry is stamped with a block that this store had whole, so what can
+-- have changed since is:
+--
+-- * transactions in the mempool or in a later block, which are first in the
+--   index of an address, newest first, and are read from it for each address
+--   whose balance moved, down to the stamp;
+--
+-- * transactions in the mempool when the entry was written that have been
+--   confirmed or dropped since, found from the mempool transactions of the
+--   entry, which are few.
+--
+-- A reorganisation that replaces the block of the stamp is not covered, and
+-- the balances catch it: if the transactions found do not account for every
+-- balance, the full path runs.
+catchUp :: Cache -> XPubSpec -> Integer -> [Address] -> IO (Maybe (HashSet TxHash))
+catchUp c x stamp addrs = do
+  newer <- sequence <$> mapM addressNewer addrs
+  pool <- run c (R.zrangebyscoreLimit (xkey c x "txs") (-1 / 0) (-0.5) 0 (toInteger catchUpMost + 1))
+  let poolHashes = rights (map decode pool)
+  tds <- Q.getManyTxData c.db poolHashes
+  let settled = [h | (h, td) <- zip poolHashes tds, maybe True left td]
+      found = HashSet.fromList (settled <> concat (fromMaybe [] newer))
+  return $
+    if isNothing newer || length pool > catchUpMost || HashSet.size found > catchUpMost
+      then Nothing
+      else Just found
+  where
+    -- a mempool transaction of the entry that is no longer in the mempool
+    left td = td.deleted || not (isMem td.block)
+    isMem MemRef {} = True
+    isMem BlockRef {} = False
+    after t = case t.block of
+      MemRef {} -> True
+      BlockRef {height = h} -> toInteger h > stamp
+    chunk = 100 :: Word32
+    addressNewer a = loop 0 []
+      where
+        loop off acc = do
+          ts <- Q.getAddressTxs c.db a Limits {limit = chunk, offset = off, start = Nothing}
+          let (new, rest) = span after ts
+              acc' = acc <> map (.txid) new
+          if
+            | length acc' > catchUpMost -> return Nothing
+            | not (null rest) || length ts < fromIntegral chunk -> return (Just acc')
+            | otherwise -> loop (off + chunk) acc'
+
+-- | Most transactions that 'catchUp' adds to the changes of a reload. Each
+-- costs a few reads; a full reload of the xpubs of the stress test costs
+-- tens of thousands.
+catchUpMost :: Int
+catchUpMost = 1000
 
 -- | The differences of an entry from the whole xpub, read from the database
 -- and from Redis. 'Nothing' if Redis has a transaction of the xpub that this

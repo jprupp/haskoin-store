@@ -419,7 +419,12 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   cannot be sure the entry has every earlier change: when the entry is more
   than a block behind, when an address with transactions enters or leaves
   the gap, when the balance of an address that no change touched differs
-  from Redis's, and at least every ten minutes. The script
+  from Redis's and its newest transactions do not explain why, and at least
+  every ten minutes. Under load the database is often a little ahead of the
+  events being applied, so a reload first adds the transactions that the
+  database has for such an address since the block the entry was written
+  at, and the mempool transactions of the entry that have since been
+  confirmed or dropped. The script
   writes nothing if the entry changed since it was read, so the entry is
   always what the database says; and Redis, which answers one client at a
   time, is held for the size of the change, not of the xpub. A page of a
@@ -581,7 +586,8 @@ transactions went in, how many reloads the cache did, how many of them read
 the whole xpub, and how long they took as the xpubs grew, how far the server
 fell behind, its CPU and memory, the
 memory of Valkey, the commands that blocked Redis for 10 ms or more (from
-its slow log), and the latencies of each endpoint over time.
+its slow log, by script, with the number of arguments of each, which grows
+with the size of a commit), and the latencies of each endpoint over time.
 
 - The defaults are 200,000 transactions between 4 wallets of 200 receiving
   and 200 change addresses, 2,000 per block; pass `-- --help` for the

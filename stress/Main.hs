@@ -787,8 +787,15 @@ slowlogStart url = withRedis url $ \conn -> Redis.runRedis conn $ do
   where
     send args = void (Redis.sendRequest args :: Redis.Redis (Either Redis.Reply Redis.Reply))
 
--- | The commands that took 10 ms or more: how long each took, in
--- milliseconds, and its name (with the first bytes of a script).
+-- | The commands that took 10 ms or more: when, how long in milliseconds,
+-- the command, and how many arguments it had. For a script of the cache,
+-- also its name and, for a commit, whether it was of a full reload.
+--
+-- The slow log keeps the first 32 arguments of a command, each cut to 128
+-- bytes, and ends the list with how many it left out. That is enough: the
+-- first argument of an EVAL is the script, whose first line names it (as
+-- @commitScript@), and the number of arguments of a commit grows with the
+-- size of the change.
 slowlog :: String -> IO [Value]
 slowlog url = withRedis url $ \conn ->
   Redis.runRedis conn (Redis.sendRequest ["SLOWLOG", "GET", "100000"]) <&&> \case
@@ -796,14 +803,29 @@ slowlog url = withRedis url $ \conn ->
     _ -> []
   where
     a <&&> f = f <$> a
-    entry (Redis.MultiBulk (Just (_ : Redis.Integer ts : Redis.Integer us : Redis.MultiBulk (Just args) : _))) =
-      Just $
-        object
-          [ "time" .= ts,
-            "ms" .= (fromIntegral us / 1000 :: Double),
-            "command" .= T.unwords [T.take 24 (decodeUtf8 b) | Redis.Bulk (Just b) <- take 1 args]
-          ]
+    entry (Redis.MultiBulk (Just (_ : Redis.Integer ts : Redis.Integer us : Redis.MultiBulk (Just reply) : _))) =
+      let args = [decodeUtf8 b | Redis.Bulk (Just b) <- reply]
+          script = case args of
+            _ : body : _ -> take 1 [w | w <- T.words body, "Script" `T.isSuffixOf` w]
+            _ -> []
+       in Just . object $
+            [ "time" .= ts,
+              "ms" .= (fromIntegral us / 1000 :: Double),
+              "command" .= T.toUpper (T.take 24 (mconcat (take 1 args))),
+              "args" .= argCount args
+            ]
+              <> ["script" .= s | s <- script]
+              -- ARGV[8] of a commit is the time of a full reload, or empty
+              <> ["full" .= not (T.null f) | script == ["commitScript"], f <- take 1 (drop 10 args)]
     entry _ = Nothing
+    -- the arguments kept, the last of which may say how many were left out:
+    -- "... (2048 more arguments)"
+    argCount args = case reverse args of
+      l : kept
+        | Just rest <- T.stripPrefix "... (" l,
+          [(n, _)] <- reads (T.unpack rest) ->
+            length kept + n :: Int
+      _ -> length args
 
 withRedis :: String -> (Redis.Connection -> IO a) -> IO a
 withRedis url = bracket (Redis.checkedConnect (either error id (Redis.parseConnectInfo url))) Redis.disconnect
