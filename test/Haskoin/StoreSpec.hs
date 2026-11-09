@@ -145,6 +145,7 @@ withTestStoreBlocks blocks net ctx t f =
               gap = gap,
               initGap = 20,
               redisMinAddrs = 100,
+              redisMinTxs = 1000,
               redisMaxXPubs = 10000,
               noMempool = False,
               wipeMempool = False,

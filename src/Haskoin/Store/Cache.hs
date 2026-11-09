@@ -136,6 +136,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
 import Data.Either (rights)
 import Data.Functor ((<&>))
+import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
@@ -219,6 +220,8 @@ data CacheConfig = CacheConfig
     url :: !String,
     -- | cache xpubs with at least this many used addresses
     minAddrs :: !Int,
+    -- | or with at least this many transactions in their addresses
+    minTxs :: !Int,
     -- | evict the least recently used xpubs past this many
     maxXPubs :: !Int,
     -- | StatsD client, to report the metrics of the cache
@@ -261,13 +264,17 @@ data Cache = Cache
     db :: !DatabaseReader,
     chain :: !Chain,
     minAddrs :: !Int,
+    minTxs :: !Int,
     maxXPubs :: !Int,
     logger :: !Logger,
     metrics :: !(Maybe CacheMetrics),
     -- | what this store did to the cache since it started
     counters :: !(IORef CacheCounters),
     -- | work for the worker, newest first
-    jobs :: !(TVar [Job])
+    jobs :: !(TVar [Job]),
+    -- | when this store last marked each xpub as used, by id, in
+    -- milliseconds; see 'touchEvery'
+    touched :: !(IORef (HashMap ByteString Integer))
   }
 
 -- | What a store did to the cache since it started.
@@ -313,6 +320,7 @@ withCache cfg db chain pub logger action = do
   conn <- R.checkedConnect info
   jobs <- newTVarIO []
   counters <- newIORef (CacheCounters 0 0)
+  touched <- newIORef HashMap.empty
   metrics <- mapM newCacheMetrics cfg.stats
   let cache =
         Cache
@@ -321,11 +329,13 @@ withCache cfg db chain pub logger action = do
             db = db,
             chain = chain,
             minAddrs = cfg.minAddrs,
+            minTxs = cfg.minTxs,
             maxXPubs = cfg.maxXPubs,
             logger = logger,
             metrics = metrics,
             counters = counters,
-            jobs = jobs
+            jobs = jobs,
+            touched = touched
           }
   withSubscription pub $ \events ->
     withAsync (listener cache events) $ \a1 ->
@@ -415,10 +425,11 @@ scoreBlockRef s
 -- cached.
 cacheXPubBals :: Cache -> XPubSpec -> IO (Maybe [XPubBal])
 cacheXPubBals c x = do
-  now <- nowMs
+  touch <- touchArgs c x
   r <- run c $ do
     b <- R.get (xkey c x "bal")
-    _ <- R.zadd (lruKey c) [(fromIntegral now, xpubId x)]
+    -- marking an xpub that is not cached is harmless: eviction removes it
+    forM_ touch $ \now -> R.zadd (lruKey c) [(fromIntegral now, xpubId x)]
     return b
   case r of
     Nothing -> count c (.misses) 1 >> return Nothing
@@ -436,93 +447,112 @@ cacheIsCached c x = run c (R.exists (xkey c x "meta"))
 
 -- | Number of transactions of a cached xpub.
 cacheXPubTxCount :: Cache -> XPubSpec -> IO (Maybe Word32)
-cacheXPubTxCount c x =
-  withCached c x $ fromIntegral <$> run c (R.zcard (xkey c x "txs"))
+cacheXPubTxCount c x = do
+  touch <- touchArgs c x
+  -- sent together, in one round trip
+  (cached, n) <- run c $ do
+    e <- R.exists (xkey c x "meta")
+    z <- R.zcard (xkey c x "txs")
+    forM_ touch $ \now -> R.zadd (lruKey c) [(fromIntegral now, xpubId x)]
+    return ((,) <$> e <*> z)
+  return (if cached then Just (fromIntegral n) else Nothing)
 
 -- | Page of the transactions of a cached xpub, newest first, as the database
 -- would give it.
 cacheXPubTxs :: Cache -> XPubSpec -> Limits -> IO (Maybe [TxRef])
-cacheXPubTxs c x limits =
-  withCached c x $ do
-    let from = case limits.start of
-          Just (AtTx th) -> Just (const (encode th))
-          _ -> Nothing
-    xs <- page c (xkey c x "txs") limits from =<< startPos c limits
-    return [TxRef {txid = t, block = scoreBlockRef s} | (bs, s) <- xs, Right t <- [decode bs]]
+cacheXPubTxs c x limits = do
+  xs <- page c x "txs" limits (\th -> (0, encode th))
+  return $ xs <&> \ys -> [TxRef {txid = t, block = scoreBlockRef sc} | (bs, sc) <- ys, Right t <- [decode bs]]
 
 -- | Page of the unspent outputs of a cached xpub, newest first, given its
 -- balances, which give the paths of the addresses.
 cacheXPubUnspents :: Cache -> XPubSpec -> [XPubBal] -> Limits -> IO (Maybe [XPubUnspent])
-cacheXPubUnspents c x bals limits =
-  withCached c x $ do
-    -- members are serialized unspent outputs, which start with their
-    -- block position, then the output point
-    let from = case limits.start of
-          Just (AtTx th) -> Just (\ref -> encode ref <> encode (OutPoint th 0))
-          _ -> Nothing
-    xs <- page c (xkey c x "utxo") limits from =<< startPos c limits
-    let paths = HashMap.fromList [(b.balance.address, b.path) | b <- bals]
-    return
+cacheXPubUnspents c x bals limits = do
+  -- members are serialized unspent outputs: their block position, which is
+  -- nine bytes long, then their output point
+  xs <- page c x "utxo" limits (\th -> (9, encode (OutPoint th 0)))
+  let paths = HashMap.fromList [(b.balance.address, b.path) | b <- bals]
+  return $
+    xs <&> \ys ->
       [ XPubUnspent {unspent = u, path = p}
-      | (bs, _) <- xs,
+      | (bs, _) <- ys,
         Right u <- [decode bs],
         Just a <- [u.address],
         Just p <- [HashMap.lookup a paths]
       ]
 
--- | Run a read only if the xpub is cached, marking it as used.
-withCached :: Cache -> XPubSpec -> IO a -> IO (Maybe a)
-withCached c x f = do
+-- | How often a store marks an xpub as used, in milliseconds. Marking it on
+-- every read would make every read a write; eviction only needs to know
+-- which xpubs were used recently.
+touchEvery :: Integer
+touchEvery = 10000
+
+-- | The time to mark an xpub as used with, if this store has not marked it
+-- in the last 'touchEvery' milliseconds.
+touchArgs :: Cache -> XPubSpec -> IO (Maybe Integer)
+touchArgs c x = do
   now <- nowMs
-  cached <- run c $ do
-    e <- R.exists (xkey c x "meta")
-    _ <- R.zadd (lruKey c) [(fromIntegral now, xpubId x)]
-    return e
-  if cached then Just <$> f else return Nothing
-
--- | Position to start a page at, if the page has a start: the position of
--- the start transaction, or of the last block at a height. 'Nothing' if the
--- start transaction is not known.
-startPos :: Cache -> Limits -> IO (Maybe (Maybe BlockRef))
-startPos c limits = case limits.start of
-  Nothing -> return (Just Nothing)
-  Just (AtBlock h) -> return (Just (Just (BlockRef h maxBound)))
-  Just (AtTx th) ->
-    cacheTxData c [th] >>= \case
-      [Just td] -> return (Just (Just td.block))
+  atomicModifyIORef' c.touched $ \m ->
+    case HashMap.lookup (xpubId x) m of
+      Just t | now - t < touchEvery -> (m, Nothing)
       _ ->
-        Q.getTxData c.db th >>= \case
-          Just td -> return (Just (Just td.block))
-          Nothing -> return Nothing
+        -- forget everything now and then, so that the map stays small
+        let m' = if HashMap.size m > 100000 then HashMap.empty else m
+         in (HashMap.insert (xpubId x) now m', Just now)
 
--- | Members of a sorted set with their scores, from a position, at an offset,
--- up to a limit (0 for all). When the page starts at a transaction, the
--- members with the score of its position whose bytes sort before the bytes
--- that the function gives for that position are skipped: those of mempool
--- transactions of the same second with smaller hashes, as the database does.
--- A start that is not found gives nothing.
-page :: Cache -> ByteString -> Limits -> Maybe (BlockRef -> ByteString) -> Maybe (Maybe BlockRef) -> IO [(ByteString, Double)]
-page _ _ _ _ Nothing = return []
-page c key limits _ (Just Nothing) =
-  run c $
-    R.zrangeWithscores
-      key
-      (fromIntegral limits.offset)
-      (if limits.limit == 0 then -1 else fromIntegral limits.offset + fromIntegral limits.limit - 1)
-page c key limits from (Just (Just ref)) = do
-  let score = blockRefScore ref
-  skip <- case from of
-    Nothing -> return 0
-    Just bytes -> do
-      ties <- run c (R.zrangebyscore key score score)
-      return (length (filter (< bytes ref) ties))
-  run c $
-    R.zrangebyscoreWithscoresLimit
-      key
-      score
-      (1 / 0)
-      (fromIntegral limits.offset + fromIntegral skip)
-      (if limits.limit == 0 then -1 else fromIntegral limits.limit)
+-- | A page of a sorted set of a cached xpub, with the scores of its members,
+-- or 'Nothing' if the xpub is not cached. One round trip to Redis: the
+-- script finds where the page starts, as the database would, and marks the
+-- xpub as used if it is time to.
+--
+-- A page that starts at a transaction starts at its position, which is the
+-- score of the transaction in the sorted set of transactions of the xpub.
+-- Members of the same score whose bytes, after a number of bytes, sort
+-- before the bytes that the function gives for the transaction are skipped,
+-- as the database skips them. A start transaction that is not in the xpub is
+-- looked up in Redis or in the database, in a second round trip; a page
+-- with a start that is found nowhere is empty.
+page ::
+  Cache ->
+  XPubSpec ->
+  ByteString ->
+  Limits ->
+  (TxHash -> (Int, ByteString)) ->
+  IO (Maybe [(ByteString, Double)])
+page c x set limits tieBytes = do
+  touch <- touchArgs c x
+  let common =
+        [ xkey c x "meta",
+          xkey c x set,
+          xkey c x "txs",
+          lruKey c,
+          maybe "" num touch,
+          xpubId x,
+          num limits.offset,
+          num limits.limit
+        ]
+      call extra = run c (R.eval pageScript [] (common <> extra))
+  r <- case limits.start of
+    Nothing -> call ["top"]
+    Just (AtBlock h) -> call ["score", num' (blockRefScore (BlockRef h maxBound))]
+    Just (AtTx th) -> do
+      let (skip, bytes) = tieBytes th
+      call ["tx", encode th, num skip, bytes] >>= \case
+        ["nostart"] ->
+          startOf th >>= \case
+            Nothing -> return ["ok"]
+            Just ref -> call ["at", num' (blockRefScore ref), num skip, bytes]
+        y -> return y
+  case r of
+    "ok" : rest -> return (Just (pairs rest))
+    _ -> return Nothing
+  where
+    pairs (m : sc : rest) | Just d <- readMaybe (C8.unpack sc) = (m, d) : pairs rest
+    pairs _ = []
+    startOf th =
+      cacheTxData c [th] >>= \case
+        [Just td] -> return (Just td.block)
+        _ -> fmap (.block) <$> Q.getTxData c.db th
 
 -- | Bodies of transactions that Redis has, in the order of the hashes, with
 -- the spenders of their outputs filled in. 'Nothing' for those it does not
@@ -554,12 +584,17 @@ cacheTxData c hs = do
 -------------------------------------------------------------------------------
 
 -- | Cache an xpub that was just read from the database, if it has enough
--- used addresses. It is loaded in the background; the caller keeps the
--- answer it has.
+-- used addresses, or enough transactions: a wallet that reuses a few
+-- addresses for many payments is as slow to read from the database as one
+-- with many addresses. Transactions are counted per address, so one that
+-- touches two addresses counts twice, which is close enough to decide. The
+-- xpub is loaded in the background; the caller keeps the answer it has.
 cacheRequest :: Cache -> XPubSpec -> [XPubBal] -> IO ()
 cacheRequest c x bals =
-  when (length (filter (not . nullBalance . (.balance)) bals) >= c.minAddrs) $
+  when (length used >= c.minAddrs || sum (map (.balance.txs) used) >= fromIntegral c.minTxs) $
     push c (JobCache x)
+  where
+    used = filter (not . nullBalance . (.balance)) bals
 
 -- | Give the worker something to do.
 push :: Cache -> Job -> IO ()
@@ -954,6 +989,58 @@ evictScript =
   \  local id = redis.call('ZRANGE', p .. 'lru', 0, 0)[1]\n"
     <> cleanupLua
     <> "  n = n + 1\nend\nreturn n\n"
+
+-- | A page of a sorted set of a cached xpub; see 'page'. Arguments: the
+-- keys of the meta hash, of the sorted set and of the sorted set of
+-- transactions, the key of the set of recent use, the time to mark the xpub
+-- used with (empty for not now), the id of the xpub, the offset and the limit
+-- (0 for no limit), and how the page starts: @top@; @score@ and a score;
+-- @at@, a score, a number of bytes and the bytes of the start; or @tx@, a
+-- transaction hash, a number of bytes and the bytes of the start. Returns
+-- @{\"none\"}@ if the xpub is not cached, @{\"nostart\"}@ if the
+-- transaction of @tx@ is not one of the xpub, or @{\"ok\"}@ followed by
+-- each member and its score.
+--
+-- Bytes are compared one by one: Lua compares strings by the collation of
+-- the locale of the server, which need not be the order of their bytes that
+-- Redis and the database sort members by.
+pageScript :: ByteString
+pageScript =
+  "local set, txs = ARGV[2], ARGV[3]\n\
+  \if redis.call('EXISTS', ARGV[1]) == 0 then return {'none'} end\n\
+  \if ARGV[5] ~= '' then redis.call('ZADD', ARGV[4], ARGV[5], ARGV[6]) end\n\
+  \local off = tonumber(ARGV[7])\nlocal lim = tonumber(ARGV[8])\nlocal mode = ARGV[9]\n\
+  \local function lt(a, b)\n\
+  \  for k = 1, math.min(#a, #b) do\n\
+  \    local x, y = string.byte(a, k), string.byte(b, k)\n\
+  \    if x ~= y then return x < y end\n\
+  \  end\n\
+  \  return #a < #b\n\
+  \end\n\
+  \local function out(r)\n\
+  \  local o = {'ok'}\n\
+  \  for _, v in ipairs(r) do table.insert(o, v) end\n\
+  \  return o\n\
+  \end\n\
+  \if mode == 'top' then\n\
+  \  local stop = -1\n\
+  \  if lim > 0 then stop = off + lim - 1 end\n\
+  \  return out(redis.call('ZRANGE', set, off, stop, 'WITHSCORES'))\n\
+  \end\n\
+  \local score = ARGV[10]\nlocal skip = 0\n\
+  \if mode == 'tx' then\n\
+  \  score = redis.call('ZSCORE', txs, ARGV[10])\n\
+  \  if not score then return {'nostart'} end\n\
+  \end\n\
+  \if mode ~= 'score' then\n\
+  \  local cut, bytes = tonumber(ARGV[11]), ARGV[12]\n\
+  \  for _, m in ipairs(redis.call('ZRANGEBYSCORE', set, score, score)) do\n\
+  \    if lt(string.sub(m, cut + 1), bytes) then skip = skip + 1 end\n\
+  \  end\n\
+  \end\n\
+  \local count = -1\n\
+  \if lim > 0 then count = lim end\n\
+  \return out(redis.call('ZRANGEBYSCORE', set, score, '+inf', 'WITHSCORES', 'LIMIT', off + skip, count))\n"
 
 -- | Replace the entry of an xpub, unless the stored one is stamped with a
 -- higher block. Arguments: prefix, id, height, time of use, serialized xpub,

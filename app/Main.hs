@@ -104,6 +104,7 @@ data Config = Config
     redis :: !Bool,
     redisURL :: !String,
     redisMinAddrs :: !Int,
+    redisMinTxs :: !Int,
     redisMaxXPubs :: !Int,
     noMempool :: !Bool,
     wipeMempool :: !Bool,
@@ -170,6 +171,8 @@ defConfig = do
     env "REDIS_URL" "" pure
   redisMinAddrs <-
     env "REDIS_MIN_ADDRS" 100 readMaybe
+  redisMinTxs <-
+    env "REDIS_MIN_TXS" 1000 readMaybe
   redisMaxXPubs <-
     env "REDIS_MAX_XPUBS" 10000 readMaybe
   noMempool <-
@@ -424,6 +427,13 @@ config c = do
         <> help "Cache xpubs with at least this many used addresses"
         <> showDefault
         <> value c.redisMinAddrs
+  redisMinTxs <-
+    option auto $
+      metavar "COUNT"
+        <> long "redis-min-txs"
+        <> help "Cache xpubs with at least this many transactions in their addresses"
+        <> showDefault
+        <> value c.redisMinTxs
   redisMaxXPubs <-
     option auto $
       metavar "COUNT"
@@ -638,6 +648,7 @@ run cfg =
             gap = cfg.webLimits.xpubGap,
             initGap = cfg.webLimits.xpubGapInit,
             redisMinAddrs = cfg.redisMinAddrs,
+            redisMinTxs = cfg.redisMinTxs,
             redisMaxXPubs = cfg.redisMaxXPubs,
             wipeMempool = cfg.wipeMempool,
             noMempool = cfg.noMempool,

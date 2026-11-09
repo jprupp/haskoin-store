@@ -239,7 +239,8 @@ every few seconds.
 ### 7. Make big wallets fast
 
 Start the store with `--redis` and a Redis (or Valkey) server. Xpubs with at
-least `--redis-min-addrs` used addresses are then cached after their first
+least `--redis-min-addrs` used addresses, or at least `--redis-min-txs`
+transactions in their addresses, are then cached after their first
 query and answered from Redis, transactions in full included. Several stores
 can share one Redis: they keep each other's cache up to date, and a store that
 has not imported a transaction yet still serves it from the cache. Add
@@ -298,6 +299,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--redis` | `REDIS` | off | Cache large xpubs in Redis |
 | `--redis-url` | `REDIS_URL` | local Redis | Redis URL, such as `redis://host:6379` |
 | `--redis-min-addrs` | `REDIS_MIN_ADDRS` | `100` | Cache xpubs with at least this many used addresses |
+| `--redis-min-txs` | `REDIS_MIN_TXS` | `1000` | Or with at least this many transactions in their addresses |
 | `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Evict the least recently used xpubs past this many |
 
 Every key of the cache starts with `hs2:<network>:`, so a Redis can be shared

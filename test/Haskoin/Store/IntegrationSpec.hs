@@ -254,6 +254,7 @@ storeConfig net ctx logger dir redisURL p2pPort =
       initGap = initGap,
       gap = gap,
       redisMinAddrs = 1,
+      redisMinTxs = 1000,
       redisMaxXPubs = 10000,
       noMempool = False,
       wipeMempool = False,

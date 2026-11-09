@@ -142,6 +142,8 @@ data StoreConfig = StoreConfig
     gap :: !Word32,
     -- | cache xpubs with at least this many used addresses
     redisMinAddrs :: !Int,
+    -- | or with at least this many transactions in their addresses
+    redisMinTxs :: !Int,
     -- | evict the least recently used xpubs from the cache past this many
     redisMaxXPubs :: !Int,
     -- | do not index new mempool transactions
@@ -232,6 +234,7 @@ withStoreCache cfg db chain pub action =
           CacheConfig
             { url = url,
               minAddrs = cfg.redisMinAddrs,
+              minTxs = cfg.redisMinTxs,
               maxXPubs = cfg.redisMaxXPubs,
               stats = cfg.stats
             }

@@ -100,6 +100,7 @@ storeConfig ctx net dir redis blocks requests =
       gap = 32,
       initGap = 20,
       redisMinAddrs = 20,
+      redisMinTxs = 1000,
       redisMaxXPubs = 10000,
       noMempool = False,
       wipeMempool = False,

@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     Redis, and checks that they end with the entry of the tip, that no
     store replaces an entry with one that knows less, that each change is
     written once, and that stores catching up after the first write nothing.
+  - A page of the transactions or unspent outputs of a cached xpub is one
+    round trip to Redis: a Lua script finds where it starts, from the
+    position of the start transaction in the xpub itself, and reads it.
+    It took four or five, and read the whole body of the start
+    transaction to find its position.
+  - A store marks a cached xpub as used at most every ten seconds, for
+    eviction, instead of on every read, which made every read a write.
+  - `--redis-min-txs` (`REDIS_MIN_TXS`, default 1000) also caches xpubs
+    with at least that many transactions in their addresses, however few
+    addresses they have.
   - Keys start with `hs2:<network>:`, so the cache can share a Redis with the
     cache of older versions and with stores of other networks.
   - `--redis-max-xpubs` (`REDIS_MAX_XPUBS`, default 10000) replaces
