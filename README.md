@@ -405,7 +405,9 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   writes nothing if the entry changed since it was read, so the entry is
   always what the database says; and Redis, which answers one client at a
   time, is held for the size of the change, not of the xpub. A page of a
-  cached xpub is one round trip to Redis. Stores sharing a Redis claim each change, so it
+  cached xpub is one round trip to Redis. The Lua scripts are in
+  `src/Haskoin/Store/Cache/lua/`, one file each, embedded in the library
+  when it is compiled. Stores sharing a Redis claim each change, so it
   is applied once, by the first store to see it; a store never replaces an
   entry that knows more than its database (a higher block, or a transaction
   it has not seen), and a store that is catching up does no cache work.
@@ -489,6 +491,8 @@ stack test                     # includes a 6000-block heap-growth test
 scripts/format                 # ormolu, the code style used here
 scripts/bench-web.sh           # load-test the API with wrk
 scripts/stress-cache.sh        # stress the Redis cache, with a report
+scripts/check-local-deps.sh    # what CI checks: no local paths in stack.yaml
+scripts/install-system-libraries.sh  # the C libraries, on Ubuntu or Debian
 ```
 
 `stack.yaml` must pin released versions of every dependency. Pointing
@@ -557,7 +561,11 @@ its slow log), and the latencies of each endpoint over time.
 
 Pull requests are welcome.
 
-- Format the code with `scripts/format` (Ormolu).
+- Format the code with `scripts/format` (Ormolu), and keep every line of
+  code shorter than 120 columns.
+- Put scripts in files of their own rather than embedding them: Lua for
+  Redis under `src/Haskoin/Store/Cache/lua/`, shell under `scripts/`, called
+  from CI rather than written into the workflow.
 - Add tests for the behaviour you change.
 - Describe the change under a new version in `CHANGELOG.md`, which follows
   [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).

@@ -19,6 +19,9 @@ github: jprupp/haskoin-store
 homepage: https://github.com/jprupp/haskoin-store#readme
 bug-reports: https://github.com/jprupp/haskoin-store/issues
 tested-with: GHC == 9.12.4
+extra-source-files:
+  - src/Haskoin/Store/Cache/lua/*.lua
+  - stress/wrk.lua
 extra-doc-files:
   - README.md
   - CHANGELOG.md
@@ -41,6 +44,7 @@ dependencies:
   - containers ^>= 0.7
   - data-default ^>= 0.8.0.2
   - deepseq ^>= 1.5.1.0
+  - file-embed ^>= 0.0.16.0
   - hashable ^>= 1.5.1.0
   - hashtables ^>= 1.4.2
   - haskoin-store-data ^>= 1.9
@@ -71,6 +75,8 @@ dependencies:
   - websockets ^>= 0.13.0.0
   - wreq ^>= 0.5.4.5
   - lens ^>= 5.3.6
+# hpack writes these on one line of haskoin-store.cabal, which is generated
+# and so may have lines of 120 columns or more.
 ghc-options:
 - -Wall
 - -Wcompat

@@ -118,8 +118,10 @@ def main():
     if gen_end:
         w(f"| Transactions per second | {fmt(summary.get('transactions_sent', 0) / gen_end)} |")
     if rounds:
-        w(f"| Median milliseconds to sign a block of them | {fmt(statistics.median(x['sign_ms'] for x in rounds))} |")
-        w(f"| Median milliseconds for the node to accept them | {fmt(statistics.median(x['submit_ms'] for x in rounds))} |")
+        sign = statistics.median(x["sign_ms"] for x in rounds)
+        submit = statistics.median(x["submit_ms"] for x in rounds)
+        w(f"| Median milliseconds to sign a block of them | {fmt(sign)} |")
+        w(f"| Median milliseconds for the node to accept them | {fmt(submit)} |")
     w(f"| Seconds for the server to catch up at the end | {fmt(summary.get('catch_up_seconds'))} |")
     w("")
 
@@ -176,8 +178,18 @@ def main():
         "number of transactions of the xpubs; the lag is how many blocks the "
         "server was behind the node.\n"
     )
-    w("| Seconds | Reloads | Mean reload ms | Longest reload ms | Most blocks behind | Server CPU % | Server MiB | Valkey MiB |")
-    w("|---|---|---|---|---|---|---|---|")
+    columns = [
+        "Seconds",
+        "Reloads",
+        "Mean reload ms",
+        "Longest reload ms",
+        "Most blocks behind",
+        "Server CPU %",
+        "Server MiB",
+        "Valkey MiB",
+    ]
+    w("| " + " | ".join(columns) + " |")
+    w("|" + "---|" * len(columns))
     series = {"reloads": [], "mean": [], "lag": [], "cpu": []}
     for g in groups:
         if not g:

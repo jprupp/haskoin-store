@@ -101,7 +101,9 @@ spec = do
       property $ \(Positive n) ->
         forAll (vectorOf (n `mod` 20) (choose (0, 70000))) $ \is ->
           let h = TxHash (sha256 ("tx" :: C8.ByteString))
-              us = [Unspent {block = BlockRef 7 1, outpoint = OutPoint h i, value = 1, script = "", address = Nothing} | i <- nub is]
+              unspent i =
+                Unspent {block = BlockRef 7 1, outpoint = OutPoint h i, value = 1, script = "", address = Nothing}
+              us = map unspent (nub is)
            in map (.outpoint) (sortOn (Down . unspentKey) us) === map (.outpoint) (sortOn (encode . (.outpoint)) us)
   describe "joinDescStreams with txRefKey" $ do
     it "merges without duplicates mempool transactions of the same second" $

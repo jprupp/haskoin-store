@@ -157,7 +157,9 @@ xpubAddr :: Ctx -> KeyIndex -> KeyIndex -> Address
 xpubAddr ctx m i = fst (deriveAddr ctx (pubSubKey ctx (benchXPub ctx) m) i)
 
 hotAddr :: Ctx -> Address
-hotAddr ctx = pubKeyAddr ctx (derivePublicKey ctx (wrapSecKey True (fromMaybe (error "key") (secKey (B.replicate 32 0x42)))))
+hotAddr ctx = pubKeyAddr ctx (derivePublicKey ctx (wrapSecKey True key))
+  where
+    key = fromMaybe (error "key") (secKey (B.replicate 32 0x42))
 
 scriptOf :: Ctx -> Address -> ByteString
 scriptOf ctx = fromMaybe (error "script") . addressToScriptBS ctx

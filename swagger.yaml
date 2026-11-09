@@ -1,3 +1,8 @@
+# Long values, such as the hexadecimal of transactions and blocks and the
+# xpubs in the examples, are split into pieces of equal width with escaped line
+# breaks in double quotes, which join the pieces with nothing between them, so
+# that every line stays under 120 columns. An xpub used as a key is split the
+# same way, as an explicit key ("? ").
 openapi: 3.0.0
 
 servers:
@@ -183,7 +188,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -218,7 +226,10 @@ paths:
                     - coinbase: false
                       txid: 741f605735c995ab6d79814da49002f7b4eea973656e70410cbf7969ebf467fd
                       output: 0
-                      sigscript: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                      sigscript: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                 e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                 49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                 a1f2407442f7a6d39ad2"
                       sequence: 4294967294
                       pkscript: 76a9145124c4e68eed7ffc6110c2326d7d3739f55a09eb88ac
                       value: 2775188314
@@ -335,7 +346,10 @@ paths:
                     - coinbase: false
                       txid: 00f304a6089a708168cd10d5ad8abd2977c36791156a55b040117cb5a3db7fad
                       output: 1
-                      sigscript: 4730440220362587be41ff4ca25ef097b6c4229b031c26420f53143560fc8bf24f65418dac022034b0c97cef1ff51460346daca727f926ee675e1acaf63cb092a8a39cb3b5d8f94121029832be5ec435a55cd8c09474348cf7ffdcf266ae4fc88f390bde21d9a9c60d09
+                      sigscript: "4730440220362587be41ff4ca25ef097b6c4229b031c26420f53143560fc8bf2\
+                                 4f65418dac022034b0c97cef1ff51460346daca727f926ee675e1acaf63cb092\
+                                 a8a39cb3b5d8f94121029832be5ec435a55cd8c09474348cf7ffdcf266ae4fc8\
+                                 8f390bde21d9a9c60d09"
                       sequence: 4294967294
                       pkscript: 76a9143ea707954f63a225fe4630701df0924c9e835a3488ac
                       value: 2259981628
@@ -370,7 +384,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -405,7 +422,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -440,7 +460,10 @@ paths:
                     - coinbase: false
                       txid: 741f605735c995ab6d79814da49002f7b4eea973656e70410cbf7969ebf467fd
                       output: 0
-                      sigscript: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                      sigscript: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                 e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                 49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                 a1f2407442f7a6d39ad2"
                       sequence: 4294967294
                       pkscript: 76a9145124c4e68eed7ffc6110c2326d7d3739f55a09eb88ac
                       value: 2775188314
@@ -789,7 +812,13 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 010000006f187fddd5e28aa1b4065daa5d9eae0c487094fb20cf97ca02b81c84000000005b7b25b51797f83192f9fd2c3871bfb27570a7d6b56d3a50760613d1a2fc1aeeab346849ffff001d36d950710101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0120ffffffff0100f2052a0100000043410408ab2f56361f83064e4ce51acc291fb57c2cbcdb1d6562f6278c43a1406b548fd6cefc11bcc29eb620d5861cb9ed69dc39f2422f54b06a8af4f78c8276cfdc6bac00000000
+                    example: "010000006f187fddd5e28aa1b4065daa5d9eae0c487094fb20cf97ca02b81c84\
+                             000000005b7b25b51797f83192f9fd2c3871bfb27570a7d6b56d3a50760613d1\
+                             a2fc1aeeab346849ffff001d36d9507101010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                             0120ffffffff0100f2052a0100000043410408ab2f56361f83064e4ce51acc29\
+                             1fb57c2cbcdb1d6562f6278c43a1406b548fd6cefc11bcc29eb620d5861cb9ed\
+                             69dc39f2422f54b06a8af4f78c8276cfdc6bac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -937,7 +966,36 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac4247e9f337221b4d4c86041b0f2b57100401000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08044c86041b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac000000000100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac000000000100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac0000000001000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f00000000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000
+                    example: "0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200\
+                             000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac\
+                             4247e9f337221b4d4c86041b0f2b571004010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff08044c86041b\
+                             020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79\
+                             a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d08\
+                             7fedf9ce467cb9f7c6287078f801df276fdf84ac000000000100000001032e38\
+                             e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000\
+                             008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57d\
+                             a93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1\
+                             ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6c\
+                             a164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f\
+                             25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c3\
+                             98efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a9\
+                             14948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac000000000100000001\
+                             c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf\
+                             010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27\
+                             942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe21\
+                             9a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d\
+                             9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b9\
+                             0da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914\
+                             b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976\
+                             a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac0000000001000000\
+                             010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51\
+                             f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd97\
+                             7500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb46\
+                             5f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336\
+                             185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d4\
+                             2fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f000000000019\
+                             76a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1072,7 +1130,13 @@ paths:
                 type: array
                 items:
                   type: string
-                  example: 01000000eb68047fb29d78480b567ef6b76be556a2ec975656424508cc1c69b700000000bad58718fc3c6f5474918f06c44400c70b4c86d55a3f3ca3493b1d40c2061f2ba00f6b49ffff001d064b3a6d0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0138ffffffff0100f2052a010000004341045e071dedd1ed03721c6e9bba28fc276795421a378637fb41090192bb9f208630dcbac5862a3baeb9df3ca6e4e256b7fd2404824c20198ca1b004ee2197866433ac00000000
+                  example: "01000000eb68047fb29d78480b567ef6b76be556a2ec975656424508cc1c69b7\
+                           00000000bad58718fc3c6f5474918f06c44400c70b4c86d55a3f3ca3493b1d40\
+                           c2061f2ba00f6b49ffff001d064b3a6d01010000000100000000000000000000\
+                           00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                           0138ffffffff0100f2052a010000004341045e071dedd1ed03721c6e9bba28fc\
+                           276795421a378637fb41090192bb9f208630dcbac5862a3baeb9df3ca6e4e256\
+                           b7fd2404824c20198ca1b004ee2197866433ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1151,7 +1215,15 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000
+                    example: "0100000000000000000000000000000000000000000000000000000000000000\
+                             000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
+                             4b1e5e4a29ab5f49ffff001d1dac2b7c01010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff4d04ffff001d\
+                             0104455468652054696d65732030332f4a616e2f32303039204368616e63656c\
+                             6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f75742066\
+                             6f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe554827\
+                             1967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4\
+                             f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1230,7 +1302,13 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 01000000456cd9f21d82d8ad7c72c36f6f0dee1208151118fce2ab161b26e3d700000000ae40981d242770153f1eaa23101d19134cf53fa0a76883d7fd028fd0e4b7cb3209216b49ffff001d79f07f070101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d010effffffff0100f2052a01000000434104bc184a82d824a8ff59576e8b6843767407e4f35edb5ad725460764a30ddf91479fd0eb1b0c2b4371a06b3fdae3453262fcf3358afafe3dbebccf2fdefcd0853cac00000000
+                    example: "01000000456cd9f21d82d8ad7c72c36f6f0dee1208151118fce2ab161b26e3d7\
+                             00000000ae40981d242770153f1eaa23101d19134cf53fa0a76883d7fd028fd0\
+                             e4b7cb3209216b49ffff001d79f07f0701010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                             010effffffff0100f2052a01000000434104bc184a82d824a8ff59576e8b6843\
+                             767407e4f35edb5ad725460764a30ddf91479fd0eb1b0c2b4371a06b3fdae345\
+                             3262fcf3358afafe3dbebccf2fdefcd0853cac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1347,7 +1425,10 @@ paths:
                   - coinbase: false
                     txid: 02ea64dfff60b1f215282bbb4b2d729fecc50d81d2d0ef09a60d550a5a69418f
                     output: 1
-                    sigscript: 41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                    sigscript: "41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66\
+                               cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8\
+                               a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                               b8c6ba8f"
                     sequence: 0
                     pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                     value: 8985694
@@ -1401,7 +1482,13 @@ paths:
             application/json:
               schema:
                 type: string
-                example: 02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
+                example: "02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160\
+                         ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af62\
+                         6fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813\
+                         dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a452\
+                         4a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7\
+                         f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a9\
+                         14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1478,7 +1565,10 @@ paths:
                     - coinbase: false
                       txid: a7319f9118f2dc743a17476e668b83f61e9ee5252cb0417baf0bea41ddd95ba6
                       output: 1
-                      sigscript: 41f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                      sigscript: "41f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb3\
+                                 1cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750\
+                                 c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                                 b8c6ba8f"
                       sequence: 0
                       pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                       value: 8987143
@@ -1513,7 +1603,10 @@ paths:
                     - coinbase: false
                       txid: 02ea64dfff60b1f215282bbb4b2d729fecc50d81d2d0ef09a60d550a5a69418f
                       output: 1
-                      sigscript: 41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                      sigscript: "41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66\
+                                 cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8\
+                                 a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                                 b8c6ba8f"
                       sequence: 0
                       pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                       value: 8985694
@@ -1566,7 +1659,13 @@ paths:
             schema:
               type: string
               description: Hex-encoded Bitcoin protocol transaction.
-              example: 0200000001bd7d375bfc0a4ac4246ccefba4df1c635e5627b607bdc4af22282ecd5869d8f9010000006441f92d192c9e33b8184c58b88eb11f57a1eb5b5a2b0e72b326864021d9e946cd2a5275efcf385fbc0d9e7c8a76f9189d624efc00ff74657a52e47efc6ffa0bfe3b412102a20b2f9bd8b475252ad054fdedb49045bd40c8926b65f64e312dd821b243a37c000000000211180000000000001976a9143404e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a91486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000
+              example: "0200000001bd7d375bfc0a4ac4246ccefba4df1c635e5627b607bdc4af22282e\
+                       cd5869d8f9010000006441f92d192c9e33b8184c58b88eb11f57a1eb5b5a2b0e\
+                       72b326864021d9e946cd2a5275efcf385fbc0d9e7c8a76f9189d624efc00ff74\
+                       657a52e47efc6ffa0bfe3b412102a20b2f9bd8b475252ad054fdedb49045bd40\
+                       c8926b65f64e312dd821b243a37c000000000211180000000000001976a91434\
+                       04e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a9\
+                       1486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000"
           application/octet-stream:
             schema:
               type: string
@@ -1640,7 +1739,9 @@ paths:
                       witness: []
                   outputs:
                     - address: null
-                      pkscript: 41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac
+                      pkscript: "41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd74575\
+                                16c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276f\
+                                df84ac"
                       value: 5000000000
                       spent: true
                       spender:
@@ -1662,7 +1763,11 @@ paths:
                     - coinbase: false
                       txid: 87a157f3fd88ac7907c05fc55e271dc4acdc5605d187d646604ca8c0e9382e03
                       output: 0
-                      sigscript: 493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3
+                      sigscript: "493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b\
+                                 58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc\
+                                 6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164\
+                                 593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f8\
+                                 7c161bc6f8a630121df2b3d3"
                       sequence: 4294967295
                       pkscript: 76a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac
                       value: 5000000000
@@ -1699,7 +1804,11 @@ paths:
                     - coinbase: false
                       txid: cf4e2978d0611ce46592e02d7e7daf8627a316ab69759a9f3df109a7f2bf3ec3
                       output: 1
-                      sigscript: 4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850f
+                      sigscript: "4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a32\
+                                 31e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b8426\
+                                 9eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff154568\
+                                 39e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee3\
+                                 9560639db462e9cb850f"
                       sequence: 4294967295
                       pkscript: 76a91435fbee6a3bf8d99f17724ec54787567393a8a6b188ac
                       value: 300000000
@@ -1736,7 +1845,11 @@ paths:
                     - coinbase: false
                       txid: f4515fed3dc4a19b90a317b9840c243bac26114cf637522373a7d486b372600b
                       output: 0
-                      sigscript: 493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbb
+                      sigscript: "493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b\
+                                 6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e\
+                                 2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c\
+                                 41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3\
+                                 e063ce6af4cfaaea4ea14fbb"
                       sequence: 4294967295
                       pkscript: 76a914c4eb47ecfdcf609a1848ee79acc2fa49d3caad7088ac
                       value: 1000000
@@ -1789,10 +1902,37 @@ paths:
                 items:
                   type: string
               example:
-                - 01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08044c86041b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac00000000
-                - 0100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac00000000
-                - 0100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac00000000
-                - 01000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f00000000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000
+                - "0100000001000000000000000000000000000000000000000000000000000000\
+                  0000000000ffffffff08044c86041b020602ffffffff0100f2052a0100000043\
+                  41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd74575\
+                  16c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276f\
+                  df84ac00000000"
+                - "0100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88\
+                  fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c2092\
+                  75ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33e\
+                  e7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d\
+                  64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331\
+                  586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e3232100\
+                  0000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe2\
+                  08010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac00\
+                  000000"
+                - "0100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61\
+                  d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8\
+                  de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc\
+                  3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a3\
+                  5bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd34\
+                  1c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000\
+                  001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d21100\
+                  0000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac000000\
+                  00"
+                - "01000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c4\
+                  3ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3\
+                  c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd\
+                  574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01e\
+                  c7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c2\
+                  4dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f0000\
+                  0000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac000000\
+                  00"
             application/octet-stream:
               schema:
                 type: string
@@ -1824,8 +1964,20 @@ paths:
                 items:
                   type: string
               example:
-                - 02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
-                - 0200000001a65bd9dd41ea0baf7b41b02c25e59e1ef6838b666e47173a74dcf218919f31a7010000006441f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002cf0400000000000017a914d1b0b139593754efcaab5ad20d13dd3be82e5bfe875e1c8900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
+                - "02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160\
+                  ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af62\
+                  6fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813\
+                  dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a452\
+                  4a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7\
+                  f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a9\
+                  14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
+                - "0200000001a65bd9dd41ea0baf7b41b02c25e59e1ef6838b666e47173a74dcf2\
+                  18919f31a7010000006441f1489e83baad016eb63e3ebfe6bda264652fa18887\
+                  7e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f\
+                  53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a452\
+                  4a8d8182b6de761f6af3b8c6ba8f0000000002cf0400000000000017a914d1b0\
+                  b139593754efcaab5ad20d13dd3be82e5bfe875e1c8900000000001976a914dd\
+                  1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -2042,7 +2194,10 @@ paths:
                     - coinbase: false
                       txid: ae3fc465a80264f45fa6f865ede43017d9826560299b6fb344d5cde84416b931
                       output: 1
-                      sigscript: 473044022073b48b298df7ffb4ed5bb54ae939968e82fa966bc92d61728c8f7e6e6d914e1b022042164959fdbbd3cda2cdaf541a2143be79f4be85144bfef7906223c8a8cb2b2a4121029c71d9b4b94e8aa48072d1affba3432560d3e79648491d4b6351d3ddff51aa8f
+                      sigscript: "473044022073b48b298df7ffb4ed5bb54ae939968e82fa966bc92d61728c8f7e\
+                                 6e6d914e1b022042164959fdbbd3cda2cdaf541a2143be79f4be85144bfef790\
+                                 6223c8a8cb2b2a4121029c71d9b4b94e8aa48072d1affba3432560d3e7964849\
+                                 1d4b6351d3ddff51aa8f"
                       sequence: 4294967295
                       pkscript: 76a91474e607acf5ecdef5f9746ffa280744413a595cdb88ac
                       value: 70000
@@ -2051,7 +2206,10 @@ paths:
                     - coinbase: false
                       txid: 6fc0394cea4f5f82fe8f332118a9079469336be53bc73975e9d58a99fbbc7ca2
                       output: 1
-                      sigscript: 47304402204dc38ccbb6b3f6dcf496b7405bfc3f1942c3834197a32af9e07e6a1f2d916c9502203a9f536951cb672b76111ec58cca35971c06af2bfaa481bd1aee67a03428e78341210250dce9058b388bbc4014d3600770b9bb59b7636a2eef591797d9572014065c94
+                      sigscript: "47304402204dc38ccbb6b3f6dcf496b7405bfc3f1942c3834197a32af9e07e6a\
+                                 1f2d916c9502203a9f536951cb672b76111ec58cca35971c06af2bfaa481bd1a\
+                                 ee67a03428e78341210250dce9058b388bbc4014d3600770b9bb59b7636a2eef\
+                                 591797d9572014065c94"
                       sequence: 4294967295
                       pkscript: 76a91473cdab4b3e2486f7cbe618845f106109e5920aa588ac
                       value: 546
@@ -2091,7 +2249,10 @@ paths:
                     - coinbase: false
                       txid: 26ce9896f0f64349670735bdc30fb42adadac61348e403e78c5f92c3fb697355
                       output: 0
-                      sigscript: 483045022100b8feba7bfc7a0809c616694237bd5e82f6f3a5fafbe0bad0366879732fa829bc02203dce83fe508b86a1449c404756c274e11ea47decc4f8802cfd2ab7e92ed7b51b41210388e0b3a8e3aa50414ac8c03ae02ac1c9931d901ad7b6c1b7b83d50554fb592d8
+                      sigscript: "483045022100b8feba7bfc7a0809c616694237bd5e82f6f3a5fafbe0bad03668\
+                                 79732fa829bc02203dce83fe508b86a1449c404756c274e11ea47decc4f8802c\
+                                 fd2ab7e92ed7b51b41210388e0b3a8e3aa50414ac8c03ae02ac1c9931d901ad7\
+                                 b6c1b7b83d50554fb592d8"
                       sequence: 4294967295
                       pkscript: 76a914c58a0c635b60d94498c416d32d4a2c15b36f8a2388ac
                       value: 40537
@@ -2100,7 +2261,10 @@ paths:
                     - coinbase: false
                       txid: 41a422e6c003596954f07eb5021d9a2d6951da297dd519a5de3885772ac60e7c
                       output: 1
-                      sigscript: 483045022100ad61cb3b0f08af0ada0ebb5be16213377fa193c9da16e4dca58a9350724106330220089ac5eea5193f0926a483668eef219c7add5fa7d2be99a63e41da985fc104a241210223dc345218b6feb1815f0f103bc30a8508e3e248c4f9b4bfdfed1d4498f879b4
+                      sigscript: "483045022100ad61cb3b0f08af0ada0ebb5be16213377fa193c9da16e4dca58a\
+                                 9350724106330220089ac5eea5193f0926a483668eef219c7add5fa7d2be99a6\
+                                 3e41da985fc104a241210223dc345218b6feb1815f0f103bc30a8508e3e248c4\
+                                 f9b4bfdfed1d4498f879b4"
                       sequence: 4294967295
                       pkscript: 76a9145590a6b61c7d22a199692ce9c55cef294acebbeb88ac
                       value: 40000
@@ -2109,7 +2273,10 @@ paths:
                     - coinbase: false
                       txid: de01f52644b2610d491d28ce474382c57655f102974526a3fba6b5a48f8ea812
                       output: 0
-                      sigscript: 483045022100d29b0dd38462a33eac65eb8df53ba2b2905bac923057f5b37e2094f1a6072355022017480d0f2eedaa5f3ff2ca620a7b5b9301292524dfcaaa9c97859ee074f92b6e412102db25e4df201e02e95f167f63e06c55febe81fd07133fb09f65b07a356aa645ec
+                      sigscript: "483045022100d29b0dd38462a33eac65eb8df53ba2b2905bac923057f5b37e20\
+                                 94f1a6072355022017480d0f2eedaa5f3ff2ca620a7b5b9301292524dfcaaa9c\
+                                 97859ee074f92b6e412102db25e4df201e02e95f167f63e06c55febe81fd0713\
+                                 3fb09f65b07a356aa645ec"
                       sequence: 4294967295
                       pkscript: 76a91457725700f16eda53d75608972ff322dd05642a8f88ac
                       value: 3000
@@ -2118,7 +2285,10 @@ paths:
                     - coinbase: false
                       txid: de01f52644b2610d491d28ce474382c57655f102974526a3fba6b5a48f8ea812
                       output: 1
-                      sigscript: 4830450221008ee0107bfc71e063ff8d5ab98f83bb63f17bda387d049b2c9e7ff885941a3859022015baabbc9280c70a19a6047f1028f261f5686b8342273316b4e2d703ab72d6264121027b884db5a796d7f96412a2efbf5961ef824323c8b064e375c3e0dd512c6a010a
+                      sigscript: "4830450221008ee0107bfc71e063ff8d5ab98f83bb63f17bda387d049b2c9e7f\
+                                 f885941a3859022015baabbc9280c70a19a6047f1028f261f5686b8342273316\
+                                 b4e2d703ab72d6264121027b884db5a796d7f96412a2efbf5961ef824323c8b0\
+                                 64e375c3e0dd512c6a010a"
                       sequence: 4294967295
                       pkscript: 76a9145f8e761ff252d3349c32e6bc12a5e11ba20aa3f188ac
                       value: 4130
@@ -2127,7 +2297,10 @@ paths:
                     - coinbase: false
                       txid: b0fddc9d29b86c695af3dd66b1834256c362698532585a597de9c800f04fde06
                       output: 401
-                      sigscript: 473044022034251190cae8ba9197f81756778d5fbf071e63bb7460386fbb36cd74d47560a9022050a1cfec6076b8e7f23cd6e843b64cb2582476fd4b44fadb387803ed9ad4f1e54121037779735684011f62563197944da9f9e074b17813c0c62e79aeac7d875f9b8bf2
+                      sigscript: "473044022034251190cae8ba9197f81756778d5fbf071e63bb7460386fbb36cd\
+                                 74d47560a9022050a1cfec6076b8e7f23cd6e843b64cb2582476fd4b44fadb38\
+                                 7803ed9ad4f1e54121037779735684011f62563197944da9f9e074b17813c0c6\
+                                 2e79aeac7d875f9b8bf2"
                       sequence: 4294967295
                       pkscript: 76a91475dcf340cbb686b30bdaf6a2c8f8c68dadf93a5a88ac
                       value: 546
@@ -2169,7 +2342,10 @@ paths:
                     - coinbase: false
                       txid: 41a422e6c003596954f07eb5021d9a2d6951da297dd519a5de3885772ac60e7c
                       output: 0
-                      sigscript: 473044022029a10619e7e98a3e7cb17821ab0725ef25b700a9b943965c8762ee3b4e19546202200be34da0f640cd3209e5f11a3b1824409df92cae6a0efd8449d8e22faaae7865412103b3a86c342fd06c33e94dcbe2565fc3d9d6c4c081caa0f1ec42bb45bbbbaf2e43
+                      sigscript: "473044022029a10619e7e98a3e7cb17821ab0725ef25b700a9b943965c8762ee\
+                                 3b4e19546202200be34da0f640cd3209e5f11a3b1824409df92cae6a0efd8449\
+                                 d8e22faaae7865412103b3a86c342fd06c33e94dcbe2565fc3d9d6c4c081caa0\
+                                 f1ec42bb45bbbbaf2e43"
                       sequence: 4294967295
                       pkscript: 76a9144abb2deefe6ca46c695132adafd70f72d50cab2688ac
                       value: 7805
@@ -2178,7 +2354,10 @@ paths:
                     - coinbase: false
                       txid: 9a396103f3656b4e119f166610d7e41e24c01a5c45200a8fcb58d3b79fb0dcaf
                       output: 315
-                      sigscript: 4730440220271872d09da2cc13b764b5bf13cc373da53d89421e0d31ac33a73420c5e6a03902206e01bf837db72fa4340428e3d061685cc49ec156a65e4b48babcfd5d6c89018f4121033da5e50b4615d790b9b755cf5db213b0d08d489587d8946a7dfd1b8dc76a1829
+                      sigscript: "4730440220271872d09da2cc13b764b5bf13cc373da53d89421e0d31ac33a734\
+                                 20c5e6a03902206e01bf837db72fa4340428e3d061685cc49ec156a65e4b48ba\
+                                 bcfd5d6c89018f4121033da5e50b4615d790b9b755cf5db213b0d08d489587d8\
+                                 946a7dfd1b8dc76a1829"
                       sequence: 4294967295
                       pkscript: 76a914485103c1b046fe0f3ca0ed9ced338b53437c0c8288ac
                       value: 546
@@ -2426,7 +2605,9 @@ paths:
                 additionalProperties:
                   $ref: '#/components/schemas/BinfoShortBalance'
               example:
-                xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ:
+                ? "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                  ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
+                :
                   final_balance: 84994
                   n_tx: 123
                   total_received: 137003577
@@ -2456,7 +2637,9 @@ paths:
                 additionalProperties:
                   $ref: '#/components/schemas/BinfoShortBalance'
               example:
-                xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ:
+                ? "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                  ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
+                :
                   final_balance: 84994
                   n_tx: 123
                   total_received: 137003577
@@ -2512,7 +2695,10 @@ paths:
                     inputs:
                       - sequence: 4294967294
                         witness: ""
-                        script: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                        script: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                4c07b9f8c3d04327794c"
                         index: 0
                         prev_out:
                           spent: true
@@ -2563,7 +2749,10 @@ paths:
                     inputs:
                       - sequence: 4294967294
                         witness: ""
-                        script: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                        script: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                a1f2407442f7a6d39ad2"
                         index: 0
                         prev_out:
                           spent: true
@@ -2643,7 +2832,10 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 473044022027aaf94096c0b4c3e0a8405078db67f3c8680b0e1def70c5dac307cd0f4f6c4b022079ce8b9dbf26f9114a9a16575b478214294274d4158672ffaa758c8904aff91b4121031b3c18ce8efcf9a1ce214cb5c62489e842663b47908b43f3af789d840af71efb
+                        script: "473044022027aaf94096c0b4c3e0a8405078db67f3c8680b0e1def70c5dac307\
+                                cd0f4f6c4b022079ce8b9dbf26f9114a9a16575b478214294274d4158672ffaa\
+                                758c8904aff91b4121031b3c18ce8efcf9a1ce214cb5c62489e842663b47908b\
+                                43f3af789d840af71efb"
                         index: 0
                         prev_out:
                           spent: true
@@ -2690,7 +2882,10 @@ paths:
                     inputs:
                       - sequence: 0
                         witness: ""
-                        script: 41c49770d0b68eb9d4552a45d3ce23ab7dc84ecded730f76903b9a4ff948ace292ba282b63ea1fa3a4203f79edffc8d00b7ef68be4a42bc530be9e9c9a6a0d2cd4412102ed4717b0f0ae1fd42423d8fa2c9ae36783bc53f7acd8839f68dc5ad58a9cf8b2
+                        script: "41c49770d0b68eb9d4552a45d3ce23ab7dc84ecded730f76903b9a4ff948ace2\
+                                92ba282b63ea1fa3a4203f79edffc8d00b7ef68be4a42bc530be9e9c9a6a0d2c\
+                                d4412102ed4717b0f0ae1fd42423d8fa2c9ae36783bc53f7acd8839f68dc5ad5\
+                                8a9cf8b2"
                         index: 0
                         prev_out:
                           spent: true
@@ -2772,7 +2967,8 @@ paths:
                 $ref: '#/components/schemas/BinfoMultiAddr'
               example:
                 addresses:
-                  - address: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                  - address: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                     change_index: 28
                     account_index: 74
                     final_balance: 84994
@@ -2803,14 +2999,18 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 47304402200e85d6f05cf9675f60382fda3e245695e12bb478128c701447e8b85d0321921d02200a8624652009ce2413718d748194ab020aef2945721c9a29e859de034a00291841210266490eabd32e0a0eb4de6089590e6dbf5bd8b5411a3ec4b78cf40091e7200c23
+                        script: "47304402200e85d6f05cf9675f60382fda3e245695e12bb478128c701447e8b8\
+                                5d0321921d02200a8624652009ce2413718d748194ab020aef2945721c9a29e8\
+                                59de034a00291841210266490eabd32e0a0eb4de6089590e6dbf5bd8b5411a3e\
+                                c4b78cf40091e7200c23"
                         index: 0
                         prev_out:
                           spent: true
                           script: 76a91437be7ac52f6f08899051efe89f228c14a171bb2588ac
                           xpub:
                             path: M/0/66
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 2c7316f0b66bf4c5a2078cdaacd679d96c2249a32736ea7d3ce36af8b6a215c0
                               n: 0
@@ -2821,7 +3021,10 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 473044022030ade2f8405e47001dfe816fb2047cb4f6beff185c942e325d7b3070dca66622022001c0bb027e88d3ea2fce18c47553461dd063a0a26aa0f69252dcce8e26fe8cbc41210269115d4edff9823c494195a0e3a9497d868c61c43c76c37f851e28655d4fad60
+                        script: "473044022030ade2f8405e47001dfe816fb2047cb4f6beff185c942e325d7b30\
+                                70dca66622022001c0bb027e88d3ea2fce18c47553461dd063a0a26aa0f69252\
+                                dcce8e26fe8cbc41210269115d4edff9823c494195a0e3a9497d868c61c43c76\
+                                c37f851e28655d4fad60"
                         index: 1
                         prev_out:
                           spent: true
@@ -2847,7 +3050,8 @@ paths:
                         addr: bitcoincash:qp70y7gsc24raphf6604hwxupanh5r5rlvh3jvjjan
                         xpub:
                           path: M/0/68
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: true
                         value: 15840
@@ -2860,7 +3064,8 @@ paths:
                         addr: bitcoincash:qpthgd2875vw784lj28qqegrvgc0y3ngqga8fpcy8k
                         xpub:
                           path: M/1/22
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: false
                         value: 546
@@ -2888,14 +3093,18 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100a3d05e493ed722b9c9519ea77d2d3c139d70bb117497d8e517fb8b5b196ceeaf0220608a93847c452c461ad841eabccc75e065c310e8ae93ad6e60953e6c089a297c412103b4c6da6474554411af1f6ed8deeeafab9848bc6bfc6cb716f135e7dd674f7a26
+                        script: "483045022100a3d05e493ed722b9c9519ea77d2d3c139d70bb117497d8e517fb\
+                                8b5b196ceeaf0220608a93847c452c461ad841eabccc75e065c310e8ae93ad6e\
+                                60953e6c089a297c412103b4c6da6474554411af1f6ed8deeeafab9848bc6bfc\
+                                6cb716f135e7dd674f7a26"
                         index: 0
                         prev_out:
                           spent: true
                           script: 76a9141369d9bd3ea79896797c4143c97e9748cc06262d88ac
                           xpub:
                             path: M/0/65
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 0
@@ -2906,14 +3115,18 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100b2e36d340c3ba421f762ce1e4adde0a8c7cf550aa30022a4add6ac1003ea1a7d02200cd9d8ccba03a33eccd6f4108189962067597d25d969b9f3ab019212a0bb6824412102e14eaaa6cec9deefe5983dec61bbb2c9fc82dbbc124d395d97d26494864f30ec
+                        script: "483045022100b2e36d340c3ba421f762ce1e4adde0a8c7cf550aa30022a4add6\
+                                ac1003ea1a7d02200cd9d8ccba03a33eccd6f4108189962067597d25d969b9f3\
+                                ab019212a0bb6824412102e14eaaa6cec9deefe5983dec61bbb2c9fc82dbbc12\
+                                4d395d97d26494864f30ec"
                         index: 1
                         prev_out:
                           spent: true
                           script: 76a9148ecd9c021c8650db874940103f1f77e6da14d88e88ac
                           xpub:
                             path: M/1/19
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 1
@@ -2924,14 +3137,18 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100ff406af352e0680f20c3efcf8a7915ee8c2f1322073fce5736cdc7d264576ad00220637cec6bd985f68395bc5a29e7c15fd8a5b74dafd169c2aed86e453c91eb196a4121025b8a5938fad2f4e6cc7d7a32dd2b6a206a0082e2c6ecdd5ab5a15e855e1a2ff3
+                        script: "483045022100ff406af352e0680f20c3efcf8a7915ee8c2f1322073fce5736cd\
+                                c7d264576ad00220637cec6bd985f68395bc5a29e7c15fd8a5b74dafd169c2ae\
+                                d86e453c91eb196a4121025b8a5938fad2f4e6cc7d7a32dd2b6a206a0082e2c6\
+                                ecdd5ab5a15e855e1a2ff3"
                         index: 2
                         prev_out:
                           spent: true
                           script: 76a914bcd2b9001eea656e1a69f280cdc8dd86dbc8bf9288ac
                           xpub:
                             path: M/1/20
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 2
@@ -2942,7 +3159,10 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 4730440220445da9cea01832fbb4882b8aeb12189a91f32c9e0eec42c2b8ab0f5af40c38de02202378f8f3e774c3515e7082460c34faf5631dbadc0fff0720849aabcc70b41dc44121028c8ec4b2d812141f34ecc23ed6b533ee1c36e165461905dae99595072529957e
+                        script: "4730440220445da9cea01832fbb4882b8aeb12189a91f32c9e0eec42c2b8ab0f\
+                                5af40c38de02202378f8f3e774c3515e7082460c34faf5631dbadc0fff072084\
+                                9aabcc70b41dc44121028c8ec4b2d812141f34ecc23ed6b533ee1c36e1654619\
+                                05dae99595072529957e"
                         index: 3
                         prev_out:
                           spent: true
@@ -2968,7 +3188,8 @@ paths:
                         addr: bitcoincash:qzlqxg40wp06qng92psxmmjzrklu9rtanyazwxtjqa
                         xpub:
                           path: M/1/21
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: true
                         value: 70000
@@ -2981,7 +3202,8 @@ paths:
                         addr: bitcoincash:qrjnhz7f6q32ajcvm5hnawr5km2k8eea3u5mcg7n9s
                         xpub:
                           path: M/0/67
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: false
                         value: 546
@@ -3087,12 +3309,20 @@ paths:
                             n: 24
                         n: 0
                         tx_index: 3395786307389866
-                        script: 4104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c0c9dac
+                        script: "4104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835\
+                                d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c\
+                                0c9dac"
                         addr: bitcoincash:qr52xkse9lqlpmfuzlx2lshmx4qnchljns9fmxxydw
             application/text:
               schema:
                 type: string
-                example: 010000008e0fe627641104e55f51a736f19b4246ff5cf2830d82c6317b51450800000000608398e4ae4d57758ad0054900534d957e64cb8d50924e0f28e51e8a6fd6f127baa5c04b15112a1cb2787c030101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff080415112a1c02c100ffffffff0100f2052a01000000434104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c0c9dac00000000
+                example: "010000008e0fe627641104e55f51a736f19b4246ff5cf2830d82c6317b514508\
+                         00000000608398e4ae4d57758ad0054900534d957e64cb8d50924e0f28e51e8a\
+                         6fd6f127baa5c04b15112a1cb2787c0301010000000100000000000000000000\
+                         00000000000000000000000000000000000000000000ffffffff080415112a1c\
+                         02c100ffffffff0100f2052a01000000434104a9d6840fdd1497b3067b8066db\
+                         783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c3\
+                         9718f7bc7486d389cd0047f53785f9a63c0c9dac00000000"
         '404':
           description: Block not found.
           content:
@@ -4107,7 +4337,9 @@ paths:
                             spending_outpoints: []
                             n: 0
                             tx_index: 3589906961130271
-                            script: 4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac
+                            script: "4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff999\
+                                    5fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d\
+                                    8a93ac"
                             addr: bitcoincash:qqt6g6wul02yakpt05amm0hey67lhh7wagrrqxcmys
 
   '/blockchain/rawtx/{txid}':
@@ -4155,12 +4387,18 @@ paths:
                     spending_outpoints: []
                     n: 0
                     tx_index: 3589906961130271
-                    script: 4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac
+                    script: "4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff999\
+                            5fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d\
+                            8a93ac"
                     addr: bitcoincash:qqt6g6wul02yakpt05amm0hey67lhh7wagrrqxcmys
             application/text:
               schema:
                 type: string
-                example: 01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d014dffffffff0100f2052a01000000434104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac00000000
+                example: "0100000001000000000000000000000000000000000000000000000000000000\
+                         0000000000ffffffff0704ffff001d014dffffffff0100f2052a010000004341\
+                         04e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995f\
+                         c5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a\
+                         93ac00000000"
         '404':
           description: Transaction not found.
           content:
@@ -4218,7 +4456,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/0/73
                   - tx_hash_big_endian: f2ffa044fa3851c88e739ef76f13b960a828b5c1c7a71005a9315969c4924103
                     tx_hash: 034192c4695931a90510a7c7c1b528a860b9136ff79e738ec85138fa44a0fff2
@@ -4229,7 +4468,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/27
                   - tx_hash_big_endian: ae3fc465a80264f45fa6f865ede43017d9826560299b6fb344d5cde84416b931
                     tx_hash: 31b91644e8cdd544b36f9b29606582d91730e4ed65f8a65ff46402a865c43fae
@@ -4240,7 +4480,8 @@ paths:
                     confirmations: 9853
                     tx_index: 1749472394418618
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/26
         '404':
           description: Invalid argument.
@@ -4286,7 +4527,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/0/73
                   - tx_hash_big_endian: f2ffa044fa3851c88e739ef76f13b960a828b5c1c7a71005a9315969c4924103
                     tx_hash: 034192c4695931a90510a7c7c1b528a860b9136ff79e738ec85138fa44a0fff2
@@ -4297,7 +4539,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/27
         '404':
           description: Invalid argument.
@@ -5800,7 +6043,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5820,7 +6064,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5846,7 +6091,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5889,7 +6135,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -6087,7 +6334,8 @@ components:
       required: true
       schema:
         type: string
-        example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+        example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                 ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
 
     xpubDerive:
       name: derive
@@ -6125,7 +6373,8 @@ components:
       required: false
       schema:
         type: string
-        example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+        example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                 ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
       description: >
         Addresses or extended public keys.
         Separate by vertical line `|` or comma `,`.

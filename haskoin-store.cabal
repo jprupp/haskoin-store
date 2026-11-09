@@ -25,6 +25,14 @@ license-file:   LICENSE
 build-type:     Simple
 tested-with:
     GHC == 9.12.4
+extra-source-files:
+    src/Haskoin/Store/Cache/lua/commit.lua
+    src/Haskoin/Store/Cache/lua/delete.lua
+    src/Haskoin/Store/Cache/lua/evict.lua
+    src/Haskoin/Store/Cache/lua/page.lua
+    src/Haskoin/Store/Cache/lua/spends.lua
+    src/Haskoin/Store/Cache/lua/unlock.lua
+    stress/wrk.lua
 extra-doc-files:
     README.md
     CHANGELOG.md
@@ -75,6 +83,7 @@ library
     , containers ==0.7.*
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
@@ -137,6 +146,7 @@ library integration
     , containers ==0.7.*
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
@@ -196,6 +206,7 @@ executable haskoin-store
     , containers ==0.7.*
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
     , filepath >=1.5.5.0 && <1.6
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
@@ -271,6 +282,7 @@ test-suite spec
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
     , fast-logger >=3.2.9 && <3.3
+    , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
@@ -334,6 +346,7 @@ benchmark haskoin-store-bench
     , containers ==0.7.*
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
@@ -395,6 +408,7 @@ benchmark haskoin-store-stress
     , containers ==0.7.*
     , data-default >=0.8.0.2 && <0.9
     , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7

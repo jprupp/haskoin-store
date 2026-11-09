@@ -252,7 +252,11 @@ memoryReport db = do
           <> T.justifyRight 16 ' ' (num mem)
           <> T.justifyRight 16 ' ' (num readers)
   return . T.unlines $
-    ["** RocksDB memory (bytes) **", T.justifyLeft 10 ' ' "family" <> T.justifyRight 16 ' ' "memtables" <> T.justifyRight 16 ' ' "table readers"]
+    [ "** RocksDB memory (bytes) **",
+      T.justifyLeft 10 ' ' "family"
+        <> T.justifyRight 16 ' ' "memtables"
+        <> T.justifyRight 16 ' ' "table readers"
+    ]
       <> map line rows
       <> [ line ("total", Just (total (\(_, m, _) -> m)), Just (total (\(_, _, r) -> r))),
            "block cache: " <> num cache,

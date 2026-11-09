@@ -11,12 +11,13 @@
 --
 -- The tests use no third-party images. The image starts from the official
 -- Ubuntu 26.04 image, pinned by the digest of its multi-architecture index,
--- installs Valkey (the Redis-compatible server Ubuntu ships) and wrk from the Ubuntu archive at a fixed snapshot date (apt checks
--- the signatures of the archive; the certificates needed to reach the
--- snapshot service over HTTPS come from the regular archive first), and
--- downloads Bitcoin Core and Bitcoin Cash
--- Node from their official release locations, checking each tarball against
--- a SHA-256 hash pinned here. A tarball that does not match stops the build.
+-- installs Valkey (the Redis-compatible server Ubuntu ships) and wrk from the
+-- Ubuntu archive at a fixed snapshot date (apt checks the signatures of the
+-- archive; the certificates needed to reach the snapshot service over HTTPS
+-- come from the regular archive first), and downloads Bitcoin Core and
+-- Bitcoin Cash Node from their official release locations, checking each
+-- tarball against a SHA-256 hash pinned here. A tarball that does not match
+-- stops the build.
 --
 -- The hashes were taken from the signed checksum files of each release and
 -- checked against the release signing keys of each project when they were
@@ -94,10 +95,16 @@ wrkBin = "/usr/bin/wrk"
 --
 -- Every download is its own layer, ordered from the one that changes least
 -- often: the packages of the snapshot, then Bitcoin Core, then Bitcoin Cash
--- Node, then wrk for the stress test, which came last. Podman keeps the layers it builds and reuses each one whose
--- instruction, and those before it, did not change, so moving one node to a
--- new release downloads only that release. Nothing in the image depends on
--- the time it is built.
+-- Node, then wrk for the stress test, which came last. Podman keeps the
+-- layers it builds and reuses each one whose instruction, and those before
+-- it, did not change, so moving one node to a new release downloads only
+-- that release. Nothing in the image depends on the time it is built.
+--
+-- The recipe stays here rather than in a Containerfile of its own: it is
+-- made from the versions and hashes defined in this module, and the tag of
+-- the image is a hash of it, so the tests and the stress program, which may
+-- run from any directory, need no file to find. It is written one
+-- instruction and one shell command per line.
 containerfile :: String
 containerfile =
   unlines $
@@ -110,17 +117,29 @@ containerfile =
       "RUN apt-get update --error-on=any \\",
       " && apt-get install -y --no-install-recommends ca-certificates \\",
       " && apt-get update --error-on=any --snapshot " <> snapshot <> " \\",
-      " && apt-get install -y --no-install-recommends --snapshot " <> snapshot <> " ca-certificates curl valkey-server \\",
+      " && apt-get install -y --no-install-recommends --snapshot "
+        <> snapshot
+        <> " ca-certificates curl valkey-server \\",
       " && rm -rf /var/lib/apt/lists/*"
     ]
       <> release
         "/opt/bitcoin-core"
-        ("https://bitcoincore.org/bin/bitcoin-core-" <> coreVersion <> "/bitcoin-" <> coreVersion <> "-$a-linux-gnu.tar.gz")
+        ( "https://bitcoincore.org/bin/bitcoin-core-"
+            <> coreVersion
+            <> "/bitcoin-"
+            <> coreVersion
+            <> "-$a-linux-gnu.tar.gz"
+        )
         coreAmd64
         coreArm64
       <> release
         "/opt/bitcoin-cash-node"
-        ("https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v" <> bchnVersion <> "/bitcoin-cash-node-" <> bchnVersion <> "-$a-linux-gnu.tar.gz")
+        ( "https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v"
+            <> bchnVersion
+            <> "/bitcoin-cash-node-"
+            <> bchnVersion
+            <> "-$a-linux-gnu.tar.gz"
+        )
         bchnAmd64
         bchnArm64
       <> [ "RUN apt-get update --error-on=any --snapshot " <> snapshot <> " \\",

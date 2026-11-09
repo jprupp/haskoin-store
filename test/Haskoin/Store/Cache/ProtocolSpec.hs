@@ -66,7 +66,10 @@ steps tip s o st = case st.holding of
         r = o.redis
      in case afterReload reload of
           Finish ->
-            [ ( o {writes = o.writes <> [(s, i, h)], redis = r {stamp = Just h, claims = IntMap.insert i DoneKey r.claims}},
+            [ ( o
+                  { writes = o.writes <> [(s, i, h)],
+                    redis = r {stamp = Just h, claims = IntMap.insert i DoneKey r.claims}
+                  },
                 st {holding = Nothing}
               )
             ]

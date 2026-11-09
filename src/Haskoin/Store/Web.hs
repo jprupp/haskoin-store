@@ -695,53 +695,88 @@ errStatus RequestTooLarge = status413
 -- | The routes of every endpoint, except those disabled in the configuration.
 handlePaths :: WebState -> WebConfig -> [Route]
 handlePaths st cfg =
-  [ pathCompact st (\req -> GetBlockBest <$> paramDef st req) (handleBlockBest st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetBlockHeight <$> paramCapture st req <*> paramDef st req) (fmap SerialList . handleBlockHeight st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetBlockTime <$> paramCapture st req <*> paramDef st req) (handleBlockTime st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetBlockMTP <$> paramCapture st req <*> paramDef st req) (handleBlockMTP st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetBlock <$> paramCapture st req <*> paramDef st req) (handleBlock st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetTx <$> paramCapture st req) (handleTx st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetTxRaw <$> paramCapture st req) (handleTxRaw st) toEncoding toJSON,
-    pathCompact st (\req -> PostTx <$> parseTxBody st req) (handlePostTx st) toEncoding toJSON,
-    pathCompact st (\req -> GetAddrTxs <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrTxs st) toEncoding toJSON,
-    pathCompact st (\req -> GetAddrBalance <$> paramCapture st req) (handleAddrBalance st) (marshalEncoding net) (marshalValue net),
-    pathCompact st (\req -> GetAddrUnspent <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\_ -> return GetPeers) (fmap SerialList . handlePeers st) toEncoding toJSON,
-    pathStatus st (\_ -> return GetHealth) (handleHealth st) (\h -> if isOK h then status200 else status503) toEncoding toJSON,
-    pathCompact st (\req -> GetMempool <$> paramOptional st req <*> parseOffset st req) (fmap SerialList . handleMempool st) toEncoding toJSON,
-    pathCompact st (\req -> GetBlocks <$> paramRequired st req <*> paramDef st req) (fmap SerialList . handleBlocks st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetBlockRaw <$> paramCapture st req) (handleBlockRaw st) toEncoding toJSON,
-    pathCompact st (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetBlockLatest <$> paramDef st req) (fmap SerialList . handleBlockLatest st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetBlockHeights <$> paramRequired st req <*> paramDef st req) (fmap SerialList . handleBlockHeights st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetBlockHeightRaw <$> paramCapture st req) (handleBlockHeightRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetBlockTimeRaw <$> paramCapture st req) (handleBlockTimeRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetBlockMTPRaw <$> paramCapture st req) (handleBlockMTPRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetTxs <$> paramRequired st req) (fmap SerialList . handleTxs st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetTxsRaw <$> paramRequired st req) (handleTxsRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetTxsBlock <$> paramCapture st req) (fmap SerialList . handleTxsBlock st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetTxsBlockRaw <$> paramCapture st req) (handleTxsBlockRaw st) toEncoding toJSON,
-    pathCompact st (\req -> GetTxAfter <$> paramCapture st req <*> paramCapture st req) (handleTxAfter st) toEncoding toJSON,
-    pathCompact st (\req -> GetAddrsTxs <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsTxs st) toEncoding toJSON,
-    pathCompact st (\req -> GetAddrTxsFull <$> paramCapture st req <*> parseLimits st req) (fmap SerialList . handleAddrTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetAddrsTxsFull <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetAddrsBalance <$> paramRequired st req) (fmap SerialList . handleAddrsBalance st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-    pathCompact st (\req -> GetAddrsUnspent <$> paramRequired st req <*> parseLimits st req) (fmap SerialList . handleAddrsUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
+  [ marshalled (\r -> GetBlockBest <$> dflt r) (handleBlockBest st),
+    marshalledList (\r -> GetBlockHeight <$> cap r <*> dflt r) (handleBlockHeight st),
+    marshalled (\r -> GetBlockTime <$> cap r <*> dflt r) (handleBlockTime st),
+    marshalled (\r -> GetBlockMTP <$> cap r <*> dflt r) (handleBlockMTP st),
+    marshalled (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
+    marshalled (\r -> GetTx <$> cap r) (handleTx st),
+    plain (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
+    plain (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
+    plainList (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
+    marshalled (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
+    marshalledList (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
+    plainList (\_ -> return GetPeers) (handlePeers st),
+    pathStatus st (\_ -> return GetHealth) (handleHealth st) healthStatus toEncoding toJSON,
+    plainList (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
+    marshalledList (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
+    plain (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
+    plain (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st),
+    marshalledList (\r -> GetBlockLatest <$> dflt r) (handleBlockLatest st),
+    marshalledList (\r -> GetBlockHeights <$> need r <*> dflt r) (handleBlockHeights st),
+    plain (\r -> GetBlockHeightRaw <$> cap r) (handleBlockHeightRaw st),
+    plain (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
+    plain (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
+    marshalledList (\r -> GetTxs <$> need r) (handleTxs st),
+    plain (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
+    marshalledList (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
+    plain (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
+    plain (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
+    plainList (\r -> GetAddrsTxs <$> need r <*> lim r) (handleAddrsTxs st),
+    marshalledList (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
+    marshalledList (\r -> GetAddrsTxsFull <$> need r <*> lim r) (handleAddrsTxsFull st),
+    marshalledList (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
+    marshalledList (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
     get "/events" (handleEvents st),
     get "/dbstats" (handleDbStats st)
   ]
     <> (if cfg.noXPub then [] else xpubRoutes)
     <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
   where
-    json_list f = toJSONList . map f
     net = cfg.store.net
+    healthStatus h = if isOK h then status200 else status503
+    -- the parameters of a request
+    cap, need :: (Param a) => Req -> IO a
+    cap = paramCapture st
+    need = paramRequired st
+    dflt :: (Default a, Param a) => Req -> IO a
+    dflt = paramDef st
+    opt :: (Param a) => Req -> IO (Maybe a)
+    opt = paramOptional st
+    lim = parseLimits st
+    off = parseOffset st
+    -- routes by how they encode their responses: in the JSON of the
+    -- network, as a list of those, or in plain JSON
+    marshalled ::
+      (ApiResource a b, MarshalJSON Network b) => (Req -> IO a) -> (a -> IO b) -> Route
+    marshalled p h = pathCompact st p h (marshalEncoding net) (marshalValue net)
+    marshalledList ::
+      (ApiResource a (SerialList b), MarshalJSON Network b) => (Req -> IO a) -> (a -> IO [b]) -> Route
+    marshalledList p h =
+      pathCompact
+        st
+        p
+        (fmap SerialList . h)
+        (list (marshalEncoding net) . (.get))
+        (toJSONList . map (marshalValue net) . (.get))
+    plain :: (ApiResource a b, ToJSON b) => (Req -> IO a) -> (a -> IO b) -> Route
+    plain p h = pathCompact st p h toEncoding toJSON
+    plainList ::
+      (ApiResource a (SerialList b), ToJSON b) => (Req -> IO a) -> (a -> IO [b]) -> Route
+    plainList p h = plain p (fmap SerialList . h)
     xpubRoutes =
-      [ pathCompact st (\req -> GetXPub <$> paramCapture st req <*> paramDef st req <*> paramDef st req) (handleXPub st) toEncoding toJSON,
-        pathCompact st (\req -> GetXPubTxs <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubTxs st) toEncoding toJSON,
-        pathCompact st (\req -> GetXPubTxsFull <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubTxsFull st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-        pathCompact st (\req -> GetXPubBalances <$> paramCapture st req <*> paramDef st req <*> paramDef st req) (fmap SerialList . handleXPubBalances st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-        pathCompact st (\req -> GetXPubUnspent <$> paramCapture st req <*> paramDef st req <*> parseLimits st req <*> paramDef st req) (fmap SerialList . handleXPubUnspent st) (list (marshalEncoding net) . (.get)) (json_list (marshalValue net) . (.get)),
-        pathCompact st (\req -> DelCachedXPub <$> paramCapture st req <*> paramDef st req) (handleDelXPub st) toEncoding toJSON
+      [ plain (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st),
+        plainList (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r) (handleXPubTxs st),
+        marshalledList
+          (\r -> GetXPubTxsFull <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (handleXPubTxsFull st),
+        marshalledList
+          (\r -> GetXPubBalances <$> cap r <*> dflt r <*> dflt r)
+          (handleXPubBalances st),
+        marshalledList
+          (\r -> GetXPubUnspent <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (handleXPubUnspent st),
+        plain (\r -> DelCachedXPub <$> cap r <*> dflt r) (handleDelXPub st)
       ]
     binfoRoutes =
       [ post "/blockchain/multiaddr" (handleMultiAddr st),
@@ -1038,7 +1073,8 @@ handleBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
       Nothing -> raise st ThingNotFound
       Just b -> RawResult <$> (toRawBlock st.query b)
 
--- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time past at or after a time, serialized.
+-- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time
+-- past at or after a time, serialized.
 handleBlockMTPRaw ::
   WebState ->
   GetBlockMTPRaw ->
@@ -1118,7 +1154,8 @@ handleTxsBlockRaw st (GetTxsBlockRaw h) =
 
 -- GET TransactionAfterHeight --
 
--- | Handler for @GET \/transaction\/:txid\/after\/:height@: whether any ancestor of a transaction is a coinbase confirmed after a height.
+-- | Handler for @GET \/transaction\/:txid\/after\/:height@: whether any ancestor
+-- of a transaction is a coinbase confirmed after a height.
 handleTxAfter ::
   WebState ->
   GetTxAfter ->
@@ -1251,7 +1288,8 @@ webSocketEvents s =
                   [("Content-Type", "application/json")]
               }
 
--- | Handler for @GET \/events@: stream of new blocks and mempool transactions, one per line in JSON, until the client falls more than 10000 events behind.
+-- | Handler for @GET \/events@: stream of new blocks and mempool transactions, one
+-- per line in JSON, until the client falls more than 10000 events behind.
 handleEvents :: WebState -> Req -> IO Response
 handleEvents st req =
   withGaugeIncrease st (.events) $ do
@@ -1769,7 +1807,8 @@ getBinfoAddr st req param' = do
       xpub = BinfoXpub <$> xPubImport net ctx txt
   maybe next return (addr <|> xpub)
 
--- | Handler for @GET\/POST \/blockchain\/export-history@: daily history of the balance of addresses and xpubs with prices, as Blockchain.info.
+-- | Handler for @GET\/POST \/blockchain\/export-history@: daily history of the
+-- balance of addresses and xpubs with prices, as Blockchain.info.
 handleBinfoHistory :: WebState -> Req -> IO Response
 handleBinfoHistory st req =
   withMetrics st (.binfoExportHistory) $ do
@@ -1859,7 +1898,8 @@ getPrice st req = do
 getSymbol :: WebState -> Req -> IO BinfoSymbol
 getSymbol st req = uncurry binfoTickerToSymbol <$> getPrice st req
 
--- | Handler for @GET \/blockchain\/blocks\/:milliseconds@: the blocks of the day before a time in milliseconds, as Blockchain.info.
+-- | Handler for @GET \/blockchain\/blocks\/:milliseconds@: the blocks of the day
+-- before a time in milliseconds, as Blockchain.info.
 handleBinfoBlocksDay :: WebState -> Req -> IO Response
 handleBinfoBlocksDay st req =
   withMetrics st (.binfoBlock) $ do
@@ -1879,7 +1919,8 @@ handleBinfoBlocksDay st req =
           b' <- st.query.getBlock b.header.prev
           (b :) <$> go t b'
 
--- | Handler for @GET\/POST \/blockchain\/multiaddr@: balances and transactions of addresses and xpubs, as Blockchain.info.
+-- | Handler for @GET\/POST \/blockchain\/multiaddr@: balances and transactions of
+-- addresses and xpubs, as Blockchain.info.
 handleMultiAddr :: WebState -> Req -> IO Response
 handleMultiAddr st req =
   withMetrics st (.binfoMultiaddr) $ do
@@ -2084,7 +2125,9 @@ getBinfoOffset st req = do
         "offset exceeded: " <> show o <> " > " <> show x
   return (fromIntegral o :: Int)
 
--- | Handler for @GET \/blockchain\/rawaddr\/:addr@: balance and transactions of an address or xpub, as Blockchain.info; also at @\/blockchain\/address\/:addr@ and @\/blockchain\/xpub\/:addr@.
+-- | Handler for @GET \/blockchain\/rawaddr\/:addr@: balance and transactions of an
+-- address or xpub, as Blockchain.info; also at @\/blockchain\/address\/:addr@
+-- and @\/blockchain\/xpub\/:addr@.
 handleRawAddr :: WebState -> Req -> IO Response
 handleRawAddr st req =
   withMetrics st (.binfoAddressRaw) $
@@ -2208,7 +2251,8 @@ handleBinfoAddrBalance st req =
     b <- fromMaybe (zeroBalance a) <$> st.query.getBalance a
     textResponse $ cs $ show $ b.confirmed + b.unconfirmed
 
--- | Handler for @GET \/blockchain\/q\/addressfirstseen\/:addr@: time of the first block with a transaction of an address.
+-- | Handler for @GET \/blockchain\/q\/addressfirstseen\/:addr@: time of the first
+-- block with a transaction of an address.
 handleFirstSeen :: WebState -> Req -> IO Response
 handleFirstSeen st req =
   withMetrics st (.binfoQaddressfirstseen) $ do
@@ -2544,7 +2588,8 @@ handleBinfoAddrPubkey st req =
       Nothing -> raise st ThingNotFound
       Just a -> textResponse $ TL.fromStrict a
 
--- | Handler for @GET \/blockchain\/q\/pubkeyaddr\/:addr@: public key of an address, found in a transaction input that spends from it.
+-- | Handler for @GET \/blockchain\/q\/pubkeyaddr\/:addr@: public key of an
+-- address, found in a transaction input that spends from it.
 handleBinfoPubKeyAddr :: WebState -> Req -> IO Response
 handleBinfoPubKeyAddr st req =
   withMetrics st (.binfoQpubkeyaddr) $ do

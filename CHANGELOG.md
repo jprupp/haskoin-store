@@ -99,6 +99,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   of this one; `store/` and `data/` are gone. haskoin-store depends on
   `haskoin-store-data ^>= 1.9`. The package has a full description, PVP
   upper bounds on every dependency, and no `Setup.hs`.
+- Every line of code is shorter than 120 columns, `swagger.yaml` included,
+  whose long hexadecimal and xpub examples are split into equal pieces that
+  parse to the same values. `scripts/format` formats `integration/` and
+  `stress/` too.
+- Scripts live in files of their own: the Lua scripts of the cache in
+  `src/Haskoin/Store/Cache/lua/`, embedded at compile time with
+  `file-embed`; the script of wrk in `stress/wrk.lua`, one for every
+  endpoint, given its paths on the command line; and the shell steps of CI
+  in `scripts/check-local-deps.sh` and `scripts/install-system-libraries.sh`.
+  The scripts do the same as before.
 
 ### Fixed
 
@@ -151,9 +161,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   thousands of transactions between a few wallets, and wrk on their xpubs
   all the while, with a report (`scripts/stress-report.py`) of reloads,
   lag, resources, the commands that blocked Redis (from its slow log) and
-  latencies, and a check of the cached answers at the end. The Podman helpers of the integration tests are an internal library
-  (`integration`) that the stress program shares, and the test image has
-  wrk in a layer of its own.
+  latencies, and a check of the cached answers at the end. The Podman
+  helpers of the integration tests are an internal library (`integration`)
+  that the stress program shares, and the test image has wrk in a layer of
+  its own.
 - `stress/results/2026-11-09/`: the results of a full default stress run,
   kept for comparison with later runs.
 - `runWebSocket` serves the API on a socket that already listens. The tests

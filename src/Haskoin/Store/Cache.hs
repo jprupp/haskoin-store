@@ -1,4 +1,5 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
 
 -- |
@@ -137,6 +138,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
 import Data.Either (rights)
+import Data.FileEmbed (embedFile, makeRelativeToProject)
 import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -992,8 +994,12 @@ affectedXPubs c tds = do
         HashMap.fromListWith (<>) [(a, HashSet.singleton (txHash td.tx)) | td <- tds, a <- addrsOf td]
       addrs = HashMap.keys byAddr
   ids <- run c (sequence <$> mapM (R.smembers . addrKey c) addrs)
-  let byId = HashMap.fromListWith (<>) [(i, ts) | (a, is) <- zip addrs ids, i <- is, Just ts <- [HashMap.lookup a byAddr]]
-  specs <- run c (sequence <$> mapM (\i -> R.hget (c.prefix <> "x:" <> i <> ":meta") "spec") (HashMap.keys byId))
+  let byId =
+        HashMap.fromListWith
+          (<>)
+          [(i, ts) | (a, is) <- zip addrs ids, i <- is, Just ts <- [HashMap.lookup a byAddr]]
+      spec i = R.hget (c.prefix <> "x:" <> i <> ":meta") "spec"
+  specs <- run c (sequence <$> mapM spec (HashMap.keys byId))
   return
     [ (x, ts)
     | (Just bs, ts) <- zip specs (HashMap.elems byId),
@@ -1005,8 +1011,9 @@ affectedXPubs c tds = do
 updateSpenders :: Cache -> [TxData] -> IO ()
 updateSpenders c tds =
   unless (null quads) $
-    void (run c (R.eval spendsScript [] (c.prefix : num (length quads) : concat quads) :: Redis (Either Reply Integer)))
+    void (run c (R.eval spendsScript [] args :: Redis (Either Reply Integer)))
   where
+    args = c.prefix : num (length quads) : concat quads
     quads =
       [ [ encode i.outpoint.hash,
           encode i.outpoint.index,
@@ -1021,41 +1028,22 @@ updateSpenders c tds =
 -- Lua scripts
 -------------------------------------------------------------------------------
 
--- | Lua that removes everything of the xpub with the id in @id@ from the
--- cache, releasing the transactions it refers to. Expects @p@ (the prefix)
--- and @id@ to be defined.
-cleanupLua :: ByteString
-cleanupLua =
-  "local xk = p .. 'x:' .. id .. ':'\n\
-  \for _, a in ipairs(redis.call('SMEMBERS', xk .. 'addrs')) do\n\
-  \  redis.call('SREM', p .. 'a:' .. a, id)\n\
-  \end\n\
-  \for _, t in ipairs(redis.call('ZRANGE', xk .. 'txs', 0, -1)) do\n\
-  \  local rk = p .. 'txref:' .. t\n\
-  \  redis.call('SREM', rk, id)\n\
-  \  if redis.call('SCARD', rk) == 0 then\n\
-  \    redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)\n\
-  \  end\n\
-  \end\n\
-  \local existed = redis.call('DEL', xk .. 'meta', xk .. 'bal', xk .. 'txs', xk .. 'utxo', xk .. 'addrs')\n\
-  \redis.call('ZREM', p .. 'lru', id)\n"
+-- The scripts that Redis runs are in files of their own under
+-- @src\/Haskoin\/Store\/Cache\/lua@, where they can be read, linted and run
+-- with @redis-cli --eval@ on their own, and are embedded here when the module
+-- is compiled. Embedding them, rather than reading them when the server
+-- starts, keeps the library free of data files that a program using it would
+-- have to install and find. Their comments are sent with every call, so keep
+-- them short; the full description of each is the Haddock of its binding.
 
 -- | Delete an xpub. Arguments: prefix, id. Returns 1 if it was cached.
 deleteScript :: ByteString
-deleteScript =
-  "local p = ARGV[1]\nlocal id = ARGV[2]\n"
-    <> cleanupLua
-    <> "if existed > 0 then return 1 else return 0 end\n"
+deleteScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/delete.lua" >>= embedFile)
 
 -- | Evict the least recently used xpubs past a number. Arguments: prefix,
 -- maximum. Returns how many were evicted.
 evictScript :: ByteString
-evictScript =
-  "local p = ARGV[1]\nlocal max = tonumber(ARGV[2])\nlocal n = 0\n\
-  \while redis.call('ZCARD', p .. 'lru') > max do\n\
-  \  local id = redis.call('ZRANGE', p .. 'lru', 0, 0)[1]\n"
-    <> cleanupLua
-    <> "  n = n + 1\nend\nreturn n\n"
+evictScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/evict.lua" >>= embedFile)
 
 -- | A page of a sorted set of a cached xpub; see 'page'. Arguments: the
 -- keys of the meta hash, of the sorted set and of the sorted set of
@@ -1072,42 +1060,7 @@ evictScript =
 -- the locale of the server, which need not be the order of their bytes that
 -- Redis and the database sort members by.
 pageScript :: ByteString
-pageScript =
-  "local set, txs = ARGV[2], ARGV[3]\n\
-  \if redis.call('EXISTS', ARGV[1]) == 0 then return {'none'} end\n\
-  \if ARGV[5] ~= '' then redis.call('ZADD', ARGV[4], ARGV[5], ARGV[6]) end\n\
-  \local off = tonumber(ARGV[7])\nlocal lim = tonumber(ARGV[8])\nlocal mode = ARGV[9]\n\
-  \local function lt(a, b)\n\
-  \  for k = 1, math.min(#a, #b) do\n\
-  \    local x, y = string.byte(a, k), string.byte(b, k)\n\
-  \    if x ~= y then return x < y end\n\
-  \  end\n\
-  \  return #a < #b\n\
-  \end\n\
-  \local function out(r)\n\
-  \  local o = {'ok'}\n\
-  \  for _, v in ipairs(r) do table.insert(o, v) end\n\
-  \  return o\n\
-  \end\n\
-  \if mode == 'top' then\n\
-  \  local stop = -1\n\
-  \  if lim > 0 then stop = off + lim - 1 end\n\
-  \  return out(redis.call('ZRANGE', set, off, stop, 'WITHSCORES'))\n\
-  \end\n\
-  \local score = ARGV[10]\nlocal skip = 0\n\
-  \if mode == 'tx' then\n\
-  \  score = redis.call('ZSCORE', txs, ARGV[10])\n\
-  \  if not score then return {'nostart'} end\n\
-  \end\n\
-  \if mode ~= 'score' then\n\
-  \  local cut, bytes = tonumber(ARGV[11]), ARGV[12]\n\
-  \  for _, m in ipairs(redis.call('ZRANGEBYSCORE', set, score, score)) do\n\
-  \    if lt(string.sub(m, cut + 1), bytes) then skip = skip + 1 end\n\
-  \  end\n\
-  \end\n\
-  \local count = -1\n\
-  \if lim > 0 then count = lim end\n\
-  \return out(redis.call('ZRANGEBYSCORE', set, score, '+inf', 'WITHSCORES', 'LIMIT', off + skip, count))\n"
+pageScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/page.lua" >>= embedFile)
 
 -- | Apply the differences of an entry of an xpub, unless the stored one is
 -- stamped with a higher block, or is not the generation they were computed
@@ -1126,83 +1079,7 @@ pageScript =
 -- A transaction removed from the entry loses this xpub from its set of
 -- xpubs, and its body goes when no cached xpub has it any more.
 commitScript :: ByteString
-commitScript =
-  "local p = ARGV[1]\nlocal id = ARGV[2]\n\
-  \local h = tonumber(ARGV[3])\n\
-  \local xk = p .. 'x:' .. id .. ':'\n\
-  \local meta = xk .. 'meta'\n\
-  \local oh = redis.call('HGET', meta, 'height')\n\
-  \if oh and h < tonumber(oh) then return {'stale'} end\n\
-  \if (redis.call('HGET', meta, 'gen') or '') ~= ARGV[7] then return {'changed'} end\n\
-  \local i = 8\n\
-  \local function list(width)\n\
-  \  local n = tonumber(ARGV[i])\n\
-  \  local s = i + 1\n\
-  \  i = s + width * n\n\
-  \  return s, n\n\
-  \end\n\
-  \local aa, naa = list(1)\n\
-  \local ad, nad = list(1)\n\
-  \local ta, nta = list(2)\n\
-  \local td, ntd = list(1)\n\
-  \local ua, nua = list(2)\n\
-  \local ud, nud = list(1)\n\
-  \local bi, nb = list(2)\n\
-  \local si, ns = list(3)\n\
-  \local given = {}\n\
-  \for j = 0, nb - 1 do given[ARGV[bi + 2 * j]] = true end\n\
-  \local missing = {'missing'}\n\
-  \for j = 0, nta - 1 do\n\
-  \  local t = ARGV[ta + 2 * j]\n\
-  \  if not given[t] and redis.call('EXISTS', p .. 'tx:' .. t) == 0 then\n\
-  \    table.insert(missing, t)\n\
-  \  end\n\
-  \end\n\
-  \if #missing > 1 then return missing end\n\
-  \for j = 0, nad - 1 do\n\
-  \  local a = ARGV[ad + j]\n\
-  \  redis.call('SREM', p .. 'a:' .. a, id)\n\
-  \  redis.call('SREM', xk .. 'addrs', a)\n\
-  \end\n\
-  \for j = 0, naa - 1 do\n\
-  \  local a = ARGV[aa + j]\n\
-  \  redis.call('SADD', p .. 'a:' .. a, id)\n\
-  \  redis.call('SADD', xk .. 'addrs', a)\n\
-  \end\n\
-  \for j = 0, ntd - 1 do\n\
-  \  local t = ARGV[td + j]\n\
-  \  local rk = p .. 'txref:' .. t\n\
-  \  redis.call('ZREM', xk .. 'txs', t)\n\
-  \  redis.call('SREM', rk, id)\n\
-  \  if redis.call('SCARD', rk) == 0 then\n\
-  \    redis.call('DEL', rk, p .. 'tx:' .. t, p .. 'sp:' .. t)\n\
-  \  end\n\
-  \end\n\
-  \for j = 0, nta - 1 do\n\
-  \  local t = ARGV[ta + 2 * j]\n\
-  \  redis.call('ZADD', xk .. 'txs', ARGV[ta + 2 * j + 1], t)\n\
-  \  redis.call('SADD', p .. 'txref:' .. t, id)\n\
-  \end\n\
-  \for j = 0, nud - 1 do redis.call('ZREM', xk .. 'utxo', ARGV[ud + j]) end\n\
-  \for j = 0, nua - 1 do\n\
-  \  redis.call('ZADD', xk .. 'utxo', ARGV[ua + 2 * j + 1], ARGV[ua + 2 * j])\n\
-  \end\n\
-  \for j = 0, nb - 1 do\n\
-  \  local t = ARGV[bi + 2 * j]\n\
-  \  redis.call('SET', p .. 'tx:' .. t, ARGV[bi + 2 * j + 1])\n\
-  \  redis.call('DEL', p .. 'sp:' .. t)\n\
-  \end\n\
-  \for j = 0, ns - 1 do\n\
-  \  local k = si + 3 * j\n\
-  \  if given[ARGV[k]] then\n\
-  \    redis.call('HSET', p .. 'sp:' .. ARGV[k], ARGV[k + 1], ARGV[k + 2])\n\
-  \  end\n\
-  \end\n\
-  \redis.call('SET', xk .. 'bal', ARGV[6])\n\
-  \redis.call('HSET', meta, 'spec', ARGV[5], 'height', ARGV[3], 'ver', '2')\n\
-  \redis.call('HINCRBY', meta, 'gen', 1)\n\
-  \redis.call('ZADD', p .. 'lru', ARGV[4], id)\n\
-  \return {'ok'}\n"
+commitScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/commit.lua" >>= embedFile)
 
 -- | Record or forget spenders of outputs of cached transactions. Arguments:
 -- prefix, number of entries, then for each: hash of the transaction that
@@ -1210,30 +1087,9 @@ commitScript =
 -- the spending transaction. Only transactions whose body is cached are
 -- touched, and a spender is only forgotten if it is still the one given.
 spendsScript :: ByteString
-spendsScript =
-  "local p = ARGV[1]\nlocal n = tonumber(ARGV[2])\nlocal i = 3\n\
-  \for j = 1, n do\n\
-  \  local t = ARGV[i]\n\
-  \  if redis.call('EXISTS', p .. 'tx:' .. t) == 1 then\n\
-  \    local sk = p .. 'sp:' .. t\n\
-  \    if ARGV[i + 2] ~= '' then\n\
-  \      redis.call('HSET', sk, ARGV[i + 1], ARGV[i + 2])\n\
-  \    else\n\
-  \      local cur = redis.call('HGET', sk, ARGV[i + 1])\n\
-  \      if cur and string.sub(cur, 1, 32) == ARGV[i + 3] then\n\
-  \        redis.call('HDEL', sk, ARGV[i + 1])\n\
-  \      end\n\
-  \    end\n\
-  \  end\n\
-  \  i = i + 4\n\
-  \end\n\
-  \return 1\n"
+spendsScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/spends.lua" >>= embedFile)
 
 -- | Release a lock if it still holds the given token. Keys: lock. Arguments:
 -- token.
 unlockScript :: ByteString
-unlockScript =
-  "if redis.call('GET', KEYS[1]) == ARGV[1] then\n\
-  \  return redis.call('DEL', KEYS[1])\n\
-  \end\n\
-  \return 0\n"
+unlockScript = $(makeRelativeToProject "src/Haskoin/Store/Cache/lua/unlock.lua" >>= embedFile)

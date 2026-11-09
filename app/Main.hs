@@ -578,14 +578,25 @@ config c = do
     option auto $
       metavar "MB"
         <> long "max-wal-mb"
-        <> help "RocksDB write-ahead log size in MiB that forces flushes so old log files can be deleted (0 = RocksDB default)"
+        <> help
+          ( unwords
+              [ "RocksDB write-ahead log size in MiB that forces flushes so old",
+                "log files can be deleted (0 = RocksDB default)"
+              ]
+          )
         <> showDefault
         <> value c.maxWalMB
   blockCacheMB <-
     option auto $
       metavar "MB"
         <> long "block-cache-mb"
-        <> help "RocksDB block cache in MiB, shared by all column families, holding index and filter blocks too (0 = RocksDB default of 32 MiB per column family)"
+        <> help
+          ( unwords
+              [ "RocksDB block cache in MiB, shared by all column families,",
+                "holding index and filter blocks too (0 = RocksDB default of",
+                "32 MiB per column family)"
+              ]
+          )
         <> showDefault
         <> value c.blockCacheMB
   pure Config {..}

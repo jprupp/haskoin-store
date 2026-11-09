@@ -43,9 +43,9 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as C8
 import Data.ByteString.Lazy qualified as BL
-import Data.Text qualified as T
 import Data.Char (isDigit, isSpace)
 import Data.List (dropWhileEnd)
+import Data.Text qualified as T
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)

@@ -1,5 +1,6 @@
 {-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 -- |
 -- Module      : Main
@@ -46,16 +47,18 @@
 module Main (main) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
-import Control.Lens ((&), (.~), (?~), (^.))
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
+import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, encode, object, (.=))
 import Data.Aeson qualified as A
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
 import Data.ByteString.Lazy qualified as BL
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (serialize)
+import Data.FileEmbed (embedFile, makeRelativeToProject)
 import Data.Foldable (toList)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -79,7 +82,6 @@ import Network.Socket qualified as Socket
 import Network.Socket.ByteString qualified as SocketB
 import Network.Wreq qualified as Wreq
 import Options.Applicative
-import UnliftIO.Directory (createDirectoryIfMissing, makeAbsolute)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, IOMode (..), hFlush, hPutStrLn, stderr, withFile)
 import System.Process
@@ -87,6 +89,7 @@ import System.Random.Stateful (IOGenM, StdGen, mkStdGen, newIOGenM, uniformRM)
 import Text.Read (readMaybe)
 import UnliftIO (MVar, bracket, newMVar, tryAny, withAsync, withMVar)
 import UnliftIO.Concurrent (threadDelay)
+import UnliftIO.Directory (createDirectoryIfMissing, makeAbsolute)
 
 -------------------------------------------------------------------------------
 -- Options
@@ -118,7 +121,12 @@ opts = do
   wrkSeconds <- num "wrk-seconds" 10 "Seconds of each run of wrk"
   server <- strOption (long "server" <> metavar "PATH" <> help "haskoin-store binary")
   serverRts <-
-    strOption (long "server-rts" <> metavar "FLAGS" <> value "-N4 -M2g" <> showDefault <> help "RTS flags of the server")
+    strOption $
+      long "server-rts"
+        <> metavar "FLAGS"
+        <> value "-N4 -M2g"
+        <> showDefault
+        <> help "RTS flags of the server"
   out <- strOption (long "out" <> metavar "DIR" <> help "Directory for the results")
   chainMb <- num "chain-mb" 1024 "Size of the tmpfs of the chain of the node, in MiB"
   seed <- num "seed" 1 "Seed of the random choices"
@@ -465,7 +473,7 @@ stress o ctx node redisURL srv stats wc = do
     n <- either (const 0) id <$> Redis.runRedis conn (Redis.dbsize)
     Redis.disconnect conn
     return (n > 0)
-  writeScripts o ws
+  writeScripts o
   slowlogStart redisURL
   stop <- newTVarIO False
   start <- getCurrentTime
@@ -473,7 +481,7 @@ stress o ctx node redisURL srv stats wc = do
     withFile (o.out <> "/wrk.jsonl") WriteMode $ \wh -> do
       wlock <- newMVar wh
       withAsync (sampler start node srv redisURL stats stop sh) $ \_ ->
-        withAsync (wrkAll o srv wc start stop wlock) $ \_ -> do
+        withAsync (wrkAll o ws srv wc start stop wlock) $ \_ -> do
           (sent, refused) <- withFile (o.out <> "/rounds.jsonl") WriteMode $ \rh ->
             rounds o ctx g node ws minerAddr start rh (Seq.fromList coins0)
           say "Waiting for the server to catch up"
@@ -526,7 +534,14 @@ rounds o ctx g node ws minerAddr start rh = go 0 (0, 0)
               back = [c | ((c, _), Just _) <- results]
               errors = [e | (_, Just e) <- results]
           case errors of
-            e : _ -> say ("The node refused " <> show (length errors) <> " transactions, such as " <> take 300 (show e))
+            e : _ ->
+              say $
+                unwords
+                  [ "The node refused",
+                    show (length errors),
+                    "transactions, such as",
+                    take 300 (show e)
+                  ]
             [] -> return ()
           void $ generateTo node 1 minerAddr
           t3 <- getCurrentTime
@@ -600,61 +615,46 @@ endpoints =
     ("multiaddr", \x -> "/blockchain/multiaddr?active=" <> x <> "&n=50")
   ]
 
--- | A script of wrk per endpoint: it rotates over the paths, and prints its
--- results as JSON when done (latencies in microseconds).
-writeScripts :: Opts -> [Wallet] -> IO ()
-writeScripts o ws =
-  forM_ endpoints $ \(name, path) ->
-    writeFile (o.out <> "/" <> name <> ".lua") . unlines $
-      ["local paths = {"]
-        <> ["  \"" <> T.unpack (path w.xpub) <> "\"," | w <- ws]
-        <> [ "}",
-             "local i = 0",
-             "request = function()",
-             "  i = i % #paths + 1",
-             "  return wrk.format(\"GET\", paths[i])",
-             "end",
-             "done = function(summary, latency, requests)",
-             "  local e = summary.errors",
-             "  io.write(string.format('{\"requests\":%d,\"duration_us\":%d,\"errors\":%d,\"non2xx\":%d,\"p50_us\":%d,\"p90_us\":%d,\"p99_us\":%d,\"max_us\":%d,\"mean_us\":%.1f}\\n',",
-             "    summary.requests, summary.duration, e.connect + e.read + e.write + e.timeout, e.status,",
-             "    latency:percentile(50), latency:percentile(90), latency:percentile(99), latency.max, latency.mean))",
-             "end"
-           ]
+-- | The script of wrk ("stress/wrk.lua"), copied into the output directory
+-- where the container of wrk sees it. It asks for the paths it is given in
+-- turn and prints its results as JSON. It is embedded when the program is
+-- compiled, so the program finds it wherever it runs.
+writeScripts :: Opts -> IO ()
+writeScripts o = BS.writeFile (o.out <> "/wrk.lua") $(makeRelativeToProject "stress/wrk.lua" >>= embedFile)
 
 -- | Run wrk on every endpoint at once, over and over, until told to stop.
-wrkAll :: Opts -> Server -> Container -> UTCTime -> TVar Bool -> MVar Handle -> IO ()
-wrkAll o srv wc start stop lock = go endpoints
+wrkAll :: Opts -> [Wallet] -> Server -> Container -> UTCTime -> TVar Bool -> MVar Handle -> IO ()
+wrkAll o ws srv wc start stop lock = go endpoints
   where
     go [] = return ()
-    go ((name, _) : rest) = withAsync (loop name) $ \_ -> go rest >> waitStop
+    go ((name, path) : rest) = withAsync (loop name (map (path . (.xpub)) ws)) $ \_ -> go rest >> waitStop
     waitStop = readTVarIO stop >>= \s -> unless s (threadDelay 500000 >> waitStop)
-    loop name = do
+    loop name paths = do
       s <- readTVarIO stop
       unless s $ do
         t <- getCurrentTime
-        (code, out, err) <-
-          readProcessWithExitCode
-            "podman"
-            [ "exec",
-              wc.cid,
-              wrkBin,
-              "-t1",
-              "-c" <> show o.connections,
-              "-d" <> show o.wrkSeconds <> "s",
-              "--timeout",
-              "10s",
-              "-s",
-              "/stress/" <> name <> ".lua",
-              srv.url
-            ]
-            ""
+        let args =
+              [ "exec",
+                wc.cid,
+                wrkBin,
+                "-t1",
+                "-c" <> show o.connections,
+                "-d" <> show o.wrkSeconds <> "s",
+                "--timeout",
+                "10s",
+                "-s",
+                "/stress/wrk.lua",
+                srv.url,
+                "--"
+              ]
+                <> map T.unpack paths
+        (code, out, err) <- readProcessWithExitCode "podman" args ""
         let result = case [l | l <- lines out, take 1 l == "{"] of
               l : _ | Just (Object r) <- A.decode (BL.fromStrict (C8.pack l)) -> Object r
               _ -> object ["failed" .= True, "exit" .= show code, "stderr" .= take 300 err]
         withMVar lock $ \h ->
           appendLine h (merge (object ["t" .= secs start t, "endpoint" .= name]) result)
-        loop name
+        loop name paths
     merge (Object a) (Object b) = Object (a <> b)
     merge a _ = a
 
@@ -680,7 +680,8 @@ sampler start node srv redisURL stats stop h = do
           sh <- serverHeight srv
           vm <- valkeyMemory conn
           m <- drainStats stats
-          let cpu = fromIntegral (max 0 (ticks - prevTicks)) / fromIntegral hz / realToFrac (now `diffUTCTime` prevTime) * 100 :: Double
+          let seconds = realToFrac (now `diffUTCTime` prevTime)
+              cpu = fromIntegral (max 0 (ticks - prevTicks)) / fromIntegral hz / seconds * 100 :: Double
           appendLine h $
             object
               [ "t" .= secs start now,
@@ -748,10 +749,11 @@ valkeyMemory conn =
 -- them: a long script blocks every client of Redis, every server included.
 slowlogStart :: String -> IO ()
 slowlogStart url = withRedis url $ \conn -> Redis.runRedis conn $ do
-  _ <- Redis.sendRequest ["CONFIG", "SET", "slowlog-log-slower-than", "10000"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
-  _ <- Redis.sendRequest ["CONFIG", "SET", "slowlog-max-len", "100000"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
-  _ <- Redis.sendRequest ["SLOWLOG", "RESET"] :: Redis.Redis (Either Redis.Reply Redis.Reply)
-  return ()
+  send ["CONFIG", "SET", "slowlog-log-slower-than", "10000"]
+  send ["CONFIG", "SET", "slowlog-max-len", "100000"]
+  send ["SLOWLOG", "RESET"]
+  where
+    send args = void (Redis.sendRequest args :: Redis.Redis (Either Redis.Reply Redis.Reply))
 
 -- | The commands that took 10 ms or more: how long each took, in
 -- milliseconds, and its name (with the first bytes of a script).

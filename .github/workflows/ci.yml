@@ -26,16 +26,10 @@ jobs:
       # Only this repository is checked out, so extra-deps that point at
       # sibling checkouts (such as ../haskoin-core) cannot build here.
       - name: Reject local path dependencies
-        run: |
-          if grep -nE '^[[:space:]]*-[[:space:]]*(\.\.?/|/|~)' stack.yaml; then
-            echo "::error file=stack.yaml::stack.yaml refers to local paths outside the repository. Pin released versions (or a git commit) in extra-deps before pushing."
-            exit 1
-          fi
+        run: scripts/check-local-deps.sh
 
       - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y librocksdb-dev libsecp256k1-dev pkg-config zlib1g-dev
+        run: scripts/install-system-libraries.sh
 
       - name: Set up Stack
         uses: haskell-actions/setup@v2
@@ -73,11 +67,7 @@ jobs:
       # Only this repository is checked out, so extra-deps that point at
       # sibling checkouts (such as ../haskoin-core) cannot build here.
       - name: Reject local path dependencies
-        run: |
-          if grep -nE '^[[:space:]]*-[[:space:]]*(\.\.?/|/|~)' stack.yaml; then
-            echo "::error file=stack.yaml::stack.yaml refers to local paths outside the repository. Pin released versions (or a git commit) in extra-deps before pushing."
-            exit 1
-          fi
+        run: scripts/check-local-deps.sh
 
       # Stack runs the build inside nix-shell, which takes GHC and the
       # libraries from <nixpkgs>; nix_path points that at nixos-unstable.

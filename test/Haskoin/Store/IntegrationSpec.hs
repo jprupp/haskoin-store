@@ -376,7 +376,10 @@ difference at' (Object x) (Object y)
 difference at' (Array x) (Array y)
   | length x /= length y = at' <> ": " <> show (length x) <> " and " <> show (length y) <> " elements"
   | otherwise =
-      case [difference (at' <> "[" <> show i <> "]") v w | (i, v, w) <- zip3 [0 :: Int ..] (toList x) (toList y), v /= w] of
+      case [ difference (at' <> "[" <> show i <> "]") v w
+           | (i, v, w) <- zip3 [0 :: Int ..] (toList x) (toList y),
+             v /= w
+           ] of
         d : _ -> d
         [] -> at' <> ": none"
 difference at' x y = at' <> ": " <> take 1000 (show x) <> " and " <> take 1000 (show y)
@@ -1217,7 +1220,13 @@ spenderTest env = do
   let x = newXPub env "spender" DeriveNormal
   ref <- newLedger
   w <- getNewAddress env.node
-  raw <- rpc env.node "createrawtransaction" [toJSON ([] :: [Value]), object [Key.fromText (at env x [0, 0]) .= btc 200000, Key.fromText w .= btc 300000]]
+  raw <-
+    rpc
+      env.node
+      "createrawtransaction"
+      [ toJSON ([] :: [Value]),
+        object [Key.fromText (at env x [0, 0]) .= btc 200000, Key.fromText w .= btc 300000]
+      ]
   funded <- rpc env.node "fundrawtransaction" [raw]
   signed <- rpc env.node "signrawtransactionwithwallet" [(funded ! "hex")]
   txT <-
@@ -1238,7 +1247,13 @@ spenderTest env = do
     v : _ -> return v
     [] -> fail "No output to the wallet address"
   w2 <- getNewAddress env.node
-  raw2 <- rpc env.node "createrawtransaction" [toJSON [object ["txid" .= txT, "vout" .= vout]], object [Key.fromText w2 .= btc 290000]]
+  raw2 <-
+    rpc
+      env.node
+      "createrawtransaction"
+      [ toJSON [object ["txid" .= txT, "vout" .= vout]],
+        object [Key.fromText w2 .= btc 290000]
+      ]
   signed2 <- rpc env.node "signrawtransactionwithwallet" [raw2]
   txU <-
     rpc env.node "sendrawtransaction" [(signed2 ! "hex")] >>= \case
