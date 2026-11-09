@@ -30,5 +30,6 @@ extra-deps:
   # The fix of the header sync stall, until it is released.
   - git: https://github.com/jprupp/haskoin-node.git
     commit: c2acc4c4f9859da251095abace6a61d29291b311
-  # Until haskoin-store-data is published: a checkout next to this one.
-  - ../haskoin-store-data
+  # haskoin-store-data from its repository, until it is on Hackage.
+  - git: https://github.com/jprupp/haskoin-store-data.git
+    commit: ba49bf99693e688ee46aa3757cdffa48d3eaf443
