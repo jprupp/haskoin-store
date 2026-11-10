@@ -110,7 +110,16 @@ import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
-import Database.RocksDB (BatchOp, getCF, iterEntry, iterFirst, iterGetError, iterNext, withIterCF)
+import Database.RocksDB
+  ( BatchOp,
+    IterConfig (..),
+    getCF,
+    iterEntry,
+    iterFirst,
+    iterGetError,
+    iterNext,
+    withIterConfig,
+  )
 import Database.RocksDB.Query
   ( deleteOp,
     deleteOpCF,
@@ -376,7 +385,10 @@ migrateRecords report r = do
             iterEntry it >>= \case
               Nothing -> iterGetError it >>= mapM_ (throwIO . Inconsistent . cs . show)
               Just row -> one row >> iterNext it >> go it
-      withIterCF db (txCF db) (\it -> iterFirst it >> go it)
+      -- every transaction, whatever its prefix: the column family has a
+      -- prefix for its filters, and an iterator there promises the keys of
+      -- one prefix only unless it is asked for the order of them all
+      withIterConfig db (Just (txCF db)) def {totalOrderSeek = True} (\it -> iterFirst it >> go it)
       write
       writeBatch db [deleteOp MigrationKey]
       c <- readIORef changed

@@ -97,6 +97,7 @@ module Haskoin.Store.Fleet.XPub
     cacheAdvance,
     cacheEvict,
     cacheTip,
+    cacheSize,
 
     -- * Encoding
     xpubId,
@@ -584,6 +585,16 @@ cacheAdvance conn keys from to changes =
 cacheEvict :: Connection -> FleetKeys -> Int -> IO Int
 cacheEvict conn keys most =
   fromInteger <$> run conn (R.eval xpubScript [] ["evict", keys.prefix, "32", num most])
+
+-- | How large the cache is: the number of its entries, one for each
+-- extended public key, and the number of addresses that they have between
+-- them, which is what its memory in Redis goes with, together with the
+-- transactions of those addresses.
+cacheSize :: Connection -> FleetKeys -> IO (Int, Int)
+cacheSize conn keys =
+  run conn (R.eval xpubScript [] ["size", keys.prefix, "32"]) >>= \case
+    [entries, addresses] -> return (fromInteger entries, fromInteger addresses)
+    other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [Integer]))
 
 -- | The block that the cache is at, if it is where the fleet tip is: at
 -- the same block, by the same move of the tip.

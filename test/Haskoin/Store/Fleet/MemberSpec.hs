@@ -223,8 +223,12 @@ spec = prepareContext $ \ctx -> do
                     tip <- tipNow
                     cacheTip conn keys `shouldReturn` Just tip
                     _ <- answeringAt m tip (\r pool _ -> cacheBuild conn keys tip r pool 1 key)
+                    -- its size is one entry, with the addresses of the wallet
+                    (n0, n1) <- cacheHave conn keys key
+                    cacheSize conn keys `shouldReturn` (1, n0 + n1)
                     cacheEvict conn keys 1 `shouldReturn` 0
                     cacheEvict conn keys 0 `shouldReturn` 1
+                    cacheSize conn keys `shouldReturn` (0, 0)
                     cachedEntry conn keys tip 20 32 1 key `shouldReturn` Miss
                     cacheHave conn keys key `shouldReturn` (0, 0)
                     closeViews m.views

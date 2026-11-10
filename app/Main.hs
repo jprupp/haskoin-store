@@ -35,7 +35,8 @@ import Haskoin.Store
 import Haskoin.Store.Common (loopForever)
 import NQE (receive, withSubscription)
 import Options.Applicative
-  ( Parser,
+  ( Mod,
+    Parser,
     auto,
     execParser,
     flag,
@@ -276,6 +277,12 @@ parseBool str = case map toLower str of
   "0" -> Just False
   _ -> Nothing
 
+-- | The help of an option, with the environment variable that sets its
+-- default: every option has one, and someone who runs the store in a
+-- container reads the help to find its name.
+helpEnv :: String -> String -> Mod f a
+helpEnv name text = help (text <> " [env: " <> name <> "]")
+
 -- | Command line parser, with defaults from the given configuration.
 config :: Config -> Parser Config
 config c = do
@@ -284,21 +291,21 @@ config c = do
       metavar "DIRECTORY"
         <> long "dir"
         <> short 'd'
-        <> help "Data directory"
+        <> helpEnv "DIR" "Data directory"
         <> showDefault
         <> value c.dir
   host <-
     strOption $
       metavar "ADDRESS"
         <> long "host"
-        <> help "Network address to bind"
+        <> helpEnv "HOST" "Network address to bind"
         <> showDefault
         <> value c.host
   port <-
     option auto $
       metavar "PORT"
         <> long "port"
-        <> help "REST API listening port"
+        <> helpEnv "PORT" "REST API listening port"
         <> showDefault
         <> value c.port
   net <-
@@ -306,13 +313,13 @@ config c = do
       metavar netNames
         <> long "net"
         <> short 'n'
-        <> help "Network to connect to"
+        <> helpEnv "NET" "Network to connect to"
         <> showDefault
         <> value c.net
   discover <-
     flag c.discover True $
       long "discover"
-        <> help "Peer discovery"
+        <> helpEnv "DISCOVER" "Peer discovery"
   peers <-
     fmap (mappend c.peers) $
       many $
@@ -320,7 +327,7 @@ config c = do
           metavar "HOSTNAME[:PORT]"
             <> long "peer"
             <> short 'p'
-            <> help "Network peer (as many as required)"
+            <> helpEnv "PEER" "Network peer (as many as required)"
   version <-
     switch $
       long "version"
@@ -329,98 +336,99 @@ config c = do
   debug <-
     flag c.debug True $
       long "debug"
-        <> help "Show debug messages"
+        <> helpEnv "DEBUG" "Show debug messages"
   maxPendingTxs <-
     option auto $
       metavar "COUNT"
         <> long "max-pending-txs"
-        <> help "Maximum pending txs to fail health check"
+        <> helpEnv "MAX_PENDING_TXS" "Maximum pending txs to fail health check"
         <> showDefault
         <> value c.maxPendingTxs
   maxLaggingBlocks <-
     option auto $
       metavar "COUNT"
         <> long "max-lagging-blocks"
-        <> help "Maximum number of unindexed blocks"
+        <> helpEnv "MAX_LAGGING_BLOCKS" "Maximum number of unindexed blocks"
         <> showDefault
         <> value c.maxLaggingBlocks
   minPeers <-
     option auto $
       metavar "COUNT"
         <> long "min-peers"
-        <> help "Minimum number of connected peers for health check"
+        <> helpEnv "MIN_PEERS" "Minimum number of connected peers for health check"
         <> showDefault
         <> value c.minPeers
   noWeb <-
     flag c.noWeb True $
       long "noweb"
-        <> help "Disable web server"
+        <> helpEnv "NO_WEB" "Disable web server"
   webLimits <- do
     maxItemCount <-
       option auto $
         metavar "COUNT"
           <> long "max-item-count"
-          <> help "Hard limit for simple listings (0 = inf)"
+          <> helpEnv "MAX_ITEM_COUNT" "Hard limit for simple listings (0 = inf)"
           <> showDefault
           <> value c.webLimits.maxItemCount
     maxFullItemCount <-
       option auto $
         metavar "COUNT"
           <> long "max-full-item-count"
-          <> help "Hard limit for full listings (0 = inf)"
+          <> helpEnv "MAX_FULL_ITEM_COUNT" "Hard limit for full listings (0 = inf)"
           <> showDefault
           <> value c.webLimits.maxFullItemCount
     maxOffset <-
       option auto $
         metavar "OFFSET"
           <> long "max-offset"
-          <> help "Hard limit for offsets (0 = inf)"
+          <> helpEnv "MAX_OFFSET" "Hard limit for offsets (0 = inf)"
           <> showDefault
           <> value c.webLimits.maxOffset
     defItemCount <-
       option auto $
         metavar "COUNT"
           <> long "def-item-count"
-          <> help "Soft default limit (0 = inf)"
+          <> helpEnv "DEF_ITEM_COUNT" "Soft default limit (0 = inf)"
           <> showDefault
           <> value c.webLimits.defItemCount
     xpubGap <-
       option auto $
         metavar "GAP"
           <> long "xpub-gap"
-          <> help "Max gap for xpub queries"
+          <> helpEnv "XPUB_GAP" "Max gap for xpub queries"
           <> showDefault
           <> value c.webLimits.xpubGap
     xpubGapInit <-
       option auto $
         metavar "GAP"
           <> long "xpub-gap-init"
-          <> help "Max gap for empty xpubs"
+          <> helpEnv "XPUB_GAP_INIT" "Max gap for empty xpubs"
           <> showDefault
           <> value c.webLimits.xpubGapInit
     blockTimeout <-
       option auto $
         metavar "SECONDS"
           <> long "block-timeout"
-          <> help "Block lag health timeout"
+          <> helpEnv "BLOCK_TIMEOUT" "Block lag health timeout"
           <> showDefault
           <> value c.webLimits.blockTimeout
     txTimeout <-
       option auto $
         metavar "SECONDS"
           <> long "tx-timeout"
-          <> help "Last tx received health timeout"
+          <> helpEnv "TX_TIMEOUT" "Last tx received health timeout"
           <> showDefault
           <> value c.webLimits.txTimeout
     return WebLimits {..}
   redis <-
     flag c.redis True $
       long "redis"
-        <> help "Redis cache for xpub data"
+        <> helpEnv "REDIS" "Redis cache for xpub data"
   fleet <-
     flag c.fleet True $
       long "fleet"
-        <> help
+        <> helpEnv
+          "FLEET"
           ( unwords
               [ "Answer as one of the servers that share the Redis of --redis:",
                 "all from the same block and the same mempool"
@@ -430,149 +438,149 @@ config c = do
     strOption $
       metavar "URL"
         <> long "redis-url"
-        <> help "URL for Redis cache"
+        <> helpEnv "REDIS_URL" "URL for Redis cache"
         <> value c.redisURL
   redisMinAddrs <-
     option auto $
       metavar "COUNT"
         <> long "redis-min-addrs"
-        <> help "Cache xpubs with at least this many used addresses"
+        <> helpEnv "REDIS_MIN_ADDRS" "Cache xpubs with at least this many used addresses"
         <> showDefault
         <> value c.redisMinAddrs
   redisMinTxs <-
     option auto $
       metavar "COUNT"
         <> long "redis-min-txs"
-        <> help "Cache xpubs with at least this many transactions in their addresses"
+        <> helpEnv "REDIS_MIN_TXS" "Cache xpubs with at least this many transactions in their addresses"
         <> showDefault
         <> value c.redisMinTxs
   redisMaxXPubs <-
     option auto $
       metavar "COUNT"
         <> long "redis-max-xpubs"
-        <> help "Evict the least recently used xpubs from Redis past this many"
+        <> helpEnv "REDIS_MAX_XPUBS" "Evict the least recently used xpubs from Redis past this many"
         <> showDefault
         <> value c.redisMaxXPubs
   noMempool <-
     flag c.noMempool True $
       long "no-mempool"
-        <> help "Do not index mempool transactions"
+        <> helpEnv "NO_MEMPOOL" "Do not index mempool transactions"
   wipeMempool <-
     flag c.wipeMempool True $
       long "wipe-mempool"
-        <> help "Wipe indexed mempool at start"
+        <> helpEnv "WIPE_MEMPOOL" "Wipe indexed mempool at start"
   syncMempool <-
     flag c.syncMempool True $
       long "sync-mempool"
-        <> help "Attempt to download peer mempools"
+        <> helpEnv "SYNC_MEMPOOL" "Attempt to download peer mempools"
   blockWindow <-
     option auto $
       metavar "COUNT"
         <> long "block-window"
-        <> help "Blocks to request from the syncing peer at a time"
+        <> helpEnv "BLOCK_WINDOW" "Blocks to request from the syncing peer at a time"
         <> showDefault
         <> value c.blockWindow
   mempoolTimeout <-
     option auto $
       metavar "DAYS"
         <> long "mempool-timeout"
-        <> help "Cull old mempool transactions"
+        <> helpEnv "MEMPOOL_TIMEOUT" "Cull old mempool transactions"
         <> showDefault
         <> value c.mempoolTimeout
   peerTimeout <-
     option auto $
       metavar "SECONDS"
         <> long "peer-timeout"
-        <> help "Unresponsive peer timeout"
+        <> helpEnv "PEER_TIMEOUT" "Unresponsive peer timeout"
         <> showDefault
         <> value c.peerTimeout
   maxPeerLife <-
     option auto $
       metavar "SECONDS"
         <> long "max-peer-life"
-        <> help "Maximum peer connection time"
+        <> helpEnv "MAX_PEER_LIFE" "Maximum peer connection time"
         <> showDefault
         <> value c.maxPeerLife
   maxPeers <-
     option auto $
       metavar "COUNT"
         <> long "max-peers"
-        <> help "Do not connect to more than this many peers"
+        <> helpEnv "MAX_PEERS" "Do not connect to more than this many peers"
         <> showDefault
         <> value c.maxPeers
   statsd <-
     flag c.statsd True $
       long "statsd"
-        <> help "Enable statsd metrics"
+        <> helpEnv "STATSD" "Enable statsd metrics"
   statsdHost <-
     strOption $
       metavar "HOSTNAME"
         <> long "statsd-host"
-        <> help "Host to send statsd metrics"
+        <> helpEnv "STATSD_HOST" "Host to send statsd metrics"
         <> showDefault
         <> value c.statsdHost
   statsdPort <-
     option auto $
       metavar "PORT"
         <> long "statsd-port"
-        <> help "Port to send statsd metrics"
+        <> helpEnv "STATSD_PORT" "Port to send statsd metrics"
         <> showDefault
         <> value c.statsdPort
   statsdPrefix <-
     strOption $
       metavar "PREFIX"
         <> long "statsd-prefix"
-        <> help "Prefix for statsd metrics"
+        <> helpEnv "STATSD_PREFIX" "Prefix for statsd metrics"
         <> showDefault
         <> value c.statsdPrefix
   statsdNoEvents <-
     flag c.statsdNoEvents True $
       long "statsd-no-events"
-        <> help "Do not report individual events to statsd"
+        <> helpEnv "STATSD_NO_EVENTS" "Do not report individual events to statsd"
   statsdAggregates <-
     flag c.statsdAggregates True $
       long "statsd-aggregates"
-        <> help "Send statistical aggregate reports to statsd every second"
+        <> helpEnv "STATSD_AGGREGATES" "Send statistical aggregate reports to statsd every second"
   tickerRefresh <-
     option auto $
       metavar "MICROSECONDS"
         <> long "ticker-refresh"
-        <> help "How often to retrieve price information"
+        <> helpEnv "TICKER_REFRESH" "How often to retrieve price information"
         <> showDefault
         <> value c.tickerRefresh
   tickerURL <-
     strOption $
       metavar "URL"
         <> long "ticker-url"
-        <> help "Blockchain.info price ticker URL"
+        <> helpEnv "TICKER_URL" "Blockchain.info price ticker URL"
         <> showDefault
         <> value c.tickerURL
   priceHistoryURL <-
     strOption $
       metavar "URL"
         <> long "price-history-url"
-        <> help "Blockchain.info price history URL"
+        <> helpEnv "PRICE_HISTORY_URL" "Blockchain.info price history URL"
         <> showDefault
         <> value c.priceHistoryURL
   noBlockchainInfo <-
     flag c.noBlockchainInfo True $
       long "no-blockchain-info"
-        <> help "Disable Blockchain.info-style API endpoints"
+        <> helpEnv "NO_BLOCKCHAIN_INFO" "Disable Blockchain.info-style API endpoints"
   noXPub <-
     flag c.noXPub True $
       long "no-xpub"
-        <> help "Disable extended public key support"
+        <> helpEnv "NO_XPUB" "Disable extended public key support"
   healthCheckInterval <-
     option auto $
       metavar "SECONDS"
         <> long "health-check-interval"
-        <> help "Background check update interval"
+        <> helpEnv "HEALTH_CHECK_INTERVAL" "Background check update interval"
         <> showDefault
         <> value c.healthCheckInterval
   noBloom <-
     switch $
       long "no-bloom"
-        <> help "No RocksDB Bloom filters on the data that is read by key, which are on by default"
+        <> helpEnv "BLOOM=false" "No RocksDB Bloom filters on the data that is read by key, which are on by default"
   -- it was the way to turn them on, and commands that have it must still
   -- start
   _ <- switch (long "bloom" <> hidden)
@@ -580,21 +588,22 @@ config c = do
     option auto $
       metavar "COUNT"
         <> long "max-open-files"
-        <> help "RocksDB max_open_files; bounds index/filter memory (0 = unlimited)"
+        <> helpEnv "MAX_OPEN_FILES" "RocksDB max_open_files; bounds index/filter memory (0 = unlimited)"
         <> showDefault
         <> value c.maxOpenFiles
   writeBufferMB <-
     option auto $
       metavar "MB"
         <> long "write-buffer-mb"
-        <> help "RocksDB memtable budget across all column families in MiB (0 = unlimited)"
+        <> helpEnv "WRITE_BUFFER_MB" "RocksDB memtable budget across all column families in MiB (0 = unlimited)"
         <> showDefault
         <> value c.writeBufferMB
   maxWalMB <-
     option auto $
       metavar "MB"
         <> long "max-wal-mb"
-        <> help
+        <> helpEnv
+          "MAX_WAL_MB"
           ( unwords
               [ "RocksDB write-ahead log size in MiB that forces flushes so old",
                 "log files can be deleted (0 = RocksDB default)"
@@ -606,7 +615,8 @@ config c = do
     option auto $
       metavar "MB"
         <> long "block-cache-mb"
-        <> help
+        <> helpEnv
+          "BLOCK_CACHE_MB"
           ( unwords
               [ "RocksDB block cache in MiB, shared by all column families,",
                 "holding index and filter blocks too (0 = RocksDB default of",

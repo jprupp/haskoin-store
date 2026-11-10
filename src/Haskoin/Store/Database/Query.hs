@@ -94,7 +94,7 @@ import Conduit
     yield,
     (.|),
   )
-import Control.Monad (forM, replicateM, (>=>))
+import Control.Monad (forM, (>=>))
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.Default (def)
@@ -108,9 +108,9 @@ import Data.Word (Word32, Word64)
 import Database.RocksDB
   ( ColumnFamily,
     DB,
+    IterConfig (..),
     Iterator,
-    createIterator,
-    destroyIterator,
+    createIteratorConfig,
     getCF,
     iterKey,
     iterLast,
@@ -119,7 +119,9 @@ import Database.RocksDB
     iterSeek,
     iterValid,
     multiGetCF,
+    prefixUpperBound,
     withIterCF,
+    withIterConfig,
   )
 import Database.RocksDB.Query
   ( matching,
@@ -377,7 +379,7 @@ getUnspent r p =
 -- | Transactions of an address, newest first.
 getAddressTxs :: DatabaseReader -> Address -> Limits -> IO [TxRef]
 getAddressTxs r a limits = do
-  txs <- withIterCFStat r (addrTxCF r.db) $ \it ->
+  txs <- withIterCFStat r (addrTxCF r.db) (AddrTxKeyA a) $ \it ->
     runConduit $
       addressConduit r a limits.start it
         .| applyLimitsC limits
@@ -388,7 +390,7 @@ getAddressTxs r a limits = do
 -- | Transactions of any of the addresses, newest first, each once.
 getAddressesTxs :: DatabaseReader -> [Address] -> Limits -> IO [TxRef]
 getAddressesTxs r addrs limits =
-  withManyIters r (addrTxCF r.db) (length addrs) $ \its -> do
+  withManyIters r (addrTxCF r.db) (map AddrTxKeyA addrs) $ \its -> do
     txs <- joinConduits txRefKey (zipWith (\a -> addressConduit r a limits.start) addrs its) limits
     count r $ \s -> incrementCounter s.dataAddrTxCount (length txs)
     return txs
@@ -396,7 +398,7 @@ getAddressesTxs r addrs limits =
 -- | Unspent outputs of an address, newest first.
 getAddressUnspents :: DatabaseReader -> Address -> Limits -> IO [Unspent]
 getAddressUnspents r a limits = do
-  us <- withIterCFStat r (addrOutCF r.db) $ \it ->
+  us <- withIterCFStat r (addrOutCF r.db) (AddrOutKeyA a) $ \it ->
     runConduit $
       unspentConduit r a limits.start it
         .| applyLimitsC limits
@@ -407,7 +409,7 @@ getAddressUnspents r a limits = do
 -- | Unspent outputs of any of the addresses, newest first.
 getAddressesUnspents :: DatabaseReader -> [Address] -> Limits -> IO [Unspent]
 getAddressesUnspents r addrs limits =
-  withManyIters r (addrOutCF r.db) (length addrs) $ \its -> do
+  withManyIters r (addrOutCF r.db) (map AddrOutKeyA addrs) $ \its -> do
     uns <- joinConduits unspentKey (zipWith (\a -> unspentConduit r a limits.start) addrs its) limits
     count r $ \s -> incrementCounter s.dataUnspentCount (length uns)
     return uns
@@ -558,7 +560,7 @@ xPubUnspents r xbals limits = do
       stream b it =
         unspentConduit r b.balance.address limits.start it
           .| mapC (\u -> XPubUnspent {path = b.path, unspent = u})
-  us <- withManyIters r (addrOutCF r.db) (length cs) $ \its ->
+  us <- withManyIters r (addrOutCF r.db) (map (AddrOutKeyA . (.balance.address)) cs) $ \its ->
     runConduit $
       mergeDescGroups (.unspent.block) (unspentKey . (.unspent)) quota (zipWith stream cs its)
         .| applyLimitsC limits
@@ -597,7 +599,7 @@ xPubTxCount r xbals = do
 getAddressesTxCount :: DatabaseReader -> [Address] -> IO Word32
 getAddressesTxCount _ [] = return 0
 getAddressesTxCount r as =
-  withManyIters r (addrTxCF r.db) (length as) $ \its ->
+  withManyIters r (addrTxCF r.db) (map AddrTxKeyA as) $ \its ->
     fromIntegral <$> countDistinctSuffixes (zip (map (encode . AddrTxKeyA) as) its)
 
 -- | Addresses of the balances that were ever used.
@@ -629,24 +631,45 @@ countDistinctSuffixes streams = do
 
 -- | Run an action with an iterator on a column family, counting it in the
 -- metrics.
-withIterCFStat :: DatabaseReader -> ColumnFamily -> (Iterator -> IO a) -> IO a
-withIterCFStat r cf f =
-  bracket_ (gauge r 1) (gauge r (-1)) $ withIterCF r.db cf f
+--
+-- The iterator is for the keys that start with a prefix, and RocksDB
+-- stops it where they end ('scanOf').
+withIterCFStat :: (Serialize k) => DatabaseReader -> ColumnFamily -> k -> (Iterator -> IO a) -> IO a
+withIterCFStat r cf prefix f =
+  bracket_ (gauge r 1) (gauge r (-1)) $ withIterConfig r.db (Just cf) (scanOf prefix) f
+
+-- | An iterator for the keys that start with a prefix, such as those of one
+-- address: one that RocksDB itself stops at the end of them.
+--
+-- A scan that stops by looking at the key that it has reached makes
+-- RocksDB find that key first, and if the keys after the prefix were
+-- deleted, it steps over the marker of every one of them to get there.
+-- With an upper bound it stops at the bound. The summary of the mempool
+-- area and the layout of the chain keep such runs of deleted keys short as
+-- things are, so this is for the day that they do not: after a
+-- reorganisation that reverts many blocks, or a change of layout.
+scanOf :: (Serialize k) => k -> IterConfig
+scanOf prefix = def {upperBound = prefixUpperBound (encode prefix)}
 
 -- | Run an action with this many iterators on a column family. They are
 -- opened and closed in a single bracket rather than one bracket each: each
 -- bracket leaves a frame on the stack, and every call into RocksDB through
 -- an iterator walks the stack, so with one bracket per address an xpub of a
 -- hundred addresses made each step of each iterator a hundred times slower.
-withManyIters :: DatabaseReader -> ColumnFamily -> Int -> ([Iterator] -> IO a) -> IO a
-withManyIters r cf i f =
+--
+-- There is one iterator for each of the prefixes given, in their order,
+-- and each is bounded to the keys of its prefix ('scanOf').
+withManyIters :: (Serialize k) => DatabaseReader -> ColumnFamily -> [k] -> ([Iterator] -> IO a) -> IO a
+withManyIters r cf prefixes f =
   bracket_ (gauge r i) (gauge r (negate i)) $
-    bracket (newIORef []) (readIORef >=> mapM_ destroyIterator) $ \ref -> do
-      its <- replicateM i . mask_ $ do
-        it <- createIterator r.db (Just cf)
-        modifyIORef' ref (it :)
+    bracket (newIORef []) (readIORef >=> sequence_) $ \ref -> do
+      its <- forM prefixes $ \prefix -> mask_ $ do
+        (it, destroy) <- createIteratorConfig r.db (Just cf) (scanOf prefix)
+        modifyIORef' ref (destroy :)
         return it
       f its
+  where
+    i = length prefixes
 
 -- | Change the gauge of open iterators.
 gauge :: DatabaseReader -> Int -> IO ()

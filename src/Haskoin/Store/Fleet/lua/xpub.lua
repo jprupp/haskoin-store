@@ -65,6 +65,9 @@
 -- had entries and was asked to empty them, or was not where the tip was
 -- one move ago, in which case what happened since cannot be told.
 --
+-- 'size': nothing. The number of entries, and the number of addresses that
+-- they have between them: {entries, addresses}.
+--
 -- 'evict': how many entries to keep. Deletes the least recently used ones
 -- past that many, and says how many it deleted.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
@@ -72,6 +75,7 @@ local key = {
   fleet = prefix .. 'fleet:tip',
   tip = prefix .. 'fx:tip',
   lru = prefix .. 'fx:lru',
+  addrs = prefix .. 'fx:addrs',
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:',
   spender = prefix .. 'pool:spender',
@@ -100,8 +104,12 @@ end
 
 local function drop(id)
   local e = key.entry .. id .. ':'
-  for _, a in ipairs(redis.call('HKEYS', e .. 'addrs')) do
+  local had = redis.call('HKEYS', e .. 'addrs')
+  for _, a in ipairs(had) do
     redis.call('SREM', key.of .. a, id)
+  end
+  if #had > 0 then
+    redis.call('DECRBY', key.addrs, #had)
   end
   redis.call('DEL', e .. 'addrs', e .. 'meta', e .. 'txs', e .. 'outs', e .. 'oval')
   redis.call('ZREM', key.lru, id)
@@ -134,6 +142,8 @@ elseif what == 'tracked' then
     flags[#flags + 1] = tostring(redis.call('EXISTS', key.of .. ARGV[i]))
   end
   return table.concat(flags)
+elseif what == 'size' then
+  return {redis.call('ZCARD', key.lru), tonumber(redis.call('GET', key.addrs) or '0')}
 elseif what == 'evict' then
   local over = redis.call('ZCARD', key.lru) - tonumber(ARGV[4])
   if over <= 0 then
@@ -286,6 +296,7 @@ if what == 'build' then
     end
   end
   redis.call('HSET', e .. 'meta', 'n0', n0, 'n1', n1)
+  redis.call('INCRBY', key.addrs, tonumber(ARGV[9]))
   return {'ok'}
 end
 

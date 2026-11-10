@@ -629,6 +629,8 @@ nothing in the store calls them.
   | `fleet.cache.abandoned` | counter | Builds given up because the fleet or the entry moved on |
   | `fleet.cache.evictions` | counter | Entries deleted for being the least recently used |
   | `fleet.cache.emptied` | counter | Times that this server emptied the cache |
+  | `fleet.cache.xpubs` | gauge | Xpubs in the cache, whichever server cached them |
+  | `fleet.cache.addresses` | gauge | Addresses that those xpubs have between them |
 
   Misses include small xpubs, which are never cached, so the share of hits
   says how much of the load the cache takes, not how well it holds what it

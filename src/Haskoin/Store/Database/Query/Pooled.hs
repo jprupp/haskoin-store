@@ -119,7 +119,9 @@ import Haskoin.Store.Database.Reader
     txCF,
   )
 import Haskoin.Store.Database.Types
-  ( MemAddrKey (..),
+  ( AddrOutKey (..),
+    AddrTxKey (..),
+    MemAddrKey (..),
     MemAddrVal (..),
     MemSpenderKey (..),
     MemSummary (..),
@@ -369,7 +371,7 @@ getAddressesTxs :: DatabaseReader -> PoolReads -> [Address] -> Limits -> IO [TxR
 getAddressesTxs _ _ [] _ = return []
 getAddressesTxs r pool as limits = paged r pool limits $ \from -> do
   touched <- touchedBy pool from as
-  Q.withManyIters r (addrTxCF r.db) (length as) $ \its ->
+  Q.withManyIters r (addrTxCF r.db) (map AddrTxKeyA as) $ \its ->
     Q.joinConduits txRefKey (zipWith3 (stream from) as touched its) limits
   where
     stream from a t it = poolTxsC pool from (firstPage limits) a t >> chainTxsC from a it
@@ -430,7 +432,7 @@ getAddressesUnspents :: DatabaseReader -> PoolReads -> [Address] -> Limits -> IO
 getAddressesUnspents _ _ [] _ = return []
 getAddressesUnspents r pool as limits = paged r pool limits $ \from -> do
   streams <- unspentStreams r pool from limits as
-  Q.withManyIters r (addrOutCF r.db) (length as) $ \its ->
+  Q.withManyIters r (addrOutCF r.db) (map AddrOutKeyA as) $ \its ->
     Q.joinConduits unspentKey (streams its) limits
 
 -- | Unspent outputs of an extended public key, newest first, given its
@@ -442,7 +444,7 @@ xPubUnspents r pool xbals limits = paged r pool limits $ \from -> do
         l -> Just l
       tag b = mapC (\u -> XPubUnspent {path = b.path, unspent = u})
   streams <- unspentStreams r pool from limits (map (.balance.address) funded)
-  Q.withManyIters r (addrOutCF r.db) (length funded) $ \its ->
+  Q.withManyIters r (addrOutCF r.db) (map (AddrOutKeyA . (.balance.address)) funded) $ \its ->
     runConduit $
       mergeDescGroups
         (.unspent.block)

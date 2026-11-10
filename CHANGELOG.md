@@ -68,18 +68,22 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     emptied. The log says why the cache was emptied each time, and with
     `--debug` has a line for each entry built and each block that the
     cache was brought to.
-- `rocksdb-haskell-jprupp` 2.7 has iterators that stop at a bound. The
-  store was measured with them and has no use for them: since every
-  address of the mempool has a summary, a scan no longer walks over the
-  keys that a block deleted. It stays on 2.6.4, and
-  `docs/layered-database.md` has the numbers.
+- Built with `rocksdb-haskell-jprupp` 2.7.1, and every scan by address
+  uses an iterator that RocksDB stops where the address ends, so that a
+  scan cannot walk over deleted keys that follow it. The migration reads
+  the transactions with an iterator that is asked for the order of them
+  all. `haskoin-node` still asks for a binding below 2.7: `stack.yaml`
+  lifts that bound, and a build with Cabal waits for `haskoin-node`.
+- `haskoin-store --help` names the environment variable of every option.
+- `swagger.yaml` documents the binary format: how to ask for it, the
+  encoding of each type that the API returns, and what differs from JSON.
+- Gauges `fleet.cache.xpubs` and `fleet.cache.addresses`: how many xpubs
+  the cache of a fleet holds, and how many addresses between them.
 
 ### Changed
 
-- One key of a column family is read with a read, not with a multi-get of
-  one key, which measured half as much again.
-- Built with `rocksdb-haskell-jprupp` 2.6.4, which reads the key and the
-  value of a row of an iterator without the cost of a safe foreign call.
+- Since version 2.6.4 the binding reads the key and the value of a row of
+  an iterator without the cost of a safe foreign call.
   Every list and every count takes between a half and a third of the time:
   the first 100 transactions of a busy address 221 microseconds instead of
   575, and the number of transactions of a wallet with 19,499 of them 34

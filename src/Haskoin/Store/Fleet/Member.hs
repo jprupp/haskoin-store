@@ -156,12 +156,15 @@ import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
 import System.Metrics.StatsD
   ( StatCounter,
+    StatGauge,
     StatTiming,
     Stats,
     addTiming,
     incrementCounter,
     newStatCounter,
+    newStatGauge,
     newStatTiming,
+    setGauge,
   )
 import UnliftIO
   ( TVar,
@@ -238,7 +241,13 @@ data CacheMetrics = CacheMetrics
     -- | times that this store emptied the cache (@fleet.cache.emptied@)
     emptied :: !StatCounter,
     -- | milliseconds to build an entry (@fleet.cache.build@)
-    buildTime :: !StatTiming
+    buildTime :: !StatTiming,
+    -- | entries in the cache, one for each extended public key, whichever
+    -- store built them (@fleet.cache.xpubs@)
+    xpubs :: !StatGauge,
+    -- | addresses that those entries have between them
+    -- (@fleet.cache.addresses@)
+    addresses :: !StatGauge
   }
 
 -- | Register the metrics of the cache.
@@ -251,6 +260,8 @@ newCacheMetrics s = do
   evictions <- c "evictions"
   emptied <- c "emptied"
   buildTime <- newStatTiming s "fleet.cache.build" 10
+  xpubs <- newStatGauge s "fleet.cache.xpubs" 0
+  addresses <- newStatGauge s "fleet.cache.addresses" 0
   return CacheMetrics {..}
   where
     c x = newStatCounter s ("fleet.cache." <> x) 10
@@ -935,6 +946,12 @@ shown = T.pack . show
 -- starts again at the tip. Every turn of a member runs this.
 syncCache :: Member -> IO ()
 syncCache m = when (m.config.cacheMax > 0) $ do
+  -- how large the cache is, at every turn: it is one small read, and the
+  -- number is the fleet's, the same from every store
+  forM_ m.metrics $ \x -> do
+    (entries, held) <- cacheSize m.redis m.keys
+    setGauge x.xpubs entries
+    setGauge x.addresses held
   tip <- fmap encode <$> readTVarIO m.tip
   at <- cacheTip m.redis m.keys
   before <- readTVarIO m.lagging

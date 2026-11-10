@@ -502,7 +502,7 @@ getAddressTxs v a = getAddressesTxs v [a]
 getAddressesTxs :: View -> [Address] -> Limits -> IO [TxRef]
 getAddressesTxs (View r) as limits = paged r limits $ \from -> do
   txs <- withMempoolIters r from as (const True) $ \mempools ->
-    Q.withManyIters r (addrTxCF r.db) (length as) $ \its ->
+    Q.withManyIters r (addrTxCF r.db) (map AddrTxKeyA as) $ \its ->
       Q.joinConduits txRefKey (zipWith3 (addressTxsC from) as (map (fmap snd) mempools) its) limits
   Q.count r $ \s -> incrementCounter s.dataAddrTxCount (length txs)
   return txs
@@ -576,7 +576,7 @@ withMempoolIters r from as wanted action = do
   summaries <- case from of
     InChain _ -> return (map (const Nothing) as)
     _ -> map (>>= \s -> if wanted s then Just s else Nothing) <$> M.getSummaries r as
-  Q.withManyIters r (mempoolAddrCF r.db) (length (catMaybes summaries)) (action . pair summaries)
+  Q.withManyIters r (mempoolAddrCF r.db) [MemAddrKeyA a | (a, Just _) <- zip as summaries] (action . pair summaries)
   where
     pair (Just s : rest) (it : its) = Just (s, it) : pair rest its
     pair (_ : rest) its = Nothing : pair rest its
@@ -631,8 +631,8 @@ withUnspentStreams r from as action = do
   let fresh = case from of
         InChain _ -> map (const Nothing) as
         _ -> map (>>= \s -> if s.paidCount > s.bothCount then Just s else Nothing) summaries
-  Q.withManyIters r (mempoolAddrCF r.db) (length (catMaybes fresh)) $ \mits ->
-    Q.withManyIters r (addrOutCF r.db) (length as) $ \its ->
+  Q.withManyIters r (mempoolAddrCF r.db) [MemAddrKeyA a | (a, Just _) <- zip as fresh] $ \mits ->
+    Q.withManyIters r (addrOutCF r.db) (map AddrOutKeyA as) $ \its ->
       action (zipWith3 stream (zip as summaries) (pair fresh mits) its)
   where
     stream (a, s) = addressUnspentsC r from a s
