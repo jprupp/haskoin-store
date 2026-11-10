@@ -372,8 +372,10 @@ getAddressesTxs r pool as limits = paged r pool limits $ \from -> do
 -- | The stream of unspent outputs of each address, from where a page
 -- starts, given the iterators on the chain's index: the outputs that the
 -- pool pays and does not spend, then those of the chain that the pool does
--- not spend. The pool is asked which outputs of the chain it spends a
--- hundred at a time, and no more once as many were found as its summary
+-- not spend. The pool is asked which outputs of the chain it spends
+-- several at a time, four at first and then four times as many each time,
+-- so that the first output of each of many addresses does not cost a batch
+-- of rows read ahead, and no more once as many were found as its summary
 -- counts.
 unspentStreams ::
   DatabaseReader ->
@@ -385,7 +387,7 @@ unspentStreams r pool from as = do
   sums <- pool.summaries as
   return $ \its -> zipWith3 stream as sums its
   where
-    stream a summary it = fresh a summary >> (chainUnspentsC r from a it .| hide a (maybe 0 hidden summary))
+    stream a summary it = fresh a summary >> (chainUnspentsC r from a it .| hide a (maybe 0 hidden summary) 4)
     hidden s = s.spentCount - s.bothCount
     fresh a = \case
       Just s | s.paidCount > s.bothCount -> case from of
@@ -399,16 +401,17 @@ unspentStreams r pool from as = do
     position u = case u.block of
       MemRef t -> (t, u.outpoint)
       BlockRef {} -> (0, u.outpoint)
-    hide :: Address -> Word64 -> ConduitT Unspent Unspent IO ()
-    hide _ 0 = awaitForever yield
-    hide a n = do
-      batch <- gather (100 :: Int)
+    hide :: Address -> Word64 -> Int -> ConduitT Unspent Unspent IO ()
+    hide _ 0 _ = awaitForever yield
+    hide a n size = do
+      batch <- gather size
       case batch of
         [] -> return ()
         _ -> do
           flags <- lift (pool.spentOutputs a (map (.outpoint) batch))
           yieldMany [u | (u, False) <- zip batch flags]
-          hide a (n - min n (fromIntegral (length (filter id flags))))
+          hide a (n - min n (fromIntegral (length (filter id flags)))) (min 256 (size * 4))
+    gather :: Int -> ConduitT Unspent o IO [Unspent]
     gather 0 = return []
     gather k =
       await >>= \case

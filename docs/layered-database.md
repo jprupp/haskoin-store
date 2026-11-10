@@ -46,7 +46,7 @@ to.
 | The keys of one transaction, and what the mempool does to a balance | `Haskoin.Store.Database.Mempool` | written |
 | Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, run when the store opens a database (`upgradeDatabase`) |
 | Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against the rules of version 20, used by the block store |
-| Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, measured: right, and too slow in two cases; not used by the store |
+| Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against the queries of version 20, measured twice: right, too slow in two cases as first built, and fixed; what the store answers with |
 | Tests against today's database, rules and queries | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs`, `test/Haskoin/Store/Database/Query/LayeredSpec.hs` | passing |
 | Cost of lookups, of whole queries and of writing | `docs/layered-database/` | measured |
 | A summary for each address, and lists read by the page | `MemSummary`, `Haskoin.Store.Database.Mempool`, `Haskoin.Store.Database.Query.Layered` | written, tested: each summary is what its entries add up to after every operation |
@@ -78,7 +78,9 @@ Six findings came out of the work, in order of how soon they matter:
    extended public key, they answer as today's queries do, on migrated
    databases and on databases that the new rules built. See
    [Evidence](#evidence).
-5. **The queries as built are not ready for the switch.** They cost 10 to 15
+5. **The queries as first built were not ready for the switch**, and those
+   that the store runs on are: see
+   [What it costs now](#what-it-costs-now-measured). As first built, they cost 10 to 15
    microseconds more for a request when the mempool has nothing for what is
    asked, which is fine. But they read all that the mempool has for an
    address on every question about it, 35 milliseconds for a busy one, and
@@ -889,17 +891,78 @@ The three accessors of an iterator as unsafe foreign calls: three times as
 fast for every scan, in today's store as much as in this layout. See
 [Reading rows through the binding](#reading-rows-through-the-binding).
 
-### What it should cost then
+### What it costs now, measured
 
-Worked out from the parts that were measured, not measured itself:
+With the summary and the streamed lists, on the same history, with the same
+program, every answer again checked against that of version 20.
+Microseconds for each question, the chain's column families without
+filters:
 
-| | As built | With the summary and streamed lists |
-|---|---|---|
-| Balance of an address with nothing in the mempool | 19 | about 9: the snapshot, the chain's balance, a key that is not there |
-| Each address of a wallet, with nothing in the mempool | 6.4 on top of the chain's 2.7 | 0.6 on top of it |
-| Balance of the busiest address | 35,000 | about 10, as any other |
-| First 100 transactions of the busiest address | 34,000 | about what today's 563 is: 100 rows |
-| An address with nothing, right after a block | 1,600 | as at rest |
+| | Version 20 | Layered, as first built | Layered, now |
+|---|---|---|---|
+| Balance of an address with nothing in the mempool | 4.2 | 19 | 11 |
+| Balances of 100 such addresses | 244 | 937 | 350 |
+| Balance of an address with a mempool transaction or two | 4.1 | 37 | 13 |
+| Balance of the busiest address | 2.9 | 35,284 | 11 |
+| Busiest address: first 100 transactions | 574 | 34,414 | 575 |
+| Busiest address: first 100 unspent outputs | 758 | 34,663 | 1,402 |
+| Cold wallet: balances | 1,268 | 3,768 | 1,634 |
+| Cold wallet: first 100 transactions | 6,641 | 10,438 | 7,197 |
+| Quiet wallet: balances | 1,257 | 4,837 | 1,699 |
+| Busy wallet: balances | 974 | 110,348 | 1,879 |
+| Busy wallet: first 100 transactions | 6,758 | 166,818 | 10,271 |
+| Busy wallet: first 100 unspent outputs | 10,208 | 166,202 | 22,622 |
+| Busy wallet: number of transactions | 165,063 | 315,424 | 221,701 |
+| A mempool transaction | 4.6 | 19 | 16 |
+| 100 mempool transactions | 285 | 688 | 624 |
+| A page of a wallet far back | 9,840 | 8,477 | 7,004 |
+
+- **A busy address costs what any other does**: 11 microseconds for its
+  balance, down from 35 milliseconds, and a page of its transactions costs
+  what it does in version 20.
+- **An address costs 7 microseconds more than in version 20**, of which 3.4
+  are the snapshot, which the web server takes once for a request and not
+  for each question as this program does; and each address of a wallet
+  about one more.
+- **Right after a block nothing changes.** `QueryCost.hs seeks` times the
+  balance of 2,000 addresses before and after a block that confirms 5,000
+  mempool transactions: 16.1 and 16.9 microseconds on average, where the
+  queries as first built went from 13 to 1,600.
+- **What is still dearer than in version 20 is what reads two areas for
+  many addresses.** The unspent outputs of an address with much in the
+  mempool take 1.9 times as long, because the outputs that the mempool both
+  pays and spends are read and passed over, where version 20 had deleted
+  them from its index. A wallet whose hundreds of addresses all have
+  mempool transactions takes 1.5 to 2.2 times as long for its first page,
+  because each such address has two streams to open instead of one. A
+  wallet with nothing or little in the mempool takes between 1.0 and 1.2
+  times as long, and a page far back takes less than in version 20.
+- **A transaction's body costs about 3 microseconds more when it is in the
+  mempool**: the spenders of its outputs are keys of their own, read in one
+  multi-get for a page, where version 20 kept them in the body.
+- **Asking which outputs the mempool spends is batched as a list goes
+  on**: one read for the first output, then twice as many each time, in a
+  multi-get from eight on. Asking about a fixed batch made a wallet's first
+  page three times slower, since each of its hundreds of addresses then
+  read a batch ahead to give one output; asking one at a time made a busy
+  address a third slower.
+
+The summary is paid for when writing. Microseconds for each transaction:
+
+| | Version 20 | Layered, without summaries | Layered, now |
+|---|---|---|---|
+| Importing a chain, with nothing in the mempool | 189 | 182 | 175 |
+| Taking a transaction into the mempool | 294 | 203 | 243 |
+| Importing a block that confirms mempool transactions | 205 | 367 | 434 |
+| A transaction over its life: the mempool, then a block | 499 | 570 | 677 |
+
+A transaction that passes through the mempool costs 36% more to write than
+in version 20, instead of 14%: about 110 microseconds for the reads and
+writes of the summaries of the three or four addresses that it touches,
+when it comes and when it goes. Taking a transaction is still cheaper than
+in version 20; a block of 3,000 transactions that the mempool had seen
+takes 1.3 seconds to import on this machine instead of 0.6. That is the
+price of a balance that is one read however busy the address is.
 
 ## Keeping the mempool in memory
 
@@ -1099,6 +1162,15 @@ alone in its fleet through random histories of payments, replacements,
 blocks and reorganisations, with a real Redis: after every step, each
 answer from the view at the fleet tip and the pool of Redis is the answer
 that the store gives from its own database.
+
+A member does not read its whole mempool every two seconds to find what
+to offer. It reads the list from the newest until a page has nothing new,
+and the whole of it only after its best block or the fleet tip changed and
+every five minutes. The first version of that forgot that a transaction can
+leave a mempool and come back, as one does that is sent again after it was
+replaced: it was remembered as offered, and what had replaced it stayed in
+the pool. The same test found it, and the store now tells its member what
+it deletes.
 
 A member does not withdraw from the pool what it deletes from its own
 mempool. A replacement reaches the pool with the offer of the transaction

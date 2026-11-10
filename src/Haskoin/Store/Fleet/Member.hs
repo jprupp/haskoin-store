@@ -51,6 +51,7 @@ module Haskoin.Store.Fleet.Member
     MemberConfig (..),
     newMember,
     noteBest,
+    memberForget,
     memberTick,
     memberLoop,
     memberAlive,
@@ -80,6 +81,8 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Either (rights)
 import Data.Functor ((<&>))
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.List (nub, sortOn)
@@ -99,6 +102,7 @@ import Haskoin
     nullOutPoint,
     txHash,
   )
+import Haskoin.Store.Common (Limits (..))
 import Haskoin.Store.Data
   ( BlockData (..),
     BlockRef (..),
@@ -128,6 +132,7 @@ import UnliftIO
     modifyTVar',
     newTVarIO,
     readTVarIO,
+    stateTVar,
     timeout,
     writeTVar,
   )
@@ -166,6 +171,14 @@ data Member = Member
     tip :: !(TVar (Maybe BlockHash)),
     -- | the transactions of the store's mempool that the pool has
     offered :: !(TVar (HashSet TxHash)),
+    -- | those that it refused, or that there was no time to offer, with
+    -- the times at which they entered the mempool: they are offered again
+    waiting :: !(TVar (HashMap TxHash UnixTime)),
+    -- | how many times the mempool was offered, and at which tip last
+    rounds :: !(TVar Int),
+    offeredAt :: !(TVar (Maybe BlockHash)),
+    -- | whether the best block changed since the mempool was last offered
+    changed :: !(TVar Bool),
     -- | whether the store's own health checks pass. While they do not, the
     -- member does nothing, so that its lease runs out and a store that is
     -- stuck does not hold the fleet back.
@@ -180,6 +193,10 @@ newMember config redis db = do
   reported <- newTVarIO []
   tip <- newTVarIO Nothing
   offered <- newTVarIO HashSet.empty
+  waiting <- newTVarIO HashMap.empty
+  rounds <- newTVarIO 0
+  offeredAt <- newTVarIO Nothing
+  changed <- newTVarIO True
   healthy <- newTVarIO True
   return Member {keys = fleetKeys config.prefix 32, ..}
 
@@ -190,8 +207,20 @@ newMember config redis db = do
 noteBest :: Member -> BlockHash -> IO ()
 noteBest m block = do
   takeView m.views block
-  atomically . modifyTVar' m.recent $ \blocks -> take m.config.depth (block : filter (/= block) blocks)
+  atomically $ do
+    modifyTVar' m.recent $ \blocks -> take m.config.depth (block : filter (/= block) blocks)
+    writeTVar m.changed True
   prune m
+
+-- | Note that transactions left the store's mempool unconfirmed. The store
+-- calls this when it deletes them. The member forgets that it offered them:
+-- one that comes back, as a transaction does that is sent again after it
+-- was replaced, is then offered again, and takes the place of what replaced
+-- it if this store's rules say so.
+memberForget :: Member -> [TxHash] -> IO ()
+memberForget m hs = atomically $ do
+  modifyTVar' m.offered (\have -> foldr HashSet.delete have hs)
+  modifyTVar' m.waiting (\held -> foldr HashMap.delete held hs)
 
 -- | Let go of the views that the rules do not ask for: all but those of
 -- the recent blocks, of the last report, and of the tip read after it.
@@ -393,43 +422,99 @@ poolTx net ctx td =
 -- store deleted every one of them by its own rules, as it does when it
 -- replaces a transaction, and otherwise stays out: the first of two that
 -- spend the same output stays.
+--
+-- = Reading no more of the mempool than is new
+--
+-- A mempool has tens of thousands of transactions and a round comes every
+-- two seconds, so a round does not read the whole list. It reads the list
+-- from the newest, a page at a time, until a page has nothing that it does
+-- not know, and offers what it found with what is waiting from earlier
+-- rounds. The whole list is read when the tip has moved or the store's best
+-- block has changed, since a block or a reorganisation changes the mempool
+-- anywhere, and every 'wholeEvery' rounds, for whatever the short way
+-- missed. What the store deletes in between it tells the member
+-- ('memberForget'). A round offers 'mostOffers'
+-- transactions at most and leaves the rest waiting, so that a store with a
+-- large mempool to offer still reports in time to keep its lease.
 offerMempool :: Member -> IO ()
 offerMempool m =
   readTVarIO m.tip >>= \case
     Nothing -> return ()
     Just tip -> void . withViewAt m.views tip $ \at -> do
+      before <- readTVarIO m.offeredAt
+      (n, dirty) <- atomically $ do
+        writeTVar m.offeredAt (Just tip)
+        (,) <$> stateTVar m.rounds (\k -> (k, k + 1)) <*> stateTVar m.changed (,False)
+      todo <- if dirty || before /= Just tip || n `mod` wholeEvery == 0 then everything else newest
+      let (now, later) = splitAt mostOffers (sortOn fst todo)
+      atomically (modifyTVar' m.waiting (HashMap.union (HashMap.fromList [(h, time) | (time, h) <- later])))
+      go at tip now
+  where
+    -- all of the mempool that the pool does not have, forgetting what has
+    -- left the mempool
+    everything = do
       mempool <- Q.getMempool m.db
       have <- readTVarIO m.offered
-      let listed = HashSet.fromList (map snd mempool)
-          todo = [h | (_, h) <- sortOn fst mempool, not (HashSet.member h have)]
-      atomically (writeTVar m.offered (HashSet.intersection have listed))
-      go at tip todo
-  where
+      let kept = HashSet.intersection have (HashSet.fromList (map snd mempool))
+      atomically (writeTVar m.offered kept >> writeTVar m.waiting HashMap.empty)
+      return [(time, h) | (time, h) <- mempool, not (HashSet.member h kept)]
+    -- the newest of the mempool that this member has not seen, and what is
+    -- waiting
+    newest = do
+      have <- readTVarIO m.offered
+      held <- readTVarIO m.waiting
+      let known h = HashSet.member h have || HashMap.member h held
+          scan offset = do
+            page <- Q.getMempoolPage m.db Limits {limit = pageSize, offset, start = Nothing}
+            let fresh = filter (not . known . snd) page
+            if null fresh || length page < fromIntegral pageSize
+              then return fresh
+              else (fresh <>) <$> scan (offset + pageSize)
+      found <- scan 0
+      return (found <> [(time, h) | (h, time) <- HashMap.toList held])
+    pageSize = 256
     go _ _ [] = return ()
-    go at tip (h : rest) =
+    go at tip ((time, h) : rest) =
       M.getMempoolTx m.db h >>= \case
-        Nothing -> go at tip rest
+        Nothing -> forget h >> go at tip rest
         Just td -> do
           let tx = poolTx m.db.net m.db.ctx td
           unspent <- forM [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
             isJust <$> Q.getUnspent at p
           let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) tx unspent
-              done = atomically (modifyTVar' m.offered (HashSet.insert h))
+              done = atomically $ do
+                modifyTVar' m.offered (HashSet.insert h)
+                modifyTVar' m.waiting (HashMap.delete h)
+              wait = atomically (modifyTVar' m.waiting (HashMap.insert h time))
           offer [] >>= \case
             Taken -> done >> go at tip rest
             Known -> done >> go at tip rest
-            Orphan _ -> go at tip rest
+            Orphan _ -> wait >> go at tip rest
+            -- the tip moved: the next round reads the whole mempool
             Late -> return ()
             Conflict rivals -> do
               mine <- mapM deletedHere rivals
-              when (and mine) $
-                offer rivals >>= \case
-                  Taken -> done
-                  _ -> return ()
+              if and mine
+                then
+                  offer rivals >>= \case
+                    Taken -> done
+                    _ -> wait
+                else wait
               go at tip rest
+    forget h = atomically (modifyTVar' m.waiting (HashMap.delete h))
     deletedHere rival = case decode rival of
       Left _ -> return False
       Right h -> maybe False (.deleted) <$> L.withView m.db (`L.getTxData` h)
+
+-- | How many rounds of offers go by between two that read the whole
+-- mempool: five minutes of them.
+wholeEvery :: Int
+wholeEvery = 150
+
+-- | The most transactions that one round offers. An offer takes a tenth of
+-- a millisecond or two, so this is well under the two seconds of a round.
+mostOffers :: Int
+mostOffers = 2000
 
 -- | Take out of the pool the transactions that entered a mempool longer
 -- ago than the configuration allows, with what spends them.

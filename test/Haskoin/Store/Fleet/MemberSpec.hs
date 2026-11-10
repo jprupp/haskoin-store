@@ -46,6 +46,8 @@ spec = prepareContext $ \ctx -> do
                         (hist', Just op) -> do
                           out <- apply layeredRules db op
                           let hist'' = record db hist' op out
+                          -- the store tells its member what it deletes
+                          memberForget m out.removed
                           when (isRight out.result) $ case op of
                             Mine _ _ -> best >>= noteBest m
                             Revert _ -> best >>= noteBest m

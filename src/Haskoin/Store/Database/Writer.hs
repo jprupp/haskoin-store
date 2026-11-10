@@ -69,6 +69,7 @@ module Haskoin.Store.Database.Writer
     deleteAddrUnspent,
     addToMempool,
     deleteFromMempool,
+    inMempool,
     setBalance,
     insertUnspent,
     deleteUnspent,
@@ -98,7 +99,7 @@ import Data.HashTable.IO qualified as H
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Ord (Down (..))
 import Database.RocksDB (BatchOp, DB)
 import Database.RocksDB.Query
@@ -541,6 +542,16 @@ getBalance w a = getLayered w (getBalanceH a) (`Q.getBalance` a)
 -- | Unspent output, with the changes of the batch applied.
 getUnspent :: Writer -> OutPoint -> IO (Maybe Unspent)
 getUnspent w op = getLayered w (getUnspentH op) (`Q.getUnspent` op)
+
+-- | Whether a transaction is in the mempool, with the changes of the batch
+-- applied. It reads the small key that lists the transaction, where
+-- 'getMempoolTx' reads and decodes its whole body: a rule that only needs
+-- to know asks this.
+inMempool :: Writer -> TxHash -> IO Bool
+inMempool w h =
+  H.lookup w.memory.mempoolTable h >>= \case
+    Just change -> return (isJust change)
+    Nothing -> isJust <$> (retrieveCF w.reader.db (mempoolCF w.reader.db) (MemTxKey h) :: IO (Maybe UnixTime))
 
 -- | Body of a transaction in the mempool area, without its spenders, with
 -- the changes of the batch applied.

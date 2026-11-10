@@ -83,7 +83,7 @@ import Haskoin.Store.Database.Reader
     createDataMetrics,
     withLayeredReader,
   )
-import Haskoin.Store.Fleet.Member (Member, MemberConfig (..), memberLoop, newMember, noteBest)
+import Haskoin.Store.Fleet.Member (Member, MemberConfig (..), memberForget, memberLoop, newMember, noteBest)
 import NQE
   ( Inbox,
     Publisher,
@@ -265,9 +265,11 @@ withStoreFleet cfg pub (Just member) action =
   withSubscription pub $ \sub ->
     withAsync (memberLoop member (nextBlock sub) complain) $ \a -> link a >> action
   where
+    -- until the next block, telling the member what the store deletes
     nextBlock sub =
       receive sub >>= \case
         StoreBestBlock _ -> return ()
+        StoreMempoolDelete h -> memberForget member [h] >> nextBlock sub
         _ -> nextBlock sub
     complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not take a turn: " <> cs why)
 

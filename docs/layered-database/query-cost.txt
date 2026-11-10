@@ -173,3 +173,156 @@ as it was left       mean      9.4, longest     45.1 microseconds
 after the block      mean     10.3, longest     41.0 microseconds
 5000 of the 40000 mempool transactions deleted
 after the deletions  mean    809.8, longest   1884.1 microseconds
+
+
+With a summary for each address and lists read by the page, 2026-11-10.
+The same machine and settings. The database of version 20 is the one
+above; the layered one was written again by the rules that keep summaries.
+
+##### make layered, no filters on the chain
+importing a chain: 35.0 seconds, 175 microseconds for each transaction
+taking transactions into the mempool: 12.2 seconds, 243 microseconds for each transaction
+importing blocks that confirm mempool transactions: 4.3 seconds, 434 microseconds for each transaction
+211 blocks, 40000 transactions left in the mempool
+
+##### time, no filters on the chain
+today's database, table files of tx: 326478 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of addr-tx: 899352 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of balance: 112108 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of mempool: 100000 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of tx: 248701 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of addr-tx: 699474 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of balance: 116217 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of mempool: 249994 keys, 249994 of them in 312517 bytes of Bloom filters
+the layered database, table files of mempool-addr: 523830 keys, 615796 of them in 769866 bytes of Bloom filters
+211 blocks, 40000 transactions in the mempool
+the busiest address: 17342 transactions, 6216 entries in the mempool area
+the cold wallet: 464 addresses read, 19499 transactions, 0 entries in the mempool area
+the quiet wallet: 464 addresses read, 19630 transactions, 10 entries in the mempool area
+the busy wallet: 464 addresses read, 42035 transactions, 16368 entries in the mempool area
+the small wallet: 84 addresses read, 399 transactions, 4 entries in the mempool area
+
+microseconds for each                                           today    layered   ratio
+balance: address with nothing in the mempool                      4.2       11.3    2.69
+balance: address with a transaction or two in the mempool         4.1       13.3    3.21
+balance: the busiest address                                      2.9       11.3    3.96
+balance: address that was never used                              4.0       10.8    2.73
+balances of 100 addresses with nothing in the mempool           243.9      350.4    1.44
+transaction: confirmed                                            6.0       13.1    2.18
+transaction: in the mempool                                       4.6       16.4    3.55
+100 transactions: confirmed                                     351.3      427.0    1.22
+100 transactions: in the mempool                                285.3      623.7    2.19
+spender of an output of a confirmed transaction                   6.1       11.3    1.84
+unspent output, if it is                                          4.6       12.1    2.62
+address with nothing in the mempool: its transactions            42.6       55.4    1.30
+address with a little in the mempool: its transactions           52.8       81.3    1.54
+busiest address: first 100 transactions                         573.5      574.8    1.00
+busiest address: 100 transactions, far back                     527.3      571.9    1.08
+busiest address: first 100 unspent outputs                      757.9     1402.4    1.85
+cold wallet: balances                                          1268.4     1633.7    1.29
+cold wallet: first 100 transactions                            6640.6     7197.0    1.08
+cold wallet: 100 transactions, far back                        9698.6     7500.3    0.77
+cold wallet: first 100 unspent outputs                        10338.4    12290.9    1.19
+cold wallet: number of transactions                           76742.3    77799.3    1.01
+quiet wallet: balances                                         1256.6     1699.3    1.35
+quiet wallet: first 100 transactions                           6700.8     7434.4    1.11
+quiet wallet: 100 transactions, far back                       9939.7     7135.8    0.72
+quiet wallet: first 100 unspent outputs                       10738.1    11240.0    1.05
+quiet wallet: number of transactions                          76579.4    78609.1    1.03
+busy wallet: balances                                           974.1     1878.7    1.93
+busy wallet: first 100 transactions                            6757.6    10271.1    1.52
+busy wallet: 100 transactions, far back                        9840.1     7003.9    0.71
+busy wallet: first 100 unspent outputs                        10208.0    22621.7    2.22
+busy wallet: number of transactions                          165062.6   221700.8    1.34
+small wallet: balances                                          212.5      294.7    1.39
+small wallet: first 100 transactions                            791.2      926.9    1.17
+small wallet: 100 transactions, far back                        915.2      832.3    0.91
+small wallet: first 100 unspent outputs                        1090.0     1175.9    1.08
+small wallet: number of transactions                           1486.9     1563.6    1.05
+
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.5
+balances of 100 addresses: the chain's part                                253.5
+balances of 100 addresses: the mempool's part                              469.2
+  100 seeks of one iterator that find nothing                              284.4
+  100 keys that are not there, in one multi-get                             84.5
+busiest address: its mempool entries, read and decoded                   31508.3
+  the same entries, read and not decoded                                 27708.6
+
+##### time, filters on the chain
+today's database, table files of tx: 326478 keys, 326478 of them in 408207 bytes of Bloom filters
+today's database, table files of addr-tx: 899352 keys, 507146 of them in 633989 bytes of Bloom filters
+today's database, table files of balance: 111848 keys, 111848 of them in 139850 bytes of Bloom filters
+today's database, table files of mempool: 100000 keys, 100000 of them in 125061 bytes of Bloom filters
+the layered database, table files of tx: 248701 keys, 248701 of them in 310922 bytes of Bloom filters
+the layered database, table files of addr-tx: 699474 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of balance: 116217 keys, 116217 of them in 145354 bytes of Bloom filters
+the layered database, table files of mempool: 249994 keys, 249994 of them in 312517 bytes of Bloom filters
+the layered database, table files of mempool-addr: 523830 keys, 615796 of them in 769866 bytes of Bloom filters
+211 blocks, 40000 transactions in the mempool
+the busiest address: 17342 transactions, 6216 entries in the mempool area
+the cold wallet: 464 addresses read, 19499 transactions, 0 entries in the mempool area
+the quiet wallet: 464 addresses read, 19630 transactions, 10 entries in the mempool area
+the busy wallet: 464 addresses read, 42035 transactions, 16368 entries in the mempool area
+the small wallet: 84 addresses read, 399 transactions, 4 entries in the mempool area
+
+microseconds for each                                           today    layered   ratio
+balance: address with nothing in the mempool                      3.4       10.6    3.09
+balance: address with a transaction or two in the mempool         3.4       12.5    3.66
+balance: the busiest address                                      3.1       11.5    3.72
+balance: address that was never used                              1.9        8.8    4.70
+balances of 100 addresses with nothing in the mempool           183.2      289.3    1.58
+transaction: confirmed                                            4.7       13.4    2.87
+transaction: in the mempool                                       4.9       16.6    3.41
+100 transactions: confirmed                                     271.9      404.3    1.49
+100 transactions: in the mempool                                288.5      623.3    2.16
+spender of an output of a confirmed transaction                   4.5       10.3    2.29
+unspent output, if it is                                          3.8        9.8    2.60
+address with nothing in the mempool: its transactions            42.8       55.1    1.29
+address with a little in the mempool: its transactions           52.4       85.7    1.63
+busiest address: first 100 transactions                         522.1      576.0    1.10
+busiest address: 100 transactions, far back                     531.4      574.2    1.08
+busiest address: first 100 unspent outputs                      714.1     1360.5    1.91
+cold wallet: balances                                           852.5     1318.2    1.55
+cold wallet: first 100 transactions                            7149.8     7195.7    1.01
+cold wallet: 100 transactions, far back                        9228.5     7036.2    0.76
+cold wallet: first 100 unspent outputs                        10522.6    11326.6    1.08
+cold wallet: number of transactions                           77049.6    78404.4    1.02
+quiet wallet: balances                                          864.5     1306.5    1.51
+quiet wallet: first 100 transactions                           6702.9     7329.3    1.09
+quiet wallet: 100 transactions, far back                       9069.5     7019.5    0.77
+quiet wallet: first 100 unspent outputs                       10223.2    11575.0    1.13
+quiet wallet: number of transactions                          76778.5    79181.3    1.03
+busy wallet: balances                                           835.2     1822.3    2.18
+busy wallet: first 100 transactions                            6844.2    11150.7    1.63
+busy wallet: 100 transactions, far back                        9436.4     7166.4    0.76
+busy wallet: first 100 unspent outputs                        11332.1    23357.3    2.06
+busy wallet: number of transactions                          176022.1   220646.8    1.25
+small wallet: balances                                           90.1      166.1    1.84
+small wallet: first 100 transactions                            796.4      914.6    1.15
+small wallet: 100 transactions, far back                        904.8      872.8    0.96
+small wallet: first 100 unspent outputs                        1121.4     1235.8    1.10
+small wallet: number of transactions                           1651.1     1640.8    0.99
+
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.6
+balances of 100 addresses: the chain's part                                208.4
+balances of 100 addresses: the mempool's part                              468.0
+  100 seeks of one iterator that find nothing                              284.6
+  100 keys that are not there, in one multi-get                             89.0
+busiest address: its mempool entries, read and decoded                   35083.8
+  the same entries, read and not decoded                                 28062.1
+
+##### seeks layered, 5,000 transactions confirmed by a block
+as it was left, seek           mean      3.5, median      3.3, 99th of 100      6.8, longest     38.0 microseconds
+as it was left, balance        mean     16.1, median     15.5, 99th of 100     27.0, longest     50.1 microseconds
+5000 of the 40000 mempool transactions confirmed by a block
+after the block, seek          mean      4.5, median      4.4, 99th of 100      8.0, longest     74.4 microseconds
+after the block, balance       mean     16.9, median     16.3, 99th of 100     27.8, longest     58.9 microseconds
+
+##### seeks mixed, 5,000 transactions confirmed by a block
+as it was left, seek           mean      6.6, median      6.6, 99th of 100     10.3, longest     45.0 microseconds
+as it was left, balance        mean      5.0, median      4.8, 99th of 100      6.9, longest     32.9 microseconds
+5000 of the 40000 mempool transactions confirmed by a block
+after the block, seek          mean      6.9, median      6.8, 99th of 100      9.8, longest     39.1 microseconds
+after the block, balance       mean      5.4, median      5.2, 99th of 100      7.5, longest     33.1 microseconds

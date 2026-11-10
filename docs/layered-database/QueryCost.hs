@@ -36,8 +36,10 @@
 --
 -- @seeks@ times the first step of a scan by address, for addresses that
 -- have nothing: in the index of transactions by address for today's layout,
--- and in the entries of the mempool by address for the layered one. It does
--- so twice: with the database as it was left, and after the oldest mempool
+-- and in the entries of the mempool by address for the layered one, and
+-- then the balance of each of those addresses as the queries of the layout
+-- read it, which for the layered layout is by key and without a scan. It
+-- does so twice: with the database as it was left, and after the oldest mempool
 -- transactions, as many as given, are confirmed by a @block@, or the newest
 -- are deleted with @delete@. It changes the database, so give it a copy.
 --
@@ -529,14 +531,27 @@ seeks ctx layout bloom dir count deleting =
           _ <- iterValid it
           t1 <- getMonotonicTimeNSec
           return (t1 - t0)
+            -- the balance of each of the same addresses, as the queries of the
+        -- layout read it
+        balance a = case layout of
+          Mixed -> void (Q.getBalance db a)
+          Layered -> void (L.withView db (`L.getBalance` a))
+        asked = forM never $ \a -> do
+          t0 <- getMonotonicTimeNSec
+          balance a
+          t1 <- getMonotonicTimeNSec
+          return (t1 - t0)
         say what = do
-          _ <- once
-          ts <- sort <$> once
+          measure (what <> ", seek") once
+          measure (what <> ", balance") asked
+        measure what run = do
+          _ <- run
+          ts <- sort <$> run
           let n = length ts
               micro t = fromIntegral t / 1000 :: Double
               at q = micro (ts !! min (n - 1) (n * q `div` 1000))
           printf
-            "%-20s mean %8.1f, median %8.1f, 99th of 100 %8.1f, longest %8.1f microseconds\n"
+            "%-30s mean %8.1f, median %8.1f, 99th of 100 %8.1f, longest %8.1f microseconds\n"
             (text what)
             (micro (sum ts) / fromIntegral n)
             (at 500)

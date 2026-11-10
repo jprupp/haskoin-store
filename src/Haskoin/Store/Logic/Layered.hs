@@ -580,7 +580,7 @@ adjustSummaries wr op r = do
   deltas <- forM r.addresses $ \case
     (MemAddrTxKey a _ _, _) -> return (a, MemSummary 1 0 0 0 0 0 0)
     (MemAddrSpentKey a p, MemAddrSpentVal v) -> do
-      made <- isJust <$> getMempoolTx wr p.hash
+      made <- inMempool wr p.hash
       return (a, if made then MemSummary 0 0 0 v 1 v 1 else MemSummary 0 0 0 v 1 0 0)
     (MemAddrOutKey a _ p, MemAddrOutVal v _) -> do
       taken <- isJust <$> getMempoolSpender wr p

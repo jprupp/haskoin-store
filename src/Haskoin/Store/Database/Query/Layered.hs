@@ -114,6 +114,7 @@ import Conduit
     runConduit,
     sinkList,
     yield,
+    yieldMany,
     (.|),
   )
 import Control.Monad (forM)
@@ -128,10 +129,10 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Serialize (Serialize, encode)
 import Data.Word (Word32, Word64)
-import Database.RocksDB (ColumnFamily, Iterator, withSnapshot)
+import Database.RocksDB (ColumnFamily, Iterator, multiGetCF, withSnapshot)
 import Database.RocksDB.Query
   ( matching,
     matchingAsListCF,
@@ -658,8 +659,8 @@ addressUnspentsC ::
   Iterator ->
   ConduitT i Unspent IO ()
 addressUnspentsC r from a summary mempool it = do
-  mapM_ (\mit -> fresh mit .| concatMapC created .| hide (maybe 0 (.bothCount) summary)) mempool
-  chainUnspentsC r from a it .| hide (maybe 0 (\s -> s.spentCount - s.bothCount) summary)
+  mapM_ (\mit -> fresh mit .| concatMapC created .| hide (maybe 0 (.bothCount) summary) 1) mempool
+  chainUnspentsC r from a it .| hide (maybe 0 (\s -> s.spentCount - s.bothCount) summary) 1
   where
     -- the outputs of the transaction that the page starts at come first
     -- among those of the same second whose hashes are not smaller
@@ -672,16 +673,43 @@ addressUnspentsC r from a summary mempool it = do
       Just Unspent {block = MemRef t, outpoint = p, value = v, script = s, address = Just a}
     created _ = Nothing
     -- let outputs through, but for those that the mempool spends, of which
-    -- there are no more than a number
-    hide :: Word64 -> ConduitT Unspent Unspent IO ()
-    hide 0 = awaitForever yield
-    hide n =
+    -- there are no more than a number. They are asked about several at a
+    -- time, in one multi-get, which costs a fifth of asking about each: one
+    -- at first, then twice as many each time. A page of one address is then
+    -- a few reads, and the first output of each of the hundreds of
+    -- addresses of a wallet, which is all that a merge of them may take,
+    -- does not cost a batch of rows read ahead for each.
+    hide :: Word64 -> Int -> ConduitT Unspent Unspent IO ()
+    hide 0 _ = awaitForever yield
+    hide n size =
+      gather size >>= \case
+        [] -> return ()
+        batch -> do
+          found <- lift (spentAmong batch)
+          yieldMany [u | (u, False) <- zip batch found]
+          hide (n - min n (fromIntegral (length (filter id found)))) (min hideBatch (size * 2))
+    -- whether the mempool spends each of some outputs of the address: a
+    -- read by key for each of a few, and one multi-get for more, which
+    -- only then costs less
+    spentAmong :: [Unspent] -> IO [Bool]
+    spentAmong batch
+      | length batch < 8 = forM batch $ \u -> do
+          found <- retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a u.outpoint)
+          return (isJust (found :: Maybe MemAddrVal))
+      | otherwise =
+          map isJust <$> multiGetCF r.db (mempoolAddrCF r.db) [encode (MemAddrSpentKey a u.outpoint) | u <- batch]
+    gather :: Int -> ConduitT Unspent o IO [Unspent]
+    gather 0 = return []
+    gather k =
       await >>= \case
-        Nothing -> return ()
-        Just u ->
-          lift (retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a u.outpoint)) >>= \case
-            Just (_ :: MemAddrVal) -> hide (n - 1)
-            Nothing -> yield u >> hide n
+        Nothing -> return []
+        Just u -> (u :) <$> gather (k - 1)
+
+-- | The most outputs that are asked about at once when looking for those
+-- that the mempool spends. More would save little, and each one is a row
+-- read ahead of what a page may need.
+hideBatch :: Int
+hideBatch = 32
 
 -- | Unspent outputs of an address in the chain, newest first, from where a
 -- page starts, streamed from the index of the address. Those that the

@@ -265,6 +265,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - The rules keep the summary with every transaction that enters or leaves
     the mempool, and the migration writes all of them from the entries that
     it moved. The tests work every summary out again after each operation.
+  - Measured again with `QueryCost.hs`: the balance of an address with
+    6,216 entries in the mempool takes 11 microseconds instead of 35
+    milliseconds, a page of its transactions what it takes in version 20,
+    the balances of a wallet of 464 busy addresses 1.9 milliseconds instead
+    of 110, and nothing gets slower right after a block. Keeping the
+    summaries costs about 110 microseconds for each transaction that passes
+    through the mempool. `docs/layered-database.md` has the tables.
 - `docs/layered-database/QueryCost.hs` writes one synthetic history into a
   database of each layout and times the rules and the queries of both,
   checking that the answers agree. `docs/layered-database.md` has the
