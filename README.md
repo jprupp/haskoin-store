@@ -510,7 +510,7 @@ of it are written and tested, and the store does not use them yet:
   waiting to be imported, and connected peers. Point your load balancer at it.
 - **Without Redis** a store that has a cache goes on answering, from its own
   database, and `/health` says 203 instead of 200, with the header
-  `Haskoin-Degraded: redis`. A request waits at most two seconds for Redis
+  `Haskoin-Degraded: redis` and `"redis": {"ok": false}` in its JSON. A request waits at most two seconds for Redis
   before the store gives up on it, and the store tries again at every health
   check. 203 is in the range that load balancers take for healthy, so the
   store stays in rotation; alert on anything but 200 to hear of it.

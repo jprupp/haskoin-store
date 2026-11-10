@@ -114,6 +114,7 @@ import Data.Aeson.Encoding
   ( encodingToLazyByteString,
     list,
   )
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
 import Data.ByteString.Builder (lazyByteString)
 import Data.ByteString.Char8 qualified as C
@@ -2799,8 +2800,16 @@ getPeersInformation mgr =
 -- response, and a monitor that expects exactly 200 will notice it. 207 was
 -- the other candidate, for a body with a status for each part; it promises
 -- a format that this body does not have. The response also names what is
--- missing in a @Haskoin-Degraded@ header, since the body, whose encoding is
--- shared with other programs, has no place for it yet.
+-- missing in a @Haskoin-Degraded@ header.
+--
+-- = The check of Redis in the body
+--
+-- The JSON body of a store that has a cache has one more check than the
+-- others, @redis@, with @ok@ true or false. It does not count towards the
+-- @ok@ of the whole, which stays the answer to "is this store fit to
+-- serve". It is added here, to the JSON alone: the type of the body and its
+-- binary encoding belong to haskoin-store-data, where a new field would
+-- break every client that reads the binary form.
 pathHealth :: WebState -> Route
 pathHealth st =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ["pretty"] $ \req -> do
@@ -2812,9 +2821,13 @@ pathHealth st =
           | not up = (status203, [("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
-      responseLBS status ((hContentType, serialType proto) : extra) (protoSerial proto toEncoding toJSON h)
+      responseLBS status ((hContentType, serialType proto) : extra) $
+        protoSerial proto (toEncoding . withRedis up) (withRedis up) h
   where
     proxy = Proxy :: Proxy GetHealth
+    withRedis up h = case (st.config.store.cache, toJSON h) of
+      (Just _, A.Object o) -> A.Object (KeyMap.insert "redis" (A.object ["ok" A..= up]) o)
+      (_, v) -> v
 
 -- | Handler for @GET \/health@: health of the store.
 handleHealth ::

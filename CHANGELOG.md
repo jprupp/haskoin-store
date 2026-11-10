@@ -220,6 +220,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
+- `Haskoin.Store.Fleet`: the rules by which stores that share a Redis agree
+  on one block to answer from, the fleet tip, as pure decisions with a model
+  test. It is the first part of the design for a fleet that answers as one,
+  in `docs/layered-database.md`. Nothing uses it yet.
 - A store whose Redis does not answer goes on answering from its database,
   instead of failing every request that the cache would have served. A
   request waits at most two seconds for Redis; after that the store leaves
@@ -227,7 +231,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   answers 203, Non-Authoritative Information, with the header
   `Haskoin-Degraded: redis`, when every other check passes: a status in the
   200s, so that load balancers keep the store, and not 200, so that
-  monitoring notices.
+  monitoring notices. The JSON of `/health` has a new check, `redis`, for a
+  store that has a cache; it does not count towards `ok`.
 - Breaking: transactions that were deleted are no longer returned. A
   transaction that was replaced, dropped from the mempool, or was the
   coinbase of a block that left the main chain used to answer by id with

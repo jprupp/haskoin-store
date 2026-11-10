@@ -1490,7 +1490,15 @@ redisDownTest env = do
   void $ pay env x ref [([0, 0], 100000), ([1, 0], 50000)]
   void $ mine env 1
   checkXPub env x ref
-  fst <$> getJSON env.cached "/health" `shouldReturn` 200
+  let redisOK (_, v) = (v ! "redis") ! "ok"
+  (code0, healthy) <- getJSON env.cached "/health"
+  code0 `shouldBe` 200
+  redisOK (code0, healthy) `shouldBe` Bool True
+  -- a store without a cache has no such check
+  (_, bare) <- getJSON env.plain "/health"
+  bare `shouldSatisfy` \case
+    Object o -> not (KeyMap.member "redis" o)
+    _ -> False
   held <- redisRun env (Redis.sendRequest ["CLIENT", "PAUSE", "12000"])
   held `shouldBe` Redis.Ok
   -- the first request waits two seconds for Redis and gives up on it
@@ -1498,6 +1506,7 @@ redisDownTest env = do
   code `shouldBe` 200
   waitFor "the health check to notice that Redis is gone" $
     (== 203) . fst <$> getJSON env.cached "/health"
+  redisOK <$> getJSON env.cached "/health" `shouldReturn` Bool False
   checkXPub env x ref
   waitFor "the health check to notice that Redis is back" $
     (== 200) . fst <$> getJSON env.cached "/health"

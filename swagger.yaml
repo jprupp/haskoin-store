@@ -272,7 +272,8 @@ paths:
         sending it traffic until its answers are current.
 
         A server that has a Redis cache and cannot reach it answers **203** when
-        every check passes, with the header `Haskoin-Degraded: redis`. It goes on
+        every check passes, with the header `Haskoin-Degraded: redis` and
+        `"redis": {"ok": false}` in the body. It goes on
         answering every request, from its own database: the answers are right for
         what this server has seen, but they are no longer the ones that the servers
         sharing that Redis give together, and requests about large wallets are
@@ -6371,6 +6372,17 @@ components:
             Connected peers.
           allOf:
             - $ref: '#/components/schemas/CountHealth'
+        redis:
+          type: object
+          description: |
+            Whether the Redis cache answers. Only in the JSON of a server that has
+            one. It does not count towards `ok`: a server without its Redis still
+            answers every request, from its own database, and `/health` gives 203.
+          required:
+            - ok
+          properties:
+            ok:
+              type: boolean
         net:
           type: string
           description: |
