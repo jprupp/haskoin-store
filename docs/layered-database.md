@@ -1017,7 +1017,12 @@ whatever their own mempools hold.
 
 ## A fleet that answers as one
 
-This section is a proposal, written on 2026-11-10. Nothing of it is built.
+This section is a proposal, written on 2026-11-10. Its first part is
+specified: `Haskoin.Store.Fleet` has the rules for the fleet tip as pure
+decisions, and `test/Haskoin/Store/FleetSpec.hs` runs three stores through
+random blocks, reorganisations, reports and lapses of time against them.
+Nothing carries them out against Redis yet, and the shared mempool is not
+specified.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,
@@ -1043,11 +1048,17 @@ same block and the same mempool. So:
   that every live store has imported.
 - **Each store imports blocks at its own pace**, with no lock, and keeps a
   view of its database at each block until the fleet tip has moved past it.
-- **Each store reports its own tip in a key that expires.** A store that
-  dies or falls behind drops out by itself, and answers 503 on `/health`
-  until it has caught up, so that the load balancer leaves it alone.
-- **One script moves the fleet tip.** When every live store has the next
-  block, a Lua script sets the new tip and, in the same step, takes out of
+- **Each store reports its recent blocks in a key that expires**: those it
+  still has a view of, newest first. A store that dies or falls behind drops
+  out by itself, and answers 503 on `/health` until it has caught up, so
+  that the load balancer leaves it alone. A store reports only when it has a
+  view of the fleet tip, so that one that is catching up cannot pull the tip
+  back.
+- **A store keeps the views of what it last reported**, and of the tip that
+  it read after reporting. The tip only moves to a block that every live
+  store reported, so a live store always has the view that a request needs.
+- **One script moves the fleet tip**, to the newest block that every live
+  store reported. A Lua script sets the new tip and, in the same step, takes out of
   the shared mempool what that block confirmed or made invalid. It is a
   compare-and-set on the tip: nothing is held, and two stores that try at
   once do the same thing.

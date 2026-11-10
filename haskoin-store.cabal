@@ -58,6 +58,7 @@ library
       Haskoin.Store.Database.Reader
       Haskoin.Store.Database.Types
       Haskoin.Store.Database.Writer
+      Haskoin.Store.Fleet
       Haskoin.Store.Logic
       Haskoin.Store.Logic.Layered
       Haskoin.Store.Manager
@@ -257,6 +258,7 @@ test-suite spec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Database.MigrateSpec
       Haskoin.Store.Database.Query.LayeredSpec
+      Haskoin.Store.FleetSpec
       Haskoin.Store.Histories
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.Logic.LayeredSpec

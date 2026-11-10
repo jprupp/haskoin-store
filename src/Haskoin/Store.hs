@@ -45,6 +45,8 @@
 --   which the mempool is kept apart from the chain, the migration to it, the
 --   rules that import blocks and transactions in it, and its queries. The
 --   store does not use them yet; see @docs\/layered-database.md@.
+-- * "Haskoin.Store.Fleet": how stores that share a Redis agree on the block
+--   that they all answer from, as pure decisions. Nothing uses it yet.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.
