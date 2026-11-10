@@ -163,9 +163,10 @@ info:
     confirms another transaction that spends the same coins, or, on BTC, when a
     replacement that pays a higher fee arrives (replace-by-fee). It is then
     removed from every balance and history, together with any transaction that
-    spends its outputs. It can still be fetched by its id, with
-    `"deleted": true`, so a wallet that showed a payment can tell its user what
-    became of it instead of the payment silently disappearing.
+    spends its outputs. From then on the server answers as if it had never
+    seen it: fetching it by its id gives 404. Earlier versions answered with
+    the transaction and `"deleted": true`, which clients that did not look at
+    that field took for a pending payment.
 
     ## Reorganisations
 
@@ -1744,8 +1745,7 @@ paths:
         spends, and which transaction spends each of its outputs.
 
         Unconfirmed transactions are here too. A transaction that was removed from
-        the mempool, or whose block was abandoned, still answers, with
-        `"deleted": true`.
+        the mempool, or whose block was abandoned, is not found.
       parameters:
         - $ref: '#/components/parameters/txidParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -6132,11 +6132,10 @@ components:
         deleted:
           type: boolean
           description: |
-            Whether the transaction was removed: replaced by fee, double-spent by a
-            confirmed transaction, or the coinbase of a block that left the main chain
-            in a reorganisation. Deleted
-            transactions count in no balance or history, but still answer by id, so a
-            wallet can say what became of them.
+            Always false. The server no longer returns transactions that were
+            removed: replaced by fee, double-spent by a confirmed transaction, or
+            the coinbase of a block that left the main chain. The field is kept so
+            that clients that read it go on working.
         time:
           type: integer
           description: |

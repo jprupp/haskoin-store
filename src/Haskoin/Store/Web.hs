@@ -3055,9 +3055,10 @@ webQuery s = case s.cache of
       cached <- cacheTxData c ths
       let missing = [h | (h, Nothing) <- zip ths cached]
       fromDB <- HashMap.fromList . zip missing <$> Q.getManyTxData s.db missing
+      -- deleted ones are left out, wherever they come from
       return $
         zipWith
-          (\h m -> maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m)
+          (\h m -> notDeleted (maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m))
           ths
           cached
 

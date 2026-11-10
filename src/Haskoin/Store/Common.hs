@@ -33,6 +33,7 @@ module Haskoin.Store.Common
     StoreEvent (..),
     getActiveBlock,
     getActiveTxData,
+    notDeleted,
     getDefaultBalance,
     getTransaction,
     getTransactions,
@@ -173,8 +174,9 @@ data StoreRead = StoreRead
     -- | data of a block imported in the past, whether still in the main
     -- chain or not; check 'Haskoin.Store.Data.main' to know
     getBlock :: BlockHash -> IO (Maybe BlockData),
-    -- | data of a transaction, deleted ones included; check
-    -- 'Haskoin.Store.Data.deleted' to know
+    -- | data of a transaction that is confirmed or in the mempool. One
+    -- that was deleted is not returned, here or by the two queries below;
+    -- see 'notDeleted'
     getTxData :: TxHash -> IO (Maybe TxData),
     -- | data of many transactions, in the order of their hashes, read
     -- together
@@ -233,7 +235,22 @@ getActiveBlock r bh =
     Just b | b.main -> Just b
     _ -> Nothing
 
+-- | Leave out a transaction that was deleted: replaced, dropped from the
+-- mempool, or the coinbase of a block that left the main chain.
+--
+-- The store used to answer with such transactions, marked as deleted, so
+-- that a wallet could say what became of a payment. Some clients do not
+-- look at the mark, and took a payment that will never happen for one that
+-- is pending. So every 'StoreRead' leaves them out, and to the API a
+-- deleted transaction is one that the store does not know. Their bodies
+-- stay in the database, where the rules that import transactions use them.
+notDeleted :: Maybe TxData -> Maybe TxData
+notDeleted (Just td) | td.deleted = Nothing
+notDeleted found = found
+
 -- | Data of a transaction, or 'Nothing' if it is unknown or was deleted.
+-- The same as the query of a 'StoreRead' now that it leaves deleted
+-- transactions out.
 getActiveTxData :: StoreRead -> TxHash -> IO (Maybe TxData)
 getActiveTxData r th =
   r.getTxData th <&> \case

@@ -133,6 +133,7 @@ import Haskoin.Store.Common
     deOffset,
     joinDescStreams,
     mergeDescGroups,
+    notDeleted,
     scanXPubBals,
     txRefKey,
     unspentKey,
@@ -152,7 +153,9 @@ import UnliftIO
 
 -- | The queries of a database as a 'StoreRead', for code that takes its
 -- queries as a value, such as the web server, which puts the Redis cache in
--- front of some of them.
+-- front of some of them. Transactions that were deleted are left out
+-- ('notDeleted'); the functions of this module still return them, for the
+-- code that imports transactions.
 databaseRead :: DatabaseReader -> StoreRead
 databaseRead r =
   StoreRead
@@ -161,8 +164,8 @@ databaseRead r =
       getBestBlock = getBestBlock r,
       getBlocksAtHeight = getBlocksAtHeight r,
       getBlock = getBlock r,
-      getTxData = getTxData r,
-      getManyTxData = getManyTxData r,
+      getTxData = fmap notDeleted . getTxData r,
+      getManyTxData = fmap (map notDeleted) . getManyTxData r,
       getSpender = getSpender r,
       getBalance = getBalance r,
       getUnspent = getUnspent r,
@@ -172,7 +175,7 @@ databaseRead r =
       getAddressesUnspents = getAddressesUnspents r,
       initialGap = r.initGap,
       maxGap = r.maxGap,
-      getNumTxData = getNumTxData r,
+      getNumTxData = fmap (filter (not . (.deleted))) . getNumTxData r,
       getBalances = getBalances r,
       getAddressTxs = getAddressTxs r,
       getAddressUnspents = getAddressUnspents r,

@@ -220,6 +220,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
+- Breaking: transactions that were deleted are no longer returned. A
+  transaction that was replaced, dropped from the mempool, or was the
+  coinbase of a block that left the main chain used to answer by id with
+  `"deleted": true`; clients that did not look at that field took it for a
+  pending payment. It now gives 404, is left out of lists of transactions
+  fetched by id, and a page cannot start at it. The `deleted` field stays in
+  responses and is always false. The bodies stay in the database.
 - Breaking: parameters are checked. A request with a parameter that its
   endpoint does not accept, such as a misspelt `limt=10` or `pretty` on the
   Blockchain.info endpoints, which never honoured it, gives 400

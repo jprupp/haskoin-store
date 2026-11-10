@@ -32,7 +32,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger (..))
-import Haskoin.Store.Common (Limits (..))
+import Haskoin.Store.Common (Limits (..), StoreRead (..))
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -207,6 +207,13 @@ spec = prepareContext $ \ctx -> do
         mempool db `shouldReturn` [txHash replacement]
         Q.getSpender db coin `shouldReturn` Just (Spender (txHash replacement) 0)
         fmap (.deleted) <$> Q.getTxData db (txHash original) `shouldReturn` Just True
+        -- the database keeps the replaced ones, and the queries that the API
+        -- answers with do not return them, by hash or among others
+        let queries = Q.databaseRead db
+            wanted = map txHash [original, child, replacement]
+        queries.getTxData (txHash original) `shouldReturn` Nothing
+        map (fmap (txHash . (.tx))) <$> queries.getManyTxData wanted
+          `shouldReturn` [Nothing, Nothing, Just (txHash replacement)]
 
     it "replaces a transaction and its descendant when both conflict" $
       withCoin btcRegTest ctx $ \db coin1 -> do
