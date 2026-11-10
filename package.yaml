@@ -1,5 +1,5 @@
 name: haskoin-store
-version: 1.8.1
+version: 1.9.0
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: |
   An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
