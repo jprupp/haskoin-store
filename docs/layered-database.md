@@ -1024,8 +1024,8 @@ random blocks, reorganisations, reports and lapses of time against them.
 `Haskoin.Store.Fleet.Redis` carries them out against Redis, in two Lua
 scripts, and a test compares Redis with the rules step by step.
 `Haskoin.Store.Fleet.Pool` has the rules of the shared mempool, also as
-pure decisions with a model test; nothing carries those out against Redis
-yet. No store uses any of it.
+pure decisions with a model test, and a third script carries those out,
+moving the tip and changing the pool in one step. No store uses any of it.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,

@@ -34,6 +34,7 @@ extra-source-files:
     src/Haskoin/Store/Cache/lua/spends.lua
     src/Haskoin/Store/Cache/lua/unlock.lua
     src/Haskoin/Store/Fleet/lua/move.lua
+    src/Haskoin/Store/Fleet/lua/pool.lua
     src/Haskoin/Store/Fleet/lua/report.lua
     stress/wrk.lua
 extra-doc-files:

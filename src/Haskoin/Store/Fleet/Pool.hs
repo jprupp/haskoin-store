@@ -9,7 +9,7 @@
 -- The mempool that stores sharing one Redis answer from, as pure decisions:
 -- the second part of "A fleet that answers as one" in
 -- @docs\/layered-database.md@, after the fleet tip of "Haskoin.Store.Fleet".
--- Nothing carries it out against Redis yet.
+-- "Haskoin.Store.Fleet.Redis" carries it out.
 --
 -- = The problem
 --
@@ -195,14 +195,21 @@ data Change t o = Change
 -- | Bring the pool from one tip to another.
 --
 -- The abandoned blocks come first: their transactions that can come back
--- do, and what spends the others leaves. Then the new blocks: what they
+-- do, putting out whatever in the pool spends what they spend, and what
+-- spends the others leaves. Then the new blocks: what they
 -- confirm leaves the pool, alone, since what spends it now spends an output
 -- of the chain; and what spends an output that they spend leaves with
 -- everything that spends it.
 advance :: (Ord t, Ord o) => (o -> t) -> Change t o -> Pool t o -> Pool t o
 advance maker change pool0 = clashed
   where
-    back = foldl' (\p (t, inputs) -> if member t p then p else insert maker t inputs p) pool0 change.returned
+    back = foldl' comeBack pool0 change.returned
+    -- a transaction that was confirmed has the better claim to what it
+    -- spends: a transaction of the pool that spends the same cannot have
+    -- been valid, and leaves
+    comeBack p (t, inputs)
+      | member t p = p
+      | otherwise = insert maker t inputs (withdraw (mapMaybe (`Map.lookup` p.spender) inputs) p)
     orphaned = concatMap (\t -> maybe [] Set.toList (Map.lookup t back.children)) change.gone
     alive = withdraw orphaned back
     settled = foldl' (flip remove) alive change.confirmed

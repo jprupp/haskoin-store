@@ -6375,8 +6375,9 @@ components:
         redis:
           type: object
           description: |
-            Whether the Redis cache answers. Only for a server that has one. It does not count towards `ok`: a server without its Redis still
-            answers every request, from its own database, and `/health` gives 203.
+            Whether the Redis cache answers. Only for a server that has one. It does
+            not count towards `ok`: a server without its Redis still answers every
+            request, from its own database, and `/health` gives 203.
           required:
             - ok
           properties:

@@ -33,6 +33,17 @@
 --
 -- A block is its hash, or any bytes of one fixed size, and a store is a
 -- name that no other store of the fleet has.
+--
+-- = The shared mempool
+--
+-- The rules of "Haskoin.Store.Fleet.Pool" are one more script, with the
+-- pool in keys next to those of the tip. A transaction is its id, of one
+-- fixed size, and an output is the id of the transaction that made it and
+-- four more bytes. An offer says which tip the store checked the
+-- transaction against, and is turned away if the tip has moved since: what
+-- was unspent at one block may be spent at the next. Moving the tip and
+-- changing the pool for the blocks in between is one step ('fleetAdvance'),
+-- so that no request finds a block without what it did to the pool.
 module Haskoin.Store.Fleet.Redis
   ( FleetKeys (..),
     fleetKeys,
@@ -41,6 +52,15 @@ module Haskoin.Store.Fleet.Redis
     fleetMove,
     fleetTip,
     fleetLive,
+
+    -- * The shared mempool
+    Offered (..),
+    PoolChange (..),
+    poolOffer,
+    poolWithdraw,
+    fleetAdvance,
+    poolSpends,
+    poolBody,
   )
 where
 
@@ -54,7 +74,9 @@ import Haskoin.Store.Fleet (Time)
 
 -- | The keys of a fleet in Redis, and the size of its blocks in bytes.
 data FleetKeys = FleetKeys
-  { -- | the fleet tip: a block
+  { -- | what every key of the fleet starts with
+    prefix :: !ByteString,
+    -- | the fleet tip: a block
     tip :: !ByteString,
     -- | a hash from each store to the time its lease runs out, in
     -- milliseconds
@@ -71,7 +93,8 @@ data FleetKeys = FleetKeys
 fleetKeys :: ByteString -> Int -> FleetKeys
 fleetKeys prefix size =
   FleetKeys
-    { tip = prefix <> "fleet:tip",
+    { prefix,
+      tip = prefix <> "fleet:tip",
       lease = prefix <> "fleet:lease",
       recent = prefix <> "fleet:recent",
       size
@@ -118,6 +141,96 @@ fleetTip conn keys = run conn (R.get keys.tip)
 fleetLive :: Connection -> FleetKeys -> IO [(ByteString, Time)]
 fleetLive conn keys = map (fmap (maybe 0 (fromIntegral . fst) . C.readInteger)) <$> run conn (R.hgetall keys.lease)
 
+-- | What became of an offer; see 'Haskoin.Store.Fleet.Pool.Offer'.
+data Offered
+  = -- | it is in the pool now
+    Taken
+  | -- | it was there already
+    Known
+  | -- | these transactions of the pool spend what it spends
+    Conflict ![ByteString]
+  | -- | these outputs are neither made by the pool nor unspent at the tip
+    Orphan ![ByteString]
+  | -- | the tip is not the one that the store checked the transaction
+    -- against: check again and offer again
+    Late
+  deriving (Eq, Show)
+
+-- | What the blocks between two tips did; see
+-- 'Haskoin.Store.Fleet.Pool.Change'.
+data PoolChange = PoolChange
+  { -- | transactions that come back, each with the outputs that it spends
+    -- and its body
+    returned :: ![(ByteString, [ByteString], ByteString)],
+    -- | transactions of abandoned blocks that cannot come back
+    gone :: ![ByteString],
+    -- | transactions that the new blocks confirm
+    confirmed :: ![ByteString],
+    -- | outputs that the new blocks spend
+    spent :: ![ByteString]
+  }
+  deriving (Eq, Show)
+
+-- | Offer a transaction to the pool: given the size of a transaction id,
+-- the tip that the store checked against, the id, each output that the
+-- transaction spends with whether the store finds it unspent at that tip,
+-- the body to keep, and the transactions that it replaces.
+poolOffer ::
+  Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe ByteString ->
+  ByteString ->
+  [(ByteString, Bool)] ->
+  ByteString ->
+  [ByteString] ->
+  IO Offered
+poolOffer conn keys tsize seen t inputs body replaced =
+  run conn (R.eval poolScript [] args) >>= \case
+    ["taken"] -> return Taken
+    ["known"] -> return Known
+    "conflict" : rivals -> return (Conflict rivals)
+    "orphan" : outputs -> return (Orphan outputs)
+    ["raced"] -> return Late
+    other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
+  where
+    flags = C.pack [if unspent then '1' else '0' | (_, unspent) <- inputs]
+    args =
+      ["offer", keys.prefix, num tsize, maybe "" id seen, t, B.concat (map fst inputs), flags, body]
+        <> [B.concat replaced]
+
+-- | Take transactions out of the pool, with all that spends them. Gives
+-- those that left.
+poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString]
+poolWithdraw conn keys tsize ts =
+  run conn (R.eval poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
+
+-- | Move the tip to a block and bring the pool there, in one step: given
+-- the tip that the caller saw, the block, which must be the one that the
+-- live stores agree on, and what the blocks in between did.
+fleetAdvance :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> PoolChange -> IO Moved
+fleetAdvance conn keys tsize clock seen target change =
+  run conn (R.eval poolScript [] args) >>= \case
+    ["moved"] -> return (MovedTo target)
+    ["stays"] -> return Stays
+    ["raced"] -> return Raced
+    other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
+  where
+    args =
+      ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size]
+        <> [num (length change.returned)]
+        <> concat [[t, B.concat inputs, body] | (t, inputs, body) <- change.returned]
+        <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
+
+-- | The transactions of the pool, each with the outputs that it spends one
+-- after the other.
+poolSpends :: Connection -> FleetKeys -> IO [(ByteString, ByteString)]
+poolSpends conn keys = run conn (R.hgetall (keys.prefix <> "pool:spends"))
+
+-- | The body of a transaction of the pool.
+poolBody :: Connection -> FleetKeys -> ByteString -> IO (Maybe ByteString)
+poolBody conn keys t = run conn (R.hget (keys.prefix <> "pool:body") t)
+
 scriptKeys :: FleetKeys -> [ByteString]
 scriptKeys keys = [keys.tip, keys.lease, keys.recent]
 
@@ -139,3 +252,8 @@ reportScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/report.lua" 
 -- | 'Haskoin.Store.Fleet.move'.
 moveScript :: ByteString
 moveScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/move.lua" >>= embedFile)
+
+-- | 'Haskoin.Store.Fleet.Pool.offer', 'Haskoin.Store.Fleet.Pool.withdraw',
+-- and 'Haskoin.Store.Fleet.Pool.advance' with the move of the tip.
+poolScript :: ByteString
+poolScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/pool.lua" >>= embedFile)

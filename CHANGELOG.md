@@ -232,7 +232,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   which of two conflicting transactions stays, what leaves and why, and how
   the pool follows the tip forwards and across a reorganisation. A model
   test keeps it valid on top of the tip through random offers, blocks and
-  reversals.
+  reversals. One more Lua script carries these rules out, moving the tip and
+  changing the pool in one step, and is compared with them step by step in a
+  real Redis like the others; the comparison found a case that the rules had
+  left open, a transaction that comes back from an abandoned block and
+  spends what the pool already spends, which now wins.
 - A store whose Redis does not answer goes on answering from its database,
   instead of failing every request that the cache would have served. A
   request waits at most two seconds for Redis; after that the store leaves
