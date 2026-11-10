@@ -72,16 +72,12 @@ packages:
     commit: 10d6a3ce22822be0a08e8b11ce909888f813ac65
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: b304acd267f7801601a9b78c2b73bf2e3b3e3267
-    git: https://github.com/jprupp/haskoin-store-data.git
-    name: haskoin-store-data
+    hackage: haskoin-store-data-1.9.0@sha256:466602ab37b24d526dd22c32ab03b3f07dfe6be8d8983bbcf7ac86dbdac0259e,3923
     pantry-tree:
-      sha256: 48ad65df183141ef32f41cd2fae42bb434999f4b0da63402635e6e479dd790ec
-      size: 1187
-    version: 1.9.0
+      sha256: 00317214a090bc151805cea4067e544c28c36664970984f32e08d69e0bf7ec64
+      size: 763
   original:
-    commit: b304acd267f7801601a9b78c2b73bf2e3b3e3267
-    git: https://github.com/jprupp/haskoin-store-data.git
+    hackage: haskoin-store-data-1.9.0
 snapshots:
 - completed:
     sha256: 2c234e9f6c9b52dbbd8e0c369dd55e275f1c143474d4a984a000588d37306e2c

@@ -114,7 +114,6 @@ import Data.Aeson.Encoding
   ( encodingToLazyByteString,
     list,
   )
-import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
 import Data.ByteString.Builder (lazyByteString)
 import Data.ByteString.Char8 qualified as C
@@ -2804,30 +2803,23 @@ getPeersInformation mgr =
 --
 -- = The check of Redis in the body
 --
--- The JSON body of a store that has a cache has one more check than the
--- others, @redis@, with @ok@ true or false. It does not count towards the
--- @ok@ of the whole, which stays the answer to "is this store fit to
--- serve". It is added here, to the JSON alone: the type of the body and its
--- binary encoding belong to haskoin-store-data, where a new field would
--- break every client that reads the binary form.
+-- The body of a store that has a cache has one more check than the others,
+-- 'Haskoin.Store.Data.redis', which says whether Redis answers. It does not
+-- count towards the @ok@ of the whole, which stays the answer to "is this
+-- store fit to serve".
 pathHealth :: WebState -> Route
 pathHealth st =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ["pretty"] $ \req -> do
     proto <- serialAs req False
     h <- handleHealth st GetHealth
-    up <- readTVarIO st.cacheUp
     let (status, extra)
           | not (isOK h) = (status503, [])
-          | not up = (status203, [("Haskoin-Degraded", "redis")])
+          | h.redis == Just False = (status203, [("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
-      responseLBS status ((hContentType, serialType proto) : extra) $
-        protoSerial proto (toEncoding . withRedis up) (withRedis up) h
+      responseLBS status ((hContentType, serialType proto) : extra) (protoSerial proto toEncoding toJSON h)
   where
     proxy = Proxy :: Proxy GetHealth
-    withRedis up h = case (st.config.store.cache, toJSON h) of
-      (Just _, A.Object o) -> A.Object (KeyMap.insert "redis" (A.object ["ok" A..= up]) o)
-      (_, v) -> v
 
 -- | Handler for @GET \/health@: health of the store.
 handleHealth ::
@@ -2836,7 +2828,11 @@ handleHealth ::
   IO HealthCheck
 handleHealth st _ =
   withMetrics st (.health) $ do
-    readTVarIO st.health
+    h <- readTVarIO st.health
+    up <- readTVarIO st.cacheUp
+    -- a store without a cache has no Redis to be without
+    let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
+    return HealthCheck {redis = up <$ st.config.store.cache, ..}
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth
@@ -2918,6 +2914,9 @@ healthCheck cfg = do
     HealthCheck
       { network = cfg.store.net.name,
         version = cfg.version,
+        -- filled in when the check is served, from what the last request
+        -- or ping found
+        redis = Nothing,
         ..
       }
 
