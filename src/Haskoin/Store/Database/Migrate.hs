@@ -56,8 +56,24 @@
 -- that knows the new layout carries the migration on. The last write
 -- removes the marker. Before the first write everything is read once, so
 -- that a database that the migration cannot handle is refused untouched.
+--
+-- = Version 22: the time of a confirmed transaction
+--
+-- Version 21 still had one thing in the chain's column families that did
+-- not follow from the chain: a transaction that a store had seen in its
+-- mempool kept the time of that when a block confirmed it. From version 22
+-- a confirmed transaction has the time of its block
+-- ('Haskoin.Store.Logic.Layered.importBlock'), and 'migrateTimes' gives
+-- that time to the ones that are there already. It has to read every
+-- transaction to find them, since nothing lists them, so it takes a time
+-- in proportion to the chain: 'upgradeDatabase' says how far it is as it
+-- goes. It changes nothing but that one number of each record, in small
+-- writes, and does the same again if it is run again, so it can be
+-- interrupted and started over.
 module Haskoin.Store.Database.Migrate
   ( upgradeDatabase,
+    currentVersion,
+    migrateTimes,
     layeredVersion,
     Migration (..),
     MigrationError (..),
@@ -76,11 +92,11 @@ import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as IntMap
 import Data.Maybe (isJust, mapMaybe)
-import Data.Serialize (encode)
+import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
-import Database.RocksDB (BatchOp, getCF)
+import Database.RocksDB (BatchOp, getCF, iterEntry, iterFirst, iterGetError, iterNext, withIterCF)
 import Database.RocksDB.Query
   ( deleteOp,
     deleteOpCF,
@@ -93,6 +109,7 @@ import Database.RocksDB.Query
   )
 import Haskoin
   ( Address,
+    BlockHeader (..),
     OutPoint (..),
     Tx (..),
     TxHash,
@@ -106,7 +123,8 @@ import Haskoin
   )
 import Haskoin.Store.Common (nub')
 import Haskoin.Store.Data
-  ( BlockRef (..),
+  ( BlockData (..),
+    BlockRef (..),
     Prev (..),
     Spender (..),
     TxData (..),
@@ -115,6 +133,7 @@ import Haskoin.Store.Data
     confirmed,
   )
 import Haskoin.Store.Database.Mempool (insertRecordOps, mempoolRecords, rebuildSummaries)
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     addrOutCF,
@@ -148,9 +167,15 @@ import UnliftIO
     writeIORef,
   )
 
--- | Version of the layered layout.
+-- | Version of the layered layout as it was first written, with the time
+-- at which a store first saw a transaction kept in the chain.
 layeredVersion :: Word32
 layeredVersion = 21
+
+-- | Version that the store runs on: the layered layout, with the time of
+-- its block for every confirmed transaction.
+currentVersion :: Word32
+currentVersion = 22
 
 -- | Version that the migration starts from.
 mixedVersion :: Word32
@@ -164,7 +189,9 @@ data Migration = Migration
     batches :: !Int,
     -- | mempool transactions checked at the end, moved by this run or by
     -- an earlier one that was interrupted
-    checked :: !Int
+    checked :: !Int,
+    -- | confirmed transactions given the time of their block by this run
+    retimed :: !Int
   }
   deriving (Eq, Show)
 
@@ -202,28 +229,125 @@ defaultMigrationOptions =
 -- | Bring a database opened with
 -- 'Haskoin.Store.Database.Reader.withLayeredReader' to the layout that the
 -- store runs on, whatever it was, telling a function what is being done:
--- a new database gets the version of the layered layout, one of version 18
--- or 19 is first brought to version 20 as it always was, and one of
--- version 20 is migrated ('migrateLayered'), from the start or from where
--- an earlier run was interrupted. Throws a 'MigrationError' for any other
--- version.
+-- a new database gets the current version, one of version 18 or 19 is
+-- first brought to version 20 as it always was, one of version 20 is
+-- migrated to the layered layout ('migrateLayered'), and one of version 21
+-- gets the time of its block for every confirmed transaction
+-- ('migrateTimes'), each from the start or after an earlier run that was
+-- interrupted. Throws a 'MigrationError' for any other version.
 --
 -- This is the point of no return for a database of an older version: a
--- store older than the layered layout refuses it afterwards.
+-- store older than the layout refuses it afterwards.
 upgradeDatabase :: (Text -> IO ()) -> DatabaseReader -> IO Migration
-upgradeDatabase report r =
-  retrieve r.db VersionKey >>= \case
+upgradeDatabase report r = do
+  version <- retrieve r.db VersionKey
+  marker <- retrieve r.db MigrationKey :: IO (Maybe Word32)
+  case version of
     Nothing -> do
-      writeBatch r.db [insertOp VersionKey layeredVersion]
-      return Migration {moved = 0, batches = 0, checked = 0}
+      writeBatch r.db [insertOp VersionKey currentVersion]
+      return nothing
     Just v
       | v == 18 || v == 19 -> do
           report $ "Upgrading the database from version " <> cs (show v) <> " to " <> cs (show mixedVersion)
           initRocksDB r
-          migrate
-    Just (_ :: Word32) -> migrate
+          layered >>= times
+      | v == currentVersion && marker == Nothing -> return nothing
+      -- the times were being set when the store last stopped
+      | v == currentVersion && marker == Just layeredVersion -> times nothing
+      | v == currentVersion -> throwIO (UnknownVersion version)
+    Just (_ :: Word32) -> layered >>= times
   where
-    migrate = migrateLayeredWith defaultMigrationOptions {report = report} r
+    nothing = Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+    layered = migrateLayeredWith defaultMigrationOptions {report = report} r
+    times done = do
+      retimed <- migrateTimes report r
+      return (done :: Migration) {retimed}
+
+-- | Give every confirmed transaction of a database of version 21 the time
+-- of its block, and make the database one of version 22; or carry that on
+-- in a database where it was interrupted. Says how many transactions it
+-- changed. Throws a 'MigrationError' for a database of another version,
+-- and for one with a confirmed transaction at a height where the main
+-- chain has no block.
+--
+-- Nothing lists the transactions that a store first saw in its mempool, so
+-- every record is read: the whole of the largest column family, which on
+-- a database of Bitcoin is hours. A function is told how far it is, every
+-- million transactions. Records that have the right time already are not
+-- written, so a store that synced from scratch and saw few transactions
+-- in its mempool has few writes.
+--
+-- The first write sets the new version and the marker of a migration under
+-- way; the last removes the marker. In between each write gives some
+-- thousand transactions their times, and a database that is half done is a
+-- valid one with both kinds of time in it. Starting again reads from the
+-- beginning and skips what is done.
+migrateTimes :: (Text -> IO ()) -> DatabaseReader -> IO Int
+migrateTimes report r = do
+  version <- retrieve db VersionKey
+  marker <- retrieve db MigrationKey :: IO (Maybe Word32)
+  if
+    | version == Just layeredVersion && marker == Nothing -> do
+        report "Setting the time of every confirmed transaction to that of its block: this reads them all"
+        writeBatch db [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
+        run
+    | version == Just currentVersion && marker == Just layeredVersion -> do
+        report "Carrying on setting the times of confirmed transactions, from the first"
+        run
+    | version == Just currentVersion && marker == Nothing -> return 0
+    | otherwise -> throwIO (UnknownVersion version)
+  where
+    db = r.db
+    run = do
+      times <- newIORef IntMap.empty
+      pending <- newIORef []
+      scanned <- newIORef (0 :: Int)
+      changed <- newIORef (0 :: Int)
+      let write = do
+            ops <- readIORef pending
+            unless (null ops) (writeBatch db ops)
+            writeIORef pending []
+          -- the time of the block of the main chain at a height
+          timeAt :: Word32 -> IO Word64
+          timeAt height =
+            IntMap.lookup (fromIntegral height) <$> readIORef times >>= \case
+              Just t -> return t
+              Nothing -> do
+                blocks <- Q.getBlocksAtHeight r height >>= mapM (Q.getBlock r)
+                case [b | Just b <- blocks, b.main] of
+                  [b] -> do
+                    let t = fromIntegral b.header.timestamp
+                    t <$ modifyIORef' times (IntMap.insert (fromIntegral height) t)
+                  _ -> throwIO (Inconsistent ("No block of the main chain at height " <> cs (show height)))
+          one (key, value) = case (decode key, decode value) of
+            (Right (TxKey h), Right (td :: TxData)) -> do
+              case td.block of
+                BlockRef {height} | not td.deleted -> do
+                  t <- timeAt height
+                  when (td.timestamp /= t) $ do
+                    modifyIORef' pending (insertOpCF (txCF db) (TxKey h) ((td :: TxData) {timestamp = t}) :)
+                    modifyIORef' changed (+ 1)
+                    n <- length <$> readIORef pending
+                    when (n >= 2000) write
+                _ -> return ()
+              n <- readIORef scanned
+              writeIORef scanned (n + 1)
+              when ((n + 1) `mod` 1000000 == 0) $ do
+                c <- readIORef changed
+                report $ cs (show (n + 1)) <> " transactions read, " <> cs (show c) <> " given the time of their block"
+            -- the short keys of the column family are not transactions
+            _ -> return ()
+          go it =
+            iterEntry it >>= \case
+              Nothing -> iterGetError it >>= mapM_ (throwIO . Inconsistent . cs . show)
+              Just row -> one row >> iterNext it >> go it
+      withIterCF db (txCF db) (\it -> iterFirst it >> go it)
+      write
+      writeBatch db [deleteOp MigrationKey]
+      c <- readIORef changed
+      n <- readIORef scanned
+      report $ cs (show c) <> " of " <> cs (show n) <> " transactions given the time of their block"
+      return c
 
 -- | Migrate a database of version 20, opened with
 -- 'Haskoin.Store.Database.Reader.withLayeredReader', to the layered layout,
@@ -238,8 +362,11 @@ migrateLayeredWith opts r = do
   version <- retrieve db VersionKey
   marker <- retrieve db MigrationKey :: IO (Maybe Word32)
   if
+    -- a database that is past this migration, whatever came after it
     | version == Just layeredVersion && marker == Nothing ->
-        return Migration {moved = 0, batches = 0, checked = 0}
+        return Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+    | version == Just currentVersion ->
+        return Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
     | version == Just layeredVersion && marker == Just mixedVersion -> do
         opts.report "Carrying on with the migration to the layered layout"
         run
@@ -269,7 +396,7 @@ migrateLayeredWith opts r = do
       moved <- readIORef env.total
       batches <- readIORef env.written
       opts.report $ "Moved " <> cs (show moved) <> " mempool transactions"
-      return Migration {moved, batches, checked = length listed}
+      return Migration {moved, batches, checked = length listed, retimed = 0}
 
 -------------------------------------------------------------------------------
 -- A batch

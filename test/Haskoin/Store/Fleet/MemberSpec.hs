@@ -33,13 +33,15 @@ spec = prepareContext $ \ctx -> do
       modifyMaxSuccess (const 20) $
         it "answers as the store does when it is the whole fleet" $ \(conn, fresh) ->
           -- A store alone in its fleet, through a random history of
-          -- payments, replacements, blocks and reorganisations. After each
+          -- payments, replacements, blocks and reorganisations. The
+          -- history is chosen from a database of the layout of version 20
+          -- that goes through the same, since that is what 'plan' reads. After each
           -- step it takes its turn as a member, and then every answer that
           -- it gives from the view at the fleet tip with the pool of Redis
           -- on top must be the answer that it gives from its own database.
           property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
             withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-              openLayered btcRegTest ctx dir $ \db -> do
+              openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
                 keys <- fresh
                 let config =
                       MemberConfig
@@ -60,9 +62,10 @@ spec = prepareContext $ \ctx -> do
                 best >>= noteBest m
                 memberTick m
                 let turn hist seed =
-                      plan db hist seed >>= \case
+                      plan shadow hist seed >>= \case
                         (hist', Nothing) -> return hist'
                         (hist', Just op) -> do
+                          void (apply mixedRules shadow op)
                           out <- apply layeredRules db op
                           let hist'' = record db hist' op out
                           -- the store tells its member what it deletes
@@ -103,7 +106,7 @@ spec = prepareContext $ \ctx -> do
           -- answer.
           property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
             withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-              openLayered btcRegTest ctx dir $ \db -> do
+              openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
                 keys <- fresh
                 said <- newIORef []
                 let config =
@@ -135,9 +138,10 @@ spec = prepareContext $ \ctx -> do
                       answeringCached m tip (\plain cached _ -> action plain cached)
                         >>= maybe (fail "the store has no view of the fleet tip") return
                     turn hist seed =
-                      plan db hist seed >>= \case
+                      plan shadow hist seed >>= \case
                         (hist', Nothing) -> return hist'
                         (hist', Just op) -> do
+                          void (apply mixedRules shadow op)
                           out <- apply layeredRules db op
                           let hist'' = record db hist' op out
                           memberForget m out.removed

@@ -4,14 +4,18 @@ module Haskoin.Store.Database.MigrateSpec (spec) where
 
 import Control.Monad (foldM, forM_, void, when)
 import Data.ByteString qualified as B
-import Data.Either (rights)
+import Data.Either (isRight, rights)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (sort)
-import Data.Maybe (catMaybes)
-import Data.Word (Word32)
+import Data.Maybe (catMaybes, listToMaybe)
+import Data.Serialize (decode, encode)
+import Data.Text qualified as T
+import Data.Word (Word16, Word32, Word64)
 import Database.RocksDB (BatchOp (..))
 import Database.RocksDB.Query (insert, insertOp, retrieve, writeBatch)
 import Haskoin
-  ( Ctx,
+  ( BlockHeader (..),
+    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -19,12 +23,13 @@ import Haskoin
     TxIn (..),
     TxOut (..),
     btcRegTest,
+    headerHash,
     prepareContext,
     scriptToAddressBS,
     sha256,
     txHash,
   )
-import Haskoin.Store.Data (Balance (..), BlockRef (..), TxData (..))
+import Haskoin.Store.Data (Balance (..), BlockData (..), BlockRef (..), TxData (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Migrate
 import Haskoin.Store.Database.Query qualified as Q
@@ -33,6 +38,7 @@ import Haskoin.Store.Database.Reader
     mempoolAddrCF,
     mempoolCF,
     mempoolInsertOps,
+    txCF,
   )
 import Haskoin.Store.Database.Types (MigrationKey (..), VersionKey (..))
 import Haskoin.Store.Histories
@@ -61,7 +67,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
       numbers old.balances one `shouldBe` Just (0, 3000, 1, 1, 3000)
       numbers old.balances two `shouldBe` Just (0, 1500, 1, 1, 1500)
       openLayered net ctx dir $ \db -> do
-        migrateLayered db `shouldReturn` Migration {moved = 2, batches = 1, checked = 2}
+        migrateLayered db `shouldReturn` Migration {moved = 2, batches = 1, checked = 2, retimed = 0}
         retrieve db.db VersionKey `shouldReturn` Just layeredVersion
         (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
         -- the chain has the coin again, whole and unspent
@@ -72,7 +78,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- and with the mempool on top, every answer is what it was
         layered db (ask hist) `shouldReturn` old
         -- a second run finds nothing to do
-        migrateLayered db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0}
+        migrateLayered db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
 
   modifyMaxSuccess (const 50) $
     it "keeps every answer and leaves the chain as if the mempool had been wiped, for random histories" $
@@ -172,8 +178,9 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
     -- a new database
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
       openLayered net ctx dir $ \db -> do
-        upgradeDatabase (\_ -> return ()) db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0}
-        retrieve db.db VersionKey `shouldReturn` Just layeredVersion
+        upgradeDatabase (\_ -> return ()) db
+          `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+        retrieve db.db VersionKey `shouldReturn` Just currentVersion
     -- one of version 20 with a mempool, and then the same one again
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
       (hist, old) <- mixedDatabase ctx dir $ \db hist0 ->
@@ -182,7 +189,8 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         openLayered net ctx dir $ \db -> do
           done <- upgradeDatabase (\_ -> return ()) db
           done.moved `shouldBe` moved
-          retrieve db.db VersionKey `shouldReturn` Just layeredVersion
+          retrieve db.db VersionKey `shouldReturn` Just currentVersion
+          (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
           layered db (ask hist) `shouldReturn` old
           M.wrongSummaries db `shouldReturn` []
     -- one of version 19, which had no index of the mempool by time
@@ -203,8 +211,140 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         insert db.db VersionKey (17 :: Word32)
         upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just 17))
 
+  describe "the time of a confirmed transaction" $ do
+    it "is the time of its block, not of when the store first saw it" $
+      withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+        openLayered net ctx dir $ \db -> do
+          hist <- start layeredRules db
+          let tx = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4000 (p2pkh 1)] [] 0
+              stored = do
+                rows <- dump db (txCF db.db)
+                return [td :: TxData | (_, v) <- rows, Right td <- [decode v], txHash td.tx == txHash tx]
+          (.result) <$> apply layeredRules db (Pay tx 1000) `shouldReturn` Right "True"
+          -- in the mempool it has the time at which it came
+          fmap (.timestamp) <$> M.getMempoolTx db (txHash tx) `shouldReturn` Just 1000
+          mined <- blockOn db [tx] >>= apply layeredRules db
+          isRight mined.result `shouldBe` True
+          best <- Q.getBestBlock db >>= maybe (fail "no best block") (Q.getBlock db)
+          time <- maybe (fail "no block") (return . fromIntegral . (.header.timestamp)) best
+          time `shouldNotBe` (1000 :: Word64)
+          map (\td -> (td.block, td.timestamp)) <$> stored `shouldReturn` [(BlockRef 2 1, time)]
+          wrongTimes db `shouldReturn` []
+          -- and when the block is reverted it goes back to the mempool
+          -- with that time, which every store has for it
+          reverted <- apply layeredRules db (Revert (headerHash (maybe (error "no block") (.header) best)))
+          isRight reverted.result `shouldBe` True
+          fmap (.timestamp) <$> M.getMempoolTx db (txHash tx) `shouldReturn` Just time
+    modifyMaxSuccess (const 20) $
+      it "is the time of its block, after any history" $
+        -- whatever a store saw in its mempool before, and through blocks
+        -- that are reverted and replaced
+        property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
+          withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+              hist0 <- start layeredRules db
+              void (foldM (walk shadow db) hist0 seeds)
+              late <- wrongTimes db
+              late `shouldBe` []
+    modifyMaxSuccess (const 20) $
+      it "is set by the migration to version 22, and nothing else is changed" $
+        -- A database as the layered rules write it has the time of its
+        -- block for every confirmed transaction. Some of them are given
+        -- another time, as a store of version 21 that saw them in its
+        -- mempool had, and the database is marked as of that version. The
+        -- migration must give back the database as it was, byte for byte.
+        property . forAll (vectorOf 40 anyNumber) $ \seeds -> ioProperty $
+          withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+              hist0 <- start layeredRules db
+              void (foldM (walk shadow db) hist0 seeds)
+              original <- dump db (txCF db.db)
+              let confirmed = [(k, td :: TxData) | (k, v) <- original, Right td <- [decode v], inChain td]
+                  -- every other one, and all of them when there are few
+                  picked = [x | (i, x) <- zip [0 :: Int ..] confirmed, even i || length confirmed < 4]
+              writeBatch db.db $
+                insertOp VersionKey layeredVersion
+                  : [PutCF (txCF db.db) k (encode (later td)) | (k, td) <- picked]
+              wrongTimes db >>= (`shouldBe` length picked) . length
+              done <- upgradeDatabase (\_ -> return ()) db
+              done.retimed `shouldBe` length picked
+              retrieve db.db VersionKey `shouldReturn` Just currentVersion
+              (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
+              dump db (txCF db.db) `shouldReturn` original
+              -- and again, it finds nothing to do
+              upgradeDatabase (\_ -> return ()) db
+                `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+    it "is set by a migration that carries on after it was interrupted" $
+      withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+        openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+          hist0 <- start layeredRules db
+          -- payments, and then blocks, which confirm some of them
+          void (foldM (walk shadow db) hist0 (onlyPayments [1 .. 6] <> [8 .. 11]))
+          original <- dump db (txCF db.db)
+          let confirmed = [(k, td :: TxData) | (k, v) <- original, Right td <- [decode v], inChain td]
+          length confirmed `shouldSatisfy` (> 0)
+          -- as a migration leaves it that stopped before its first change
+          writeBatch db.db $
+            [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
+              <> [PutCF (txCF db.db) k (encode ((td :: TxData) {timestamp = 7})) | (k, td) <- confirmed]
+          said <- newIORef []
+          done <- upgradeDatabase (\line -> modifyIORef' said (line :)) db
+          done.retimed `shouldBe` length confirmed
+          dump db (txCF db.db) `shouldReturn` original
+          (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
+          readIORef said >>= (`shouldSatisfy` any ("Carrying on" `T.isPrefixOf`))
+    it "is not guessed for a transaction whose block the database does not have" $
+      withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+        openLayered net ctx dir $ \db -> do
+          _ <- start layeredRules db
+          rows <- dump db (txCF db.db)
+          let confirmed = [(k, td :: TxData) | (k, v) <- rows, Right td <- [decode v], inChain td]
+          (k, td) <- maybe (fail "no confirmed transaction") return (listToMaybe confirmed)
+          writeBatch
+            db.db
+            [ insertOp VersionKey layeredVersion,
+              PutCF (txCF db.db) k (encode ((td :: TxData) {block = BlockRef 5000 0}))
+            ]
+          upgradeDatabase (\_ -> return ()) db `shouldThrow` \case
+            Inconsistent _ -> True
+            _ -> False
+
 net :: Network
 net = btcRegTest
+
+-- | Choose one operation of a history from a database of version 20 that
+-- has gone through it ('withShadow'), and carry it out there and, under
+-- the layered rules, in a database of the layered layout.
+walk :: DatabaseReader -> DatabaseReader -> History -> Word16 -> IO History
+walk shadow db hist seed =
+  plan shadow hist seed >>= \case
+    (hist', Nothing) -> return hist'
+    (hist', Just op) -> do
+      void (apply mixedRules shadow op)
+      record db hist' op <$> apply layeredRules db op
+
+-- | A transaction with a time that is not that of its block.
+later :: TxData -> TxData
+later td = (td :: TxData) {timestamp = td.timestamp + 12345}
+
+-- | Whether a transaction is in the chain.
+inChain :: TxData -> Bool
+inChain td = case td.block of
+  BlockRef {} -> not td.deleted
+  MemRef {} -> False
+
+-- | The confirmed transactions of a database whose time is not that of
+-- their block, each with both times.
+wrongTimes :: DatabaseReader -> IO [(TxHash, Word64, Maybe Word64)]
+wrongTimes db = do
+  rows <- dump db (txCF db.db)
+  fmap catMaybes . mapM check $ [td :: TxData | (_, v) <- rows, Right td <- [decode v], inChain td]
+  where
+    check td = do
+      hashes <- Q.getBlocksAtHeight db td.block.height
+      blocks <- catMaybes <$> mapM (Q.getBlock db) hashes
+      let time = listToMaybe [fromIntegral b.header.timestamp | b <- blocks, b.main]
+      return (if time == Just td.timestamp then Nothing else Just (txHash td.tx, td.timestamp, time))
 
 data Interrupted = Interrupted
   deriving (Eq, Show, Exception)

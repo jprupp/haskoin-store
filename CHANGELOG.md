@@ -82,6 +82,27 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the first 100 transactions of a busy address 221 microseconds instead of
   575, and the number of transactions of a wallet with 19,499 of them 34
   milliseconds instead of 78.
+- **Database version 22: a confirmed transaction has the time of its
+  block**, on every server, so that what the chain's column families hold
+  follows from the chain alone. A server that had seen a transaction in
+  its mempool used to keep the time of that when a block confirmed it: two
+  servers then gave two values of `time` for the same confirmed
+  transaction, which the servers of a fleet must not do.
+  - A transaction that returns to the mempool when its block leaves the
+    main chain has the time of that block there, not the time at which the
+    server first saw it, which is no longer kept.
+  - A database of version 21 is migrated the first time the store opens
+    it (`migrateTimes`). **It reads every transaction of the database**,
+    since nothing lists those that were first seen in a mempool: 210,000 a
+    second were measured on a small database in memory, so a database of
+    Bitcoin takes hours. The log says how far it is, and it can be
+    interrupted and started again. Records that have the right time are
+    not written.
+  - The tests that run the store through random histories now choose them
+    from a database of version 20 that goes through the same
+    (`withShadow`). Given a layered database, the chooser found next to
+    nothing in the mempool, and the blocks of the tests of the fleet
+    confirmed almost none of it.
 - **Database version 21: the mempool has an area of its own.** Unconfirmed
   transactions are no longer written into the indices of the chain. They
   are kept apart and applied on top when a query is answered

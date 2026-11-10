@@ -6169,7 +6169,12 @@ components:
           type: integer
           description: |
             Timestamp of its block, or, if unconfirmed, the Unix time this server first
-            saw it.
+            saw it; in a fleet, the time at which the first server of the fleet did. A
+            confirmed transaction has the time of its block on every server, whether
+            the server saw it before the block or not: until database version 22 a
+            server that had seen it unconfirmed went on giving the time of that. A
+            transaction that goes back to the mempool because its block left the main
+            chain keeps the time of that block.
           format: int64
         rbf:
           type: boolean

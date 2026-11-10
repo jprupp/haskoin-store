@@ -35,10 +35,13 @@ mempool, and everything it did to the chain's indices, into its own area.
 
 ## Where this stands
 
-The store runs on the layered layout, version 21. A database of version 20
-is migrated when the store opens it. The rules and queries of version 20
-are still in the library, as the reference that the tests hold the new ones
-to.
+The store runs on the layered layout, version 22. A database of version 20
+is migrated when the store opens it, and so is one of version 21, which
+was the same layout with one thing in the chain's area that was not the
+chain's, the time of a confirmed transaction: see
+[Version 22](#version-22-the-time-of-a-confirmed-transaction). The rules
+and queries of version 20 are still in the library, as the reference that
+the tests hold the new ones to.
 
 | Piece | Where | State |
 |---|---|---|
@@ -1619,10 +1622,59 @@ transactions that the mempool spends have to be read.
 ### Running it
 
 The store runs it when it opens a database (`upgradeDatabase`, called by
-`Haskoin.Store.Manager`): a new database gets version 21, one of version 18
-or 19 is first brought to version 20 by the migrations that those always
-had, and one of version 20 is migrated, from the start or from where an
-earlier run stopped. The log says how many transactions were moved.
+`Haskoin.Store.Manager`): a new database gets the current version, one of
+version 18 or 19 is first brought to version 20 by the migrations that
+those always had, and one of version 20 is migrated, from the start or from
+where an earlier run stopped. The log says how many transactions were
+moved. Then comes the step to version 22, below.
+
+### Version 22: the time of a confirmed transaction
+
+The point of the layered layout is that the chain's area holds what follows
+from the chain, the same on every store. Version 21 left one number that
+did not: the time of a transaction. A store that had a transaction in its
+mempool kept the time at which it first saw it when a block confirmed it,
+as version 20 did. Two stores had two times for it, a store that synced
+later had the time of the block, and the servers of a fleet, which answer
+about confirmed transactions from their own databases, gave different
+values of `time` for the same one.
+
+- **The rule.** A confirmed transaction has the time of its block
+  (`importChainTx` in `Haskoin.Store.Logic.Layered`). The time of first
+  sight belongs to the mempool, where it is the store's own or, in a fleet,
+  the pool's. A transaction that goes back to the mempool because its
+  block was reverted has the time of that block there: the earlier time is
+  gone, and this one every store agrees on.
+- **The migration** (`migrateTimes` in `Haskoin.Store.Database.Migrate`).
+  Nothing lists the confirmed transactions that were first seen in a
+  mempool, so it reads every record of the `tx` column family, looks up the
+  time of the block of the main chain at its height, once for each height,
+  and writes the records whose time is another, two thousand to a write.
+  It changes nothing else, and running it again does the same, so it needs
+  no record of how far it got: interrupted, it starts from the first
+  transaction and skips what is done.
+- **What it costs.** On the database of the measurements, 210,212
+  transactions in memory, one second: 4.8 microseconds for each, nearly all
+  of it decoding the record. A database of Bitcoin has more than a billion
+  transactions and has to read them from disk, and one block for each
+  height, so it is a matter of hours, during which the store does not
+  start. Reading the records in place, when they are asked for, would cost
+  nothing at the start and a read of a block for each transaction for ever
+  after, and would leave the databases different.
+- **What holds it.** A test pays, confirms and reverts, and reads the
+  record at each step. Another runs random histories and checks every
+  confirmed record against its block. A third gives half the confirmed
+  transactions of such a database another time, marks it as version 21,
+  and expects the migration to give back the same bytes; a fourth does
+  that to a database marked as interrupted. Undoing the rule makes three
+  of them fail.
+- **What still changes in a record of the chain.** The outputs of a
+  confirmed transaction get their spenders written into its record as later
+  blocks spend them, and lose them when such a block is reverted. That
+  follows from the chain, so it is the same on every store at the same
+  block, but the record of a transaction is not written once and left
+  alone. Moving spenders to keys of their own would make it so; that is
+  not done here.
 
 - **There is no way back.** RocksDB opens a database only when given all its
   column families, so a store of version 20 cannot open one that has

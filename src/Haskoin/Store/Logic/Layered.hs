@@ -284,18 +284,35 @@ importTxs wr bn txns = do
     action i tx =
       getMempoolTx wr (txHash tx) >>= \case
         Just td -> do
-          -- it leaves the mempool, and keeps the time it was first seen
+          -- it leaves the mempool, and with it the time at which this
+          -- store first saw it: in the chain its time is that of its
+          -- block, like that of a transaction that was never in the
+          -- mempool, so that the record is the same on every store
           removeMempoolTx wr td
-          td' <- importChainTx wr (br i) td.timestamp tx
+          td' <- importChainTx wr (br i) blockTime tx
           updateSpendersRBF wr tx
           return td'
         Nothing ->
           chainTx wr (txHash tx) >>= \case
-            Just td -> moveChainTx wr td (br i)
+            Just td -> moveChainTx wr td (br i) blockTime
             Nothing -> importChainTx wr (br i) blockTime tx
 
--- | Import a transaction of a block into the chain. Throws 'Orphan' if an
--- output that it spends is not unspent in the chain.
+-- | Import a transaction of a block into the chain, with the time of the
+-- block. Throws 'Orphan' if an output that it spends is not unspent in the
+-- chain.
+--
+-- = Why the time of the block
+--
+-- What the chain's column families hold is to follow from the chain and
+-- from nothing else: the same bytes on every store that has the same
+-- blocks, whatever each of them saw before. The time of a transaction was
+-- the one thing in them that did not. A store kept the time at which it
+-- first saw a transaction in its mempool when a block confirmed it, so two
+-- stores had two times for it, a store that synced later had the time of
+-- the block, and the stores of a fleet gave different answers about the
+-- same confirmed transaction. The time of first sight is still what a
+-- transaction has while it is in the mempool, where it is the store's own,
+-- or the pool's in a fleet.
 importChainTx :: Writer -> BlockRef -> Word64 -> Tx -> IO TxData
 importChainTx wr br time tx = do
   us <- forM (prevOuts tx) $ \p ->
@@ -313,15 +330,16 @@ importChainTx wr br time tx = do
 -- | Give a confirmed transaction a new position in the chain: a block has a
 -- transaction that is already confirmed. Only two coinbases of 2010 are, on
 -- Bitcoin; the later one takes the place of the earlier, with the outputs
--- that are still unspent, as in the layout of version 20.
-moveChainTx :: Writer -> TxData -> BlockRef -> IO TxData
-moveChainTx wr t new = do
+-- that are still unspent, as in the layout of version 20, and the time of
+-- the later block.
+moveChainTx :: Writer -> TxData -> BlockRef -> Word64 -> IO TxData
+moveChainTx wr t new time = do
   forM_ (txDataAddresses wr t) $ \a -> do
     deleteAddrTx wr a TxRef {block = t.block, txid = h}
     insertAddrTx wr a TxRef {block = new, txid = h}
   forM_ (zip [0 ..] t.tx.outputs) $ \(i, _) ->
     getUnspent wr (OutPoint h i) >>= mapM_ move
-  let td = (t :: TxData) {block = new}
+  let td = (t :: TxData) {block = new, timestamp = time}
   insertTx wr td
   return td
   where
@@ -356,8 +374,10 @@ revertBlock wr bh = do
           ordered = filter ((`M.member` returned) . txHash) (map snd (sortTxs (map (.tx) tds)))
       -- out of the chain, each after the transactions that spend it
       forM_ (reverse ordered) (leave . txHash)
-      -- into the mempool, at the time each was first seen. The coinbase is
-      -- still in the chain: a transaction that spends it has all its
+      -- into the mempool, at the time that each had in the chain, which is
+      -- that of the block: the time at which a store first saw it is not
+      -- kept past its confirmation, and every store gives it the same
+      -- time this way. The coinbase is still in the chain: a transaction that spends it has all its
       -- parents while its flag is worked out, as in the layout of version 20
       forM_ (mapMaybe ((`M.lookup` returned) . txHash) ordered) $ \td -> do
         rbf <- isRBF wr td.tx

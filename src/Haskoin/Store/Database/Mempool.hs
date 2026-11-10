@@ -9,7 +9,7 @@
 -- The mempool area of the layered layout of the database, and how it is
 -- applied on top of the chain. The design, and the reasons for it, are in
 -- @docs\/layered-database.md@. This is the layout that the store runs on,
--- version 21. Its rules are checked by the tests of
+-- since version 21. Its rules are checked by the tests of
 -- "Haskoin.Store.Database.Migrate" against the answers of a database of
 -- version 20, in which the mempool was mixed into the chain. The queries
 -- that apply them are in "Haskoin.Store.Database.Query.Layered".

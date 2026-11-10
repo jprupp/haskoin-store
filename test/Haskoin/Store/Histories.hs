@@ -14,6 +14,7 @@ module Haskoin.Store.Histories
   ( -- * Databases and rules
     open20,
     openLayered,
+    withShadow,
     Rules (..),
     mixedRules,
     layeredRules,
@@ -146,7 +147,7 @@ import Haskoin.Store.Logic qualified as Mixed
 import Haskoin.Store.Logic.Layered qualified as Layered
 import Haskoin.Store.TestBlocks (nextBlock, script)
 import Test.QuickCheck (Gen, choose, elements, frequency, vectorOf)
-import UnliftIO (try)
+import UnliftIO (try, withSystemTempDirectory)
 
 -------------------------------------------------------------------------------
 -- Databases and rules
@@ -157,6 +158,21 @@ import UnliftIO (try)
 open20, openLayered :: Network -> Ctx -> FilePath -> (DatabaseReader -> IO a) -> IO a
 open20 net ctx dir = withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
 openLayered net ctx dir = withLayeredReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
+
+-- | Run an action with a new database of the layout of version 20 that has
+-- the start of a history ('start'), in a directory of its own.
+--
+-- 'plan' chooses the next operation of a history by reading a database of
+-- that layout: what is unspent, what the mempool has. Given a database of
+-- the layered layout it finds almost none of the mempool, and its blocks
+-- confirm next to nothing. So a test of the layered layout keeps one of
+-- these beside its own database, plans from it, and applies each
+-- operation to both, as 'mixedRules' and 'layeredRules' take the same
+-- operations and give the same outcomes.
+withShadow :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
+withShadow net ctx action =
+  withSystemTempDirectory "haskoin-store-shadow-" $ \dir ->
+    open20 net ctx dir $ \shadow -> start mixedRules shadow >> action shadow
 
 -- | The rules that import blocks and transactions, for one layout.
 data Rules = Rules

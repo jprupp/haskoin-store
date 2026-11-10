@@ -47,7 +47,7 @@
 -- = Keys of the layered layout
 --
 -- They belong to the layout that the store runs on, that of
--- @docs\/layered-database.md@, version 21, in which the column families of
+-- @docs\/layered-database.md@, version 22, in which the column families of
 -- the chain hold nothing from the mempool and everything about the mempool
 -- is in two column families of its own. t'TxKey' is used there too, for the
 -- bodies of mempool transactions. "Haskoin.Store.Database.Mempool" reads

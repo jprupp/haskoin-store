@@ -186,8 +186,8 @@ createDataMetrics s = do
 -- 18 and 19 are migrated to it when opened that way; other versions are
 -- refused.
 --
--- The store runs on the version after it,
--- 'Haskoin.Store.Database.Migrate.layeredVersion', and opens its database
+-- The store runs on a later one,
+-- 'Haskoin.Store.Database.Migrate.currentVersion', and opens its database
 -- with 'withLayeredReader' and 'Haskoin.Store.Database.Migrate.upgradeDatabase'.
 -- This version is kept for the tests, which hold the new layout to the
 -- answers of this one, and as the way through for databases of 18 and 19.

@@ -307,7 +307,15 @@ importOrConfirm wr bn txns = do
           logDebug wr $
             "Confirming tx: "
               <> txHashToHex (txHash tx)
-          confirmTx wr t (br i)
+          -- with the time of the block, as the layered rules give it: see
+          -- 'Haskoin.Store.Logic.Layered.importChainTx'. Version 20 kept
+          -- the time at which the store first saw the transaction; these
+          -- rules are what the tests hold the layered ones to, and have
+          -- to agree with them on it.
+          td <- confirmTx wr t (br i)
+          let timed = (td :: TxData) {timestamp = bn_time}
+          insertTx wr timed
+          return timed
         Nothing -> do
           logError wr $
             "Cannot find tx to confirm: "

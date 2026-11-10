@@ -553,6 +553,20 @@ first time this version of the store opens it: its mempool is moved to the
 new area, in batches that can be interrupted, and the log says how many
 transactions were moved. **There is no way back**: an older store refuses
 the database afterwards, so take a copy of a production database first.
+
+Version 22 makes the chain's data the same on every server that has the
+same blocks: a confirmed transaction has the time of its block. Until then
+a server that had seen a transaction in its mempool kept the time of that
+when a block confirmed it, so two servers gave two times for one confirmed
+transaction, and a server that synced later gave a third. A database of
+version 21, or of version 20 once its mempool is moved, gets the new times
+the first time this version of the store opens it. Nothing lists the
+transactions that need it, so **the store reads every transaction that it
+has before it starts**, and the log says how far it is every million. It
+read 210,000 a second of a small database that was in memory; a database
+of Bitcoin has more than a billion, and a disk to read them from, so plan
+for hours. It can be interrupted, and starts again from the first
+transaction, skipping what is done.
 The parts:
 
 - the migration from version 20 (`Haskoin.Store.Database.Migrate`);
