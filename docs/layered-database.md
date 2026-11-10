@@ -707,8 +707,9 @@ What follows from it:
   everything that is read by key.
 - **The mempool area cannot find out that an address has nothing by
   scanning it.** It has to be a read by key.
-- **The binding should offer bounded iterators.** With them the filters can
-  come back for scans.
+- **The binding should offer bounded iterators.** It does since version
+  2.7; [what they would do for the store](#3-bounded-iterators-in-the-binding)
+  was measured after the summary was built, and is nothing.
 
 ### Reading rows through the binding
 
@@ -894,14 +895,45 @@ mempool transactions of those that have are read to count each once.
 
 ### 3. Bounded iterators in the binding
 
-`rocksdb-haskell-jprupp` creates iterators with no bound, and RocksDB lets
-an iterator be told to stay within the prefix that it was sent to. With
-that, a scan through a filter stops where it should, and the filters can go
-back on the indices by address of the chain, and stay on those of the
-mempool area. It needs a new function in the binding, and the scans of the
-store have to ask for it. The summary makes the layered layout safe without
-it; today's store with `--bloom` is safe without it because the filters are
-off where it matters.
+Done in the binding, and not used by the store. `rocksdb-haskell-jprupp`
+2.7 has `withIterConfig`, which creates an iterator that RocksDB itself
+stops: below an upper bound, or within the prefix that it was sent to. In
+the binding's own test, a scan of an empty range that is followed by 20,000
+deleted keys takes 2,600 microseconds without a bound and 2.5 with one.
+
+The store was then measured with it, on 2026-11-10, and has nothing to
+gain. The same 2,000 seeks as in
+[the table above](#a-scan-through-a-filter-can-step-over-every-deleted-key),
+in the mempool area as it is now, in microseconds:
+
+| Iterator | As it was left | After a block | After deletions |
+|---|---|---|---|
+| One without a bound, sent to each address, as the store has it | 4.3 | 5.5 | 5.6 |
+| One that stays within the prefix it is sent to | 4.5 | 5.3 | 5.1 |
+| One for each address, with the end of the address as its bound | 14.2 | 15.3 | 14.9 |
+
+- **The long walk over deleted keys is gone without a bound.** It was
+  1,638 microseconds after a block when this was first measured. Since
+  then every address that the mempool touches has a summary, which is the
+  last key of the address. A block deletes the entries of the transactions
+  that it confirms and writes the summaries of their addresses again, so
+  the deleted keys of an address are now followed by a key that is alive,
+  and a seek stops there.
+- **An iterator for each address costs ten microseconds to make**, which
+  is more than the seek. The store sends one iterator to many addresses,
+  so only the prefix would do for a bound, and that one asks that no key
+  be shorter than the prefix, which the keys of short witness programs
+  are.
+- **The indices by address of the chain have no deleted keys to walk
+  over** in the layered layout: the mempool is not in them, and only a
+  reorganisation deletes from them. So the filters could go back on them
+  without any bound. That is not done: it would save a few microseconds
+  for an address that the chain does not have, and cost memory in
+  proportion to the number of addresses.
+
+The store therefore stays on version 2.6.4 of the binding. Moving it to
+2.7 needs `haskoin-node` to allow that version first: its bound on the
+binding stops below 2.7.
 
 ### 4. Cheaper row reads in the binding
 

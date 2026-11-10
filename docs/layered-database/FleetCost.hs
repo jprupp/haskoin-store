@@ -26,6 +26,7 @@ import Conduit (concatMapC, runConduit, sinkList, takeC, (.|))
 import Control.DeepSeq (NFData, rnf)
 import Control.Exception (evaluate)
 import Control.Monad (forM_, unless, when)
+import Data.ByteString (ByteString)
 import Data.HashSet qualified as HashSet
 import Data.List (sortOn)
 import Data.List.NonEmpty (nonEmpty)
@@ -37,7 +38,8 @@ import Database.RocksDB (withIterCF)
 import Database.RocksDB.Query (matching)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
-import Haskoin.Store.Common (Limits (..), StoreRead (..))
+import Haskoin.Store.Common (Limits (..), StoreRead (..), deriveAddresses, deriveFunction)
+import Haskoin.Store.Data (DeriveType (..), XPubSpec (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Query.Pooled (pooledRead)
@@ -122,6 +124,24 @@ main = withContext $ \ctx -> do
     ask "transaction: in the mempool" 3 [\q -> q.getTxData h | h <- newest]
     ask "100 transactions: in the mempool" 20 [\q -> q.getManyTxData (take 100 newest)]
     ask "first 100 of the mempool" 50 [\q -> q.getMempoolPage page]
+    -- the wallets of QueryCost.hs: what a request for an extended public
+    -- key costs with no cache, which a fleet does not have
+    let wallets =
+          [ ("cold wallet", wallet ctx "the cold wallet of the measurements of haskoin-store"),
+            ("quiet wallet", wallet ctx "the quiet wallet of the measurements of haskoin-store"),
+            ("busy wallet", wallet ctx "the busy wallet of the measurements of haskoin-store"),
+            ("small wallet", wallet ctx "the small wallet of the measurements of haskoin-store")
+          ]
+    forM_ wallets $ \(name, spec) -> do
+      bals <- own (\q -> q.xPubBals spec)
+      let derive = deriveFunction ctx spec.deriv
+          addrs m = map snd (take (length bals `div` 2 + 20) (deriveAddresses derive (pubSubKey ctx spec.key m) 0))
+      derived <- timed 5 (return (addrs 0 <> addrs 1))
+      printf "%s: %d addresses with a balance, %.0f microseconds to derive them\n" name (length bals) derived
+      ask (name <> ": balances") 5 [\q -> q.xPubBals spec]
+      ask (name <> ": first 100 transactions") 5 [\q -> q.xPubTxs spec bals page]
+      ask (name <> ": first 100 unspent outputs") 5 [\q -> q.xPubUnspents spec bals page]
+      ask (name <> ": count of transactions") 5 [\q -> q.xPubTxCount spec bals]
   where
     summary :: (MemAddrKey, MemAddrVal) -> Maybe (Address, Word64)
     summary = \case
@@ -131,6 +151,10 @@ main = withContext $ \ctx -> do
     balanced = \case
       (BalKey a, _) -> Just a
       _ -> Nothing
+
+-- | A wallet of the history that QueryCost.hs writes.
+wallet :: Ctx -> ByteString -> XPubSpec
+wallet ctx seed = XPubSpec {key = deriveXPubKey ctx (makeXPrvKey seed), deriv = DeriveNormal}
 
 -- | The mean time of an action in microseconds, over so many runs after
 -- one that does not count.
