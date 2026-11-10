@@ -1021,8 +1021,9 @@ This section is a proposal, written on 2026-11-10. Its first part is
 specified: `Haskoin.Store.Fleet` has the rules for the fleet tip as pure
 decisions, and `test/Haskoin/Store/FleetSpec.hs` runs three stores through
 random blocks, reorganisations, reports and lapses of time against them.
-Nothing carries them out against Redis yet, and the shared mempool is not
-specified.
+`Haskoin.Store.Fleet.Redis` carries them out against Redis, in two Lua
+scripts, and a test compares Redis with the rules step by step. No store
+uses either yet, and the shared mempool is being specified.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,

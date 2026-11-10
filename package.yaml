@@ -21,6 +21,7 @@ bug-reports: https://github.com/jprupp/haskoin-store/issues
 tested-with: GHC == 9.12.4
 extra-source-files:
   - src/Haskoin/Store/Cache/lua/*.lua
+  - src/Haskoin/Store/Fleet/lua/*.lua
   - stress/wrk.lua
 extra-doc-files:
   - README.md

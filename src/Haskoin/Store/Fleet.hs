@@ -7,10 +7,10 @@
 -- Portability : POSIX
 --
 -- How stores that share one Redis agree on the block that they all answer
--- from, as pure decisions. Nothing carries them out against Redis yet: this
--- is the first part of the design in @docs\/layered-database.md@, "A fleet
--- that answers as one", written down so that it can be tested before it is
--- built.
+-- from, as pure decisions. "Haskoin.Store.Fleet.Redis" carries them out.
+-- This is the first part of the design in @docs\/layered-database.md@, "A
+-- fleet that answers as one", written down so that it can be tested before
+-- a store depends on it.
 --
 -- = The problem
 --
