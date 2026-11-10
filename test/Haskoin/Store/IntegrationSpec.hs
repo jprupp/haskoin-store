@@ -34,7 +34,7 @@
 module Haskoin.Store.IntegrationSpec (spec) where
 
 import Control.Lens ((&), (?~), (^.))
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM_, forever, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -75,6 +75,7 @@ import Haskoin
     prvSubKey,
     pubSubKey,
     sha256,
+    txHashToHex,
     xPrvWif,
     xPubAddr,
     xPubCompatWitnessAddr,
@@ -104,6 +105,7 @@ import Haskoin.Store.Cache
     cacheXPubBals,
     xpubId,
   )
+import Haskoin.Store.Common (StoreEvent (..))
 import Haskoin.Store.Data (Balance (..), BlockRef (..), Spender (..), TxData (..), XPubBal (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
@@ -112,12 +114,13 @@ import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
 import Haskoin.Store.Integration.Valkey
+import NQE (receive, withSubscription)
 import Network.Socket qualified as Socket
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
 import Test.Hspec
-import UnliftIO (bracket, link, tryAny, withAsync)
+import UnliftIO (async, bracket, cancel, link, tryAny, withAsync)
 import UnliftIO.Concurrent (threadDelay)
 
 spec :: Spec
@@ -1590,6 +1593,19 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   waitStore env a
   waitStore env b
   atTip
+  -- what each store tells its clients from here on
+  heardA <- newIORef []
+  heardB <- newIORef []
+  let said = \case
+        StoreBestBlock h -> Just ("block " <> blockHashToHex h)
+        StoreMempoolNew t -> Just ("new " <> txHashToHex t)
+        StoreMempoolDelete t -> Just ("gone " <> txHashToHex t)
+        _ -> Nothing
+      listen st heard = withSubscription st.events $ \sub ->
+        forever (receive sub >>= \e -> forM_ (said e) (\line -> modifyIORef' heard (line :)))
+  listenA <- async (listen a heardA)
+  listenB <- async (listen b heardB)
+  threadDelay 500000
   ref <- newLedger
   txid <- pay env x ref [([0, 0], 100000)]
   waitFor "the pool of the fleet to have the payment" (inPool txid)
@@ -1608,6 +1624,19 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   inPool txid `shouldReturn` False
   alike "the two stores to answer alike, with the payment confirmed" (paths txid)
   throughCache "with the payment confirmed"
+  -- both told the same events in the same order: the payment as it
+  -- entered the pool, and then the block, which is not told as the
+  -- payment leaving
+  best <- bestBlockHash env.node
+  waitFor "both stores to tell of the block" $ do
+    told <- (,) <$> readIORef heardA <*> readIORef heardB
+    return (("block " <> best) `elem` fst told && ("block " <> best) `elem` snd told)
+  toldA <- reverse <$> readIORef heardA
+  toldB <- reverse <$> readIORef heardB
+  toldA `shouldBe` toldB
+  toldA `shouldBe` ["new " <> txid, "block " <> best]
+  cancel listenA
+  cancel listenB
   (_, confirmed) <- getJSON urlB ("/transaction/" <> T.unpack txid)
   (confirmed ! "block") `shouldSatisfy` \case
     Object o -> KeyMap.member "height" o

@@ -72,6 +72,9 @@ module Haskoin.Store.Fleet.Redis
     poolOffer,
     poolWithdraw,
     fleetAdvance,
+    FleetEvent (..),
+    fleetEventsEnd,
+    fleetEventsAfter,
     poolSpends,
     poolBody,
     poolRead,
@@ -258,6 +261,10 @@ poolWithdraw conn keys tsize ts =
 -- back after all its stores were away. The stores then offer their mempools
 -- to the empty pool. With another store live the answer is 'Raced', and
 -- the tip waits for a store that knows the way.
+--
+-- The last argument is the blocks that the tip moves through, oldest
+-- first and the new tip last, for the events of the fleet ('FleetEvent'):
+-- with none given, the new tip is the one block told.
 fleetAdvance ::
   Connection ->
   FleetKeys ->
@@ -266,8 +273,9 @@ fleetAdvance ::
   Maybe ByteString ->
   ByteString ->
   Maybe PoolChange ->
+  [ByteString] ->
   IO Moved
-fleetAdvance conn keys tsize clock seen target known =
+fleetAdvance conn keys tsize clock seen target known path =
   run conn (R.eval poolScript [] args) >>= \case
     ["moved"] -> return (MovedTo target)
     ["stays"] -> return Stays
@@ -280,6 +288,7 @@ fleetAdvance conn keys tsize clock seen target known =
         <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
         <> [num (length change.returned)]
         <> concatMap txArgs change.returned
+        <> [B.concat path]
 
     change = maybe (PoolChange [] [] [] []) id known
 
@@ -292,6 +301,51 @@ poolRead conn keys tsize tip what args =
     "ok" : rows -> return (Just rows)
     ["raced"] -> return Nothing
     other -> fail ("Unexpected answer of the read script: " <> show (take 1 other))
+
+-- | Something that happened to the fleet, as every store of it tells its
+-- clients.
+--
+-- A store alone tells what its own node saw. The stores of a fleet answer
+-- from one tip and one pool, and their events have to be those of that tip
+-- and that pool: otherwise a client would hear of a transaction from one
+-- server and find that the next does not have it. So the script that
+-- changes the pool or moves the tip appends what it did to a stream in
+-- Redis, in the same step, and every store reads the stream.
+data FleetEvent
+  = -- | the fleet tip moved to this block, or through it
+    FleetBlock !ByteString
+  | -- | a transaction entered the pool
+    FleetEntered !ByteString
+  | -- | a transaction left the pool unconfirmed
+    FleetLeft !ByteString
+  deriving (Eq, Ord, Show)
+
+-- | The place in the stream of events after the last event that there is:
+-- where a store that starts listening now begins.
+fleetEventsEnd :: Connection -> FleetKeys -> IO ByteString
+fleetEventsEnd conn keys =
+  run conn (R.sendRequest ["XREVRANGE", keys.prefix <> "fleet:events", "+", "-", "COUNT", "1"]) >>= \case
+    R.MultiBulk (Just [R.MultiBulk (Just (R.Bulk (Just at) : _))]) -> return at
+    _ -> return "0-0"
+
+-- | The events after a place in the stream, each with its place, waiting
+-- up to so many milliseconds for one if there is none yet.
+fleetEventsAfter :: Connection -> FleetKeys -> ByteString -> Integer -> IO [(ByteString, FleetEvent)]
+fleetEventsAfter conn keys from wait =
+  run conn (R.sendRequest ["XREAD", "BLOCK", num wait, "STREAMS", keys.prefix <> "fleet:events", from]) >>= \case
+    R.MultiBulk (Just [R.MultiBulk (Just [_, R.MultiBulk (Just records)])]) -> return (concatMap record records)
+    _ -> return []
+  where
+    record = \case
+      R.MultiBulk (Just [R.Bulk (Just at), R.MultiBulk (Just fields)]) ->
+        case (lookup "k" (pairs fields), lookup "h" (pairs fields)) of
+          (Just "b", Just h) -> [(at, FleetBlock h)]
+          (Just "t", Just h) -> [(at, FleetEntered h)]
+          (Just "d", Just h) -> [(at, FleetLeft h)]
+          _ -> []
+      _ -> []
+    pairs (R.Bulk (Just k) : R.Bulk (Just v) : more) = (k, v) : pairs more
+    pairs _ = []
 
 -- | A transaction as the arguments of the pool script.
 txArgs :: PoolTx -> [ByteString]

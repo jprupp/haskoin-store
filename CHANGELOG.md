@@ -74,6 +74,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the transactions with an iterator that is asked for the order of them
   all. `haskoin-node` still asks for a binding below 2.7: `stack.yaml`
   lifts that bound, and a build with Cabal waits for `haskoin-node`.
+- **`/events` agrees across a fleet.** The servers of a fleet send the
+  events of the block and the mempool that they share, read from a stream
+  in Redis that the pool's script writes as it makes each change, and no
+  longer those of their own nodes. A block is told when the fleet has
+  moved to it, with every block that it moved through.
 - `haskoin-store --help` names the environment variable of every option.
 - `swagger.yaml` documents the binary format: how to ask for it, the
   encoding of each type that the API returns, and what differs from JSON.

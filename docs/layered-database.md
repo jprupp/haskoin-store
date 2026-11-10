@@ -240,6 +240,12 @@ on the moment at which each commits a block.
 - **Every request** is answered from the view at the fleet tip with the pool
   on top. Each read of the pool checks that the tip has not moved. If it
   has, the request is answered again, unless its response is on its way.
+- **Events:** the script that changes the pool or moves the tip appends
+  what it did to a stream in Redis, in the same step: a transaction that
+  entered, one that left unconfirmed, a block that the tip moved to or
+  through. Every store serves `/events` from that stream, so all tell the
+  same, in the same order. A store's own events would tell of a
+  transaction that the next server does not have yet.
 - **Conflicts:** of two transactions that spend the same output, the first
   one in stays, unless the store that offers the other deleted the first
   from its own mempool, as it does when it replaces it by fee. A store

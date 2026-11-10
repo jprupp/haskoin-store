@@ -80,32 +80,58 @@ spec = do
         poolOffer conn keys 4 (Just (block 1)) seven [True] [] `shouldReturn` Taken
         poolBody conn keys (block 7) `shouldReturn` Just "seven"
         -- the tip does not move to a block that the stores do not agree on
-        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just nothing) `shouldReturn` Raced
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just nothing) [] `shouldReturn` Raced
         fleetReport conn keys Nothing 60000 "a" [block 2, block 1] [block 1] `shouldReturn` True
         let confirms = nothing {confirmed = [block 7], spent = [out 0 0]}
-        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) `shouldReturn` MovedTo (block 2)
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) [] `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
+      it "tells what happens to the pool and to the tip, in the order in which it happens" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
+        fleetAdvance conn keys 4 Nothing Nothing (block 1) (Just nothing) [] `shouldReturn` MovedTo (block 1)
+        -- a store that starts to listen hears what comes after
+        start <- fleetEventsEnd conn keys
+        let seven = txOf 7 [out 0 0]
+            eight = txOf 8 [out 7 0]
+            nine = txOf 9 [out 0 1]
+        forM_ [seven, eight, nine] $ \t ->
+          poolOffer conn keys 4 (Just (block 1)) t [True] [] `shouldReturn` Taken
+        -- what spends a transaction that is withdrawn leaves with it
+        _ <- poolWithdraw conn keys 4 [block 7]
+        -- a block confirms the third, which is not an event of the mempool,
+        -- and the tip moves through two blocks
+        fleetReport conn keys Nothing 60000 "a" [block 3, block 2, block 1] [block 1] `shouldReturn` True
+        let confirms = nothing {confirmed = [block 9], spent = [out 0 1]}
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 3) (Just confirms) [block 2, block 3]
+          `shouldReturn` MovedTo (block 3)
+        heard <- map snd <$> fleetEventsAfter conn keys start 10
+        take 3 heard `shouldBe` map FleetEntered [block 7, block 8, block 9]
+        sort (take 2 (drop 3 heard)) `shouldBe` map FleetLeft [block 7, block 8]
+        drop 5 heard `shouldBe` map FleetBlock [block 2, block 3]
+        -- and nothing twice: from the last event on there is nothing
+        end <- fleetEventsEnd conn keys
+        fleetEventsAfter conn keys end 10 `shouldReturn` []
       it "empties the pool for a store that is alone and does not know the way" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing `shouldReturn` MovedTo (block 1)
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
         -- with another store live, the tip waits for one that knows
         fleetReport conn keys (Just 0) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
         fleetReport conn keys (Just 0) 10 "b" [block 2, block 1] [block 1] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) (Just (block 1)) (block 2) Nothing `shouldReturn` Raced
+        fleetAdvance conn keys 4 (Just 0) (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
         map fst <$> poolSpends conn keys `shouldReturn` [block 7]
         -- the other store's lease runs out
         fleetReport conn keys (Just 20) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 20) (Just (block 1)) (block 2) Nothing `shouldReturn` MovedTo (block 2)
+        fleetAdvance conn keys 4 (Just 20) (Just (block 1)) (block 2) Nothing [] `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
       it "reads the pool by the page, as it is at the tip that is asked for" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing `shouldReturn` MovedTo (block 1)
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         let tip = Just (block 1)
             a = address 1
         -- nine transactions, of which the fifth spends the first output of
@@ -220,7 +246,7 @@ spec = do
                 change.confirmed
                 change.spent
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) tip target (Just sent) `shouldReturn` MovedTo target
+        fleetAdvance conn keys 4 (Just 0) tip target (Just sent) [] `shouldReturn` MovedTo target
         let model' = P.advance maker change model
         samePool conn keys model'
         return (model', Just target, n + 1)

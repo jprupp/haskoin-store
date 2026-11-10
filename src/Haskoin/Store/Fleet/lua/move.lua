@@ -66,6 +66,8 @@ for i = 1, #first, size do
     redis.call('SET', KEYS[1], block)
     -- the moves of the tip are counted, next to it: see pool.lua
     redis.call('INCR', string.sub(KEYS[1], 1, -4) .. 'moves')
+    -- and told to the stores, as pool.lua tells it
+    redis.call('XADD', string.sub(KEYS[1], 1, -4) .. 'events', 'MAXLEN', '~', '10000', '*', 'k', 'b', 'h', block)
     return {'moved', block}
   end
 end

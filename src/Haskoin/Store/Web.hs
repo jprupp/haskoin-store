@@ -1371,7 +1371,7 @@ webSocketEvents :: WebState -> Middleware
 webSocketEvents s =
   websocketsOr defaultConnectionOptions (wrap . events)
   where
-    pub = s.config.store.pub
+    pub = s.config.store.events
     pingPong = defaultPingPongOptions {pingInterval = 30, pongTimeout = 60}
     gauge = (.events) <$> s.metrics
     wrap f = case gauge of
@@ -1416,7 +1416,7 @@ handleEvents :: WebState -> Req -> IO Response
 handleEvents st req =
   withGaugeIncrease st (.events) $ do
     proto <- serialAs req False
-    let pub = st.config.store.pub
+    let pub = st.config.store.events
     return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
       withEventSubscription pub $ \nextEvent ->
         -- ends the response when the client falls too far behind

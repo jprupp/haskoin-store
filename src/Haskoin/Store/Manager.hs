@@ -22,8 +22,10 @@ module Haskoin.Store.Manager
   )
 where
 
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
+import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
+import Data.Serialize (Serialize, decode)
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32, Word64)
@@ -87,14 +89,17 @@ import Haskoin.Store.Fleet.Member
   ( Member,
     MemberConfig (..),
     memberCacheLoop,
+    memberEvents,
     memberForget,
     memberLoop,
     newMember,
     noteBest,
   )
+import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import NQE
   ( Inbox,
     Publisher,
+    publish,
     publishSTM,
     receive,
     withPublisher,
@@ -126,6 +131,12 @@ data Store = Store
     cache :: !(Maybe Cache),
     -- | the store as a member of a fleet, if it is one
     fleet :: !(Maybe Member),
+    -- | what the store tells its clients: new best blocks and changes of
+    -- the mempool. For a store alone they are its own, those that the
+    -- block store publishes.
+    -- For a member of a fleet they are those of the fleet, read from the
+    -- Redis that it shares, so that every server tells the same.
+    events :: !(Publisher StoreEvent),
     -- | store events are published here
     pub :: !(Publisher StoreEvent),
     -- | network constants
@@ -228,18 +239,20 @@ withStore cfg action =
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
                 withStoreFleet cfg pub member . withStoreCache cfg db node.chain pub $ \cache ->
-                  action $
-                    Store
-                      { peerMgr = node.peerMgr,
-                        chain = node.chain,
-                        block = block_store,
-                        db = db,
-                        cache = cache,
-                        fleet = member,
-                        pub = pub,
-                        net = cfg.net,
-                        ctx = cfg.ctx
-                      }
+                  withFleetEvents cfg pub member $ \events ->
+                    action $
+                      Store
+                        { peerMgr = node.peerMgr,
+                          chain = node.chain,
+                          block = block_store,
+                          db = db,
+                          cache = cache,
+                          fleet = member,
+                          events = events,
+                          pub = pub,
+                          net = cfg.net,
+                          ctx = cfg.ctx
+                        }
 
 -- | The store as a member of a fleet, if the configuration says that it is
 -- one and has a Redis to share: under a name of its own, with a lease of
@@ -291,6 +304,29 @@ withStoreFleet cfg pub (Just member) action =
         _ -> nextBlock sub
     complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not take a turn: " <> cs why)
     cacheComplain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not cache an xpub: " <> cs why)
+
+-- | Run an action with the events that the store tells its clients. A
+-- store alone tells its own. A member of a fleet tells those of the
+-- fleet, which a thread reads from Redis for as long as the action runs.
+withFleetEvents ::
+  StoreConfig ->
+  Publisher StoreEvent ->
+  Maybe Member ->
+  (Publisher StoreEvent -> IO a) ->
+  IO a
+withFleetEvents _ pub Nothing action = action pub
+withFleetEvents cfg _ (Just member) action =
+  withPublisher $ \shared ->
+    withAsync (memberEvents member (tell shared) complain) $ \a -> link a >> action shared
+  where
+    tell shared event = forM_ (told event) (`publish` shared)
+    told = \case
+      FleetBlock h -> StoreBestBlock <$> hash h
+      FleetEntered h -> StoreMempoolNew <$> hash h
+      FleetLeft h -> StoreMempoolDelete <$> hash h
+    hash :: (Serialize x) => ByteString -> Maybe x
+    hash = either (const Nothing) Just . decode
+    complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not read the events: " <> cs why)
 
 -- | Run the cache while an action runs, if Redis is configured.
 withStoreCache ::

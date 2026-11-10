@@ -62,6 +62,7 @@ module Haskoin.Store.Fleet.Member
     memberTick,
     memberLoop,
     memberAlive,
+    memberEvents,
 
     -- * Answering
     Standing (..),
@@ -122,6 +123,7 @@ import Haskoin
     TxHash,
     TxIn (..),
     blockHashToHex,
+    headerHash,
     nullOutPoint,
     txHash,
   )
@@ -407,6 +409,25 @@ memberLoop m nextBlock complain = go
       when well (handleAny (complain . show) (memberTick m))
       go
 
+-- | Hear what happens to the fleet, for as long as the store runs: each
+-- move of the tip and each transaction that enters or leaves the pool is
+-- told to a function, in the order in which Redis has them, from the
+-- moment that this starts. Every store of the fleet hears the same, which
+-- is what its clients are told ('FleetEvent'). When Redis cannot be read
+-- a function is told why, and listening starts again from what is newest
+-- then: the events in between are not told.
+memberEvents :: Member -> (FleetEvent -> IO ()) -> (String -> IO ()) -> IO a
+memberEvents m tell complain = start
+  where
+    start = do
+      handleAny (complain . show) (fleetEventsEnd m.redis m.keys >>= listen)
+      void (timeout 1000000 (atomically retrySTM) :: IO (Maybe ()))
+      start
+    listen from = do
+      events <- fleetEventsAfter m.redis m.keys from 1000
+      mapM_ (tell . snd) events
+      listen (foldl (\_ (at, _) -> at) from events)
+
 -- | Report the blocks of the main chain that the store has views of, newest
 -- first.
 report :: Member -> IO ()
@@ -441,7 +462,8 @@ moveTip m = do
       between <- case (traverse decode seen, decode target) of
         (Right from, Right to) -> blocksBetween m.db from to
         _ -> return Nothing
-      fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) >>= \case
+      let path = maybe [] (map encode . (.path)) between
+      fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) path >>= \case
         MovedTo _ -> advanceCache m seen target between >> return True
         _ -> return False
     _ -> return False
@@ -481,7 +503,10 @@ data Between = Between
     -- left the way to the first tip, up to the second, in their order
     added :: ![TxData],
     -- | whether blocks of the way to the first tip were abandoned
-    reorganised :: !Bool
+    reorganised :: !Bool,
+    -- | those blocks of the main chain, oldest first, the second tip last:
+    -- what the fleet tells its clients that the tip moved through
+    path :: ![BlockHash]
   }
 
 -- | 'changeBetween', with the transactions that the new blocks confirm,
@@ -529,7 +554,8 @@ blocksBetween db from to = L.withView db $ \view -> do
                         confirmed = map (encode . txHash . (.tx)) new,
                         spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
                       }
-              return (Just Between {pool, added = new, reorganised = not (null abandoned)})
+              let path = map (headerHash . (.header)) (reverse added)
+              return (Just Between {pool, added = new, reorganised = not (null abandoned), path})
     _ -> return Nothing
   where
     -- the transactions of an abandoned block, each with what the store has

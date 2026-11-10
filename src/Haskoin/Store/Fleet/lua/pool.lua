@@ -28,8 +28,9 @@
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
 -- bytes, '1' to empty the pool instead of changing it or '0', the
 -- transactions that are gone, those that are confirmed, the outputs that
--- are spent, the number of transactions that come back, and those
--- transactions. Returns {'moved'}, {'stays'} or {'raced'}. The pool is
+-- are spent, the number of transactions that come back, those
+-- transactions, and the blocks that the tip moves through, oldest first,
+-- or ''. Returns {'moved'}, {'stays'} or {'raced'}. The pool is
 -- emptied for a store that cannot say what the blocks between the two tips
 -- did, and only when no other store is live: {'raced'} otherwise.
 --
@@ -65,6 +66,7 @@ local osize = tsize + 4
 local key = {
   tip = prefix .. 'fleet:tip',
   moves = prefix .. 'fleet:moves',
+  events = prefix .. 'fleet:events',
   lease = prefix .. 'fleet:lease',
   recent = prefix .. 'fleet:recent',
   spends = prefix .. 'pool:spends',
@@ -91,6 +93,16 @@ local function split(s, n)
     items[#items + 1] = string.sub(s, i, i + n - 1)
   end
   return items
+end
+
+-- Tell every store of the fleet that something happened: 'b' and a block
+-- that the tip moved to or through, 't' and a transaction that entered the
+-- pool, 'd' and one that left it unconfirmed. The events go in a stream, in
+-- the step that makes the change, so that every store serves the same
+-- events in the same order, whatever its own node saw and when. The stream
+-- keeps about the last ten thousand.
+local function emit(kind, what)
+  redis.call('XADD', key.events, 'MAXLEN', '~', '10000', '*', 'k', kind, 'h', what)
 end
 
 local function member(t)
@@ -239,11 +251,15 @@ local function replaceable(t)
   end
 end
 
--- take one transaction out, leaving what spends it
-local function remove(t)
+-- take one transaction out, leaving what spends it: quietly if a block
+-- confirmed it, which is no event of the mempool
+local function remove(t, quiet)
   local inputs = redis.call('HGET', key.spends, t)
   if not inputs then
     return
+  end
+  if not quiet then
+    emit('d', t)
   end
   local kept = cmsgpack.unpack(redis.call('HGET', key.entries, t))
   account(t, kept[1], kept[2], -1)
@@ -280,6 +296,7 @@ local function insert(tx)
     redis.call('SADD', key.own, t)
   end
   replaceable(t)
+  emit('t', t)
 end
 
 local function withdraw(from)
@@ -401,6 +418,7 @@ if ARGV[8] == '1' then
   end
   redis.call('SET', key.tip, target)
   redis.call('INCR', key.moves)
+  emit('b', target)
   return {'moved'}
 end
 
@@ -434,7 +452,7 @@ withdraw(orphaned)
 -- the new blocks: what they confirm leaves alone, and what spends what they
 -- spend leaves with all that spends it
 for _, t in ipairs(split(ARGV[10], tsize)) do
-  remove(t)
+  remove(t, true)
 end
 local clashing = {}
 for _, o in ipairs(split(ARGV[11], osize)) do
@@ -447,4 +465,13 @@ withdraw(clashing)
 
 redis.call('SET', key.tip, target)
 redis.call('INCR', key.moves)
+-- the blocks that the tip moved through, oldest first, if the store that
+-- moves it gave them, and the block that it is at now otherwise
+local path = split(ARGV[at] or '', bsize)
+if #path == 0 then
+  path = {target}
+end
+for _, block in ipairs(path) do
+  emit('b', block)
+end
 return {'moved'}

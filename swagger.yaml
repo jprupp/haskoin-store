@@ -223,6 +223,13 @@ info:
     that falls more than 10,000 events behind is disconnected, so that one slow
     client cannot make the server hold an ever-growing queue for it.
 
+    The servers of a fleet all send the same events in the same order: those of
+    the block and the mempool that the fleet shares, not what each server's own
+    node saw. A transaction is told when it enters the shared mempool and when
+    it leaves it unconfirmed, and a block when the fleet has moved to it, which
+    is when every server can answer about it. A client can therefore reconnect
+    to another server and ask it about what the first one told.
+
     ## Blockchain.info compatibility
 
     The endpoints under `/blockchain/` answer like those of Blockchain.info, with

@@ -340,6 +340,11 @@ the same block and the same mempool:
   than something that the others would not say, and stops counting after
   ten seconds without a report, so that it holds nobody up. A server whose
   health check fails stops reporting.
+- **`/events` is the same stream on every server.** What changes the
+  shared mempool or moves the fleet to a block writes an event to Redis
+  in the same step, and every server sends those events, in that order,
+  instead of what its own node saw. A block is told when the whole fleet
+  can answer about it.
 - **Without Redis** each server answers from its own database, and
   `/health` says 203, as it does for the cache.
 - **Large xpubs are cached for the whole fleet**, under the same
