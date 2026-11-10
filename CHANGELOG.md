@@ -203,14 +203,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     upgraded in the middle of a history. They also check that an open view
     goes on answering from its moment while blocks and transactions are
     written.
+- `docs/layered-database/QueryCost.hs` writes one synthetic history into a
+  database of each layout and times the rules and the queries of both,
+  checking that the answers agree. `docs/layered-database.md` has the
+  results and what follows from them: writing costs the same when syncing
+  and 14% more for a transaction that passes through the mempool; the new
+  queries cost 10 to 15 microseconds more for a request when the mempool
+  has nothing for what is asked; and they are too slow, as built, for
+  addresses that the mempool touches a lot and for any address right after
+  a block. The document proposes a summary for each address in the mempool
+  area, read by key, and two changes to the RocksDB binding.
 - Documentation: a page that starts at a height has no unconfirmed
   transactions, whatever the height. The comment on `AtBlock` said that a
   height above the best block includes them, and the API reference could be
   read that way. The behaviour is unchanged.
-- Known issue: `--bloom` builds no Bloom filters when the store is built
-  against RocksDB 6.24 or later, because of a wrong type in
-  `rocksdb-haskell-jprupp` 2.6.1, fixed in 2.6.2. `stack.yaml` still pins
-  2.6.1; the README says what to expect when the fix is picked up.
 - The stress report breaks the commands that blocked Redis down by script,
   and commits by full and incremental reloads, with their numbers of
   arguments.
@@ -253,6 +259,24 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `--bloom` builds Bloom filters. It built none when the store was built
+  against RocksDB 6.24 or later, as the Docker image is, because
+  `rocksdb-haskell-jprupp` passed the size of the filter to RocksDB with the
+  wrong type. Nothing failed; a lookup of a key that is not there just went
+  on reading data blocks to find that out. The store is now built with
+  `rocksdb-haskell-jprupp` 2.6.3, which has the fix. A store that already
+  runs with `--bloom` starts building filters when it is upgraded, for the
+  table files written from then on: about 1.25 bytes for each key, held in
+  the block cache. Size that on a full database, or turn the option off to
+  keep things as they were.
+- `--bloom` no longer asks for filters on the two indices by address, which
+  are scanned and not read by key. With a filter, a scan of an address that
+  has nothing steps over every key deleted since the last flush: 810
+  microseconds after 5,000 mempool transactions were deleted, against 13
+  without filters. No store was affected, because no filter was ever built;
+  with the fixed binding they would have been. The option still builds
+  filters for transactions, unspent outputs, blocks, balances and the
+  mempool.
 - `/blockchain/multiaddr` no longer reads every transaction of the wallet to
   count them. `n_tx` of one xpub is its count (a `ZCARD` when it is cached);
   for several xpubs and addresses, the database counts the distinct

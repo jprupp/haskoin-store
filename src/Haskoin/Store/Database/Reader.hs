@@ -329,10 +329,30 @@ memoryReport db = do
 
 -- | Column families, with Bloom filters or not, and with their index and
 -- filter blocks in the block cache or not.
+--
+-- = Why the indices by address never have filters
+--
+-- A filter lets RocksDB skip a table file that cannot have a key, or, for a
+-- scan, a key prefix. That is safe for column families that are read by
+-- key. It is not for the two that are scanned by address, as long as the
+-- iterators of the binding have no bound: a scan asks RocksDB for the first
+-- key at or after an address and stops when the key is of another address.
+-- With filters, the files that hold the keys of the addresses that follow
+-- are skipped, as they should be, but the keys that were deleted lately are
+-- not in a file yet, and RocksDB steps over every one of them looking for a
+-- key to give back, since it can no longer see that most still have
+-- neighbours that are alive.
+--
+-- Measured with 5,000 mempool transactions just deleted: a scan of an
+-- address that has nothing took 810 microseconds with filters on these
+-- indices, and 13 without (@docs\/layered-database.md@). The store deletes
+-- old mempool transactions by the thousand, so @--bloom@ would have made
+-- every such scan slow for a while after each round. It never did, because
+-- no filter was ever built before rocksdb-haskell-jprupp 2.6.2.
 columnFamilyConfig :: Bool -> Bool -> [(String, Config)]
 columnFamilyConfig bloom cached =
-  [ ("addr-tx", c (Just 22)),
-    ("addr-out", c (Just 22)),
+  [ ("addr-tx", scanned (Just 22)),
+    ("addr-out", scanned (Just 22)),
     ("tx", c (Just 33)),
     ("spender", c (Just 33)), -- unused
     ("unspent", c (Just 37)),
@@ -343,6 +363,7 @@ columnFamilyConfig bloom cached =
   ]
   where
     c p = def {prefixLength = p, bloomFilter = bloom, cacheIndexAndFilterBlocks = cached}
+    scanned p = (c p) {bloomFilter = False}
 
 -- | Column families of the layered layout: those of 'columnFamilyConfig',
 -- and one for the entries of the mempool by address ('MemAddrKey').
@@ -353,16 +374,20 @@ columnFamilyConfig bloom cached =
 -- transaction spends, an address with nothing in the mempool. A filter
 -- answers those without reading a block, and for column families this small
 -- it takes a few megabytes; on the column families of the chain the same
--- filters would take gigabytes, which is why they are optional there. (With
--- rocksdb-haskell-jprupp 2.6.1 on RocksDB 6.24 or later no filter is built at
--- all, whatever is asked for; see @--bloom@ in the README.)
+-- filters would take gigabytes, which is why they are optional there.
 --
 -- The entries by address are in a column family of their own because their
 -- filter is on the first 22 bytes of the key, the kind of key and the
--- address, as in the column families of addresses of the chain: a scan of an
--- address with nothing in the mempool then stops at the filter. The mempool
--- column family is read by whole keys and scanned across prefixes, for the
--- index by time, so it cannot have a filter by prefix.
+-- address: a scan of an address with nothing in the mempool then stops at
+-- the filter. The mempool column family is read by whole keys and scanned
+-- across prefixes, for the index by time, so it cannot have a filter by
+-- prefix.
+--
+-- That scan through a filter is what 'columnFamilyConfig' keeps out of the
+-- indices of the chain, and it is as slow here after a block, which deletes
+-- the keys of the transactions it confirms: 1.6 milliseconds for an address
+-- with nothing, measured. It is one of the things that have to change before
+-- this layout is used; @docs\/layered-database.md@ says how.
 layeredFamilyConfig :: Bool -> Bool -> [(String, Config)]
 layeredFamilyConfig bloom cached =
   map mempool (columnFamilyConfig bloom cached)

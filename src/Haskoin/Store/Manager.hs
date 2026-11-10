@@ -160,7 +160,7 @@ data StoreConfig = StoreConfig
     connect :: !(SockAddr -> WithConnection),
     -- | StatsD
     stats :: !(Maybe Stats),
-    -- | database Bloom filters
+    -- | Bloom filters on the column families that are read by key
     bloom :: !Bool,
     -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
     -- and filter blocks stay resident for the life of the process)

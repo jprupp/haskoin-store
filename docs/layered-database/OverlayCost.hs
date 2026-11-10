@@ -29,9 +29,11 @@
 -- them when the database was opened again.
 --
 -- The first line of output says whether the table files have Bloom filters.
--- With rocksdb-haskell-jprupp 2.6.1 and RocksDB 6.24 or later they have
--- none, whatever the configuration asks for. To measure with them, build
--- against a checkout of the binding that has the fix, by adding
+-- With rocksdb-haskell-jprupp 2.6.1 and RocksDB 6.24 or later they had none,
+-- whatever the configuration asked for; the store is built with 2.6.3 now,
+-- which builds them. The output kept next to this file has both: its
+-- measurements with filters were made before the fix was released, against
+-- a checkout of the binding, by adding
 --
 -- > -i/path/to/rocksdb-haskell/src -hide-package rocksdb-haskell-jprupp -lrocksdb
 --

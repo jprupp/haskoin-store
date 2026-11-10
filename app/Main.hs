@@ -559,7 +559,7 @@ config c = do
   bloom <-
     flag c.bloom True $
       long "bloom"
-        <> help "RocksDB Bloom filters"
+        <> help "RocksDB Bloom filters, on the data that is read by key"
   maxOpenFiles <-
     option auto $
       metavar "COUNT"

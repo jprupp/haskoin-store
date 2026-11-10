@@ -338,7 +338,7 @@ versions are gone.
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--bloom` | `BLOOM` | off | Bloom filters, for faster lookups at the cost of memory |
+| `--bloom` | `BLOOM` | off | Bloom filters on what is read by key, for faster lookups at the cost of memory |
 | `--max-open-files` | `MAX_OPEN_FILES` | `2000` | Open files; bounds index and filter memory (0 = unlimited) |
 | `--write-buffer-mb` | `WRITE_BUFFER_MB` | `256` | Memtables across all column families (0 = unlimited) |
 | `--max-wal-mb` | `MAX_WAL_MB` | `1024` | Write-ahead log size that forces flushes (0 = RocksDB default) |
@@ -347,15 +347,26 @@ versions are gone.
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
 
-`--bloom` builds no filters at present when the store is built against
-RocksDB 6.24 or later: `rocksdb-haskell-jprupp` 2.6.1 passes the size of the
-filter to RocksDB with the wrong type, and RocksDB builds none, without an
-error. The fix is in `rocksdb-haskell-jprupp` 2.6.2
-([pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21));
-`stack.yaml` still pins 2.6.1. Once the store is built with the fix, the
-option will work, for the table files written from then on, and the filters
-will need about 1.25 bytes for each key, held in the block cache: on a chain
-with billions of keys, size that before turning it on.
+`--bloom` builds Bloom filters for the table files written while it is on.
+They need about 1.25 bytes for each key and are held in the block cache: on a
+chain with billions of keys, size that before turning the option on.
+
+The filters are for the data that is read by key: transactions, unspent
+outputs, blocks, balances and the mempool. The two indices by address, which
+are scanned, never get them. With a filter RocksDB skips the files that
+cannot have an address, and then a scan of an address that has nothing can
+no longer see the keys that would stop it: it steps over every key deleted
+since the last flush. With 5,000 mempool transactions just deleted, such a
+scan took 810 microseconds with filters on those indices and 13 without.
+`docs/layered-database.md` has the measurements.
+
+Up to and including version 1.8.1 the option had no effect when the store
+was built against RocksDB 6.24 or later, as the Docker image is:
+`rocksdb-haskell-jprupp` passed the size of the filter to RocksDB with the
+wrong type, and RocksDB built none, without an error. The store is now built
+with `rocksdb-haskell-jprupp` 2.6.3, which has the fix. A store that already
+runs with `--bloom` therefore starts building filters, and using that memory,
+when it is upgraded; turn the option off to keep it as it was.
 
 ## API
 
@@ -651,7 +662,7 @@ with the size of a commit), and the latencies of each endpoint over time.
 
 ### Measurements for the layered database
 
-`docs/layered-database/` has the two programs behind the numbers in
+`docs/layered-database/` has the three programs behind the numbers in
 `docs/layered-database.md`, with their output. They are not part of the
 package; each says in its header how to build and run it.
 
@@ -659,6 +670,11 @@ package; each says in its header how to build and run it.
   of its own adds to a query, in RocksDB and in memory.
 - `MigrateBench.hs` times the migration to the layered layout against
   wiping the same mempool.
+- `QueryCost.hs` writes the same synthetic history into a database of each
+  layout, with each set of rules, and times both: importing blocks and
+  mempool transactions, and every kind of query, for addresses and wallets
+  that have nothing, a little and much in the mempool. It checks that both
+  databases give the same answers.
 
 ### Contributing
 
