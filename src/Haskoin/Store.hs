@@ -47,8 +47,9 @@
 --   store does not use them yet; see @docs\/layered-database.md@.
 -- * "Haskoin.Store.Fleet": how stores that share a Redis agree on the block
 --   that they all answer from, as pure decisions, and
---   "Haskoin.Store.Fleet.Redis", which carries them out. Nothing uses them
---   yet.
+--   "Haskoin.Store.Fleet.Redis", which carries them out.
+--   "Haskoin.Store.Fleet.Pool" has the rules of the mempool that they share.
+--   Nothing uses them yet.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.

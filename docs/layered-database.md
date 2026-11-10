@@ -1022,8 +1022,10 @@ specified: `Haskoin.Store.Fleet` has the rules for the fleet tip as pure
 decisions, and `test/Haskoin/Store/FleetSpec.hs` runs three stores through
 random blocks, reorganisations, reports and lapses of time against them.
 `Haskoin.Store.Fleet.Redis` carries them out against Redis, in two Lua
-scripts, and a test compares Redis with the rules step by step. No store
-uses either yet, and the shared mempool is being specified.
+scripts, and a test compares Redis with the rules step by step.
+`Haskoin.Store.Fleet.Pool` has the rules of the shared mempool, also as
+pure decisions with a model test; nothing carries those out against Redis
+yet. No store uses any of it.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,
@@ -1102,7 +1104,14 @@ aside for these reasons:
   address belongs with the shared mempool there, and the local mempool area
   needs none.
 - **Conflicts between stores' mempools** are settled when a transaction is
-  offered to Redis: the first one in stays, as in the cache design above.
+  offered to Redis: the first one in stays, unless the store that offers the
+  other names it as replaced, having replaced it by its own rules.
+- **A store that is ahead of the tip holds back** what only makes sense
+  after its newer blocks: it offers a transaction when each input spends an
+  output of the pool or one that is unspent in its view at the tip.
+- **The store that moves the tip tells the pool what the blocks did**: what
+  they confirmed and spent, and across a reorganisation what comes back and
+  what is gone for good. So it needs both tips and the blocks between them.
 - **How long a store may lag** before it is dropped from the fleet.
 
 ## Migration

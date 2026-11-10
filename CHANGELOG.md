@@ -227,7 +227,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `Haskoin.Store.Fleet.Redis` carries the rules out against Redis, with a
   Lua script for each step that has to be one step, and a test that takes
   random sequences of steps through a real Redis and through the rules and
-  compares them after each.
+  compares them after each. `Haskoin.Store.Fleet.Pool` has the rules of the
+  mempool that such stores share, as of the fleet tip: what may be offered,
+  which of two conflicting transactions stays, what leaves and why, and how
+  the pool follows the tip forwards and across a reorganisation. A model
+  test keeps it valid on top of the tip through random offers, blocks and
+  reversals.
 - A store whose Redis does not answer goes on answering from its database,
   instead of failing every request that the cache would have served. A
   request waits at most two seconds for Redis; after that the store leaves
