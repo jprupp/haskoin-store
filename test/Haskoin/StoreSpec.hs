@@ -147,6 +147,7 @@ withTestStoreBlocks blocks net ctx t f =
               redisMaxXPubs = 10000,
               noMempool = False,
               wipeMempool = False,
+              fleet = False,
               syncMempool = False,
               blockWindow = 64,
               mempoolTimeout = 14,

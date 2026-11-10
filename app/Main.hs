@@ -101,6 +101,7 @@ data Config = Config
     minPeers :: !Int,
     webLimits :: !WebLimits,
     redis :: !Bool,
+    fleet :: !Bool,
     redisURL :: !String,
     redisMinAddrs :: !Int,
     redisMinTxs :: !Int,
@@ -166,6 +167,8 @@ defConfig = do
     getWebLimits
   redis <-
     env "REDIS" False parseBool
+  fleet <-
+    env "FLEET" False parseBool
   redisURL <-
     env "REDIS_URL" "" pure
   redisMinAddrs <-
@@ -413,6 +416,15 @@ config c = do
     flag c.redis True $
       long "redis"
         <> help "Redis cache for xpub data"
+  fleet <-
+    flag c.fleet True $
+      long "fleet"
+        <> help
+          ( unwords
+              [ "Answer as one of the servers that share the Redis of --redis:",
+                "all from the same block and the same mempool"
+              ]
+          )
   redisURL <-
     strOption $
       metavar "URL"
@@ -655,6 +667,7 @@ run cfg =
             net = net,
             ctx = ctx,
             redis = if cfg.redis then Just cfg.redisURL else Nothing,
+            fleet = cfg.fleet,
             gap = cfg.webLimits.xpubGap,
             initGap = cfg.webLimits.xpubGapInit,
             redisMinAddrs = cfg.redisMinAddrs,

@@ -23,9 +23,11 @@ module Haskoin.Store.Manager
 where
 
 import Control.Monad (unless, when)
+import Data.ByteString.Char8 qualified as C
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
+import Database.Redis qualified as Redis
 import Haskoin
   ( BlockHash (..),
     Ctx,
@@ -70,7 +72,7 @@ import Haskoin.Store.BlockStore
     blockStoreTxSTM,
     withBlockStore,
   )
-import Haskoin.Store.Cache (Cache, CacheConfig (..), withCache)
+import Haskoin.Store.Cache (Cache, CacheConfig (..), cachePrefix, withCache)
 import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
@@ -81,6 +83,7 @@ import Haskoin.Store.Database.Reader
     createDataMetrics,
     withLayeredReader,
   )
+import Haskoin.Store.Fleet.Member (Member, MemberConfig (..), memberLoop, newMember, noteBest)
 import NQE
   ( Inbox,
     Publisher,
@@ -91,6 +94,7 @@ import NQE
   )
 import Network.Socket (SockAddr (..))
 import System.Metrics.StatsD
+import System.Random (randomIO)
 import UnliftIO
   ( STM,
     atomically,
@@ -109,8 +113,11 @@ data Store = Store
     block :: !BlockStore,
     -- | database reader
     db :: !DatabaseReader,
-    -- | cache of extended public keys, if Redis is configured
+    -- | cache of extended public keys, if Redis is configured and the store
+    -- is not a member of a fleet
     cache :: !(Maybe Cache),
+    -- | the store as a member of a fleet, if it is one
+    fleet :: !(Maybe Member),
     -- | store events are published here
     pub :: !(Publisher StoreEvent),
     -- | network constants
@@ -150,6 +157,13 @@ data StoreConfig = StoreConfig
     noMempool :: !Bool,
     -- | wipe mempool when starting
     wipeMempool :: !Bool,
+    -- | answer as one of a fleet of stores that share the Redis of 'redis':
+    -- every store of the fleet then gives the same answer to the same
+    -- request, from the block that they agree on and the mempool that they
+    -- share ("Haskoin.Store.Fleet.Member"). The cache of extended public
+    -- keys is not used then: its entries follow each store's own database,
+    -- which is what a fleet does not answer from.
+    fleet :: !Bool,
     -- | sync mempool from peers
     syncMempool :: !Bool,
     -- | blocks to request from the syncing peer in one batch
@@ -198,11 +212,12 @@ withStore cfg action =
     withPublisher $ \pub ->
       withPublisher $ \node_pub ->
         withSubscription node_pub $ \node_sub ->
-          withNode (nodeCfg cfg db node_pub) $ \node ->
-            withBlockStore (blockStoreCfg cfg node pub db) $ \block_store ->
+          withNode (nodeCfg cfg db node_pub) $ \node -> do
+            member <- storeMember cfg db
+            withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
-                withStoreCache cfg db node.chain pub $ \cache ->
+                withStoreFleet cfg pub member . withStoreCache cfg db node.chain pub $ \cache ->
                   action $
                     Store
                       { peerMgr = node.peerMgr,
@@ -210,10 +225,51 @@ withStore cfg action =
                         block = block_store,
                         db = db,
                         cache = cache,
+                        fleet = member,
                         pub = pub,
                         net = cfg.net,
                         ctx = cfg.ctx
                       }
+
+-- | The store as a member of a fleet, if the configuration says that it is
+-- one and has a Redis to share: under a name of its own, with a lease of
+-- ten seconds, views of its last six blocks, and the store's limit on the
+-- age of unconfirmed transactions.
+storeMember :: StoreConfig -> DatabaseReader -> IO (Maybe Member)
+storeMember cfg db = case (cfg.fleet, cfg.redis) of
+  (True, Just url) -> do
+    info <-
+      if null url
+        then return Redis.defaultConnectInfo
+        else either fail return (Redis.parseConnectInfo url)
+    conn <- Redis.checkedConnect info
+    name <- C.pack . show <$> (randomIO :: IO Word64)
+    Just
+      <$> newMember
+        MemberConfig
+          { prefix = cachePrefix cfg.net,
+            name,
+            lease = 10000,
+            depth = 6,
+            expiry = fromIntegral cfg.mempoolTimeout * 24 * 3600
+          }
+        conn
+        db
+  _ -> return Nothing
+
+-- | Take the store's turns as a member of its fleet while an action runs,
+-- if it is one: every two seconds, and whenever the best block changes.
+withStoreFleet :: StoreConfig -> Publisher StoreEvent -> Maybe Member -> IO a -> IO a
+withStoreFleet _ _ Nothing action = action
+withStoreFleet cfg pub (Just member) action =
+  withSubscription pub $ \sub ->
+    withAsync (memberLoop member (nextBlock sub) complain) $ \a -> link a >> action
+  where
+    nextBlock sub =
+      receive sub >>= \case
+        StoreBestBlock _ -> return ()
+        _ -> nextBlock sub
+    complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not take a turn: " <> cs why)
 
 -- | Run the cache while an action runs, if Redis is configured.
 withStoreCache ::
@@ -226,6 +282,7 @@ withStoreCache ::
 withStoreCache cfg db chain pub action =
   case cfg.redis of
     Nothing -> action Nothing
+    Just _ | cfg.fleet -> action Nothing
     Just url ->
       withCache
         CacheConfig
@@ -277,8 +334,9 @@ blockStoreCfg ::
   Node ->
   Publisher StoreEvent ->
   DatabaseReader ->
+  Maybe Member ->
   BlockStoreConfig
-blockStoreCfg cfg node pub db =
+blockStoreCfg cfg node pub db member =
   BlockStoreConfig
     { chain = node.chain,
       peerMgr = node.peerMgr,
@@ -288,6 +346,7 @@ blockStoreCfg cfg node pub db =
       ctx = cfg.ctx,
       noMempool = cfg.noMempool,
       wipeMempool = cfg.wipeMempool,
+      onBest = maybe (\_ -> return ()) noteBest member,
       syncMempool = cfg.syncMempool,
       blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,

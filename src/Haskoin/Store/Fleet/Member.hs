@@ -52,11 +52,14 @@ module Haskoin.Store.Fleet.Member
     newMember,
     noteBest,
     memberTick,
+    memberLoop,
     memberAlive,
 
     -- * Answering
     Standing (..),
     answering,
+    memberTip,
+    answeringAt,
     TipMoved (..),
     redisPool,
 
@@ -162,7 +165,11 @@ data Member = Member
     -- | the fleet tip, read after that report
     tip :: !(TVar (Maybe BlockHash)),
     -- | the transactions of the store's mempool that the pool has
-    offered :: !(TVar (HashSet TxHash))
+    offered :: !(TVar (HashSet TxHash)),
+    -- | whether the store's own health checks pass. While they do not, the
+    -- member does nothing, so that its lease runs out and a store that is
+    -- stuck does not hold the fleet back.
+    healthy :: !(TVar Bool)
   }
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
@@ -173,6 +180,7 @@ newMember config redis db = do
   reported <- newTVarIO []
   tip <- newTVarIO Nothing
   offered <- newTVarIO HashSet.empty
+  healthy <- newTVarIO True
   return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
@@ -219,6 +227,19 @@ memberTick m = do
   offerMempool m
   where
     decoded = either (const Nothing) Just . decode
+
+-- | Take a turn as a member every two seconds, and at once when an action
+-- that waits for the next best block returns, for as long as the store's
+-- health checks pass. A turn that fails, as when Redis is away, is told to
+-- a function and tried again at the next.
+memberLoop :: Member -> IO () -> (String -> IO ()) -> IO a
+memberLoop m nextBlock complain = go
+  where
+    go = do
+      void (timeout 2000000 nextBlock)
+      well <- readTVarIO m.healthy
+      when well (handleAny (complain . show) (memberTick m))
+      go
 
 -- | Report the blocks of the main chain that the store has views of, newest
 -- first.
@@ -444,12 +465,21 @@ instance Exception TipMoved
 -- at that tip. The action must do all its reading before it returns.
 answering :: Member -> (DatabaseReader -> PoolReads -> IO a) -> IO (Standing a)
 answering m action =
-  fleetTip m.redis m.keys >>= \case
+  memberTip m >>= \case
     Nothing -> return Alone
-    Just tip -> case decode tip of
-      Left _ -> return Behind
-      Right block ->
-        maybe Behind Answered <$> withViewAt m.views block (\r -> action r (redisPool m.redis m.keys tip))
+    Just tip -> maybe Behind Answered <$> answeringAt m tip action
+
+-- | The fleet tip as Redis has it now, if there is one.
+memberTip :: Member -> IO (Maybe ByteString)
+memberTip m = fleetTip m.redis m.keys
+
+-- | Run an action with the database as it was at a fleet tip and the pool
+-- as it is at that tip, or give 'Nothing' if the store has no view of that
+-- block. The action must do all its reading before it returns.
+answeringAt :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO a) -> IO (Maybe a)
+answeringAt m tip action = case decode tip of
+  Left _ -> return Nothing
+  Right block -> withViewAt m.views block (\r -> action r (redisPool m.redis m.keys tip))
 
 -- | The shared pool of a fleet as it is at a tip, for the queries of
 -- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if

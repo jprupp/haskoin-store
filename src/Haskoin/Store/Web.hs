@@ -51,6 +51,11 @@
 --   queries to answer with in 'query' ('webQuery': the database, with the
 --   cache in front of the queries about xpubs); @nocache=true@ is the same
 --   handler given a state whose queries read only the database ('cacheOr').
+--   The state is made for each request, around one view of the database,
+--   so that everything a request reads is of one moment; a store that is a
+--   member of a fleet takes the view at the block that its fleet answers
+--   from, with the mempool that the fleet shares on top
+--   ("Haskoin.Store.Fleet.Member").
 --   Routes, parameters and the passing of a request to the next route are
 --   in "Haskoin.Store.Web.Router", a few dozen lines over WAI. A handler
 --   stops early by throwing an 'Except', which becomes the response
@@ -188,7 +193,9 @@ import Haskoin.Store.Common qualified as C
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Database.Query.Pooled (pooledRead)
 import Haskoin.Store.Database.Reader
+import Haskoin.Store.Fleet.Member (Member (..), TipMoved (..), answeringAt, memberAlive, memberTip)
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.Web.Router qualified as Router
@@ -270,14 +277,18 @@ import UnliftIO
     checkSTM,
     fromException,
     handleAny,
+    newIORef,
     newTVarIO,
     orElse,
     race_,
+    readIORef,
     readTVar,
     readTVarIO,
     throwIO,
     timeout,
+    try,
     withAsync,
+    writeIORef,
     writeTVar,
   )
 import UnliftIO.Concurrent (threadDelay)
@@ -600,7 +611,37 @@ serveWeb config serve = do
       -- has one view for all that it reads, which is let go when its
       -- response is sent
       st = stateOf (L.standaloneRead db)
-      scoped answer = L.withView db (answer . routesOf . stateOf . L.layeredRead)
+      local answer = L.withView db (answer . routesOf . stateOf . L.layeredRead)
+      scoped answer = case config.store.fleet of
+        Nothing -> local answer
+        Just member ->
+          readTVarIO cacheUp >>= \case
+            True -> shared member (3 :: Int) answer
+            -- without Redis there is no fleet to answer with
+            False -> local answer
+      -- as a member of a fleet: from the view at the fleet tip, with the
+      -- pool that the fleet shares on top
+      shared member tries answer =
+        (timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing) >>= \case
+          Nothing -> atomically (writeTVar cacheUp False) >> local answer
+          -- no store has reported yet
+          Just Nothing -> local answer
+          Just (Just tip) -> do
+            handled <- newIORef False
+            let marked r = r {handler = \req -> r.handler req <* writeIORef handled True} :: Route
+                inFleet r pool = answer (map marked (routesOf (stateOf (pooledRead r pool))))
+            try (answeringAt member tip inFleet) >>= \case
+              Right (Just sent) -> return sent
+              Right Nothing -> behind answer
+              Left TipMoved ->
+                -- the tip moved while the handler was reading: answer
+                -- again from the new one, unless the response is on its way
+                readIORef handled >>= \case
+                  True -> throwIO TipMoved
+                  False
+                    | tries > 0 -> shared member (tries - 1) answer
+                    | otherwise -> behind answer
+      behind answer = answer [r {handler = \_ -> behindResponse st} :: Route | r <- routesOf st]
       app = routerScoped (routesOf st) scoped notFound
       notFound _ NoRoute = errorResponse st ThingNotFound
       notFound _ (Unknown ks) =
@@ -619,10 +660,17 @@ serveWeb config serve = do
           config.tickerURL
           config.tickerRefresh
     runHealthCheck = healthCheck config
-    cacheCheck = maybe (return True) cacheAlive config.store.cache
+    cacheCheck = case (config.store.cache, config.store.fleet) of
+      (Just cache, _) -> cacheAlive cache
+      (_, Just member) -> memberAlive member
+      _ -> return True
     healthCheckLoop v up = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
-      runHealthCheck >>= atomically . writeTVar v
+      h <- runHealthCheck
+      atomically (writeTVar v h)
+      -- a store whose checks fail stops taking its turns as a member of
+      -- its fleet, so that it does not hold the others back
+      forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
       cacheCheck >>= atomically . writeTVar up
     anyOrigin = modifyResponse (mapResponseHeaders (("Access-Control-Allow-Origin", "*") :))
 
@@ -634,10 +682,24 @@ guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
   where
     answer req e
       | Just Next <- fromException e = throwIO Next
+      | Just TipMoved <- fromException e = throwIO TipMoved
       | Just x <- fromException e = errorResponse st x
       | otherwise = do
           logError st.config.logger $ fmtReq req.wai <> ": " <> cs (show e)
           errorResponse st ServerError
+
+-- | What a store that is a member of a fleet answers when it has no view of
+-- the block that the fleet answers from: 503, so that a load balancer sends
+-- the request to another store. Any answer of its own could differ from
+-- those of the other stores, which is what a fleet is there to prevent.
+behindResponse :: WebState -> IO Response
+behindResponse st = do
+  forM_ st.metrics $ \m -> incrementCounter m.serverErrors 1
+  return . responseLBS status503 [(hContentType, "application/json")] . A.encode $
+    A.object
+      [ "error" A..= ("behind-fleet" :: Text),
+        "message" A..= ("This server is behind the other servers of its fleet" :: Text)
+      ]
 
 -- | The response to an error, counted in the metrics.
 errorResponse :: WebState -> Except -> IO Response
@@ -2842,7 +2904,8 @@ handleHealth st _ =
     up <- readTVarIO st.cacheUp
     -- a store without a cache has no Redis to be without
     let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
-    return HealthCheck {redis = up <$ st.config.store.cache, ..}
+    let shares = void st.config.store.cache <|> void st.config.store.fleet
+    return HealthCheck {redis = up <$ shares, ..}
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth

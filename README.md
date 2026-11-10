@@ -312,6 +312,40 @@ by stores of several networks, and by stores of older versions, whose cache
 uses other keys. `--redis-max-keys` and `--redis-sync-interval` of older
 versions are gone.
 
+### A fleet of servers
+
+| Option | Environment | Default | Meaning |
+| --- | --- | --- | --- |
+| `--fleet` | `FLEET` | off | Answer as one of the servers that share the Redis of `--redis` |
+
+Servers behind a load balancer import the same blocks and transactions at
+slightly different times, so the same request can get different answers
+depending on which of them it reaches. Start every one of them with
+`--redis`, the same `--redis-url` and `--fleet`, and they all answer from
+the same block and the same mempool:
+
+- **The block** is the newest that every live server has. Each server
+  imports blocks when it gets them and keeps its database as it was at each
+  of its last six, and a request is answered from the block that the fleet
+  agreed on. The fleet moves to a new block in one step, when the last
+  server has it.
+- **The mempool** is one pool in Redis, which every server offers its
+  unconfirmed transactions to and all answer from. A transaction has one
+  time of arrival there, so lists come in the same order everywhere.
+- **A server that falls behind** answers 503 with `behind-fleet` rather
+  than something that the others would not say, and stops counting after
+  ten seconds without a report, so that it holds nobody up. A server whose
+  health check fails stops reporting.
+- **Without Redis** each server answers from its own database, and
+  `/health` says 203, as it does for the cache.
+- **The xpub cache is not used with `--fleet`.** Its entries follow each
+  server's own database, which is what a fleet does not answer from.
+- **Deleted transactions** are not known to a fleet: a page that starts at
+  one is empty.
+
+The rules, and the tests that hold Redis to them, are described in "A fleet
+that answers as one" in `docs/layered-database.md`.
+
 ### Health check
 
 | Option | Environment | Default | Meaning |
@@ -531,6 +565,10 @@ nothing in the store calls them.
   (`store.*`).
 - **`/dbstats`** returns RocksDB memory use per column family and RocksDB's own
   statistics, as text.
+- **In a fleet** (`--fleet`), any request can be answered 503 with
+  `{"error": "behind-fleet"}` by a server that does not have the block that
+  the fleet answers from. Have the load balancer try another server, and
+  alert if one keeps saying it: its `/health` will say why.
 - **Memory.** The resident memory of the store is its GHC heap plus RocksDB:
   the block cache and memtables fill up to `--block-cache-mb` and
   `--write-buffer-mb`, then stay there. The executable is built with

@@ -374,6 +374,11 @@ data BlockStoreConfig = BlockStoreConfig
     noMempool :: !Bool,
     -- | wipe mempool at start
     wipeMempool :: !Bool,
+    -- | what to do with the best block right after it changes, and when the
+    -- store starts, before anything else is written to the database: a
+    -- member of a fleet takes a view of the database for the block here
+    -- ('Haskoin.Store.Fleet.Member.noteBest')
+    onBest :: !(BlockHash -> IO ()),
     -- | sync mempool from peers
     syncMempool :: !Bool,
     -- | blocks to request from the syncing peer in one batch
@@ -429,7 +434,10 @@ runImportNotify self block f = do
         publish (StoreMempoolDelete h) l
       forM_ (filter notInBlock c.added) $ \h ->
         publish (StoreMempoolNew h) l
-      forM_ block $ \b ->
+      forM_ block $ \b -> do
+        -- before the event, so that whoever hears of the block finds what
+        -- was done for it
+        self.config.onBest (headerHash b.header)
         publish (StoreBestBlock (headerHash b.header)) l
       return (Right x)
   where
@@ -508,7 +516,7 @@ withBlockStore cfg action = do
               logError self $
                 "Could not initialize: " <> cs (show e)
               throwIO e
-            Right () -> return ()
+            Right () -> getBestBlock self >>= mapM_ cfg.onBest
         run =
           withAsync (pingMe (inboxToMailbox inbox)) $ \a ->
             link a >> runBlockStoreLoop self inbox
@@ -868,7 +876,9 @@ revertToMainChain self = do
             <> ": "
             <> cs (show e)
         throwIO e
-      Right () -> transition self $ \st -> ((), Sync.forgetRequests st)
+      Right () -> do
+        getBestBlock self >>= mapM_ self.config.onBest
+        transition self $ \st -> ((), Sync.forgetRequests st)
     revertToMainChain self
 
 -- | Header of the best block in the database.

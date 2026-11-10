@@ -1043,15 +1043,15 @@ whatever their own mempools hold.
 
 ## A fleet that answers as one
 
-This section is a proposal, written on 2026-11-10. Its first part is
-specified: `Haskoin.Store.Fleet` has the rules for the fleet tip as pure
+This section was a proposal, written on 2026-11-10, and is now built, behind
+`--fleet`. Its first part is specified: `Haskoin.Store.Fleet` has the rules for the fleet tip as pure
 decisions, and `test/Haskoin/Store/FleetSpec.hs` runs three stores through
 random blocks, reorganisations, reports and lapses of time against them.
 `Haskoin.Store.Fleet.Redis` carries them out against Redis, in two Lua
 scripts, and a test compares Redis with the rules step by step.
 `Haskoin.Store.Fleet.Pool` has the rules of the shared mempool, also as
 pure decisions with a model test, and a third script carries those out,
-moving the tip and changing the pool in one step. No store uses any of it.
+moving the tip and changing the pool in one step.
 
 On the store's side, `Haskoin.Store.Database.Views` keeps a snapshot of the
 database for each recent block and releases those that the rules no longer
@@ -1116,8 +1116,19 @@ transaction when that one comes or goes (`replaceable` in
 `Haskoin.Store.Fleet.Pool` is the rule, and the script is compared with it
 at every step).
 
-What is left: running the member in the store, and the web server
-answering through it.
+The store runs the member when started with `--fleet`
+(`Haskoin.Store.Manager`): the block store takes the view of each block
+before it publishes the block or writes anything else, the member takes a
+turn every two seconds and at every new block, and stops while the store's
+health check fails. The web server reads the fleet tip for each request and
+answers from the view at that block with the pool on top; with no tip yet,
+or without Redis, from its own database as a store alone does; and with a
+tip that it has no view of, 503 and `behind-fleet`. A request whose reads
+find that the tip moved is answered again from the new tip, unless its
+response is already on its way, which only a streamed one can be. The
+integration tests run two stores as a fleet against a real node: both
+answer every question about a payment alike, with the one time that the
+pool has for it, and again after the block that confirms it.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,
@@ -1192,9 +1203,24 @@ aside for these reasons:
 - **The fleet is one import behind its fastest store.**
 - **Redis must not lose writes.** A failover that loses the last second
   loses mempool transactions and can move the tip back.
-- **The slow reads measured above move to Redis.** The summary for each
-  address belongs with the shared mempool there, and the local mempool area
-  needs none.
+- **The pool has the summary for each address too**, as the local mempool
+  area does, which a store still answers from when it is alone or Redis is
+  down.
+- **Several round trips for a request about addresses**: the tip, the
+  summaries, and a page of entries for each address that has some. Each is
+  one script, and each checks the tip.
+- **A request sees one block, but not one moment of the pool.** Each read
+  of the pool is one script and checks that the tip has not moved, and a
+  request that finds it moved starts again. Between two reads of one
+  request, though, a transaction can enter the pool: the balance of an
+  address and its list, read one after the other, can then differ by that
+  transaction. A store alone reads one snapshot and has no such gap.
+  Closing it in Redis would take versions of every entry of the pool.
+- **The xpub cache is not used in a fleet.** Its entries follow each
+  store's own database. The cache on two layers, of the section before,
+  would be the way to have both.
+- **Deleted transactions are not known to a fleet**, since each store keeps
+  its own.
 - **Conflicts between stores' mempools** are settled when a transaction is
   offered to Redis: the first one in stays, unless the store that offers the
   other names it as replaced, having replaced it by its own rules.
@@ -1204,7 +1230,9 @@ aside for these reasons:
 - **The store that moves the tip tells the pool what the blocks did**: what
   they confirmed and spent, and across a reorganisation what comes back and
   what is gone for good. So it needs both tips and the blocks between them.
-- **How long a store may lag** before it is dropped from the fleet.
+- **How long a store may lag** before it is dropped from the fleet: ten
+  seconds without a report, and at once when its health check fails, both
+  fixed in the code for now.
 
 ## Migration
 

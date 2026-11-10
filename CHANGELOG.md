@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `--fleet` (`FLEET`): servers that share a Redis answer as one. Every
+  request is answered from the newest block that all live servers have and
+  from one mempool that they share in Redis, so that the same request gets
+  the same answer whichever server a load balancer picks, also while a
+  block or a transaction is on its way through them.
+  - Each server keeps its database as it was at each of its last six
+    blocks, reports them under a lease of ten seconds, and offers its
+    unconfirmed transactions to the shared pool. The fleet tip moves in one
+    step, together with what the blocks in between did to the pool.
+  - A server that does not have the block that the fleet answers from says
+    503 with `behind-fleet`. One whose health check fails stops reporting,
+    and stops counting when its lease runs out.
+  - Without Redis a server answers from its own database and `/health` says
+    203. The xpub cache is not used with `--fleet`.
+  - `Haskoin.Store.Manager` runs the member (`Store.fleet`), the block
+    store takes a view of the database right after each block
+    (`BlockStoreConfig.onBest`), and the web server answers through
+    `Haskoin.Store.Database.Query.Pooled`.
+  - An integration test runs two servers as a fleet against a real node and
+    Redis and compares their answers with a payment in the pool and after
+    the block that confirms it.
+
 ### Changed
 
 - **Database version 21: the mempool has an area of its own.** Unconfirmed

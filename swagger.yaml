@@ -138,7 +138,8 @@ info:
     | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
     | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
-    | 503 | | Only from `/health`: the server is not ready. |
+    | 503 | | From `/health`: the server is not ready. |
+    | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
 
     `/health` also answers 203 for a server that works but cannot reach its
     Redis; see there.

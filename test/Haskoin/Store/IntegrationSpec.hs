@@ -107,6 +107,7 @@ import Haskoin.Store.Cache
 import Haskoin.Store.Data (Balance (..), BlockRef (..), Spender (..), TxData (..), XPubBal (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Fleet.Member (memberTip)
 import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
@@ -155,6 +156,7 @@ chainSpec kind = do
   it "does not replace what it does not know" unknownTest
   it "leaves the keys of older caches alone" oldKeysTest
   it "answers from its database, and says so, while Redis does not answer" redisDownTest
+  it "gives the same answers from every store of a fleet, from one block and one mempool" fleetTest
 
 -------------------------------------------------------------------------------
 -- Environment
@@ -180,7 +182,9 @@ data Env = Env
     redis :: !Redis.Connection,
     -- | configuration of a store like this one with its database in a
     -- directory, to start another one
-    configIn :: FilePath -> StoreConfig
+    configIn :: FilePath -> StoreConfig,
+    -- | the same for a store that is a member of a fleet
+    memberIn :: FilePath -> StoreConfig
   }
 
 -- | Initial gap and gap of the store under test, the defaults.
@@ -213,7 +217,7 @@ withEnv kind ctx go = do
       void $ generateTo node 150 miner
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
-            cfg = storeConfig net ctx logger dir redisURL p2pPort
+            cfg = storeConfig net ctx logger dir redisURL p2pPort False
         withStore cfg $ \store -> do
           listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
             let web s = runWebSocket (webConfig logger s)
@@ -235,7 +239,8 @@ withEnv kind ctx go = do
                           miner = miner,
                           redisCache = cache,
                           redis = conn,
-                          configIn = \d -> storeConfig net ctx logger d redisURL p2pPort
+                          configIn = \d -> storeConfig net ctx logger d redisURL p2pPort False,
+                          memberIn = \d -> storeConfig net ctx logger d redisURL p2pPort True
                         }
                 waitSynced env
                 go env
@@ -249,9 +254,9 @@ withTestLogger f =
     _ -> f Logger {level = LevelError, source = "", push = \_ -> return ()}
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
--- buffers and caches.
-storeConfig :: Network -> Ctx -> Logger -> FilePath -> String -> Int -> StoreConfig
-storeConfig net ctx logger dir redisURL p2pPort =
+-- buffers and caches, as a member of a fleet or not.
+storeConfig :: Network -> Ctx -> Logger -> FilePath -> String -> Int -> Bool -> StoreConfig
+storeConfig net ctx logger dir redisURL p2pPort fleet =
   StoreConfig
     { maxPeers = 1,
       initPeers = ["127.0.0.1:" <> show p2pPort],
@@ -267,6 +272,7 @@ storeConfig net ctx logger dir redisURL p2pPort =
       redisMaxXPubs = 10000,
       noMempool = False,
       wipeMempool = False,
+      fleet = fleet,
       syncMempool = True,
       blockWindow = 64,
       mempoolTimeout = 14,
@@ -1512,6 +1518,76 @@ redisDownTest env = do
   waitFor "the health check to notice that Redis is back" $
     (== 200) . fst <$> getJSON env.cached "/health"
   checkXPub env x ref
+
+-- | Two more stores, each with its own database, syncing from the same
+-- node, as members of one fleet on the Redis of the tests, each with a web
+-- server. The fleet agrees on the best block; a payment that both stores
+-- hear of from the node reaches the pool once, and both answer every
+-- question about it alike, with the one time that the pool has for it; and
+-- when a block confirms it, the fleet moves there and the pool lets it go.
+fleetTest :: Env -> IO ()
+fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member logger $ \b urlB -> do
+  one <- maybe (fail "The store is not a member of a fleet") return a.fleet
+  let x = newXPub env "fleet" DeriveNormal
+      q = "?derive=" <> deriveParam x
+      address = "/address/" <> T.unpack (at env x [0, 0])
+      xpub = "/xpub/" <> x.text
+      paths txid =
+        [ address <> "/balance",
+          address <> "/transactions/full",
+          address <> "/unspent",
+          xpub <> q,
+          xpub <> "/transactions/full" <> q,
+          xpub <> "/unspent" <> q,
+          "/mempool",
+          "/transaction/" <> T.unpack txid
+        ]
+      atTip = waitFor "the fleet tip to be the best block of the node" $ do
+        best <- bestBlockHash env.node
+        tip <- memberTip one
+        return (fmap blockHashToHex (tip >>= either (const Nothing) Just . decode) == Just best)
+      alike what ps = waitFor what $ do
+        fromA <- mapM (getJSON urlA) ps
+        fromB <- mapM (getJSON urlB) ps
+        return (fromA == fromB && all ((== 200) . fst) fromA)
+      inPool txid = do
+        let h = fromMaybe (error "bad txid") (hexToTxHash txid)
+        redisRun env (Redis.hexists (cachePrefix env.net <> "pool:spends") (encode h))
+      listed url = length . arr . snd <$> getJSON url (address <> "/transactions")
+  waitStore env a
+  waitStore env b
+  atTip
+  ref <- newLedger
+  txid <- pay env x ref [([0, 0], 100000)]
+  waitFor "the pool of the fleet to have the payment" (inPool txid)
+  waitFor "both stores to list the payment" $ (== (1, 1)) <$> ((,) <$> listed urlA <*> listed urlB)
+  alike "the two stores to answer alike, with the payment in the pool" (paths txid)
+  -- the payment is unconfirmed in the answers, at the time that the pool has
+  (_, unconfirmed) <- getJSON urlA ("/transaction/" <> T.unpack txid)
+  (unconfirmed ! "block") `shouldSatisfy` \case
+    Object o -> KeyMap.member "mempool" o
+    _ -> False
+  void (mine env 1)
+  waitStore env a
+  waitStore env b
+  atTip
+  inPool txid `shouldReturn` False
+  alike "the two stores to answer alike, with the payment confirmed" (paths txid)
+  (_, confirmed) <- getJSON urlB ("/transaction/" <> T.unpack txid)
+  (confirmed ! "block") `shouldSatisfy` \case
+    Object o -> KeyMap.member "height" o
+    _ -> False
+  -- the health check runs every few seconds, and first ran before the
+  -- store had synced
+  waitFor "the health check of a member to pass" ((== 200) . fst <$> getJSON urlA "/health")
+  (_, health) <- getJSON urlA "/health"
+  ((health ! "redis") ! "ok") `shouldBe` Bool True
+  where
+    member logger f = withRamDir $ \dir ->
+      withStore (env.memberIn dir) $ \s ->
+        listening $ \(sock, port) ->
+          withAsync (runWebSocket (webConfig logger s) sock) $ \web ->
+            link web >> f s ("http://127.0.0.1:" <> show port)
 
 -- | Run a second store, with its own database, syncing from the same node
 -- and sharing the same Redis, while an action runs.
