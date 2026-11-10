@@ -286,6 +286,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   queries to those of the layered layout with the store's own mempool as
   the pool. `fleetAdvance` can empty the pool for a store that is alone and
   does not know the way from the old tip.
+- `Haskoin.Store.Fleet.Member`: what a store does as a member of a fleet.
+  It keeps a view at each recent block, reports them, moves the fleet tip
+  with what the blocks in between did to the pool, offers its mempool, and
+  answers from the view at the tip with the pool on top. A test with a real
+  Redis takes a store that is alone in its fleet through random histories
+  and compares every answer with the store's own after each step. It found
+  that a body kept in the pool went stale when a parent was confirmed or
+  came back, because a transaction inherits from its unconfirmed parents
+  whether it can be replaced by fee; the pool now keeps that apart from the
+  body and corrects it as transactions come and go.
 - `Haskoin.Store.Database.Views` keeps the database as it was at each recent
   block, a RocksDB snapshot for each, so that a store can answer from the
   block that its fleet agrees on and not only from its newest. Views that

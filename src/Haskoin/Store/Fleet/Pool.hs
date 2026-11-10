@@ -80,6 +80,9 @@ module Haskoin.Store.Fleet.Pool
     Totals (..),
     addresses,
     totals,
+
+    -- * Replacing by fee
+    replaceable,
   )
 where
 
@@ -298,3 +301,20 @@ totals p =
     }
   where
     inside = [v | (_, o, v) <- p.paid, Map.member o p.spent]
+
+-- | The transactions of a pool that can be replaced by fee, given those
+-- that say so themselves: those, and whatever spends from one that can be.
+-- A transaction inherits this from its unconfirmed parents only, so it
+-- changes when a parent is confirmed and when one comes back from an
+-- abandoned block. This is the specification of what Redis keeps right as
+-- transactions come and go.
+replaceable :: (Ord t) => (t -> Bool) -> (o -> t) -> Pool t o -> Set t
+replaceable signals maker pool = go (Set.filter signals members)
+  where
+    members = Map.keysSet pool.spends
+    inherits found t = any ((`Set.member` found) . maker) (Map.findWithDefault [] t pool.spends)
+    go found
+      | grown == found = found
+      | otherwise = go grown
+      where
+        grown = Set.union found (Set.filter (inherits found) members)

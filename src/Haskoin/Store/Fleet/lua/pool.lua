@@ -8,8 +8,9 @@
 -- other.
 --
 -- A transaction is given as its id, the time it entered a mempool, the
--- outputs that it spends, its body, the number of its entries by address,
--- and then five arguments for each entry: its kind, the address, an output
+-- outputs that it spends, its body, '1' if it says itself that it can be
+-- replaced by fee or '0', the number of its entries by address, and then
+-- five arguments for each entry: its kind, the address, an output
 -- or '', an amount or '', and a script or ''. The kinds are 't', the
 -- transaction touches the address; 's', it spends that output of the
 -- address, of that amount; and 'o', it pays that output to the address,
@@ -38,7 +39,13 @@
 -- summary of Haskoin.Store.Database.Types.MemSummary. It also holds every
 -- transaction by the time it entered a mempool, which is the list of the
 -- mempool, and by its id alone, to find those whose id starts with some
--- bytes. An output counts in
+-- bytes.
+--
+-- A transaction can be replaced by fee if it says so itself or if it spends
+-- from a transaction of the pool that can be. The second changes when a
+-- parent is confirmed or comes back from an abandoned block, so the pool
+-- keeps the answer apart from the body, and corrects it for what spends a
+-- transaction whenever that one comes or goes. An output counts in
 -- 'both' while the pool has both the entry that pays it and the entry that
 -- spends it, so it is added by the second to come and taken off by the
 -- first to go.
@@ -55,6 +62,8 @@ local key = {
   entries = prefix .. 'pool:entries',
   time = prefix .. 'pool:time',
   ids = prefix .. 'pool:ids',
+  own = prefix .. 'pool:own',
+  rbf = prefix .. 'pool:rbf',
   atx = prefix .. 'pool:atx:',
   aout = prefix .. 'pool:aout:',
   aval = prefix .. 'pool:aval:',
@@ -99,9 +108,10 @@ end
 -- it
 local function read(at)
   local tx = {id = ARGV[at], time = tonumber(ARGV[at + 1]), inputs = ARGV[at + 2], body = ARGV[at + 3]}
+  tx.own = ARGV[at + 4] == '1'
   local entries = {}
-  local n = tonumber(ARGV[at + 4])
-  at = at + 5
+  local n = tonumber(ARGV[at + 5])
+  at = at + 6
   for i = 1, n do
     entries[i] = {ARGV[at], ARGV[at + 1], ARGV[at + 2], ARGV[at + 3], ARGV[at + 4]}
     at = at + 5
@@ -166,6 +176,34 @@ local function account(t, time, entries, sign)
   end
 end
 
+-- work out again whether a transaction of the pool can be replaced by
+-- fee, and if that changed, the same for what spends it
+local function replaceable(t)
+  local inputs = redis.call('HGET', key.spends, t)
+  if not inputs then
+    return
+  end
+  local can = redis.call('SISMEMBER', key.own, t) == 1
+  if not can then
+    for _, o in ipairs(split(inputs, osize)) do
+      if redis.call('SISMEMBER', key.rbf, string.sub(o, 1, tsize)) == 1 then
+        can = true
+        break
+      end
+    end
+  end
+  if can ~= (redis.call('SISMEMBER', key.rbf, t) == 1) then
+    if can then
+      redis.call('SADD', key.rbf, t)
+    else
+      redis.call('SREM', key.rbf, t)
+    end
+    for _, kid in ipairs(redis.call('SMEMBERS', key.kids .. t)) do
+      replaceable(kid)
+    end
+  end
+end
+
 -- take one transaction out, leaving what spends it
 local function remove(t)
   local inputs = redis.call('HGET', key.spends, t)
@@ -183,6 +221,12 @@ local function remove(t)
   end
   redis.call('HDEL', key.spends, t)
   redis.call('HDEL', key.body, t)
+  redis.call('SREM', key.own, t)
+  if redis.call('SREM', key.rbf, t) == 1 then
+    for _, kid in ipairs(redis.call('SMEMBERS', key.kids .. t)) do
+      replaceable(kid)
+    end
+  end
 end
 
 local function insert(tx)
@@ -197,6 +241,10 @@ local function insert(tx)
   redis.call('ZADD', key.time, tx.time, t)
   redis.call('ZADD', key.ids, 0, t)
   account(t, tx.time, tx.entries, 1)
+  if tx.own then
+    redis.call('SADD', key.own, t)
+  end
+  replaceable(t)
 end
 
 local function withdraw(from)

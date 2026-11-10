@@ -194,6 +194,10 @@ data PoolTx = PoolTx
     inputs :: ![ByteString],
     -- | what a store needs to answer about it
     body :: !ByteString,
+    -- | whether it says itself that it can be replaced by fee. Whether it
+    -- can also depends on the transactions of the pool that it spends
+    -- from, which the pool works out and keeps right as those come and go.
+    signals :: !Bool,
     -- | what it does at each address
     entries :: ![PoolEntry]
   }
@@ -292,7 +296,8 @@ poolRead conn keys tsize tip what args =
 -- | A transaction as the arguments of the pool script.
 txArgs :: PoolTx -> [ByteString]
 txArgs tx =
-  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, num (length tx.entries)] <> concatMap entry tx.entries
+  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, if tx.signals then "1" else "0", num (length tx.entries)]
+    <> concatMap entry tx.entries
   where
     entry = \case
       PoolTouches a -> ["t", a, "", "", ""]

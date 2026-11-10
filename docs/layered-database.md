@@ -1090,8 +1090,34 @@ does not have the old tip or the way is too long, empties the pool when it
 moves the tip, which the script allows only when no other store is live.
 That is how a fleet starts again after all its stores were away.
 
-What is left: the process that reports, moves the tip, and offers the
-store's mempool to the pool, and the web server answering through it.
+`Haskoin.Store.Fleet.Member` is what a store does as a member: it takes a
+view at each block, reports, moves the tip with what the blocks in between
+did, read from its database, offers its mempool to the pool, each
+transaction with whether its inputs are unspent at the tip, and answers
+from the view at the tip with the pool on top. Its test runs a store that is
+alone in its fleet through random histories of payments, replacements,
+blocks and reorganisations, with a real Redis: after every step, each
+answer from the view at the fleet tip and the pool of Redis is the answer
+that the store gives from its own database.
+
+A member does not withdraw from the pool what it deletes from its own
+mempool. A replacement reaches the pool with the offer of the transaction
+that replaces, a conflict with a block when the tip moves there, and age is
+counted on the pool's own times, so that stores need not agree on when each
+first saw a transaction.
+
+That test found what the pool had wrong. Whether a transaction can be
+replaced by fee is in its body, and a transaction inherits it from its
+unconfirmed parents: the answer changes when a parent is confirmed, and
+when one comes back from an abandoned block. A body given to the pool once
+went stale. The pool now keeps that answer apart from the body, from which
+transactions say so themselves, and corrects it for whatever spends a
+transaction when that one comes or goes (`replaceable` in
+`Haskoin.Store.Fleet.Pool` is the rule, and the script is compared with it
+at every step).
+
+What is left: running the member in the store, and the web server
+answering through it.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,

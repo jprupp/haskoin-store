@@ -1,4 +1,4 @@
-module Haskoin.Store.Fleet.RedisSpec (spec) where
+module Haskoin.Store.Fleet.RedisSpec (spec, withRedis) where
 
 import Control.Monad (foldM_, forM_)
 import Data.ByteString (ByteString)
@@ -154,7 +154,10 @@ spec = do
         Just [flags] <- poolRead conn keys 4 tip "spent" [a, B.concat [o | (_, o, _) <- mine.paid]]
         C.unpack flags `shouldBe` [if Map.member o mine.spent then '1' else '0' | (_, o, _) <- mine.paid]
         -- bodies, spenders with the number of the input, and ids by prefix
-        poolRead conn keys 4 tip "bodies" [block 4 <> block 99] `shouldReturn` Just ["body", ""]
+        -- bodies come with whether they can be replaced by fee: the first
+        -- says so itself, the fifth too, and the second does not
+        poolRead conn keys 4 tip "bodies" [block 4 <> block 99 <> block 1]
+          `shouldReturn` Just ["body", "1", "", "0", "body", "0"]
         poolRead conn keys 4 tip "spenders" [out 1 0 <> out 0 0 <> out 5 0]
           `shouldReturn` Just [block 4, "1", block 4, "0", "", ""]
         poolRead conn keys 4 tip "ids" [B.take 3 (block 4)] `shouldReturn` Just (map block [0 .. 8])
@@ -184,7 +187,9 @@ spec = do
     -- carry a step of the pool out in Redis and in the model, and compare
     pooled conn keys (model, tip, n) = \case
       Give t inputs replaced -> do
-        let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs]
+        -- a transaction spends from those of lower numbers only, as none
+        -- can spend from one that spends from it
+        let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
             unspent o = lookup o outs == Just True
             (expected, model') = case P.offer maker unspent (block t) (map fst outs) (map block replaced) model of
               P.Taken next -> (Taken, next)
@@ -204,7 +209,7 @@ spec = do
       Go back dead done used -> do
         -- one store, which reports a block that no step has had
         let target = block (1000 + n)
-            returned' = [(block t, [out a i | (a, i) <- nubOrd ins]) | (t, ins) <- back]
+            returned' = [(block t, [out a i | (a, i) <- nubOrd ins, a < t]) | (t, ins) <- back]
             change = P.Change returned' (map block dead) (map block done) [out a i | (a, i) <- used]
             sent =
               PoolChange
@@ -234,6 +239,10 @@ spec = do
       forM_ (Map.toList model.children) $ \(t, expected) -> do
         members <- list (Redis.smembers (key ("pool:kids:" <> t)))
         Set.fromList members `shouldBe` expected
+      -- those that can be replaced by fee are those that say so and what
+      -- spends from them
+      canBe <- list (Redis.smembers (key "pool:rbf"))
+      Set.fromList canBe `shouldBe` P.replaceable signalling maker model
       -- and what it holds for each address is what the entries of its
       -- transactions come to
       let members = [(t, timeOf (number t), entriesOf (number t) os) | (t, os) <- Map.toList model.spends]
@@ -325,6 +334,11 @@ entriesOf t spends =
   where
     made = [out t 0, out t 1]
 
+-- | Whether a transaction of the tests says itself that it can be replaced
+-- by fee: one in four does.
+signalling :: ByteString -> Bool
+signalling t = number t `mod` 4 == 0
+
 -- | A transaction of the tests as the pool takes it.
 txOf :: Word32 -> [ByteString] -> PoolTx
 txOf t spends =
@@ -333,6 +347,7 @@ txOf t spends =
       time = timeOf t,
       inputs = spends,
       body = "body",
+      signals = signalling (block t),
       entries = map entry (entriesOf t spends)
     }
   where

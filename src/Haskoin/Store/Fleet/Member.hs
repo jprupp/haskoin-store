@@ -1,0 +1,514 @@
+{-# LANGUAGE RecordWildCards #-}
+
+-- |
+-- Module      : Haskoin.Store.Fleet.Member
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- A store as a member of a fleet: what it does, with its own database and
+-- the Redis that the fleet shares, so that every store of the fleet gives
+-- the same answer to the same request. The rules are in
+-- "Haskoin.Store.Fleet" and "Haskoin.Store.Fleet.Pool", Redis carries them
+-- out through "Haskoin.Store.Fleet.Redis", and the reasons are in "A fleet
+-- that answers as one" in @docs\/layered-database.md@.
+--
+-- = What a member does
+--
+-- * __It keeps a view of its database at each recent block__ ('noteBest'),
+--   taken by the block store right after it imports or reverts a block,
+--   and lets go of those that the rules no longer ask for.
+--
+-- * __It reports those blocks under a lease, and moves the fleet tip__
+--   ('memberTick') to the newest block that every live store reported,
+--   telling the pool what the blocks in between did ('changeBetween'):
+--   which transactions they confirmed and which outputs they spent, and
+--   across a reorganisation which transactions come back.
+--
+-- * __It offers its mempool to the shared pool__ ('offerMempool'), each
+--   transaction with whether its inputs are unspent in the store's view at
+--   the fleet tip, so that the pool only takes what is valid there.
+--
+-- * __It answers from the view at the fleet tip with the pool on top__
+--   ('answering', 'redisPool'), or says that it is behind when it has no
+--   view of the tip.
+--
+-- = Why the member does not withdraw what it deletes
+--
+-- A store deletes a transaction from its own mempool when it replaces it,
+-- when a block confirms a conflicting one, and when it is too old. The
+-- first reaches the pool with the offer of the replacement, which names
+-- what it replaces. The second reaches it when the tip moves to that block.
+-- The third is done on the pool itself, by its own times ('expirePool'), so
+-- that the stores do not have to agree on when each of them first saw a
+-- transaction. A store that simply does not have a transaction says
+-- nothing about it: another store has it.
+module Haskoin.Store.Fleet.Member
+  ( -- * A member
+    Member (..),
+    MemberConfig (..),
+    newMember,
+    noteBest,
+    memberTick,
+    memberAlive,
+
+    -- * Answering
+    Standing (..),
+    answering,
+    TipMoved (..),
+    redisPool,
+
+    -- * The parts of a tick
+    report,
+    moveTip,
+    changeBetween,
+    offerMempool,
+    expirePool,
+    poolTx,
+  )
+where
+
+import Control.Exception (Exception, throwIO)
+import Control.Monad (filterM, forM, unless, void, when)
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as B
+import Data.ByteString.Char8 qualified as C
+import Data.Either (rights)
+import Data.Functor ((<&>))
+import Data.HashSet (HashSet)
+import Data.HashSet qualified as HashSet
+import Data.List (nub, sortOn)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Serialize (Serialize, decode, encode)
+import Data.Word (Word64)
+import Database.Redis qualified as R
+import Haskoin
+  ( BlockHash,
+    BlockHeader (..),
+    Ctx,
+    Network (..),
+    Tx (..),
+    TxHash,
+    TxIn (..),
+    nullOutPoint,
+    txHash,
+  )
+import Haskoin.Store.Data
+  ( BlockData (..),
+    BlockRef (..),
+    Spender (..),
+    TxData (..),
+    UnixTime,
+    Unspent (..),
+  )
+import Haskoin.Store.Database.Mempool qualified as M
+import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Database.Query.Pooled (PoolReads (..))
+import Haskoin.Store.Database.Reader (DatabaseReader (..), txCF)
+import Haskoin.Store.Database.Types
+  ( MemAddrKey (..),
+    MemAddrVal (..),
+    MemSummary (..),
+    TxKey (..),
+  )
+import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, takeView, withViewAt)
+import Haskoin.Store.Fleet qualified as F
+import Haskoin.Store.Fleet.Redis
+import UnliftIO
+  ( TVar,
+    atomically,
+    handleAny,
+    modifyTVar',
+    newTVarIO,
+    readTVarIO,
+    timeout,
+    writeTVar,
+  )
+
+-- | How a store takes part in a fleet.
+data MemberConfig = MemberConfig
+  { -- | what every key of the fleet in Redis starts with
+    prefix :: !ByteString,
+    -- | the name of this store, which no other store of the fleet has
+    name :: !ByteString,
+    -- | how long a report counts for, in milliseconds. A store that stops
+    -- reporting holds the tip back for this long at most.
+    lease :: !Word64,
+    -- | how many recent blocks to keep views of and report. With more, the
+    -- stores find a block in common sooner when they import several at
+    -- once; each view keeps the files that it reads from being deleted.
+    depth :: !Int,
+    -- | seconds after which a transaction leaves the pool unconfirmed, or 0
+    -- for never
+    expiry :: !Word64
+  }
+
+-- | A store that is a member of a fleet.
+data Member = Member
+  { config :: !MemberConfig,
+    redis :: !R.Connection,
+    keys :: !FleetKeys,
+    db :: !DatabaseReader,
+    -- | the database as it was at each recent block
+    views :: !(Views BlockHash),
+    -- | the blocks that views were taken of, newest first
+    recent :: !(TVar [BlockHash]),
+    -- | the blocks of the last report that was taken
+    reported :: !(TVar [BlockHash]),
+    -- | the fleet tip, read after that report
+    tip :: !(TVar (Maybe BlockHash)),
+    -- | the transactions of the store's mempool that the pool has
+    offered :: !(TVar (HashSet TxHash))
+  }
+
+-- | A member with no views yet, on a connection to the Redis of the fleet.
+newMember :: MemberConfig -> R.Connection -> DatabaseReader -> IO Member
+newMember config redis db = do
+  views <- newViews db
+  recent <- newTVarIO []
+  reported <- newTVarIO []
+  tip <- newTVarIO Nothing
+  offered <- newTVarIO HashSet.empty
+  return Member {keys = fleetKeys config.prefix 32, ..}
+
+-- | Take a view of the database for its best block. The block store calls
+-- this right after it imports or reverts a block, and when it starts,
+-- before it writes anything else: the view is then of that block and of
+-- nothing more.
+noteBest :: Member -> BlockHash -> IO ()
+noteBest m block = do
+  takeView m.views block
+  atomically . modifyTVar' m.recent $ \blocks -> take m.config.depth (block : filter (/= block) blocks)
+  prune m
+
+-- | Let go of the views that the rules do not ask for: all but those of
+-- the recent blocks, of the last report, and of the tip read after it.
+prune :: Member -> IO ()
+prune m = do
+  recent <- readTVarIO m.recent
+  reported <- readTVarIO m.reported
+  tip <- readTVarIO m.tip
+  keepViews m.views (nub (F.keep (recent <> reported) tip))
+
+-- | Whether Redis answers a ping within two seconds.
+memberAlive :: Member -> IO Bool
+memberAlive m =
+  handleAny (\_ -> return False) $
+    timeout 2000000 (R.runRedis m.redis R.ping) <&> \case
+      Just (Right _) -> True
+      _ -> False
+
+-- | One round of what a member does: report, move the tip if the stores
+-- agree on another block, offer what the pool does not have of the store's
+-- mempool, and let go of old views. Call it every second or two, and when
+-- the best block changes. A store whose own health checks fail must not
+-- call it: its lease then runs out, and the fleet goes on without it.
+memberTick :: Member -> IO ()
+memberTick m = do
+  report m
+  moved <- moveTip m
+  -- the tip is read after the report, as the rule of 'F.keep' asks
+  tip <- fmap decoded <$> fleetTip m.redis m.keys
+  atomically (writeTVar m.tip (fromMaybe Nothing tip))
+  prune m
+  unless moved (expirePool m)
+  offerMempool m
+  where
+    decoded = either (const Nothing) Just . decode
+
+-- | Report the blocks of the main chain that the store has views of, newest
+-- first.
+report :: Member -> IO ()
+report m = do
+  held <- heldViews m.views
+  recent <- readTVarIO m.recent
+  blocks <- filterM main (filter (`elem` held) recent)
+  taken <- fleetReport m.redis m.keys Nothing m.config.lease m.config.name (map encode blocks) (map encode held)
+  atomically (writeTVar m.reported (if taken then blocks else []))
+  where
+    main h = maybe False (.main) <$> Q.getBlock m.db h
+
+-- | Move the fleet tip to the block that the live stores agree on, if it is
+-- another one, with what the blocks in between did to the pool. Says
+-- whether it moved. When this store cannot say what they did, the pool is
+-- emptied, which Redis allows only to a store that is alone.
+moveTip :: Member -> IO Bool
+moveTip m = do
+  seen <- fleetTip m.redis m.keys
+  leases <- fleetLive m.redis m.keys
+  recents <- redis' (R.hgetall m.keys.recent)
+  now <- redis' R.time <&> \(s, us) -> fromIntegral (s * 1000 + us `div` 1000)
+  let reports =
+        Map.fromList
+          [ (store, F.Report {recent = chunks blocks, expires})
+          | (store, expires) <- leases,
+            Just blocks <- [lookup store recents]
+          ]
+      fleet = F.Fleet {tip = seen, reports}
+  case F.agreed now fleet of
+    Just target | Just target /= seen -> do
+      change <- case (traverse decode seen, decode target) of
+        (Right from, Right to) -> changeBetween m.db from to
+        _ -> return Nothing
+      fleetAdvance m.redis m.keys 32 Nothing seen target change <&> \case
+        MovedTo _ -> True
+        _ -> False
+    _ -> return False
+  where
+    redis' :: R.Redis (Either R.Reply a) -> IO a
+    redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
+    chunks bytes
+      | B.null bytes = []
+      | otherwise = B.take 32 bytes : chunks (B.drop 32 bytes)
+
+-- | The most blocks that 'changeBetween' goes through on either side of a
+-- fork. Beyond that, a store that is alone starts the pool again, which
+-- costs the stores an offer of their mempools; going through a thousand
+-- blocks would cost a read of every transaction in them.
+farthest :: Int
+farthest = 50
+
+-- | What the blocks between two tips did, as far as the pool is concerned,
+-- read from the database as it is now: the transactions of the blocks that
+-- lead from the first tip, or from the genesis block, to where the main
+-- chain forked from it, which come back or are gone, and those of the
+-- blocks of the main chain from there to the second tip, which are
+-- confirmed, with the outputs that they spend.
+--
+-- Without a first tip there was no pool, and the blocks did nothing to it.
+-- 'Nothing' if the database does not have one of the tips, if the second
+-- is not on its main chain, or if the way is longer than 'farthest'
+-- blocks on either side.
+changeBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe PoolChange)
+changeBetween db from to = L.withView db $ \view -> do
+  let r = L.viewReader view
+      -- the blocks from one that is not on the main chain back to it
+      back :: Int -> BlockHash -> IO (Maybe ([BlockData], BlockData))
+      back n h
+        | n > farthest = return Nothing
+        | otherwise =
+            Q.getBlock r h >>= \case
+              Nothing -> return Nothing
+              Just bd
+                | bd.main -> return (Just ([], bd))
+                | otherwise -> fmap (\(bs, fork) -> (bd : bs, fork)) <$> back (n + 1) bd.header.prev
+      -- the blocks of the main chain from a block down to above a height
+      down :: Int -> BlockData -> BlockData -> IO (Maybe [BlockData])
+      down n fork bd
+        | n > farthest = return Nothing
+        | bd.height <= fork.height = return (if bd.header == fork.header then Just [] else Nothing)
+        | otherwise =
+            Q.getBlock r bd.header.prev >>= \case
+              Nothing -> return Nothing
+              Just parent -> fmap (bd :) <$> down (n + 1) fork parent
+  target <- Q.getBlock r to
+  left <- case from of
+    Just h -> back 0 h
+    -- without a tip there was no pool, and nothing for the blocks to do
+    Nothing -> return (fmap ([],) target)
+  case (target, left) of
+    (Just bd, Just (abandoned, fork))
+      | bd.main ->
+          down 0 fork bd >>= \case
+            Nothing -> return Nothing
+            Just added -> do
+              old <- concat <$> mapM (bodies view) (reverse abandoned)
+              new <- concat <$> mapM (confirmedBy r) (reverse added)
+              return . Just $
+                PoolChange
+                  { returned = [poolTx r.net r.ctx td | (_, Just td) <- old, not (coinbase td)],
+                    gone = [encode h | (h, found) <- old, maybe True coinbase found],
+                    confirmed = map (encode . txHash . (.tx)) new,
+                    spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
+                  }
+    _ -> return Nothing
+  where
+    -- the transactions of an abandoned block, each with what the store has
+    -- of it now, if it still has it and did not delete it
+    bodies view bd = do
+      found <- L.getManyTxData view bd.txs
+      return [(h, found' >>= live) | (h, found') <- zip bd.txs found]
+    live td = if td.deleted then Nothing else Just td
+    confirmedBy :: DatabaseReader -> BlockData -> IO [TxData]
+    confirmedBy r bd = catMaybes <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey bd.txs)
+    coinbase td = any ((== nullOutPoint) . (.outpoint)) td.tx.inputs
+
+-- | A transaction as the pool keeps it: its body without spenders, and
+-- what it does at each address, as "Haskoin.Store.Database.Mempool" works
+-- them out for the store's own mempool area.
+poolTx :: Network -> Ctx -> TxData -> PoolTx
+poolTx net ctx td =
+  PoolTx
+    { txid = encode records.txid,
+      time,
+      inputs = [encode op | (op, _) <- records.spends],
+      body = encode records.body,
+      signals = net.replaceByFee && any ((< 0xffffffff - 1) . (.sequence)) td.tx.inputs,
+      entries = mapMaybe entry records.addresses
+    }
+  where
+    time = case td.block of
+      MemRef t -> t
+      BlockRef {} -> 0
+    records = M.mempoolRecords net ctx time td
+    entry = \case
+      (MemAddrTxKey a _ _, _) -> Just (PoolTouches (encode a))
+      (MemAddrSpentKey a p, MemAddrSpentVal v) -> Just (PoolSpends (encode a) (encode p) v)
+      (MemAddrOutKey a _ p, MemAddrOutVal v s) -> Just (PoolPays (encode a) (encode p) v s)
+      _ -> Nothing
+
+-- | Offer to the pool the transactions of the store's mempool that it does
+-- not have, oldest first, so that each comes after those that it spends
+-- from. A store without a view of the fleet tip offers nothing: it cannot
+-- say what is unspent there.
+--
+-- A transaction that the pool refuses is offered again at the next round:
+-- its parents may not be there yet, or the tip may have moved. One that
+-- conflicts with transactions of the pool takes their place when this
+-- store deleted every one of them by its own rules, as it does when it
+-- replaces a transaction, and otherwise stays out: the first of two that
+-- spend the same output stays.
+offerMempool :: Member -> IO ()
+offerMempool m =
+  readTVarIO m.tip >>= \case
+    Nothing -> return ()
+    Just tip -> void . withViewAt m.views tip $ \at -> do
+      mempool <- Q.getMempool m.db
+      have <- readTVarIO m.offered
+      let listed = HashSet.fromList (map snd mempool)
+          todo = [h | (_, h) <- sortOn fst mempool, not (HashSet.member h have)]
+      atomically (writeTVar m.offered (HashSet.intersection have listed))
+      go at tip todo
+  where
+    go _ _ [] = return ()
+    go at tip (h : rest) =
+      M.getMempoolTx m.db h >>= \case
+        Nothing -> go at tip rest
+        Just td -> do
+          let tx = poolTx m.db.net m.db.ctx td
+          unspent <- forM [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
+            isJust <$> Q.getUnspent at p
+          let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) tx unspent
+              done = atomically (modifyTVar' m.offered (HashSet.insert h))
+          offer [] >>= \case
+            Taken -> done >> go at tip rest
+            Known -> done >> go at tip rest
+            Orphan _ -> go at tip rest
+            Late -> return ()
+            Conflict rivals -> do
+              mine <- mapM deletedHere rivals
+              when (and mine) $
+                offer rivals >>= \case
+                  Taken -> done
+                  _ -> return ()
+              go at tip rest
+    deletedHere rival = case decode rival of
+      Left _ -> return False
+      Right h -> maybe False (.deleted) <$> L.withView m.db (`L.getTxData` h)
+
+-- | Take out of the pool the transactions that entered a mempool longer
+-- ago than the configuration allows, with what spends them.
+expirePool :: Member -> IO ()
+expirePool m = when (m.config.expiry > 0) $ do
+  (now, _) <- R.runRedis m.redis R.time >>= either (fail . show) return
+  let before = fromIntegral now - fromIntegral m.config.expiry :: Double
+  old <-
+    R.runRedis m.redis (R.zrangebyscoreLimit (m.keys.prefix <> "pool:time") 0 before 0 1000)
+      >>= either (fail . show) return
+  unless (null old) (void (poolWithdraw m.redis m.keys 32 old))
+
+-- | Where a store stands when a request comes.
+data Standing a
+  = -- | the request was answered from the view at the fleet tip
+    Answered !a
+  | -- | there is no fleet tip yet: the store answers by itself
+    Alone
+  | -- | the store has no view of the fleet tip, so any answer of its own
+    -- would differ from those of the other stores
+    Behind
+
+-- | What a read of the pool throws when the fleet tip is no longer the
+-- block that the request answers from. The request is then answered again,
+-- from the new tip.
+data TipMoved = TipMoved
+  deriving (Show)
+
+instance Exception TipMoved
+
+-- | Answer a request as a member of a fleet: read the fleet tip, and run
+-- an action with the database as it was at that block and the pool as it is
+-- at that tip. The action must do all its reading before it returns.
+answering :: Member -> (DatabaseReader -> PoolReads -> IO a) -> IO (Standing a)
+answering m action =
+  fleetTip m.redis m.keys >>= \case
+    Nothing -> return Alone
+    Just tip -> case decode tip of
+      Left _ -> return Behind
+      Right block ->
+        maybe Behind Answered <$> withViewAt m.views block (\r -> action r (redisPool m.redis m.keys tip))
+
+-- | The shared pool of a fleet as it is at a tip, for the queries of
+-- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if
+-- the tip is another one by then.
+redisPool :: R.Connection -> FleetKeys -> ByteString -> PoolReads
+redisPool conn keys tip =
+  PoolReads
+    { summaries = \as -> case as of
+        [] -> return []
+        _ -> map summary <$> ask "sums" (map encode as),
+      addressTxs = \a start n -> do
+        rows <- ask "txs" (encode a : from start <> [num n])
+        return [(number time, h) | [member, time] <- groups 2 rows, Right h <- [decode member]],
+      addressOuts = \a start n -> do
+        rows <- ask "outs" (encode a : from start <> [num n])
+        let paid time p v s = Unspent {block = MemRef time, outpoint = p, value = v, script = s, address = Just a}
+        return
+          [ (paid (number time) p (number v) s, f == "1")
+          | [member, time, kept, f] <- groups 4 rows,
+            Right p <- [decode member],
+            let (v, s) = B.drop 1 <$> C.break (== ' ') kept
+          ],
+      spentOutputs = \a ps -> case ps of
+        [] -> return []
+        _ -> map (== '1') . C.unpack . B.concat <$> ask "spent" [encode a, B.concat (map encode ps)],
+      bodies = \hs -> case hs of
+        [] -> return []
+        _ -> do
+          rows <- ask "bodies" [B.concat (map encode hs)]
+          return [body bytes (flag == "1") | [bytes, flag] <- groups 2 rows],
+      spenders = \ps -> case ps of
+        [] -> return []
+        _ -> do
+          rows <- ask "spenders" [B.concat (map encode ps)]
+          return [spender t i | [t, i] <- groups 2 rows],
+      page = \offset limit -> do
+        rows <- ask "page" [num offset, num limit]
+        return [(number time, h) | [member, time] <- groups 2 rows, Right h <- [decode member]],
+      startingWith = \start -> rights . map decode <$> ask "ids" [B.drop 1 (encode (TxKeyS start))]
+    }
+  where
+    ask what args = poolRead conn keys 32 (Just tip) what args >>= maybe (throwIO TipMoved) return
+    num :: (Show a) => a -> ByteString
+    num = C.pack . show
+    number :: (Num a) => ByteString -> a
+    number = maybe 0 (fromInteger . fst) . C.readInteger
+    from :: (Serialize k) => Maybe (UnixTime, k) -> [ByteString]
+    from = maybe ["", ""] (\(time, k) -> [num time, encode k])
+    groups n rows
+      | null rows = []
+      | otherwise = take n rows : groups n (drop n rows)
+    summary row = case map number (C.words row) of
+      [txs, paid, paidCount, spent, spentCount, both, bothCount] -> Just MemSummary {..}
+      _ -> Nothing
+    -- whether a transaction can be replaced by fee is what the pool says
+    -- now, not what the store that offered it found then
+    body bytes can
+      | B.null bytes = Nothing
+      | otherwise = either (const Nothing) (\td -> Just (td :: TxData) {rbf = can}) (decode bytes)
+    spender t i
+      | B.null t = Nothing
+      | otherwise = either (const Nothing) (\h -> Just Spender {txid = h, index = number i}) (decode t)
