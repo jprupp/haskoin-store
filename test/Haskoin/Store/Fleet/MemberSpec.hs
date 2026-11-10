@@ -5,7 +5,9 @@ import Data.Default (def)
 import Data.Either (isRight)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Serialize (encode)
+import Data.Text qualified as T
 import Haskoin (btcRegTest, prepareContext, txHash)
+import Haskoin.Node (LogLevel (..))
 import Haskoin.Store.Common (Limits (..), Start (..), StoreRead)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered (From (..))
@@ -48,7 +50,9 @@ spec = prepareContext $ \ctx -> do
                           expiry = 0,
                           cacheMax = 0,
                           cacheMinAddrs = 0,
-                          cacheMinTxs = 0
+                          cacheMinTxs = 0,
+                          stats = Nothing,
+                          note = \_ _ -> return ()
                         }
                     best = Q.getBestBlock db >>= maybe (fail "no best block") return
                 m <- newMember config conn db
@@ -101,6 +105,7 @@ spec = prepareContext $ \ctx -> do
             withSystemTempDirectory "haskoin-store-member-" $ \dir ->
               openLayered btcRegTest ctx dir $ \db -> do
                 keys <- fresh
+                said <- newIORef []
                 let config =
                       MemberConfig
                         { prefix = keys.prefix,
@@ -110,7 +115,9 @@ spec = prepareContext $ \ctx -> do
                           expiry = 0,
                           cacheMax = 10,
                           cacheMinAddrs = 0,
-                          cacheMinTxs = 0
+                          cacheMinTxs = 0,
+                          stats = Nothing,
+                          note = \level line -> modifyIORef' said ((level, line) :)
                         }
                     best = Q.getBestBlock db >>= maybe (fail "no best block") return
                     key = wallet ctx
@@ -151,7 +158,9 @@ spec = prepareContext $ \ctx -> do
                             else memberTick m
                           let made = map txHash hist''.made
                               pick xs = xs !! (fromIntegral seed `mod` length xs)
-                              starts = Nothing : [Just (AtBlock (fromIntegral seed `mod` 8))] <> [Just (AtTx (pick made)) | not (null made)]
+                              starts =
+                                [Nothing, Just (AtBlock (fromIntegral seed `mod` 8))]
+                                  <> [Just (AtTx (pick made)) | not (null made)]
                               limits =
                                 [ Limits {limit, offset, start = from}
                                 | from <- starts,
@@ -212,4 +221,10 @@ spec = prepareContext $ \ctx -> do
                 cacheHave conn keys key `shouldReturn` (0, 0)
                 closeViews m.views
                 closeViews bare.views
+                -- what the member logged: that it emptied the cache, and
+                -- why, as information, and nothing else above debugging
+                logged <- readIORef said
+                let emptied = [line | (LevelInfo, line) <- logged]
+                [() | (level, _) <- logged, level /= LevelInfo, level /= LevelDebug] `shouldBe` []
+                emptied `shouldSatisfy` all ("Emptied the xpub cache at block " `T.isPrefixOf`)
                 readIORef hits >>= (`shouldSatisfy` (> 10))

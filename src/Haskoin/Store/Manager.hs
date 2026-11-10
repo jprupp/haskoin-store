@@ -264,7 +264,9 @@ storeMember cfg db = case (cfg.fleet, cfg.redis) of
             expiry = fromIntegral cfg.mempoolTimeout * 24 * 3600,
             cacheMax = cfg.redisMaxXPubs,
             cacheMinAddrs = cfg.redisMinAddrs,
-            cacheMinTxs = cfg.redisMinTxs
+            cacheMinTxs = cfg.redisMinTxs,
+            stats = cfg.stats,
+            note = \level -> logAt level (withSource "Fleet" cfg.logger)
           }
         conn
         db

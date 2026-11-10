@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - The test of the member compares every answer about a wallet through
     the cache with the uncached one after each step of random histories,
     and the two servers of the integration test do the same over HTTP.
+  - StatsD metrics under `fleet.cache.*`: hits, misses, builds and their
+    time, builds given up, evictions, and the times that the cache was
+    emptied. The log says why the cache was emptied each time, and with
+    `--debug` has a line for each entry built and each block that the
+    cache was brought to.
 - `rocksdb-haskell-jprupp` 2.7 has iterators that stop at a bound. The
   store was measured with them and has no use for them: since every
   address of the mempool has a summary, a scan no longer walks over the

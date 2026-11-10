@@ -1322,8 +1322,10 @@ the block that confirms it.
   shared pool for every store.
 - *Stores that disagree* and *sharing transactions* are as the pool
   settles them.
-- The cache has no metrics of its own yet: hits, misses and builds are not
-  counted.
+- The cache has metrics, under `fleet.cache.*`, but they are each store's
+  own count of what it did: nothing reports the size of the cache or the
+  number of its entries, which are in Redis (`ZCARD` of `fx:lru` under the
+  prefix of the network).
 
 ## A fleet that answers as one
 

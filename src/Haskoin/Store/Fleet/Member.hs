@@ -73,6 +73,7 @@ module Haskoin.Store.Fleet.Member
     redisPool,
 
     -- * The cache of extended public keys
+    CacheMetrics (..),
     memberCacheLoop,
     wantCached,
     syncCache,
@@ -90,7 +91,7 @@ module Haskoin.Store.Fleet.Member
 where
 
 import Control.Exception (Exception, throwIO)
-import Control.Monad (filterM, forM, unless, void, when)
+import Control.Monad (filterM, forM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -105,6 +106,9 @@ import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Serialize (Serialize, decode, encode)
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Encoding (decodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import Database.Redis qualified as R
@@ -117,9 +121,11 @@ import Haskoin
     Tx (..),
     TxHash,
     TxIn (..),
+    blockHashToHex,
     nullOutPoint,
     txHash,
   )
+import Haskoin.Node (LogLevel (..))
 import Haskoin.Store.Common (Limits (..), StoreRead (..))
 import Haskoin.Store.Data
   ( Balance (..),
@@ -148,6 +154,15 @@ import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, take
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
+import System.Metrics.StatsD
+  ( StatCounter,
+    StatTiming,
+    Stats,
+    addTiming,
+    incrementCounter,
+    newStatCounter,
+    newStatTiming,
+  )
 import UnliftIO
   ( TVar,
     atomically,
@@ -190,8 +205,59 @@ data MemberConfig = MemberConfig
     -- | cache a key that has at least this many used addresses
     cacheMinAddrs :: !Int,
     -- | or at least this many transactions in its addresses
-    cacheMinTxs :: !Int
+    cacheMinTxs :: !Int,
+    -- | StatsD client, to report what the cache of extended public keys
+    -- does, as t'CacheMetrics' lists
+    stats :: !(Maybe Stats),
+    -- | where to say what a log should have: that the cache was emptied
+    -- and why, as information, and each entry built and each move of the
+    -- cache, for debugging
+    note :: !(LogLevel -> Text -> IO ())
   }
+
+-- | StatsD metrics of the fleet's cache of extended public keys, as this
+-- store sees it. They have the names of those of "Haskoin.Store.Cache"
+-- under @fleet@, so that a dashboard reads both alike.
+data CacheMetrics = CacheMetrics
+  { -- | requests about a key whose balances the cache gave
+    -- (@fleet.cache.hits@)
+    hits :: !StatCounter,
+    -- | requests about a key that the database answered: the cache did
+    -- not have the key, had it with other addresses, or was not at the
+    -- fleet tip (@fleet.cache.misses@)
+    misses :: !StatCounter,
+    -- | entries that this store built or added addresses to
+    -- (@fleet.cache.builds@)
+    builds :: !StatCounter,
+    -- | builds that this store gave up, because the tip moved or another
+    -- store wrote the entry (@fleet.cache.abandoned@)
+    abandoned :: !StatCounter,
+    -- | entries that this store deleted for being the least recently used
+    -- (@fleet.cache.evictions@)
+    evictions :: !StatCounter,
+    -- | times that this store emptied the cache (@fleet.cache.emptied@)
+    emptied :: !StatCounter,
+    -- | milliseconds to build an entry (@fleet.cache.build@)
+    buildTime :: !StatTiming
+  }
+
+-- | Register the metrics of the cache.
+newCacheMetrics :: Stats -> IO CacheMetrics
+newCacheMetrics s = do
+  hits <- c "hits"
+  misses <- c "misses"
+  builds <- c "builds"
+  abandoned <- c "abandoned"
+  evictions <- c "evictions"
+  emptied <- c "emptied"
+  buildTime <- newStatTiming s "fleet.cache.build" 10
+  return CacheMetrics {..}
+  where
+    c x = newStatCounter s ("fleet.cache." <> x) 10
+
+-- | Add to a counter of the cache, if metrics are reported.
+tally :: Member -> (CacheMetrics -> StatCounter) -> Int -> IO ()
+tally m which n = forM_ m.metrics (\x -> incrementCounter (which x) n)
 
 -- | A store that is a member of a fleet.
 data Member = Member
@@ -227,7 +293,9 @@ data Member = Member
     wanted :: !(TVar (HashMap ByteString XPubSpec)),
     -- | the fleet tip at which the cache was found at another block, at
     -- the last turn
-    lagging :: !(TVar (Maybe ByteString))
+    lagging :: !(TVar (Maybe ByteString)),
+    -- | the metrics of the cache, if the configuration has a StatsD client
+    metrics :: !(Maybe CacheMetrics)
   }
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
@@ -245,6 +313,7 @@ newMember config redis db = do
   healthy <- newTVarIO True
   wanted <- newTVarIO HashMap.empty
   lagging <- newTVarIO Nothing
+  metrics <- mapM newCacheMetrics config.stats
   return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
@@ -709,8 +778,11 @@ cachedRead m tip r pool found
           { xPubBals = \x -> do
               now <- milliseconds
               cachedEntry m.redis m.keys tip r.initGap r.maxGap now x >>= hit >>= \case
-                Just e -> e.balances <$ modifyIORef' seen (HashMap.insert (xpubId x) e)
+                Just e -> do
+                  tally m (.hits) 1
+                  e.balances <$ modifyIORef' seen (HashMap.insert (xpubId x) e)
                 Nothing -> do
+                  tally m (.misses) 1
                   bals <- base.xPubBals x
                   wantCached m x bals
                   return bals,
@@ -771,11 +843,24 @@ memberCacheLoop m complain = go
         Just block -> do
           now <- milliseconds
           let tip = encode block
+              name = decodeUtf8 (xpubId spec)
           built <-
-            handle (\TipMoved -> return Nothing) $
+            handle (\TipMoved -> return (Just Abandoned)) $
               answeringAt m tip (\r pool _ -> cacheBuild m.redis m.keys tip r pool now spec)
+          took <- subtract now <$> milliseconds
           case built of
-            Just (Built n) | n > 0 -> void (cacheEvict m.redis m.keys m.config.cacheMax)
+            Just (Built n) | n > 0 -> do
+              tally m (.builds) 1
+              forM_ m.metrics (\x -> addTiming x.buildTime (fromIntegral took))
+              m.config.note LevelDebug $
+                "Cached xpub " <> name <> ": " <> shown n <> " addresses added in " <> shown took <> " ms"
+              gone <- cacheEvict m.redis m.keys m.config.cacheMax
+              when (gone > 0) $ do
+                tally m (.evictions) gone
+                m.config.note LevelDebug ("Evicted " <> shown gone <> " xpubs from the cache")
+            Just Abandoned -> do
+              tally m (.abandoned) 1
+              m.config.note LevelDebug ("Gave up caching xpub " <> name <> ": the fleet or the entry moved on")
             _ -> return ()
 
 -- | Bring the cache of extended public keys to the block that this member
@@ -794,7 +879,38 @@ advanceCache m seen target between = when (m.config.cacheMax > 0) $ do
         bal <- Q.getBalance r a
         return (a, bal, change)
     _ -> return Nothing
-  void (cacheAdvance m.redis m.keys seen target changes)
+  let why = case (between, changes) of
+        (Nothing, _) -> "this store cannot say what the blocks since the last tip did"
+        (Just b, _) | b.reorganised -> "the chain was reorganised"
+        (_, Nothing) -> "this store has no view of the block"
+        _ -> "it was at another block than the last tip"
+  cacheAdvance m.redis m.keys seen target changes >>= \case
+    CacheEmptied -> wasEmptied m target why
+    CacheMoved ->
+      m.config.note LevelDebug $
+        "The xpub cache is at block "
+          <> blockName target
+          <> ": "
+          <> shown (maybe 0 length changes)
+          <> " addresses changed"
+    _ -> return ()
+
+-- | Count and say that this store emptied the cache, at a block and for a
+-- reason. It is information and not a warning: nothing is wrong with what
+-- the fleet answers, which comes from the database until entries are
+-- built again. Emptied at every block, though, the cache is of no use,
+-- and the log is where that shows.
+wasEmptied :: Member -> ByteString -> Text -> IO ()
+wasEmptied m block why = do
+  tally m (.emptied) 1
+  m.config.note LevelInfo ("Emptied the xpub cache at block " <> blockName block <> ": " <> why)
+
+-- | A block as a log names it.
+blockName :: ByteString -> Text
+blockName bytes = either (const "?") blockHashToHex (decode bytes :: Either String BlockHash)
+
+shown :: (Show a) => a -> Text
+shown = T.pack . show
 
 -- | See that the cache of extended public keys does not stay at another
 -- block than the fleet tip. It is there for a moment after every move of
@@ -809,7 +925,11 @@ syncCache m = when (m.config.cacheMax > 0) $ do
   before <- readTVarIO m.lagging
   case tip of
     Just t | at /= Just t -> do
-      when (before == Just t) (void (cacheAdvance m.redis m.keys Nothing t Nothing))
+      when (before == Just t) $
+        cacheAdvance m.redis m.keys Nothing t Nothing >>= \case
+          -- a cache that never had a block is not worth a line
+          CacheEmptied | isJust at -> wasEmptied m t "no store brought it to the fleet tip"
+          _ -> return ()
       atomically (writeTVar m.lagging (Just t))
     _ -> atomically (writeTVar m.lagging Nothing)
 
@@ -867,7 +987,13 @@ redisPool conn keys tip checked =
     -- them
     transactions (bytes : flag : count : rest) =
       let (spent, more) = splitAt (3 * number count) rest
-          inputs = IntMap.fromList [(fromIntegral p.index, s) | [o, t, i] <- groups 3 spent, Right p <- [outpoint o], Just s <- [spender t i]]
+          inputs =
+            IntMap.fromList
+              [ (fromIntegral p.index, s)
+              | [o, t, i] <- groups 3 spent,
+                Right p <- [outpoint o],
+                Just s <- [spender t i]
+              ]
        in (body bytes (flag == "1"), inputs) : transactions more
     transactions _ = []
     outpoint :: ByteString -> Either String OutPoint

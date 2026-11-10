@@ -73,7 +73,9 @@ main = withContext $ \ctx -> do
               expiry = 0,
               cacheMax = 100,
               cacheMinAddrs = 0,
-              cacheMinTxs = 0
+              cacheMinTxs = 0,
+                          stats = Nothing,
+                          note = \_ _ -> return ()
             }
     m <- newMember config conn db
     Just best <- Q.getBestBlock db
@@ -130,8 +132,9 @@ main = withContext $ \ctx -> do
     ask "balance: address with a transaction or two in the mempool" 3 [\q -> q.getBalance a | a <- little]
     ask "balance: the busiest address" 200 [\q -> q.getBalance busiest]
     ask "balances of 100 addresses with nothing in the mempool" 20 [\q -> q.getBalances (take 100 nothing)]
-    ask "address with nothing in the mempool: its transactions" 3 [\q -> q.getAddressTxs a page | a <- take 200 nothing]
-    ask "address with a little in the mempool: its transactions" 3 [\q -> q.getAddressTxs a page | a <- take 200 little]
+    let listed as = [\q -> q.getAddressTxs a page | a <- take 200 as]
+    ask "address with nothing in the mempool: its transactions" 3 (listed nothing)
+    ask "address with a little in the mempool: its transactions" 3 (listed little)
     ask "busiest address: first 100 transactions" 50 [\q -> q.getAddressTxs busiest page]
     ask "busiest address: first 100 unspent outputs" 50 [\q -> q.getAddressUnspents busiest page]
     let newest = map snd (take 1000 mempool)

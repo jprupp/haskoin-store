@@ -587,7 +587,25 @@ nothing in the store calls them.
   request (`web.*`), database reads (`db.*`), cache hits, misses, reloads and
   full reloads (`cache.*`),
   and block store gauges such as block and header heights and mempool size
-  (`store.*`).
+  (`store.*`). A server of a fleet reports what it does with the fleet's
+  cache of xpubs under `fleet.cache.*`:
+
+  | Metric | Kind | Meaning |
+  | --- | --- | --- |
+  | `fleet.cache.hits` | counter | Requests about an xpub whose balances the cache gave |
+  | `fleet.cache.misses` | counter | Requests about an xpub that the database answered |
+  | `fleet.cache.builds` | counter | Entries that this server built, or added addresses to |
+  | `fleet.cache.build` | timing | Milliseconds to build an entry |
+  | `fleet.cache.abandoned` | counter | Builds given up because the fleet or the entry moved on |
+  | `fleet.cache.evictions` | counter | Entries deleted for being the least recently used |
+  | `fleet.cache.emptied` | counter | Times that this server emptied the cache |
+
+  Misses include small xpubs, which are never cached, so the share of hits
+  says how much of the load the cache takes, not how well it holds what it
+  has. `fleet.cache.emptied` should move only at a reorganisation or when a
+  server stops at the wrong moment: the log of the server says why each
+  time, at the level of information. With `--debug` it also has a line for
+  each entry built and each block that the cache was brought to.
 - **`/dbstats`** returns RocksDB memory use per column family and RocksDB's own
   statistics, as text.
 - **In a fleet** (`--fleet`), any request can be answered 503 with

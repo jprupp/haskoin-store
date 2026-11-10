@@ -42,7 +42,10 @@ spec = describe "cache of extended public keys of a fleet" $ do
            in if HashSet.member n used then zero {txs = 1, received = 5} else zero
         scan (igap, gap, ext, chg) =
           let chain m = [(n, address m n) | n <- [0 ..]]
-              known = HashMap.fromList ([(address 0 n, balance ext 0 n) | n <- [0 .. 80]] <> [(address 1 n, balance chg 1 n) | n <- [0 .. 80]])
+              known =
+                HashMap.fromList $
+                  [(address 0 n, balance ext 0 n) | n <- [0 .. 80]]
+                    <> [(address 1 n, balance chg 1 n) | n <- [0 .. 80]]
               bal a = HashMap.lookupDefault (zeroBalance a) a known
            in runIdentity (scanXPubBals (return . map bal) igap gap (chain 0) (chain 1))
         rows found = [(m, n, b.balance) | b@XPubBal {path = [m, n]} <- found]
@@ -52,7 +55,8 @@ spec = describe "cache of extended public keys of a fleet" $ do
     it "gives nothing when the entry lacks the last address of a chain" $
       property . forAll key $ \k@(igap, gap, _, _) ->
         let found = scan k
-            lacking m = [r | r@(m', n, _) <- rows found, m' /= m || n /= maximum [n' | (m'', n', _) <- rows found, m'' == m]]
+            final m = maximum [n | (m', n, _) <- rows found, m' == m]
+            lacking m = [r | r@(m', n, _) <- rows found, m' /= m || n /= final m]
          in conjoin [window igap gap (lacking m) === Nothing | m <- [0, 1], any (\(m', _, _) -> m' == m) (rows found)]
     it "gives nothing when the entry has an address more" $
       property . forAll key $ \k@(igap, gap, ext, chg) ->
