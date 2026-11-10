@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - An integration test runs two servers as a fleet against a real node and
     Redis and compares their answers with a payment in the pool and after
     the block that confirms it.
+  - `docs/layered-database/FleetCost.hs` times a store alone against the
+    same store in a fleet, with 40,000 transactions in the pool: a fleet
+    adds about one round trip to Redis to a request. A request is answered
+    from the tip that the member last read, which its first read of the
+    pool checks; a transaction's body comes with what spends its outputs;
+    and a first page is as large as the page asked for.
 
 ### Changed
 

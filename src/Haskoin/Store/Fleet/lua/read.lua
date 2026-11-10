@@ -22,8 +22,10 @@
 -- 'spent': an address and outputs. A string with '1' for each output of the
 -- address that the pool spends and '0' for the others.
 --
--- 'bodies': transactions. For each, its body or '', and '1' if it can be
--- replaced by fee or '0'.
+-- 'bodies': transactions, of the pool or not. For each: its body or '',
+-- '1' if it can be replaced by fee or '0', the number of its outputs that
+-- the pool spends, and for each of those the output, the transaction that
+-- spends it and the number of its input that does.
 --
 -- 'spenders': outputs. For each, the transaction that spends it and the
 -- number of its input that does, or two ''.
@@ -118,6 +120,22 @@ elseif what == 'bodies' then
   for _, t in ipairs(split(ARGV[5], tsize)) do
     answer[#answer + 1] = redis.call('HGET', prefix .. 'pool:body', t) or ''
     answer[#answer + 1] = tostring(redis.call('SISMEMBER', prefix .. 'pool:rbf', t))
+    -- what spends its outputs: the inputs of the transactions of the pool
+    -- that spend from it
+    local spent = {}
+    for _, kid in ipairs(redis.call('SMEMBERS', prefix .. 'pool:kids:' .. t)) do
+      for i, input in ipairs(split(redis.call('HGET', prefix .. 'pool:spends', kid), osize)) do
+        if string.sub(input, 1, tsize) == t then
+          spent[#spent + 1] = input
+          spent[#spent + 1] = kid
+          spent[#spent + 1] = tostring(i - 1)
+        end
+      end
+    end
+    answer[#answer + 1] = tostring(#spent / 3)
+    for _, item in ipairs(spent) do
+      answer[#answer + 1] = item
+    end
   end
 elseif what == 'spenders' then
   for _, o in ipairs(split(ARGV[5], osize)) do

@@ -154,10 +154,12 @@ spec = do
         Just [flags] <- poolRead conn keys 4 tip "spent" [a, B.concat [o | (_, o, _) <- mine.paid]]
         C.unpack flags `shouldBe` [if Map.member o mine.spent then '1' else '0' | (_, o, _) <- mine.paid]
         -- bodies, spenders with the number of the input, and ids by prefix
-        -- bodies come with whether they can be replaced by fee: the first
-        -- says so itself, the fifth too, and the second does not
+        -- bodies come with whether they can be replaced by fee, and with
+        -- what spends their outputs: the fifth says itself that it can be
+        -- replaced and nothing spends from it; the second does not say so,
+        -- and the second input of the fifth spends its first output
         poolRead conn keys 4 tip "bodies" [block 4 <> block 99 <> block 1]
-          `shouldReturn` Just ["body", "1", "", "0", "body", "0"]
+          `shouldReturn` Just ["body", "1", "0", "", "0", "0", "body", "0", "1", out 1 0, block 4, "1"]
         poolRead conn keys 4 tip "spenders" [out 1 0 <> out 0 0 <> out 5 0]
           `shouldReturn` Just [block 4, "1", block 4, "0", "", ""]
         poolRead conn keys 4 tip "ids" [B.take 3 (block 4)] `shouldReturn` Just (map block [0 .. 8])

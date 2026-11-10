@@ -144,7 +144,7 @@ import Data.Maybe
     maybeToList,
   )
 import Data.Proxy (Proxy (..))
-import Data.Serialize (decode)
+import Data.Serialize (decode, encode)
 import Data.String (fromString)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -616,30 +616,43 @@ serveWeb config serve = do
         Nothing -> local answer
         Just member ->
           readTVarIO cacheUp >>= \case
-            True -> shared member (3 :: Int) answer
+            True -> shared member (3 :: Int) False answer
             -- without Redis there is no fleet to answer with
             False -> local answer
       -- as a member of a fleet: from the view at the fleet tip, with the
-      -- pool that the fleet shares on top
-      shared member tries answer =
-        (timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing) >>= \case
+      -- pool that the fleet shares on top. The tip is taken to be the one
+      -- that the member read at its last turn, which saves asking Redis
+      -- for it: the first read of the pool checks it, and a request that
+      -- reads nothing from the pool checks it when its handler is done. If
+      -- it is not the tip any more, the request is answered again, from the
+      -- tip that Redis has.
+      shared member tries fresh answer = do
+        known <- if fresh then return Nothing else fmap encode <$> readTVarIO member.tip
+        asked <- case known of
+          Just tip -> return (Just (Just tip))
+          Nothing -> timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing
+        case asked of
           Nothing -> atomically (writeTVar cacheUp False) >> local answer
           -- no store has reported yet
           Just Nothing -> local answer
           Just (Just tip) -> do
             handled <- newIORef False
-            let marked r = r {handler = \req -> r.handler req <* writeIORef handled True} :: Route
-                inFleet r pool = answer (map marked (routesOf (stateOf (pooledRead r pool))))
+            let marked confirm r = r {handler = \req -> r.handler req <* confirm <* writeIORef handled True} :: Route
+                inFleet r pool confirm = answer (map (marked confirm) (routesOf (stateOf (pooledRead r pool))))
             try (answeringAt member tip inFleet) >>= \case
               Right (Just sent) -> return sent
-              Right Nothing -> behind answer
+              Right Nothing
+                -- a tip from the member's last turn of which there is no
+                -- view may not be the tip any more
+                | not fresh && tries > 0 -> shared member (tries - 1) True answer
+                | otherwise -> behind answer
               Left TipMoved ->
                 -- the tip moved while the handler was reading: answer
                 -- again from the new one, unless the response is on its way
                 readIORef handled >>= \case
                   True -> throwIO TipMoved
                   False
-                    | tries > 0 -> shared member (tries - 1) answer
+                    | tries > 0 -> shared member (tries - 1) True answer
                     | otherwise -> behind answer
       behind answer = answer [r {handler = \_ -> behindResponse st} :: Route | r <- routesOf st]
       app = routerScoped (routesOf st) scoped notFound

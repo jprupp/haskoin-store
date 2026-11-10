@@ -85,6 +85,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
+import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
@@ -96,6 +97,7 @@ import Haskoin
     BlockHeader (..),
     Ctx,
     Network (..),
+    OutPoint (..),
     Tx (..),
     TxHash,
     TxIn (..),
@@ -130,10 +132,13 @@ import UnliftIO
     atomically,
     handleAny,
     modifyTVar',
+    newIORef,
     newTVarIO,
+    readIORef,
     readTVarIO,
     stateTVar,
     timeout,
+    writeIORef,
     writeTVar,
   )
 
@@ -552,25 +557,43 @@ answering :: Member -> (DatabaseReader -> PoolReads -> IO a) -> IO (Standing a)
 answering m action =
   memberTip m >>= \case
     Nothing -> return Alone
-    Just tip -> maybe Behind Answered <$> answeringAt m tip action
+    Just tip -> maybe Behind Answered <$> answeringAt m tip (\r pool _ -> action r pool)
 
 -- | The fleet tip as Redis has it now, if there is one.
 memberTip :: Member -> IO (Maybe ByteString)
 memberTip m = fleetTip m.redis m.keys
 
--- | Run an action with the database as it was at a fleet tip and the pool
--- as it is at that tip, or give 'Nothing' if the store has no view of that
--- block. The action must do all its reading before it returns.
-answeringAt :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO a) -> IO (Maybe a)
+-- | Run an action with the database as it was at a block that is taken to
+-- be the fleet tip, and the pool as it is at that tip, or give 'Nothing' if
+-- the store has no view of that block. The action must do all its reading
+-- before it returns.
+--
+-- The block need not be the tip any more: it can be the one that the
+-- member read at its last turn, which saves a request the round trip of
+-- asking. Every read of the pool checks it and throws v'TipMoved' if the tip
+-- is another one. The action is also given a check to run when it has what
+-- it needs: it asks Redis for the tip if no read of the pool has done so,
+-- and throws the same. An answer that passed either is one that every
+-- store of the fleet gave at that moment.
+answeringAt :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO () -> IO a) -> IO (Maybe a)
 answeringAt m tip action = case decode tip of
   Left _ -> return Nothing
-  Right block -> withViewAt m.views block (\r -> action r (redisPool m.redis m.keys tip))
+  Right block -> withViewAt m.views block $ \r -> do
+    checked <- newIORef False
+    let confirm =
+          readIORef checked >>= \case
+            True -> return ()
+            False -> do
+              now <- memberTip m
+              if now == Just tip then writeIORef checked True else throwIO TipMoved
+    action r (redisPool m.redis m.keys tip (writeIORef checked True)) confirm
 
 -- | The shared pool of a fleet as it is at a tip, for the queries of
 -- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if
--- the tip is another one by then.
-redisPool :: R.Connection -> FleetKeys -> ByteString -> PoolReads
-redisPool conn keys tip =
+-- the tip is another one by then, and runs an action if it is not, by which
+-- a caller knows that the tip was checked.
+redisPool :: R.Connection -> FleetKeys -> ByteString -> IO () -> PoolReads
+redisPool conn keys tip checked =
   PoolReads
     { summaries = \as -> case as of
         [] -> return []
@@ -592,9 +615,7 @@ redisPool conn keys tip =
         _ -> map (== '1') . C.unpack . B.concat <$> ask "spent" [encode a, B.concat (map encode ps)],
       bodies = \hs -> case hs of
         [] -> return []
-        _ -> do
-          rows <- ask "bodies" [B.concat (map encode hs)]
-          return [body bytes (flag == "1") | [bytes, flag] <- groups 2 rows],
+        _ -> transactions <$> ask "bodies" [B.concat (map encode hs)],
       spenders = \ps -> case ps of
         [] -> return []
         _ -> do
@@ -606,7 +627,7 @@ redisPool conn keys tip =
       startingWith = \start -> rights . map decode <$> ask "ids" [B.drop 1 (encode (TxKeyS start))]
     }
   where
-    ask what args = poolRead conn keys 32 (Just tip) what args >>= maybe (throwIO TipMoved) return
+    ask what args = poolRead conn keys 32 (Just tip) what args >>= maybe (throwIO TipMoved) (<$ checked)
     num :: (Show a) => a -> ByteString
     num = C.pack . show
     number :: (Num a) => ByteString -> a
@@ -616,6 +637,16 @@ redisPool conn keys tip =
     groups n rows
       | null rows = []
       | otherwise = take n rows : groups n (drop n rows)
+    -- for each transaction: its body, whether it can be replaced by fee,
+    -- how many of its outputs the pool spends, and those with what spends
+    -- them
+    transactions (bytes : flag : count : rest) =
+      let (spent, more) = splitAt (3 * number count) rest
+          inputs = IntMap.fromList [(fromIntegral p.index, s) | [o, t, i] <- groups 3 spent, Right p <- [outpoint o], Just s <- [spender t i]]
+       in (body bytes (flag == "1"), inputs) : transactions more
+    transactions _ = []
+    outpoint :: ByteString -> Either String OutPoint
+    outpoint = decode
     summary row = case map number (C.words row) of
       [txs, paid, paidCount, spent, spentCount, both, bothCount] -> Just MemSummary {..}
       _ -> Nothing

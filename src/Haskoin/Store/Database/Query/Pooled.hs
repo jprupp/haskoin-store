@@ -80,7 +80,6 @@ import Haskoin
     TxOut (..),
     eitherToMaybe,
     scriptToAddressBS,
-    txHash,
   )
 import Haskoin.Store.Common
   ( Limits (..),
@@ -144,9 +143,13 @@ data PoolReads = PoolReads
     addressOuts :: Address -> Maybe (UnixTime, OutPoint) -> Int -> IO [(Unspent, Bool)],
     -- | whether the pool spends each of some outputs of an address
     spentOutputs :: Address -> [OutPoint] -> IO [Bool],
-    -- | the bodies of transactions of the pool, in their order, without
-    -- spenders
-    bodies :: [TxHash] -> IO [Maybe TxData],
+    -- | for each of some transactions, in their order: its body if it is
+    -- in the pool, without spenders, and the inputs of the pool that spend
+    -- its outputs, by output, whether it is in the pool or in the chain.
+    -- The two come together because nearly every question about a
+    -- transaction needs both, and a pool that is far away answers them in
+    -- one go.
+    bodies :: [TxHash] -> IO [(Maybe TxData, IntMap.IntMap Spender)],
     -- | the input of the pool that spends each output, if one does
     spenders :: [OutPoint] -> IO [Maybe Spender],
     -- | the list of the pool, newest first and by hash downwards within a
@@ -206,53 +209,35 @@ getManyTxData :: DatabaseReader -> PoolReads -> [TxHash] -> IO [Maybe TxData]
 getManyTxData _ _ [] = return []
 getManyTxData r pool hs = do
   found <- known r pool hs
-  spent <- poolSpenders pool (Map.toList found)
-  return [withSpenders spent h <$> Map.lookup h found | h <- hs]
+  return [Map.lookup h found | h <- hs]
 
--- | The bodies of transactions by hash: those that the pool has, and those
--- that the chain has for the others, with the spenders that blocks give to
--- their outputs.
+-- | The data of transactions by hash: those that the pool has, and those
+-- that the chain has for the others, each with the spenders that blocks
+-- and the pool give to its outputs. One read of the pool, and one of the
+-- chain for what the pool does not have.
 known :: DatabaseReader -> PoolReads -> [TxHash] -> IO (Map TxHash TxData)
+known _ _ [] = return Map.empty
 known r pool hs = do
-  unconfirmed <- Map.fromList . catMaybes . zipWith (fmap . (,)) hs <$> pool.bodies hs
-  let rest = filter (`Map.notMember` unconfirmed) hs
+  inPool <- zip hs <$> pool.bodies hs
+  let unconfirmed = Map.fromList [(h, td) | (h, (Just td, _)) <- inPool]
+      spent = HashMap.fromList [(h, spenders) | (h, (_, spenders)) <- inPool, not (IntMap.null spenders)]
+      rest = filter (`Map.notMember` unconfirmed) hs
   chain <- case rest of
     [] -> return Map.empty
     _ -> Map.fromList . catMaybes . zipWith (fmap . (,)) rest <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey rest)
-  return (unconfirmed <> Map.mapMaybe notDeleted' chain)
+  return (Map.mapWithKey (withSpenders spent) (unconfirmed <> Map.mapMaybe notDeleted' chain))
   where
     notDeleted' = notDeleted . Just
-
--- | The spenders that the pool has for the outputs of transactions that no
--- block spends, in one read.
-poolSpenders :: PoolReads -> [(TxHash, TxData)] -> IO (HashMap.HashMap TxHash (IntMap.IntMap Spender))
-poolSpenders pool txs = do
-  found <- case points of
-    [] -> return []
-    _ -> pool.spenders points
-  return . HashMap.fromListWith IntMap.union $
-    [(p.hash, IntMap.singleton (fromIntegral p.index) s) | (p, Just s) <- zip points found]
-  where
-    points =
-      [ OutPoint h i
-      | (h, td) <- txs,
-        (i, _) <- zip [0 ..] td.tx.outputs,
-        IntMap.notMember (fromIntegral i) td.spenders
-      ]
 
 -- | Transactions whose hash, read as a number, matches a short identifier
 -- of the Blockchain.info API, in the order of their hashes.
 getNumTxData :: DatabaseReader -> PoolReads -> Word64 -> IO [TxData]
 getNumTxData r pool i = do
   inPool <- pool.startingWith prefix
-  unconfirmed <- catMaybes <$> pool.bodies inPool
   chain <- matchingAsListCF r.db (txCF r.db) (TxKeyS prefix)
-  let found =
-        Map.fromList [(txHash td.tx, td) | td <- unconfirmed]
-          <> Map.fromList [(h, td) | (TxKey h, td) <- chain, not td.deleted]
-      matches = filter (seventh . fst) (Map.toAscList found)
-  spent <- poolSpenders pool matches
-  return [withSpenders spent h td | (h, td) <- matches]
+  let confirmed = [h | (TxKey h, td :: TxData) <- chain, not td.deleted]
+  found <- known r pool (filter seventh (inPool <> confirmed))
+  return (Map.elems found)
   where
     (prefix, bits) = decodeTxKey i
     seventh h = BS.index (encode h) 6 .&. 0xf8 == bits
@@ -295,7 +280,7 @@ getUnspent r pool p =
         Nothing -> (>>= output) . only <$> pool.bodies [p.hash]
   where
     only = \case
-      [found] -> found
+      [(found, _)] -> found
       _ -> Nothing
     output td = case drop (fromIntegral p.index) td.tx.outputs of
       o : _ ->
@@ -325,12 +310,14 @@ paged :: DatabaseReader -> PoolReads -> Limits -> (From -> IO [a]) -> IO [a]
 paged r pool limits answer = pageStart r pool limits.start >>= maybe (return []) answer
 
 -- | A stream of what a function gives by the page: it is asked for a first
--- page from a start, and then for more from the last item that it gave,
--- which it gives again if it still has it, for as long as it gives full
--- pages. The pages grow, so that a short list costs one small read and a
--- long one few large ones.
-pages :: (Eq k) => (x -> k) -> (Maybe k -> Int -> IO [x]) -> Maybe k -> ConduitT i x IO ()
-pages key fetch = go 64 Nothing
+-- page of a size from a start, and then for more from the last item that
+-- it gave, which it gives again if it still has it, for as long as it gives
+-- full pages. The pages grow, so that a long list costs few reads. The
+-- first is given the size of what the query is asked for, so that one read
+-- is enough for a page of the API: each read of a pool that is far away
+-- costs more than the rows it brings.
+pages :: (Eq k) => (x -> k) -> (Maybe k -> Int -> IO [x]) -> Int -> Maybe k -> ConduitT i x IO ()
+pages key fetch first = go first Nothing
   where
     go size after start = do
       rows <- lift (fetch start size)
@@ -341,33 +328,47 @@ pages key fetch = go 64 Nothing
         _ -> return ()
 
 -- | The transactions of an address in the pool that belong in a list that
--- starts somewhere, newest first: none when it starts in the chain, or when
--- the pool has nothing for the address.
-poolTxsC :: PoolReads -> From -> Address -> Maybe MemSummary -> ConduitT i TxRef IO ()
-poolTxsC pool from a summary = case (from, summary) of
+-- starts somewhere, newest first, read so many at first: none when the
+-- list starts in the chain, or when the pool is known to have nothing for
+-- the address.
+poolTxsC :: PoolReads -> From -> Int -> Address -> Bool -> ConduitT i TxRef IO ()
+poolTxsC pool from first a touched = case (from, touched) of
   (InChain _, _) -> return ()
-  (_, Nothing) -> return ()
-  (Top, Just _) -> stream Nothing
-  (InMempool time h, Just _) -> stream (Just (time, h))
+  (_, False) -> return ()
+  (Top, True) -> stream Nothing
+  (InMempool time h, True) -> stream (Just (time, h))
   where
-    stream start = pages id (pool.addressTxs a) start .| mapC (\(t, h) -> TxRef {block = MemRef t, txid = h})
+    stream start = pages id (pool.addressTxs a) first start .| mapC (\(t, h) -> TxRef {block = MemRef t, txid = h})
 
--- | The summaries of addresses for a list that starts somewhere: none are
--- read for one that starts in the chain.
-summariesFor :: PoolReads -> From -> [Address] -> IO [Maybe MemSummary]
-summariesFor pool from as = case from of
-  InChain _ -> return (map (const Nothing) as)
-  _ -> pool.summaries as
+-- | How many items to ask a pool for at first, for a query with limits: as
+-- many as the page and what is skipped before it, and one more, so that a
+-- page that is not full is known to be the end; within bounds, for a query
+-- without a limit.
+firstPage :: Limits -> Int
+firstPage limits = case limits.limit of
+  0 -> 256
+  n -> max 16 (min 1024 (fromIntegral (n + limits.offset) + 1))
+
+-- | Whether a pool may have transactions of each of some addresses, for a
+-- list that starts somewhere. For one address it is not asked: its
+-- transactions are, which says as much in the same read. For several, the
+-- summaries are read, in one read for all of them, so that only those that
+-- have something are asked for it.
+touchedBy :: PoolReads -> From -> [Address] -> IO [Bool]
+touchedBy pool from as = case (from, as) of
+  (InChain _, _) -> return (map (const False) as)
+  (_, [_]) -> return [True]
+  _ -> map isJust <$> pool.summaries as
 
 -- | Transactions of any of the addresses, newest first, each once.
 getAddressesTxs :: DatabaseReader -> PoolReads -> [Address] -> Limits -> IO [TxRef]
 getAddressesTxs _ _ [] _ = return []
 getAddressesTxs r pool as limits = paged r pool limits $ \from -> do
-  sums <- summariesFor pool from as
+  touched <- touchedBy pool from as
   Q.withManyIters r (addrTxCF r.db) (length as) $ \its ->
-    Q.joinConduits txRefKey (zipWith3 (stream from) as sums its) limits
+    Q.joinConduits txRefKey (zipWith3 (stream from) as touched its) limits
   where
-    stream from a s it = poolTxsC pool from a s >> chainTxsC from a it
+    stream from a t it = poolTxsC pool from (firstPage limits) a t >> chainTxsC from a it
 
 -- | The stream of unspent outputs of each address, from where a page
 -- starts, given the iterators on the chain's index: the outputs that the
@@ -381,9 +382,10 @@ unspentStreams ::
   DatabaseReader ->
   PoolReads ->
   From ->
+  Limits ->
   [Address] ->
   IO ([Iterator] -> [ConduitT () Unspent IO ()])
-unspentStreams r pool from as = do
+unspentStreams r pool from limits as = do
   sums <- pool.summaries as
   return $ \its -> zipWith3 stream as sums its
   where
@@ -395,8 +397,9 @@ unspentStreams r pool from as = do
         InMempool time h -> outs a (Just (time, OutPoint h 0))
         InChain _ -> return ()
       _ -> return ()
+    -- some of what the pool pays it also spends, so more is asked for
     outs a start =
-      pages (\(u, _) -> position u) (pool.addressOuts a) start
+      pages (\(u, _) -> position u) (pool.addressOuts a) (2 * firstPage limits) start
         .| awaitForever (\(u, spent) -> if spent then return () else yield u)
     position u = case u.block of
       MemRef t -> (t, u.outpoint)
@@ -422,7 +425,7 @@ unspentStreams r pool from as = do
 getAddressesUnspents :: DatabaseReader -> PoolReads -> [Address] -> Limits -> IO [Unspent]
 getAddressesUnspents _ _ [] _ = return []
 getAddressesUnspents r pool as limits = paged r pool limits $ \from -> do
-  streams <- unspentStreams r pool from as
+  streams <- unspentStreams r pool from limits as
   Q.withManyIters r (addrOutCF r.db) (length as) $ \its ->
     Q.joinConduits unspentKey (streams its) limits
 
@@ -434,7 +437,7 @@ xPubUnspents r pool xbals limits = paged r pool limits $ \from -> do
         0 -> Nothing
         l -> Just l
       tag b = mapC (\u -> XPubUnspent {path = b.path, unspent = u})
-  streams <- unspentStreams r pool from (map (.balance.address) funded)
+  streams <- unspentStreams r pool from limits (map (.balance.address) funded)
   Q.withManyIters r (addrOutCF r.db) (length funded) $ \its ->
     runConduit $
       mergeDescGroups
@@ -459,7 +462,7 @@ getAddressesTxCount r pool as = do
     [] -> return 0
     [(_, s)] -> return (fromIntegral s.txs)
     several -> do
-      txs <- forM several $ \(a, s) -> runConduit (poolTxsC pool Top a (Just s) .| mapC (.txid) .| sinkList)
+      txs <- forM several $ \(a, _) -> runConduit (poolTxsC pool Top 256 a True .| mapC (.txid) .| sinkList)
       return (HashSet.size (HashSet.fromList (concat txs)))
   return (inBlocks + fromIntegral inPool)
 
@@ -495,7 +498,7 @@ localPool r =
           isJust <$> (retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a p) :: IO (Maybe MemAddrVal)),
       bodies = \hs -> case hs of
         [] -> return []
-        _ -> Q.retrieveManyCF r.db (mempoolCF r.db) (map TxKey hs),
+        _ -> zip <$> Q.retrieveManyCF r.db (mempoolCF r.db) (map TxKey hs) <*> mapM (M.getMempoolSpenders r) hs,
       spenders = \ps -> case ps of
         [] -> return []
         _ -> Q.retrieveManyCF r.db (mempoolCF r.db) (map MemSpenderKey ps),

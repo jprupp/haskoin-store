@@ -1278,9 +1278,36 @@ aside for these reasons:
 - **The pool has the summary for each address too**, as the local mempool
   area does, which a store still answers from when it is alone or Redis is
   down.
-- **Several round trips for a request about addresses**: the tip, the
-  summaries, and a page of entries for each address that has some. Each is
-  one script, and each checks the tip.
+- **One round trip for most requests, measured.** `FleetCost.hs` asks one
+  store the same questions alone and as the only member of a fleet, with
+  40,000 transactions in its mempool and Redis in a container on the same
+  machine, and checks that the answers are the same. Microseconds:
+
+  | | Alone | Fleet, as first built | Fleet, now |
+  |---|---|---|---|
+  | Balance of an address | 20 | 156 | 101 |
+  | Balance of the busiest address | 11 | 163 | 104 |
+  | Balances of 100 addresses | 283 | 637 | 560 |
+  | Transactions of an address with a little in the mempool | 78 | 341 | 161 |
+  | Busiest address: first 100 transactions | 414 | 1,083 | 316 |
+  | Busiest address: first 100 unspent outputs | 1,048 | 2,231 | 1,255 |
+  | A mempool transaction | 25 | 246 | 96 |
+  | 100 mempool transactions | 522 | 1,247 | 783 |
+  | Offering a transaction to the pool | | | 328 |
+
+  What a fleet adds is the time of talking to Redis, about 80 microseconds
+  a round trip here, so the work was to talk less. A request is answered
+  from the tip that the member read at its last turn, and its first read
+  of the pool checks that it is still the tip, where at first every request
+  asked for the tip before anything else; a request that reads nothing from
+  the pool asks when its handler is done. The body of a transaction comes
+  with what spends its outputs, in one read. The list of one address is
+  asked for without asking for its summary first. And the first page asked
+  of the pool is the size of the page asked of the store, instead of a
+  small one followed by a larger one.
+- **A list of many addresses is a read for each address that has
+  something**, after one for all their summaries. One script for all of
+  them would make it two.
 - **A request sees one block, but not one moment of the pool.** Each read
   of the pool is one script and checks that the tip has not moved, and a
   request that finds it moved starts again. Between two reads of one

@@ -717,7 +717,7 @@ with the size of a commit), and the latencies of each endpoint over time.
 
 ### Measurements for the layered database
 
-`docs/layered-database/` has the three programs behind the numbers in
+`docs/layered-database/` has the programs behind the numbers in
 `docs/layered-database.md`, with their output. They are not part of the
 package; each says in its header how to build and run it.
 
@@ -730,6 +730,9 @@ package; each says in its header how to build and run it.
   mempool transactions, and every kind of query, for addresses and wallets
   that have nothing, a little and much in the mempool. It checks that both
   databases give the same answers.
+- `FleetCost.hs` asks one store the same questions alone and as a member
+  of a fleet, with its mempool in a pool in Redis, checks that the answers
+  are the same, and times both.
 
 ### Contributing
 
