@@ -28,6 +28,4 @@ extra-deps:
   - nqe-0.6.9
   - haskoin-core-1.6.1
   - haskoin-node-2.5.0
-  # 1.11.0 before its release to Hackage: the commands of /events
-  - git: https://github.com/jprupp/haskoin-store-data.git
-    commit: 5cb9bf052f391ddd92a43a61ad7849a6b51a3444
+  - haskoin-store-data-1.11.0
