@@ -5,7 +5,7 @@ import Data.Either (isLeft)
 import Data.Maybe (fromJust)
 import Data.Text.Encoding (decodeUtf8)
 import Haskoin (Tx (..), bch, btc, decodeHex, txHash, txHashToHex)
-import Haskoin.Store.Web (decodeTxBody)
+import Haskoin.Store.Web (acceptsBinary, decodeTxBody)
 import Test.Hspec
 
 -- | A transaction written by hand, in the format without witness. It has
@@ -32,7 +32,25 @@ segwitTxHex =
   \00000000"
 
 spec :: Spec
-spec =
+spec = do
+  describe "acceptsBinary" $ do
+    it "takes the binary type by itself" $
+      acceptsBinary "application/octet-stream" `shouldBe` True
+    it "takes it in a list, in any case and with spaces" $ do
+      acceptsBinary "text/html, Application/Octet-Stream" `shouldBe` True
+      acceptsBinary "application/octet-stream , */*" `shouldBe` True
+    it "takes it with a weight above zero" $
+      acceptsBinary "application/octet-stream;q=0.5" `shouldBe` True
+    it "gives JSON to a wildcard, to nothing and to JSON" $ do
+      acceptsBinary "*/*" `shouldBe` False
+      acceptsBinary "" `shouldBe` False
+      acceptsBinary "application/json" `shouldBe` False
+    it "gives JSON when binary is refused with a weight of zero" $
+      acceptsBinary "application/octet-stream;q=0, application/json" `shouldBe` False
+    it "follows the weights when both are named" $ do
+      acceptsBinary "application/json;q=0.9, application/octet-stream" `shouldBe` True
+      acceptsBinary "application/json, application/octet-stream;q=0.9" `shouldBe` False
+      acceptsBinary "application/json;q=0.5, application/octet-stream; q=0.5" `shouldBe` True
   describe "decodeTxBody" $ do
     -- The id is the double SHA-256 of the bytes of plainTxHex, reversed. It
     -- was computed outside this library. The witness is not part of the id,

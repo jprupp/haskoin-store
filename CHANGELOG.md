@@ -84,6 +84,19 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   in Redis that the pool's script writes as it makes each change, and no
   longer those of their own nodes. A block is told when the fleet has
   moved to it, with every block that it moved through.
+- **Errors in binary.** A request that asks for the binary format gets
+  its errors in that format too, the 503 of a server behind its fleet
+  included. They were JSON whatever was asked. This needs
+  `haskoin-store-data` 1.10, whose client reads both.
+- **The `Accept` header is read as a list with weights.** Binary is sent
+  when `application/octet-stream` is listed with a weight above 0 that is
+  no less than that of `application/json`. The header used to be compared
+  with that one string, so a list or a weight silently gave JSON. Every
+  answer has `Vary: Accept`.
+- **The raw lists start with a count**, in binary: `/transactions/raw`,
+  `/block/{block}/transactions/raw` and `/block/height/{height}/raw` were
+  the one kind of list without it. A binary client of those three
+  endpoints has to change with the server.
 - `haskoin-store --help` names the environment variable of every option.
 - `swagger.yaml` documents the binary format: how to ask for it, the
   encoding of each type that the API returns, and what differs from JSON.

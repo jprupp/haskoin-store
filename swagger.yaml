@@ -141,6 +141,9 @@ info:
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
 
+    A request that asks for the binary format gets its errors in binary too:
+    see "Binary format".
+
     `/health` also answers 203 for a server that works but cannot reach its
     Redis; see there.
 
@@ -250,13 +253,18 @@ info:
 
     ### Asking for it
 
-    - Send the header `Accept: application/octet-stream`, with exactly that
-      value. A list of types or a `q` weight gives JSON. There is no query
+    - Send the header `Accept: application/octet-stream`. In a list of types,
+      binary is sent when that type has a `q` weight above 0 that is no less
+      than the weight of `application/json`, if that is listed too. A
+      wildcard such as `*/*`, or no header, gives JSON. There is no query
       parameter for it, and `pretty` has no effect on it.
+    - Every answer has `Vary: Accept`, so that a cache keeps the two formats
+      apart.
     - A binary answer has `Content-Type: application/octet-stream`. The body is
       one value, with nothing before or after it.
-    - **Errors are always JSON**, with `Content-Type: application/json`, as in
-      "Errors" above, whatever the request accepts. Check the status first.
+    - **An error comes in the format asked for**, like any other answer. In
+      binary it is an `Except`, described below. Servers up to version 1.8.1
+      sent every error as JSON: read the `Content-Type` of an error to tell.
     - `/health` answers 503 and 203 with a normal body, in the format asked for.
     - The only endpoint that reads a body is `POST /transactions`: one
       transaction as in the peer-to-peer protocol, as raw bytes or as hex. The
@@ -438,8 +446,23 @@ info:
 
     ### What each endpoint returns
 
-    Lists are `list T`, with two exceptions that have no count: read until the
-    body ends.
+    Lists are `list T`. The events are the one exception: they have no count,
+    because they have no end.
+
+    An error, with any status that is not a success, is an `Except`: one byte
+    that says which, and for some a body.
+
+    | Byte | Error | Body |
+    | --- | --- | --- |
+    | `00` | `not-found-or-invalid-arg` | |
+    | `01` | `server-error` | |
+    | `02` | `bad-request` | |
+    | `03` | `user-error` | The message: `bytes`, UTF-8. |
+    | `04` | `string-error` | The message: `bytes`, UTF-8. |
+    | `05` | `multiple-tx-index` | `list hash256`: the transactions that match. |
+    | `06` | `server-timeout` | |
+    | `07` | `request-too-large` | |
+    | `08` | `behind-fleet` | |
 
     | Endpoints | Body |
     | --- | --- |
@@ -461,7 +484,7 @@ info:
     | `/peers` | `list PeerInfo` |
     | `/health` | Health, as above. |
     | `…/raw` of one block or transaction | `Block` or `Tx`, bare. |
-    | `…/raw` of several | Each `Block` or `Tx` after the other, **no count**. |
+    | `…/raw` of several | `list Block` or `list Tx`. Servers up to 1.8.1 sent them with no count. |
     | `/events` | An endless stream of `Event`, **no count** and nothing between them. |
 
     The wrappers add no bytes: the `result` object of the JSON

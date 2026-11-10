@@ -73,6 +73,7 @@ module Haskoin.Store.Web
 
     -- * Request parsing
     decodeTxBody,
+    acceptsBinary,
   )
 where
 
@@ -141,6 +142,7 @@ import Data.Maybe
     fromJust,
     fromMaybe,
     isJust,
+    listToMaybe,
     mapMaybe,
     maybeToList,
   )
@@ -657,11 +659,11 @@ serveWeb config serve = do
                   False
                     | tries > 0 -> shared member (tries - 1) True answer
                     | otherwise -> behind answer
-      behind answer = answer [r {handler = \_ -> behindResponse st} :: Route | r <- routesOf st]
+      behind answer = answer [r {handler = behindResponse st} :: Route | r <- routesOf st]
       app = routerScoped (routesOf st) scoped notFound
-      notFound _ NoRoute = errorResponse st ThingNotFound
-      notFound _ (Unknown ks) =
-        errorResponse st . UserError $
+      notFound req NoRoute = errorResponse st req ThingNotFound
+      notFound req (Unknown ks) =
+        errorResponse st req . UserError $
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health cacheUp) $ \_a2 ->
@@ -688,7 +690,11 @@ serveWeb config serve = do
       -- its fleet, so that it does not hold the others back
       forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
       cacheCheck >>= atomically . writeTVar up
-    anyOrigin = modifyResponse (mapResponseHeaders (("Access-Control-Allow-Origin", "*") :))
+    -- any origin may ask, and what is answered depends on the format that
+    -- was asked for, which a cache between the client and the server has
+    -- to know: it must not give the JSON of one client to another that
+    -- asked for binary
+    anyOrigin = modifyResponse (mapResponseHeaders ([("Access-Control-Allow-Origin", "*"), ("Vary", "Accept")] <>))
 
 -- | Answer the errors of the handler of a route: an 'Except' with its
 -- status and JSON, any other error as a server error, after logging it. A
@@ -699,34 +705,37 @@ guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
     answer req e
       | Just Next <- fromException e = throwIO Next
       | Just TipMoved <- fromException e = throwIO TipMoved
-      | Just x <- fromException e = errorResponse st x
+      | Just x <- fromException e = errorResponse st req x
       | otherwise = do
           logError st.config.logger $ fmtReq req.wai <> ": " <> cs (show e)
-          errorResponse st ServerError
+          errorResponse st req ServerError
 
 -- | What a store that is a member of a fleet answers when it has no view of
 -- the block that the fleet answers from: 503, so that a load balancer sends
 -- the request to another store. Any answer of its own could differ from
 -- those of the other stores, which is what a fleet is there to prevent.
-behindResponse :: WebState -> IO Response
-behindResponse st = do
-  forM_ st.metrics $ \m -> incrementCounter m.serverErrors 1
-  return . responseLBS status503 [(hContentType, "application/json")] . A.encode $
-    A.object
-      [ "error" A..= ("behind-fleet" :: Text),
-        "message" A..= ("This server is behind the other servers of its fleet" :: Text)
-      ]
+behindResponse :: WebState -> Req -> IO Response
+behindResponse st req = errorResponse st req BehindFleet
 
--- | The response to an error, counted in the metrics.
-errorResponse :: WebState -> Except -> IO Response
-errorResponse st e = do
+-- | The response to an error, counted in the metrics, in the format that
+-- the request asked for.
+--
+-- Errors were JSON whatever was asked, because 'Except' had no binary
+-- encoding. A client that speaks binary had to carry a JSON decoder for
+-- the one answer that it least expects. From haskoin-store-data 1.10 an
+-- error has a binary encoding like everything else.
+errorResponse :: WebState -> Req -> Except -> IO Response
+errorResponse st req e = do
   forM_ st.metrics $ \m ->
     mapM_ (`incrementCounter` 1) $
       if
         | statusIsClientError (errStatus e) -> Just m.clientErrors
         | statusIsServerError (errStatus e) -> Just m.serverErrors
         | otherwise -> Nothing
-  return $ responseLBS (errStatus e) [(hContentType, "application/json")] (A.encode e)
+  return $
+    if wantsBinary req
+      then responseLBS (errStatus e) [(hContentType, "application/octet-stream")] (runPutL (serialize e))
+      else responseLBS (errStatus e) [(hContentType, "application/json")] (A.encode e)
 
 -- | Historical prices of the coin of the network in a currency at several times. Returns an empty list on failure.
 getRates ::
@@ -792,6 +801,7 @@ errStatus ServerError = status500
 errStatus TxIndexConflict {} = status409
 errStatus ServerTimeout = status500
 errStatus RequestTooLarge = status413
+errStatus BehindFleet = status503
 
 -- | The routes of every endpoint, except those disabled in the configuration.
 handlePaths :: WebState -> WebConfig -> [Route]
@@ -1014,12 +1024,43 @@ serialType :: SerialAs -> C.ByteString
 serialType SerialAsBinary = "application/octet-stream"
 serialType _ = "application/json"
 
--- | The encoding that a request asks for: binary with the header
--- @Accept: application\/octet-stream@, else JSON, pretty if the @pretty@
--- parameter or the default says so.
+-- | Whether a request asks for the binary encoding: its @Accept@ header
+-- names @application\/octet-stream@, and gives it no less weight than it
+-- gives JSON.
+--
+-- The header is a list of media types, each with a weight from 0 to 1,
+-- written @;q=@, that is 1 when left out. Binary is what is sent when
+-- @application\/octet-stream@ is in the list with a weight above 0 that is
+-- at least that of @application\/json@, if that is there too. A wildcard
+-- such as @*\/*@ asks for nothing in particular and gets JSON, the
+-- default, as does a request without the header. The header used to be
+-- compared with the one string, so that a client that sent a list, or a
+-- weight, got JSON without being told.
+wantsBinary :: Req -> Bool
+wantsBinary req = maybe False acceptsBinary (Router.header req "accept")
+
+-- | 'wantsBinary', given the value of the @Accept@ header.
+acceptsBinary :: Text -> Bool
+acceptsBinary accept =
+  case weight "application/octet-stream" of
+    Just q | q > 0 -> maybe True (q >=) (weight "application/json")
+    _ -> False
+  where
+    ranges = map range (T.splitOn "," accept)
+    weight name = lookup name ranges
+    range :: Text -> (Text, Double)
+    range part = case map T.strip (T.splitOn ";" part) of
+      [] -> ("", 0)
+      name : params -> (T.toLower name, fromMaybe 1 (listToMaybe (mapMaybe quality params)))
+    quality setting = case T.splitOn "=" setting of
+      [k, v] | T.toLower (T.strip k) == "q" -> readMaybe (T.unpack (T.strip v)) <|> Just 0
+      _ -> Nothing
+
+-- | The encoding that a request asks for: binary if it 'wantsBinary', else
+-- JSON, pretty if the @pretty@ parameter or the default says so.
 serialAs :: Req -> Bool -> IO SerialAs
 serialAs req pretty
-  | Router.header req "accept" == Just "application/octet-stream" = return SerialAsBinary
+  | wantsBinary req = return SerialAsBinary
   | otherwise = do
       p <- paramOr req readBool "pretty" pretty
       return $ if p then SerialAsPrettyJSON else SerialAsJSON

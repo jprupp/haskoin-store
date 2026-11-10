@@ -105,7 +105,7 @@ library
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -168,7 +168,7 @@ library integration
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -230,7 +230,7 @@ executable haskoin-store
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
     , haskoin-store
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -316,7 +316,7 @@ test-suite spec
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
     , haskoin-store
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , hspec >=2.11.18 && <2.12
     , http-types >=0.12.6 && <0.13
@@ -380,7 +380,7 @@ benchmark haskoin-store-bench
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
     , haskoin-store
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -442,7 +442,7 @@ benchmark haskoin-store-stress
     , haskoin-core >=1.6.1 && <1.7
     , haskoin-node ==2.5.*
     , haskoin-store
-    , haskoin-store-data ==1.9.*
+    , haskoin-store-data ==1.10.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , integration

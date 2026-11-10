@@ -33,7 +33,7 @@
 -- limit. Set @HASKOIN_TEST_LOG@ to see the log of the store.
 module Haskoin.Store.IntegrationSpec (spec) where
 
-import Control.Lens ((&), (?~), (^.))
+import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (forM_, forever, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as Key
@@ -106,7 +106,7 @@ import Haskoin.Store.Cache
     xpubId,
   )
 import Haskoin.Store.Common (StoreEvent (..))
-import Haskoin.Store.Data (Balance (..), BlockRef (..), Spender (..), TxData (..), XPubBal (..))
+import Haskoin.Store.Data (Balance (..), BlockRef (..), Except (..), Spender (..), TxData (..), XPubBal (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Fleet.Member (memberTip)
@@ -154,6 +154,7 @@ chainSpec kind = do
   it "catches up with changes that the database has before their events" catchUpTest
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
+  it "answers an error in the format that was asked for" errorFormatTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
   it "applies each change once with two stores sharing Redis" onceTest
   it "does not replace what it does not know" unknownTest
@@ -1521,6 +1522,35 @@ redisDownTest env = do
   waitFor "the health check to notice that Redis is back" $
     (== 200) . fst <$> getJSON env.cached "/health"
   checkXPub env x ref
+
+-- | An error is answered in binary to a request that asks for binary, and
+-- in JSON otherwise, and every answer says that it depends on what was
+-- asked for.
+errorFormatTest :: Env -> IO ()
+errorFormatTest env = do
+  let unknown = "/transaction/" <> replicate 64 'a'
+      ask accept = do
+        let opts =
+              Wreq.defaults
+                & Wreq.checkResponse ?~ (\_ _ -> return ())
+                & maybe id (\a -> Wreq.header "Accept" .~ [a]) accept
+        r <- Wreq.getWith opts (env.plain <> unknown)
+        return
+          ( r ^. Wreq.responseStatus . Wreq.statusCode,
+            r ^. Wreq.responseHeader "Content-Type",
+            r ^. Wreq.responseHeader "Vary",
+            r ^. Wreq.responseBody
+          )
+  (code, kind, vary, bytes) <- ask (Just "application/octet-stream")
+  (code, kind, vary) `shouldBe` (404, "application/octet-stream", "Accept")
+  -- the error, as haskoin-store-data encodes it
+  decode (BL.toStrict bytes) `shouldBe` Right ThingNotFound
+  -- in a list with a weight, which used to give JSON
+  (_, listed, _, _) <- ask (Just "text/plain;q=0.1, application/octet-stream;q=0.9")
+  listed `shouldBe` "application/octet-stream"
+  (code', kind', vary', json) <- ask Nothing
+  (code', kind', vary') `shouldBe` (404, "application/json", "Accept")
+  (body json ! "error") `shouldBe` String "not-found-or-invalid-arg"
 
 -- | Two more stores, each with its own database, syncing from the same
 -- node, as members of one fleet on the Redis of the tests, each with a web
