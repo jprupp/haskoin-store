@@ -1,0 +1,101 @@
+Output of docs/layered-database/FleetCost.hs, 2026-11-10.
+
+AMD Ryzen 9 3900X, the layered database of query-cost.txt with 40,000
+transactions in its mempool, and Redis 7 in a container on the same
+machine, reached through a forwarded port. One thread. "alone" is the store
+answering from its own database, "fleet" the same store answering as the
+only member of a fleet, from the view at the fleet tip and the pool in
+Redis. Every answer is checked to be the same both ways.
+
+##### as first built: the tip asked for at every request, bodies and spenders apart
+40000 of 40000 mempool transactions in the pool, 324 microseconds for each
+
+microseconds for each                                         alone      fleet   ratio
+balance: address with nothing in the mempool                   19.1      156.1     8.2
+balance: address with a transaction or two in the mempool       23.4      168.3     7.2
+balance: the busiest address                                    9.5      162.9    17.1
+balances of 100 addresses with nothing in the mempool         270.6      636.6     2.4
+address with nothing in the mempool: its transactions          78.7      256.8     3.3
+address with a little in the mempool: its transactions         78.5      340.5     4.3
+busiest address: first 100 transactions                       623.7     1083.3     1.7
+busiest address: first 100 unspent outputs                   1141.7     2230.7     2.0
+transaction: in the mempool                                    27.0      245.6     9.1
+100 transactions: in the mempool                              856.2     1247.0     1.5
+first 100 of the mempool                                      245.7      320.8     1.3
+
+##### from the tip that the member knows, bodies with their spenders
+40000 of 40000 mempool transactions in the pool, 325 microseconds for each
+
+microseconds for each                                         alone      fleet   ratio
+balance: address with nothing in the mempool                   19.3      113.0     5.8
+balance: address with a transaction or two in the mempool       21.0      110.0     5.2
+balance: the busiest address                                    9.5      106.0    11.1
+balances of 100 addresses with nothing in the mempool         329.9      617.4     1.9
+address with nothing in the mempool: its transactions          67.6      184.3     2.7
+address with a little in the mempool: its transactions         90.0      258.7     2.9
+busiest address: first 100 transactions                       407.0     1013.8     2.5
+busiest address: first 100 unspent outputs                   1044.1     1877.5     1.8
+transaction: in the mempool                                    28.8      102.0     3.5
+100 transactions: in the mempool                              509.5      809.7     1.6
+first 100 of the mempool                                      268.1      262.4     1.0
+
+##### and a list of one address without its summary, first pages of the size asked for
+40000 of 40000 mempool transactions in the pool, 328 microseconds for each
+
+microseconds for each                                         alone      fleet   ratio
+balance: address with nothing in the mempool                   20.3      101.3     5.0
+balance: address with a transaction or two in the mempool       20.8      105.8     5.1
+balance: the busiest address                                   11.5      104.3     9.1
+balances of 100 addresses with nothing in the mempool         283.3      559.5     2.0
+address with nothing in the mempool: its transactions          80.1      172.7     2.2
+address with a little in the mempool: its transactions         77.6      161.4     2.1
+busiest address: first 100 transactions                       413.7      315.9     0.8
+busiest address: first 100 unspent outputs                   1048.1     1255.4     1.2
+transaction: in the mempool                                    25.4       95.8     3.8
+100 transactions: in the mempool                              522.3      783.4     1.5
+first 100 of the mempool                                      247.5      318.8     1.3
+
+##### with the cache of extended public keys of a fleet, and wallets asked about
+#
+# The wallets of query-cost.txt, asked about three ways: of the store
+# alone, of the store in a fleet without the cache, and through the cache
+# after their entries are built. Every request but the first of each wallet
+# reads the balances and then what it was asked for, as a request of the
+# API does. The time that building each entry took is on the line that
+# names the wallet.
+40000 of 40000 mempool transactions in the pool, 334 microseconds for each
+
+microseconds for each                                         alone      fleet   ratio
+balance: address with nothing in the mempool                   20.2      105.2     5.2
+balance: address with a transaction or two in the mempool       21.5      109.2     5.1
+balance: the busiest address                                    9.0      105.0    11.6
+balances of 100 addresses with nothing in the mempool         299.5      576.7     1.9
+address with nothing in the mempool: its transactions          35.1      137.8     3.9
+address with a little in the mempool: its transactions         48.1      149.6     3.1
+busiest address: first 100 transactions                       189.1      342.6     1.8
+busiest address: first 100 unspent outputs                    668.8     1313.1     2.0
+transaction: in the mempool                                    26.7      107.8     4.0
+100 transactions: in the mempool                              443.6      837.2     1.9
+first 100 of the mempool                                      122.7      279.4     2.3
+
+microseconds for each                             alone      fleet     cached
+cold wallet: 464 addresses, 19499 transactions, Just (Built 464) in 467 milliseconds
+cold wallet: balances                            1741.5     4772.2     1644.2
+cold wallet: first 100 transactions              6721.4    10543.0     1531.6
+cold wallet: first 100 unspent outputs          10615.9    15814.8     2172.3
+cold wallet: count of transactions              33118.9    37792.8     1283.9
+quiet wallet: 464 addresses, 19630 transactions, Just (Built 464) in 454 milliseconds
+quiet wallet: balances                           1798.2     4415.9     1972.6
+quiet wallet: first 100 transactions             6904.6    11180.5     2384.7
+quiet wallet: first 100 unspent outputs         11317.2    15478.9     2909.8
+quiet wallet: count of transactions             33202.9    37911.9     2107.1
+busy wallet: 464 addresses, 42035 transactions, Just (Built 464) in 429 milliseconds
+busy wallet: balances                            1986.3     5357.6     3259.2
+busy wallet: first 100 transactions              9581.1    64573.8     3127.1
+busy wallet: first 100 unspent outputs          17110.9    72268.4     3852.0
+busy wallet: count of transactions              78637.7   125720.5     3884.6
+small wallet: 84 addresses, 399 transactions, Just (Built 84) in 13 milliseconds
+small wallet: balances                            317.4      822.1      424.3
+small wallet: first 100 transactions              745.7     1718.0      674.7
+small wallet: first 100 unspent outputs          1063.4     2020.7     1435.0
+small wallet: count of transactions               948.5     1897.3      553.3

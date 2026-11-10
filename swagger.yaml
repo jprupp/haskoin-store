@@ -1,3 +1,8 @@
+# Long values, such as the hexadecimal of transactions and blocks and the
+# xpubs in the examples, are split into pieces of equal width with escaped line
+# breaks in double quotes, which join the pieces with nothing between them, so
+# that every line stays under 120 columns. An xpub used as a key is split the
+# same way, as an explicit key ("? ").
 openapi: 3.0.0
 
 servers:
@@ -7,7 +12,7 @@ servers:
   - url: 'https://api.haskoin.com/btctest4/'
 
 info:
-  version: &version 1.8.0
+  version: &version 1.9.0
   title: Haskoin
   contact:
     name: JP Rupp
@@ -15,22 +20,556 @@ info:
     email: jprupp@protonmail.ch
   license:
     name: MIT
-    url: https://github.com/jprupp/haskoin-store/blob/master/store/LICENSE
+    url: https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE
   description: |
-    Rich and fast API to query indexed block chain data for Bitcoin and Bitcoin
-    Cash.
+    Haskoin Store indexes the Bitcoin (BTC) and Bitcoin Cash (BCH) block chains
+    and answers the questions that a node cannot answer on its own: what is the
+    balance of this address, which transactions belong to this wallet, which
+    outputs can it spend. It connects to the peer-to-peer network itself, keeps
+    its indices up to date with every block and every unconfirmed transaction,
+    and serves them here.
+
+    The servers of this reference are the public instance at api.haskoin.com, one per
+    network: `btc`, `bch`, and their test networks `btctest4` and `bchtest4`. The
+    same API is served by any Haskoin Store you run yourself.
+
+    ## The basics
+
+    - **Amounts** of coins are whole numbers of satoshis (1 coin is 100,000,000
+      satoshis), never decimal numbers of coins: floating-point numbers cannot
+      hold every satoshi amount exactly, and a balance that is off by one
+      satoshi is a bug that is hard to find. Only prices in other currencies,
+      in the Blockchain.info endpoints, are decimal.
+    - **Hashes** of blocks and transactions are hexadecimal, in the byte order
+      that nodes and block explorers display, so they can be copied between them
+      and this API.
+    - **Scripts and serialized data** are hexadecimal.
+    - **Times** are Unix timestamps, in seconds.
+    - **Addresses** are written as the network writes them: Base58 or Bech32 on
+      BTC, CashAddr on BCH.
+
+    ## Lists are newest first
+
+    Every list of transactions or unspent outputs starts with the newest:
+    unconfirmed transactions first, by the time this server first saw them, then
+    confirmed ones, from the highest block down, and within a block from the last
+    transaction to the first.
+
+    This is the order in which wallets and explorers show activity, and the
+    database is laid out in that order, so the first page of any list is a single
+    lookup however long the history is.
+
+    ## Paging
+
+    Lists take three parameters:
+
+    - `limit`: how many items to return. Without it the server returns its
+      default number (100, unless the operator changed it). There is a maximum,
+      lower for lists of full transactions, which are much larger; `limit=0`
+      asks for that maximum.
+    - `height`: where the page starts. It can be:
+      - a **transaction id**: the page starts at that transaction, which is
+        included;
+      - a **block hash**: the page starts at that block;
+      - a **block height**: the page starts at transactions confirmed at or below
+        that height;
+      - a **Unix time**: the page starts at the last block mined at or before
+        that time.
+
+      Numbers up to 1,230,768,000 are heights and larger ones are times. That
+      number is midnight on 1 January 2009, before the first block, so no time
+      of a block is mistaken for a height, and no chain will reach that height.
+    - `offset`: how many items to skip after the start. The server has a
+      maximum (50,000, unless the operator changed it).
+
+    **To get the next page, pass the id of the last transaction you received as
+    `height`, and `offset=1` to skip it.** An offset counts from the newest item,
+    so every new transaction shifts every page by one, and a deep offset makes the
+    server step over all the items before it. A transaction id is a fixed point:
+    pages do not shift, and the server finds the start with one lookup however
+    far back it is. The maximum offset is there because deep offsets are slow.
+
+    ## Formats
+
+    - **JSON** by default, without spaces, to keep responses small.
+    - **Pretty JSON** with `pretty=true`, indented for people to read.
+    - **Binary** with the header `Accept: application/octet-stream`: the compact
+      serialization that the Haskell client in
+      [haskoin-store-data](https://github.com/jprupp/haskoin-store-data)
+      decodes. It is smaller and faster to decode than JSON. "Binary format"
+      below gives every byte of it.
+
+    Endpoints that end in `/raw` return data serialized as in the peer-to-peer
+    protocol, in hexadecimal inside JSON (`{"result": "0100…"}`), or as bytes
+    with the binary format.
+
+    ## Parameters are checked
+
+    Every endpoint lists the parameters it accepts, and refuses a request with
+    any other, with 400 and a message that names it:
+
+    ```json
+    {"error": "user-error", "message": "Unknown parameter: limt"}
+    ```
+
+    A value that the endpoint cannot read is refused the same way, such as
+    `limit=ten`, `notx=yes` or `derive=Legacy`. Without this, a misspelt
+    parameter or a value the server does not understand would be ignored, and
+    the client would get an answer to a question it did not ask, with nothing
+    to tell it so. Requests are checked before anything is done, so a refused
+    request has no effect.
+
+    One thing is not refused, because it is not a mistake: a `limit` above the
+    server's maximum is lowered to it, as a client cannot know the maximum of
+    every server. Names of parameters are case-sensitive.
+
+    ## Errors
+
+    An error is a JSON object with a stable `error` code, for programs, and a
+    `message`, for people:
+
+    ```json
+    {"error": "user-error", "message": "Invalid value for parameter limit: ten"}
+    ```
+
+    | Status | `error` | When |
+    | --- | --- | --- |
+    | 400 | `user-error`, `bad-request` | A parameter or the body is wrong; the message says which. |
+    | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
+    | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
+    | 500 | `server-error` | Something went wrong on the server; it is logged there. |
+    | 503 | | From `/health`: the server is not ready. |
+    | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
+
+    A request that asks for the binary format gets its errors in binary too:
+    see "Binary format".
+
+    `/health` also answers 203 for a server that works but cannot reach its
+    Redis; see there.
+
+    A value in the path that does not parse, such as a misspelt address, gives
+    404 rather than 400. Paths are matched by the shape of what is in them, and
+    a segment that does not parse may belong to another endpoint (`/block/best`
+    and `/block/{block}` share a prefix), so the server tries the others, and
+    when none matches it answers that there is nothing there. Query parameters
+    are not ambiguous, so a bad one gives 400, with its name in the message.
+
+    A 409 comes only from the Blockchain.info endpoints, which can name a
+    transaction by a short number; the error lists the matching ids in `txids`.
+
+    The codes `server-timeout` and `request-too-large` are part of the format, for
+    clients that decode it, but this version of the server does not send them.
+
+    ## Unconfirmed transactions
+
+    The mempool is indexed like the chain. A payment shows up in balances and
+    histories as soon as this server sees it on the network, with
+    `"block": {"mempool": <time first seen>}` instead of a block height.
+
+    A transaction can leave the mempool without being confirmed: when a block
+    confirms another transaction that spends the same coins, or, on BTC, when a
+    replacement that pays a higher fee arrives (replace-by-fee). It is then
+    removed from every balance and history, together with any transaction that
+    spends its outputs. From then on the server answers as if it had never
+    seen it: fetching it by its id gives 404. Earlier versions answered with
+    the transaction and `"deleted": true`, which clients that did not look at
+    that field took for a pending payment.
+
+    ## Reorganisations
+
+    When the network switches to a chain with more work, the server undoes the
+    blocks that are no longer in it, puts their transactions back in the
+    mempool, and applies the new blocks. Every answer reflects the chain with
+    the most work at the time of the request. Blocks of an abandoned chain keep
+    answering by hash, with `"mainchain": false`.
+
+    ## What the server trusts
+
+    The server follows the chain with the most proof of work, as the network
+    reports it, and checks what it needs to keep its indices consistent: that
+    inputs exist and are not spent twice. It does not validate scripts or every
+    consensus rule, as a full node does. Its answers are what the network says;
+    for payments where a mistake would be costly, wait for confirmations, as with
+    any wallet.
+
+    ## Extended public keys
+
+    Most wallets are an extended public key (xpub) from which they derive their
+    addresses. The `/xpub` endpoints answer for all of them at once: the server
+    derives the receiving chain (`0`) and the change chain (`1`), and looks at
+    every address up to the last used one of each chain and then a gap of unused
+    addresses after it (32, unless the operator changed it), and always at least
+    the first 20 addresses. A payment to an address further away is not seen,
+    as a wallet that follows BIP 44 with the same gap would not see it either.
+
+    The `derive` parameter says which kind of address the wallet derives. An
+    xpub does not say it, and the same key gives different addresses for each
+    kind, so asking for the wrong kind would find nothing, and a wallet would
+    show its user a zero balance. Instead, when a wallet has no transactions
+    with the kind asked for but has some with another kind, the server answers
+    400 with a message that names the right one. A wallet with no transactions
+    of any kind is new, and gets an empty answer. The check only runs for
+    wallets that look empty, so it costs nothing for wallets in use.
+
+    Servers with a Redis cache keep large wallets ready: their first query reads
+    the database and caches the result, and later ones are answered from memory.
+    A cached answer is always the same as the database's; `nocache=true` skips
+    the cache. The servers of a fleet share one such cache, and each answers
+    from it what it would answer from its database at the block that the
+    fleet answers from.
+
+    ## Live updates
+
+    Instead of polling, keep `/events` open: it sends a line for every new block
+    and every change to the mempool, as a stream of JSON lines or over a
+    WebSocket. Events carry only the hash; fetch what you need from it.
+
+    The server keeps its last 10,000 events. A client that lost its connection
+    comes back with `?after=` and the hash of the last event it heard, and gets
+    what came after it. A client that falls further behind than that is
+    disconnected, so that a slow client costs the server nothing.
+
+    Over the WebSocket a client can choose the transactions it hears about: by
+    address, by extended public key, or with a Bloom filter. See `/events`.
+
+    The servers of a fleet all send the same events in the same order: those of
+    the block and the mempool that the fleet shares, not what each server's own
+    node saw. A transaction is told when it enters the shared mempool and when
+    it leaves it unconfirmed, and a block when the fleet has moved to it, which
+    is when every server can answer about it. A client can therefore reconnect
+    to another server and ask it about what the first one told.
+
+    ## Blockchain.info compatibility
+
+    The endpoints under `/blockchain/` answer like those of Blockchain.info, with
+    the same parameters, field names and conventions, so that software written
+    for it can switch by changing its base URL. They are documented here where
+    they differ or where the original is unclear. An operator may turn them off.
+
+    ## Browsers
+
+    Every response has the header `Access-Control-Allow-Origin: *`, so web
+    applications can call the API directly from a browser. The API needs no
+    credentials and keeps no sessions, so there is nothing for another site to
+    abuse. A browser that first asks what it may send, with `OPTIONS`, is told:
+    `GET`, `HEAD`, `POST` and `DELETE`, with the headers `Accept` and
+    `Content-Type`.
+
+    ## HTTP
+
+    - **`HEAD`** works wherever `GET` does, and answers with the headers alone.
+    - **Compression.** A request with `Accept-Encoding: gzip` gets its answer
+      compressed, in either format. The events are not compressed: they have
+      to leave as they happen.
+    - **Long lists.** The endpoints that take a list of addresses, blocks,
+      heights or transactions in a parameter take it under `POST` too, with
+      the same parameters in a body of type
+      `application/x-www-form-urlencoded`. A URL has room for some hundred
+      addresses; a body has no such limit. `/transactions` is the exception:
+      `POST` there publishes a transaction.
+    - **`Vary: Accept, Accept-Encoding`** is on every answer, so that a cache
+      keeps the formats apart.
+    - **`Retry-After`** is on a 503: one second from a server that is behind
+      its fleet, five from a health check that fails.
+    - **The reference itself** is at the root of every server: `/` is this
+      page, for the version that the server runs, and `/swagger.yaml` the file
+      behind it.
+
+    ## Binary format
+
+    This section is enough to write a client in any language.
+
+    ### Asking for it
+
+    - Send the header `Accept: application/octet-stream`. In a list of types,
+      binary is sent when that type has a `q` weight above 0 that is no less
+      than the weight of `application/json`, if that is listed too. A
+      wildcard such as `*/*`, or no header, gives JSON. There is no query
+      parameter for it, and `pretty` has no effect on it.
+    - Every answer has `Vary: Accept`, so that a cache keeps the two formats
+      apart.
+    - A binary answer has `Content-Type: application/octet-stream`. The body is
+      one value, with nothing before or after it.
+    - **An error comes in the format asked for**, like any other answer. In
+      binary it is an `Except`, described below. Servers up to version 1.8.1
+      sent every error as JSON: read the `Content-Type` of an error to tell.
+    - `/health` answers 503 and 203 with a normal body, in the format asked for.
+    - The only endpoint that reads a body is `POST /transactions`: one
+      transaction as in the peer-to-peer protocol, as raw bytes or as hex. The
+      server tells them apart by content, not by `Content-Type`.
+    - The Blockchain.info endpoints and `/dbstats` have no binary form.
+    - Over the WebSocket at `/events`, binary is binary frames: the server
+      sends them when the handshake asked for binary, and from the first binary
+      frame that the client sends.
+
+    ### Primitives
+
+    Everything is big-endian, except inside the peer-to-peer structures (`Tx`,
+    `BlockHeader`, `OutPoint`, `Block`), which are byte for byte what nodes send.
+
+    | Name | Encoding |
+    | --- | --- |
+    | `u8`, `u32`, `u64` | Unsigned integer of 1, 4 or 8 bytes, big-endian. |
+    | `i32`, `i64` | Two's complement, big-endian. |
+    | `u32le`, `u64le` | Little-endian; only in peer-to-peer structures. |
+    | `bool` | One byte: `00` false, `01` true. |
+    | `bytes` | `u64` length, then that many bytes. |
+    | `text` | `bytes` that hold UTF-8. |
+    | `list T` | `u64` count, then that many `T`. |
+    | `opt T` | `00` for none; `01` then `T`. |
+    | `map T` | `list` of pairs `u64` key, `T`; keys ascending, each once. |
+    | `hash256` | 32 bytes, in the reverse order of the hex in JSON. |
+    | `hash160` | 20 bytes, in the order of the hex. |
+    | `varint` | Bitcoin's CompactSize, shortest form; only in peer-to-peer structures. |
+    | `integer` | See below. |
+
+    There are no variable-length integers outside the peer-to-peer structures:
+    every length and count is a `u64`. A type with several forms starts with a
+    tag byte, given in its table.
+
+    `integer` holds a number of any size. `00` then `i32` when it fits 32 bits.
+    Otherwise `01`, a sign byte (`01`, or `ff` for negative), a `u64` length,
+    and the absolute value in that many bytes, least significant first, with no
+    zero byte at the end.
+
+    ### Peer-to-peer structures
+
+    | Type | Layout |
+    | --- | --- |
+    | `OutPoint` | `hash256` transaction id, `u32le` output index. 36 bytes. |
+    | `BlockHeader` | `u32le` version, `hash256` previous, `hash256` Merkle root, `u32le` time, bits, nonce. |
+    | `Tx` | `u32le` version, `varint` count, inputs, `varint` count, outputs, `u32le` lock time. |
+    | `Tx` input | `OutPoint`, `varint` length, script, `u32le` sequence. |
+    | `Tx` output | `u64le` value, `varint` length, script. |
+    | `Block` | `BlockHeader`, `varint` count, that many `Tx`. |
+
+    A `Tx` with a witness has the SegWit form: `00 01` after the version, and
+    before the lock time one stack per input, each a `varint` count of items,
+    each a `varint` length and bytes. A `Tx` in which no input has a witness is
+    written in the form without it, on every network.
+
+    ### Address
+
+    An address is a tag and a hash. It does not carry its network, so it decodes
+    without knowing it. Writing it as text needs the network.
+
+    | Tag | Then | Kind |
+    | --- | --- | --- |
+    | `00` | `hash160` | Pay to public key hash. |
+    | `01` | `hash160` | Pay to script hash. |
+    | `02` | `hash160` | Pay to witness public key hash. |
+    | `03` | `hash256` | Pay to witness script hash. |
+    | `04` | `u8` version, `bytes` program (40 at most) | Other SegWit address, such as Taproot. |
+    | `05` | `hash256` | Pay to script hash of 32 bytes (BCH). |
+    | `06` | `u8` type, `bytes` hash (64 at most) | Other CashAddr address. |
+
+    The `hash256` of tags `03` and `05` is in the order of the script, not
+    reversed.
+
+    ### BlockRef and TxRef
+
+    `BlockRef` says where a transaction is. Its numbers are **inverted**: each
+    is written as the largest value of its width minus the number, so that the
+    bytes sort newest first. Subtract again to read them.
+
+    | Tag | Then | Meaning |
+    | --- | --- | --- |
+    | `00` | `u64`: 2^64 - 1 - time | In the mempool; time first seen. |
+    | `01` | `u32`: 2^32 - 1 - height, `u32`: 2^32 - 1 - position | In a block, at that position in it. |
+
+    `TxRef` is a `BlockRef`, then the `hash256` transaction id.
+
+    ### Transaction
+
+    | Field | Encoding | Note |
+    | --- | --- | --- |
+    | block | `BlockRef` | |
+    | version | `u32` | |
+    | locktime | `u32` | |
+    | inputs | `list Input` | |
+    | outputs | `list Output` | |
+    | deleted | `bool` | |
+    | rbf | `bool` | |
+    | time | `u64` | Not inverted. |
+    | txid | `hash256` | |
+    | size | `u32` | With the witness. |
+    | weight | `u32` | Present on every network. |
+    | fee | `u64` | 0 for a coinbase. |
+
+    `Input`, by tag:
+
+    | Field | Encoding | `00` coinbase | `01` other |
+    | --- | --- | --- | --- |
+    | outpoint | `OutPoint` | yes | yes |
+    | sequence | `u32` | yes | yes |
+    | sigscript | `bytes` | yes | yes |
+    | pkscript | `bytes` | | yes |
+    | value | `u64` | | yes |
+    | witness | `list bytes` | yes | yes |
+    | address | `opt Address` | | yes |
+
+    The witness list is present on every network, and empty where there is none.
+
+    `Output`: `u64` value, `bytes` script, `opt Spender`, `opt Address`.
+
+    `Spender`: `hash256` id of the spending transaction, `u32` input index.
+
+    `TxData` is the record of a transaction in the database. No endpoint
+    returns it; it is here for programs that read the database.
+
+    | Field | Encoding | Note |
+    | --- | --- | --- |
+    | block | `BlockRef` | |
+    | tx | `Tx` | |
+    | prevs | `map Prev` | By input index. `Prev`: `bytes` script, `u64` value. |
+    | deleted | `bool` | |
+    | rbf | `bool` | |
+    | time | `u64` | |
+    | spenders | `map Spender` | By output index. |
+
+    ### Blocks, balances and unspent outputs
+
+    `BlockData`. The hash is not sent: it is the double SHA-256 of the header.
+
+    | Field | Encoding | Note |
+    | --- | --- | --- |
+    | height | `u32` | |
+    | mainchain | `bool` | |
+    | work | `integer` | |
+    | header | `BlockHeader` | |
+    | size | `u32` | |
+    | weight | `u32` | Present on every network. |
+    | tx | `list hash256` | |
+    | outputs | `u64` | |
+    | fee | `u64` | |
+    | subsidy | `u64` | |
+
+    | Type | Layout |
+    | --- | --- |
+    | `Balance` | `Address`, then `u64` confirmed, unconfirmed, utxo, txs, received. |
+    | `Unspent` | `BlockRef`, `OutPoint`, `u64` value, `bytes` script, `opt Address`. |
+    | `XPubBal` | `list u32` path, `Balance`. |
+    | `XPubUnspent` | `list u32` path, `Unspent`. |
+    | `XPubSummary` | `u64` confirmed, unconfirmed, received, utxo; `u32` external, change. |
+    | `TxId` | `hash256`. |
+    | `Event` | Tag `00` new best block or `01` mempool transaction, then `hash256`. 33 bytes. |
+    | `PeerInfo` | `bytes` user agent, `text` address, `i32` version, `u64` services, `bool` relay. |
+
+    ### Commands of the event WebSocket
+
+    What a client sends in a binary frame over the WebSocket at `/events`, one
+    command to a frame: a tag, then what it carries.
+
+    | Tag | Then | Command |
+    | --- | --- | --- |
+    | `00` | `list Address` | Watch these addresses too. |
+    | `01` | `list Address` | Stop watching these addresses. |
+    | `02` | `XPub`, `u8` derivation | Watch this extended public key too. |
+    | `03` | `XPub`, `u8` derivation | Stop watching this key. |
+    | `04` | `Filter` | Set the Bloom filter, in place of the one before. |
+    | `05` | `bytes`, 520 at most | Add an element to the Bloom filter. |
+    | `06` | | Remove the Bloom filter. |
+    | `07` | | Forget all of it, and hear of every transaction. |
+    | `08` | | Forget all of it, and hear of blocks alone. |
+
+    `XPub` is the 78 bytes of the key as BIP 32 serializes it, which is what
+    the Base58Check of its text decodes to: `u32` version of the network, `u8`
+    depth, 4 bytes fingerprint of the parent, `u32` index, 32 bytes chain code,
+    33 bytes compressed public key. The derivation is `00` legacy, `01` compat,
+    `02` segwit.
+
+    `Filter` is the `filterload` message of the peer-to-peer protocol (BIP 37):
+    `varint` length and that many bytes of filter, 36,000 at most, `u32le`
+    number of hash functions, 50 at most, `u32le` tweak, `u8` flags.
+
+    ### Health
+
+    Each part starts with its own `ok`, which repeats what its numbers say.
+
+    | Field | Encoding | Note |
+    | --- | --- | --- |
+    | ok | `bool` | The whole check. |
+    | blocks | `bool` ok, `u32` headers, `u32` blocks, `i32` max | |
+    | last-block | `bool` ok, `i64` age, `i64` max | |
+    | last-tx | `bool` ok, `i64` age, `i64` max | |
+    | pending-txs | `bool` ok, `i64` count, `i64` max | |
+    | peers | `bool` ok, `i64` count, `i64` min | |
+    | net | `text` | |
+    | version | `text` | |
+    | time | `u64` | A number, not the text of the JSON. |
+    | redis | `u8` | `00` no cache, `01` not answering, `02` answering. |
+
+    Older servers end the body before `redis`; read that as no cache.
+
+    ### What each endpoint returns
+
+    Lists are `list T`. The events are the one exception: they have no count,
+    because they have no end.
+
+    An error, with any status that is not a success, is an `Except`: one byte
+    that says which, and for some a body.
+
+    | Byte | Error | Body |
+    | --- | --- | --- |
+    | `00` | `not-found-or-invalid-arg` | |
+    | `01` | `server-error` | |
+    | `02` | `bad-request` | |
+    | `03` | `user-error` | The message: `bytes`, UTF-8. |
+    | `04` | `string-error` | The message: `bytes`, UTF-8. |
+    | `05` | `multiple-tx-index` | `list hash256`: the transactions that match. |
+    | `06` | `server-timeout` | |
+    | `07` | `request-too-large` | |
+    | `08` | `behind-fleet` | |
+
+    | Endpoints | Body |
+    | --- | --- |
+    | `/block/{block}`, `/block/best`, `/block/time/…`, `/block/mtp/…` | `BlockData` |
+    | `/blocks`, `/block/latest`, `/block/height/…`, `/block/heights` | `list BlockData` |
+    | `/transaction/{txid}` | `Transaction` |
+    | `/transactions`, `/transactions/block/…`, `…/transactions/full` | `list Transaction` |
+    | `/address/…/transactions`, `/xpub/…/transactions` | `list TxRef` |
+    | `/address/{address}/balance` | `Balance` |
+    | `/address/balances` | `list Balance` |
+    | `/address/…/unspent` | `list Unspent` |
+    | `/xpub/{xpub}` | `XPubSummary` |
+    | `/xpub/{xpub}/balances` | `list XPubBal` |
+    | `/xpub/{xpub}/unspent` | `list XPubUnspent` |
+    | `DELETE /xpub/{xpub}` | `bool` |
+    | `/transaction/{txid}/after/{height}` | `opt bool` |
+    | `POST /transactions` | `TxId` |
+    | `/mempool` | `list hash256` |
+    | `/peers` | `list PeerInfo` |
+    | `/health` | Health, as above. |
+    | `…/raw` of one block or transaction | `Block` or `Tx`, bare. |
+    | `…/raw` of several | `list Block` or `list Tx`. Servers up to 1.8.1 sent them with no count. |
+    | `/events` | An endless stream of `Event`, **no count** and nothing between them. |
+
+    The wrappers add no bytes: the `result` object of the JSON
+    (`GenericResult`, `RawResult`, `RawResultList` in the Haskell client) is
+    its content alone, and `SerialList` is `list T`.
 
 tags:
   - name: Address
-    description: Operations on addresses and extended public keys.
+    description: |
+      Balances, transactions and unspent outputs of addresses, one at a time or
+      many at once, and of extended public keys (xpubs), which stand for every
+      address of a wallet.
   - name: Transaction
-    description: Operations related to transactions.
+    description: |
+      Transactions by id, the transactions of a block, the mempool, and
+      broadcasting new transactions to the network.
   - name: Block
-    description: Operations related to blocks.
+    description: |
+      Blocks by hash, height or time, the newest blocks, and their serialized
+      form.
   - name: Network
-    description: Network statistics and other miscelaneous operations.
+    description: |
+      The state of the server and the network: health, peers, and a live stream of
+      new blocks and transactions.
   - name: Blockchain
-    description: Blockchain.info compatibility. May be disabled.
+    description: |
+      Endpoints that answer like those of Blockchain.info, for software written
+      for it. An operator may turn them off, in which case they answer 404.
 
 paths:
   '/health':
@@ -38,10 +577,44 @@ paths:
       tags:
         - Network
       summary: Health Check
+      description: |
+        Whether this server is ready to answer, for load balancers and monitoring.
+
+        The status is **200** when every check passes and **503** when one fails;
+        the body is the same either way and says which check failed. A server that is
+        still catching up with the network answers 503, so a load balancer stops
+        sending it traffic until its answers are current.
+
+        A server that has a Redis cache and cannot reach it answers **203** when
+        every check passes, with the header `Haskoin-Degraded: redis` and
+        `"redis": {"ok": false}` in the body. It goes on
+        answering every request, from its own database: the answers are right for
+        what this server has seen, but they are no longer the ones that the servers
+        sharing that Redis give together, and requests about large wallets are
+        slower. A load balancer that takes any status in the 200s for healthy keeps
+        sending it traffic, which is what it should do; a monitor that expects 200
+        sees that something is wrong.
+
+        The checks are run in the background every 30 seconds (unless the operator
+        changed it), and this endpoint returns the latest result. It does no work of
+        its own, so it is safe to call as often as a load balancer likes.
       operationId: healthCheck
       parameters:
         - $ref: '#/components/parameters/prettyParam'
       responses:
+        '203':
+          description: |
+            Every check passes, but the server cannot reach its Redis and answers
+            from its own database alone. The body is that of 200.
+          headers:
+            Haskoin-Degraded:
+              description: What the server is doing without; `redis`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthCheck'
         '200':
           description: success
           content:
@@ -74,6 +647,7 @@ paths:
                   ok: true
                   count: 20
                   min: 1
+                time: '2021-06-14 10:21:43 UTC'
             application/octet-stream:
               schema:
                 type: string
@@ -97,7 +671,7 @@ paths:
                   ok: true
                   max: 100
                   count: 0
-                version: 0.52.14
+                version: *version
                 last-tx:
                   ok: true
                   max: 300
@@ -108,14 +682,26 @@ paths:
                   age: 3279
                 peers:
                   ok: false
-                  count: 20
-                  min: 0
-                
+                  count: 0
+                  min: 1
+                time: '2021-06-14 10:21:43 UTC'
+
   '/address/{address}/transactions':
     get:
       tags:
         - Address
       summary: Transactions for Address
+      description: |
+        The transactions that pay to or spend from an address, newest first, as
+        transaction ids with their place in the chain.
+
+        This is the light way to follow an address: fetch the transactions you do not
+        have yet with `/transactions`. Use `/transactions/full` to get them in one
+        call when you need them all. See *Paging* at the top for `limit`, `offset`
+        and `height`.
+
+        An address with no transactions gives an empty list. An address that does
+        not parse for this network gives 404.
       operationId: getAddressTxs
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -151,12 +737,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/address/{address}/transactions/full':
     get:
       tags:
         - Address
       summary: Detailed Address Transactions
+      description: |
+        Like `/address/{address}/transactions`, with the full transactions instead
+        of their ids.
+
+        Full transactions are much larger, so the most that one call returns is
+        lower (5,000, unless the operator changed it).
       operationId: getAddressTxsFull
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -183,7 +775,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -218,7 +813,10 @@ paths:
                     - coinbase: false
                       txid: 741f605735c995ab6d79814da49002f7b4eea973656e70410cbf7969ebf467fd
                       output: 0
-                      sigscript: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                      sigscript: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                 e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                 49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                 a1f2407442f7a6d39ad2"
                       sequence: 4294967294
                       pkscript: 76a9145124c4e68eed7ffc6110c2326d7d3739f55a09eb88ac
                       value: 2775188314
@@ -260,6 +858,12 @@ paths:
       tags:
         - Address
       summary: Multiple Address Transactions
+      description: |
+        The transactions of several addresses, merged into one list, newest first.
+        A transaction that touches several of the addresses appears once.
+
+        This is how to follow a wallet that is a list of addresses rather than an
+        xpub: one call, and one consistent page, instead of one call per address.
       operationId: getMultipleAddressTxs
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -309,6 +913,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Detailed Transactions
+      description: |
+        Like `/address/transactions`, with the full transactions instead of their
+        ids, and the lower maximum of full transactions.
       operationId: getMultipleAddressTxsFull
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -335,7 +942,10 @@ paths:
                     - coinbase: false
                       txid: 00f304a6089a708168cd10d5ad8abd2977c36791156a55b040117cb5a3db7fad
                       output: 1
-                      sigscript: 4730440220362587be41ff4ca25ef097b6c4229b031c26420f53143560fc8bf24f65418dac022034b0c97cef1ff51460346daca727f926ee675e1acaf63cb092a8a39cb3b5d8f94121029832be5ec435a55cd8c09474348cf7ffdcf266ae4fc88f390bde21d9a9c60d09
+                      sigscript: "4730440220362587be41ff4ca25ef097b6c4229b031c26420f53143560fc8bf2\
+                                 4f65418dac022034b0c97cef1ff51460346daca727f926ee675e1acaf63cb092\
+                                 a8a39cb3b5d8f94121029832be5ec435a55cd8c09474348cf7ffdcf266ae4fc8\
+                                 8f390bde21d9a9c60d09"
                       sequence: 4294967294
                       pkscript: 76a9143ea707954f63a225fe4630701df0924c9e835a3488ac
                       value: 2259981628
@@ -370,7 +980,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -405,7 +1018,10 @@ paths:
                     - coinbase: false
                       txid: b810589c80335083ed715c03abf62f23968846d2f54343bac305f890f292ec8e
                       output: 1
-                      sigscript: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                      sigscript: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                 d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                 5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                 4c07b9f8c3d04327794c"
                       sequence: 4294967294
                       pkscript: 76a91437d070b3c6716a6174080722579fbdddad39bfb388ac
                       value: 2275183814
@@ -440,7 +1056,10 @@ paths:
                     - coinbase: false
                       txid: 741f605735c995ab6d79814da49002f7b4eea973656e70410cbf7969ebf467fd
                       output: 0
-                      sigscript: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                      sigscript: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                 e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                 49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                 a1f2407442f7a6d39ad2"
                       sequence: 4294967294
                       pkscript: 76a9145124c4e68eed7ffc6110c2326d7d3739f55a09eb88ac
                       value: 2775188314
@@ -483,6 +1102,12 @@ paths:
         - Address
       operationId: getBalance
       summary: Address Balance
+      description: |
+        The balance of an address: confirmed and unconfirmed amounts, the number of
+        unspent outputs and of transactions, and the total ever received.
+
+        An address that has never been used has a balance of zero rather than giving
+        404: every valid address exists, it just has not received anything yet.
       parameters:
         - $ref: '#/components/parameters/addressParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -516,6 +1141,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Balances
+      description: |
+        The balances of several addresses, in one call. Every address in the request
+        has a balance in the response, unused ones with zeros.
       operationId: getMultipleAddressBalances
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -558,6 +1186,13 @@ paths:
       tags:
         - Address
       summary: Address Unspent Outputs
+      description: |
+        The outputs paid to an address that are not spent yet, newest first: the
+        coins a wallet can spend.
+
+        Outputs spent by an unconfirmed transaction are left out, because spending
+        them again would conflict with it. Unconfirmed outputs are included, with
+        `"block": {"mempool": …}`; whether to spend them is the wallet's choice.
       operationId: getAddressUnspent
       parameters:
         - $ref: '#/components/parameters/addressParam'
@@ -623,6 +1258,9 @@ paths:
       tags:
         - Address
       summary: Multiple Address Unspent Outputs
+      description: |
+        The unspent outputs of several addresses, merged into one list, newest
+        first.
       operationId: getMultipleAddressUnspent
       parameters:
         - $ref: '#/components/parameters/addressesParam'
@@ -696,6 +1334,12 @@ paths:
       tags:
         - Block
       summary: Block Chain Head
+      description: |
+        The newest block of the chain with the most work that this server has
+        imported.
+
+        It can be a block or two behind the network while the server imports a new
+        one; `/health` says how far behind it is.
       operationId: getBlockHead
       parameters:
         - $ref: '#/components/parameters/notxParam'
@@ -774,7 +1418,12 @@ paths:
       tags:
         - Block
       summary: Raw Block Chain Head
+      description: |
+        The newest block, serialized as in the peer-to-peer protocol, with all its
+        transactions.
       operationId: getRawBlockHead
+      parameters:
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -789,7 +1438,13 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 010000006f187fddd5e28aa1b4065daa5d9eae0c487094fb20cf97ca02b81c84000000005b7b25b51797f83192f9fd2c3871bfb27570a7d6b56d3a50760613d1a2fc1aeeab346849ffff001d36d950710101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0120ffffffff0100f2052a0100000043410408ab2f56361f83064e4ce51acc291fb57c2cbcdb1d6562f6278c43a1406b548fd6cefc11bcc29eb620d5861cb9ed69dc39f2422f54b06a8af4f78c8276cfdc6bac00000000
+                    example: "010000006f187fddd5e28aa1b4065daa5d9eae0c487094fb20cf97ca02b81c84\
+                             000000005b7b25b51797f83192f9fd2c3871bfb27570a7d6b56d3a50760613d1\
+                             a2fc1aeeab346849ffff001d36d9507101010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                             0120ffffffff0100f2052a0100000043410408ab2f56361f83064e4ce51acc29\
+                             1fb57c2cbcdb1d6562f6278c43a1406b548fd6cefc11bcc29eb620d5861cb9ed\
+                             69dc39f2422f54b06a8af4f78c8276cfdc6bac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -800,6 +1455,10 @@ paths:
       tags:
         - Block
       summary: Most Recent Blocks
+      description: |
+        The newest block and the ones before it, up to 100 blocks, newest first. For
+        explorers that show recent blocks; use `notx=true` when you do not need the
+        transaction ids, as blocks can have thousands of them.
       operationId: getLatestBlocks
       parameters:
         - $ref: '#/components/parameters/notxParam'
@@ -866,13 +1525,18 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/block/{block}':
     get:
       tags:
         - Block
       operationId: getBlock
       summary: Block Information
+      description: |
+        A block by its hash, with the ids of its transactions.
+
+        Blocks that are no longer in the main chain after a reorganisation keep
+        answering, with `"mainchain": false`, so a link to a block never breaks.
       parameters:
         - $ref: '#/components/parameters/notxParam'
         - $ref: '#/components/parameters/blockParam'
@@ -914,15 +1578,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/block/{block}/raw':
     get:
       tags:
         - Block
       operationId: getRawBlock
       summary: Raw Block
+      description: |
+        A block by its hash, serialized as in the peer-to-peer protocol, with all
+        its transactions.
       parameters:
         - $ref: '#/components/parameters/blockParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -937,7 +1605,36 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac4247e9f337221b4d4c86041b0f2b57100401000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08044c86041b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac000000000100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac000000000100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac0000000001000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f00000000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000
+                    example: "0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200\
+                             000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac\
+                             4247e9f337221b4d4c86041b0f2b571004010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff08044c86041b\
+                             020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79\
+                             a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d08\
+                             7fedf9ce467cb9f7c6287078f801df276fdf84ac000000000100000001032e38\
+                             e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000\
+                             008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57d\
+                             a93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1\
+                             ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6c\
+                             a164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f\
+                             25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c3\
+                             98efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a9\
+                             14948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac000000000100000001\
+                             c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf\
+                             010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27\
+                             942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe21\
+                             9a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d\
+                             9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b9\
+                             0da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914\
+                             b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976\
+                             a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac0000000001000000\
+                             010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51\
+                             f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd97\
+                             7500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb46\
+                             5f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336\
+                             185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d4\
+                             2fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f000000000019\
+                             76a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -955,6 +1652,10 @@ paths:
         - Block
       operationId: getBlocks
       summary: Information for Multiple Blocks
+      description: |
+        Several blocks by hash, in one call. Hashes that are not known are left out
+        of the response rather than failing the whole request, and repeated hashes
+        are answered once.
       parameters:
         - $ref: '#/components/parameters/notxParam'
         - $ref: '#/components/parameters/blocksParam'
@@ -1012,6 +1713,10 @@ paths:
         - Block
       operationId: getBlocksAtHeight
       summary: Blocks at Height
+      description: |
+        The blocks at a height. It is a list because the server keeps the blocks of
+        chains that were abandoned in a reorganisation; the one in the main chain
+        has `"mainchain": true`.
       parameters:
         - $ref: '#/components/parameters/blockHeightParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1059,8 +1764,11 @@ paths:
         - Block
       operationId: getRawBlocksAtHeight
       summary: Raw Blocks at Height
+      description: |
+        The blocks at a height, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/blockHeightParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1072,7 +1780,13 @@ paths:
                 type: array
                 items:
                   type: string
-                  example: 01000000eb68047fb29d78480b567ef6b76be556a2ec975656424508cc1c69b700000000bad58718fc3c6f5474918f06c44400c70b4c86d55a3f3ca3493b1d40c2061f2ba00f6b49ffff001d064b3a6d0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0138ffffffff0100f2052a010000004341045e071dedd1ed03721c6e9bba28fc276795421a378637fb41090192bb9f208630dcbac5862a3baeb9df3ca6e4e256b7fd2404824c20198ca1b004ee2197866433ac00000000
+                  example: "01000000eb68047fb29d78480b567ef6b76be556a2ec975656424508cc1c69b7\
+                           00000000bad58718fc3c6f5474918f06c44400c70b4c86d55a3f3ca3493b1d40\
+                           c2061f2ba00f6b49ffff001d064b3a6d01010000000100000000000000000000\
+                           00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                           0138ffffffff0100f2052a010000004341045e071dedd1ed03721c6e9bba28fc\
+                           276795421a378637fb41090192bb9f208630dcbac5862a3baeb9df3ca6e4e256\
+                           b7fd2404824c20198ca1b004ee2197866433ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1090,6 +1804,14 @@ paths:
         - Block
       operationId: getBlockAtTime
       summary: Block Mined at Time
+      description: |
+        The last block of the main chain whose timestamp is at or before a time:
+        the block that was the newest at that moment, as far as the timestamps of
+        blocks tell.
+
+        Timestamps of blocks are set by miners and are only roughly right; they can
+        even go backwards from one block to the next. For a time that only goes
+        forward, use `/block/mtp/{time}`.
       parameters:
         - $ref: '#/components/parameters/timeParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1135,8 +1857,11 @@ paths:
         - Block
       operationId: getRawBlockAtTime
       summary: Raw Block Mined at Time
+      description: |
+        Like `/block/time/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1151,7 +1876,15 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000
+                    example: "0100000000000000000000000000000000000000000000000000000000000000\
+                             000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
+                             4b1e5e4a29ab5f49ffff001d1dac2b7c01010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff4d04ffff001d\
+                             0104455468652054696d65732030332f4a616e2f32303039204368616e63656c\
+                             6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f75742066\
+                             6f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe554827\
+                             1967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4\
+                             f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1168,7 +1901,15 @@ paths:
       tags:
         - Block
       operationId: getBlockMTP
-      summary: Block Mined at Time
+      summary: Block at Median Time Past
+      description: |
+        The first block of the main chain whose median time past is at or after a
+        time.
+
+        The median time past of a block is the median of the timestamps of the 11
+        blocks up to it. Unlike the timestamps themselves, it never goes backwards,
+        and it is the time that the consensus rules use for time locks, so it is the
+        right one to answer "from which block on is this lock time reached".
       parameters:
         - $ref: '#/components/parameters/timeParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1214,8 +1955,11 @@ paths:
         - Block
       operationId: getRawBlockMTP
       summary: Raw Block at Median Time Past
+      description: |
+        Like `/block/mtp/{time}`, serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/timeParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1230,7 +1974,13 @@ paths:
                 properties:
                   result:
                     type: string
-                    example: 01000000456cd9f21d82d8ad7c72c36f6f0dee1208151118fce2ab161b26e3d700000000ae40981d242770153f1eaa23101d19134cf53fa0a76883d7fd028fd0e4b7cb3209216b49ffff001d79f07f070101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d010effffffff0100f2052a01000000434104bc184a82d824a8ff59576e8b6843767407e4f35edb5ad725460764a30ddf91479fd0eb1b0c2b4371a06b3fdae3453262fcf3358afafe3dbebccf2fdefcd0853cac00000000
+                    example: "01000000456cd9f21d82d8ad7c72c36f6f0dee1208151118fce2ab161b26e3d7\
+                             00000000ae40981d242770153f1eaa23101d19134cf53fa0a76883d7fd028fd0\
+                             e4b7cb3209216b49ffff001d79f07f0701010000000100000000000000000000\
+                             00000000000000000000000000000000000000000000ffffffff0704ffff001d\
+                             010effffffff0100f2052a01000000434104bc184a82d824a8ff59576e8b6843\
+                             767407e4f35edb5ad725460764a30ddf91479fd0eb1b0c2b4371a06b3fdae345\
+                             3262fcf3358afafe3dbebccf2fdefcd0853cac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1248,6 +1998,8 @@ paths:
         - Block
       operationId: getBlocksAtHeights
       summary: Blocks at Multiple Heights
+      description: |
+        The blocks at several heights, in one call, all of them for each height.
       parameters:
         - $ref: '#/components/parameters/blockHeightsParam'
         - $ref: '#/components/parameters/notxParam'
@@ -1327,6 +2079,13 @@ paths:
         - Transaction
       operationId: getTransaction
       summary: Detailed Transaction
+      description: |
+        A transaction, with what this server knows about it beyond its raw form:
+        where it is in the chain, the fee, the address and amount of every output it
+        spends, and which transaction spends each of its outputs.
+
+        Unconfirmed transactions are here too. A transaction that was removed from
+        the mempool, or whose block was abandoned, is not found.
       parameters:
         - $ref: '#/components/parameters/txidParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1347,7 +2106,10 @@ paths:
                   - coinbase: false
                     txid: 02ea64dfff60b1f215282bbb4b2d729fecc50d81d2d0ef09a60d550a5a69418f
                     output: 1
-                    sigscript: 41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                    sigscript: "41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66\
+                               cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8\
+                               a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                               b8c6ba8f"
                     sequence: 0
                     pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                     value: 8985694
@@ -1390,8 +2152,12 @@ paths:
         - Transaction
       operationId: getRawTransaction
       summary: Raw Transaction
+      description: |
+        A transaction serialized as in the peer-to-peer protocol, as a node would
+        send it.
       parameters:
         - $ref: '#/components/parameters/txidParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1401,7 +2167,13 @@ paths:
             application/json:
               schema:
                 type: string
-                example: 02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
+                example: "02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160\
+                         ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af62\
+                         6fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813\
+                         dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a452\
+                         4a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7\
+                         f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a9\
+                         14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1419,6 +2191,17 @@ paths:
         - Transaction
       operationId: cbAfterHeight
       summary: Hard Fork Safety Check
+      description: |
+        Whether any ancestor of a transaction is a coinbase mined after a height.
+
+        This answers a question that matters after a chain split, such as the one
+        between BTC and BCH: coins created by miners after the split exist on one
+        chain only, so a transaction that descends from them cannot be replayed on
+        the other chain. The server follows the inputs of the transaction back
+        through its ancestors, and answers `true` as soon as it finds such a
+        coinbase, `false` when every path ends in older blocks, and `null` when it
+        gives up after looking at 10,000 transactions, so that one request cannot
+        keep the server busy for long.
       parameters:
         - $ref: '#/components/parameters/txidParam'
         - $ref: '#/components/parameters/blockHeightParam'
@@ -1449,13 +2232,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-                
+
   '/transactions':
     get:
       tags:
         - Transaction
       operationId: getTransactions
       summary: Multiple Detailed Transactions
+      description: |
+        Several transactions by id, in one call. Ids that are not known are left out
+        of the response rather than failing the whole request, and repeated ids are
+        answered once.
       parameters:
         - $ref: '#/components/parameters/txidsParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1478,7 +2265,10 @@ paths:
                     - coinbase: false
                       txid: a7319f9118f2dc743a17476e668b83f61e9ee5252cb0417baf0bea41ddd95ba6
                       output: 1
-                      sigscript: 41f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                      sigscript: "41f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb3\
+                                 1cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750\
+                                 c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                                 b8c6ba8f"
                       sequence: 0
                       pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                       value: 8987143
@@ -1513,7 +2303,10 @@ paths:
                     - coinbase: false
                       txid: 02ea64dfff60b1f215282bbb4b2d729fecc50d81d2d0ef09a60d550a5a69418f
                       output: 1
-                      sigscript: 41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f
+                      sigscript: "41e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66\
+                                 cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8\
+                                 a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3\
+                                 b8c6ba8f"
                       sequence: 0
                       pkscript: 76a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac
                       value: 8985694
@@ -1553,7 +2346,27 @@ paths:
     post:
       tags:
         - Transaction
+      summary: Broadcast Transaction
+      description: |
+        Send a signed transaction to the network, and get its id back.
+
+        The body is the transaction in hexadecimal (white space is ignored) or as
+        raw bytes. It must be in the format that nodes of the network read: on BCH,
+        which has no SegWit, the format without witness data.
+
+        **A 200 means the transaction was sent, not that the network accepted it.**
+        The server does not validate transactions; it gives the transaction to half
+        of its peers, which check it as they would any other. If they accept it, they
+        relay it back, and it appears in the mempool and in balances within seconds.
+        To know whether it was accepted, look for it with `/transaction/{txid}` or
+        watch `/events`.
+
+        Five seconds later the server asks those peers for the transaction back. A
+        peer that accepted it sends it, and the server imports it like any other
+        transaction it hears about; a peer that refused it has nothing to send.
       operationId: postTransaction
+      parameters:
+        - $ref: '#/components/parameters/prettyParam'
       requestBody:
         description: >-
           Publish Transaction. The body holds one transaction and nothing
@@ -1566,7 +2379,13 @@ paths:
             schema:
               type: string
               description: Hex-encoded Bitcoin protocol transaction.
-              example: 0200000001bd7d375bfc0a4ac4246ccefba4df1c635e5627b607bdc4af22282ecd5869d8f9010000006441f92d192c9e33b8184c58b88eb11f57a1eb5b5a2b0e72b326864021d9e946cd2a5275efcf385fbc0d9e7c8a76f9189d624efc00ff74657a52e47efc6ffa0bfe3b412102a20b2f9bd8b475252ad054fdedb49045bd40c8926b65f64e312dd821b243a37c000000000211180000000000001976a9143404e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a91486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000
+              example: "0200000001bd7d375bfc0a4ac4246ccefba4df1c635e5627b607bdc4af22282e\
+                       cd5869d8f9010000006441f92d192c9e33b8184c58b88eb11f57a1eb5b5a2b0e\
+                       72b326864021d9e946cd2a5275efcf385fbc0d9e7c8a76f9189d624efc00ff74\
+                       657a52e47efc6ffa0bfe3b412102a20b2f9bd8b475252ad054fdedb49045bd40\
+                       c8926b65f64e312dd821b243a37c000000000211180000000000001976a91434\
+                       04e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a9\
+                       1486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000"
           application/octet-stream:
             schema:
               type: string
@@ -1610,6 +2429,8 @@ paths:
         - Block
       operationId: getBlockTransactions
       summary: Transactions for Block
+      description: |
+        The full transactions of a block, in the order of the block.
       parameters:
         - $ref: '#/components/parameters/blockParam'
         - $ref: '#/components/parameters/prettyParam'
@@ -1640,7 +2461,9 @@ paths:
                       witness: []
                   outputs:
                     - address: null
-                      pkscript: 41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac
+                      pkscript: "41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd74575\
+                                16c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276f\
+                                df84ac"
                       value: 5000000000
                       spent: true
                       spender:
@@ -1662,7 +2485,11 @@ paths:
                     - coinbase: false
                       txid: 87a157f3fd88ac7907c05fc55e271dc4acdc5605d187d646604ca8c0e9382e03
                       output: 0
-                      sigscript: 493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3
+                      sigscript: "493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b\
+                                 58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc\
+                                 6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164\
+                                 593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f8\
+                                 7c161bc6f8a630121df2b3d3"
                       sequence: 4294967295
                       pkscript: 76a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac
                       value: 5000000000
@@ -1699,7 +2526,11 @@ paths:
                     - coinbase: false
                       txid: cf4e2978d0611ce46592e02d7e7daf8627a316ab69759a9f3df109a7f2bf3ec3
                       output: 1
-                      sigscript: 4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850f
+                      sigscript: "4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a32\
+                                 31e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b8426\
+                                 9eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff154568\
+                                 39e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee3\
+                                 9560639db462e9cb850f"
                       sequence: 4294967295
                       pkscript: 76a91435fbee6a3bf8d99f17724ec54787567393a8a6b188ac
                       value: 300000000
@@ -1736,7 +2567,11 @@ paths:
                     - coinbase: false
                       txid: f4515fed3dc4a19b90a317b9840c243bac26114cf637522373a7d486b372600b
                       output: 0
-                      sigscript: 493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbb
+                      sigscript: "493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b\
+                                 6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e\
+                                 2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c\
+                                 41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3\
+                                 e063ce6af4cfaaea4ea14fbb"
                       sequence: 4294967295
                       pkscript: 76a914c4eb47ecfdcf609a1848ee79acc2fa49d3caad7088ac
                       value: 1000000
@@ -1775,8 +2610,12 @@ paths:
         - Block
       operationId: getRawBlockTransactions
       summary: Raw Block Transactions
+      description: |
+        The transactions of a block, serialized as in the peer-to-peer protocol, in
+        the order of the block.
       parameters:
         - $ref: '#/components/parameters/blockParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >-
@@ -1789,10 +2628,37 @@ paths:
                 items:
                   type: string
               example:
-                - 01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08044c86041b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac00000000
-                - 0100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e32321000000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac00000000
-                - 0100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a35bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd341c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d211000000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac00000000
-                - 01000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c43ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01ec7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f00000000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000
+                - "0100000001000000000000000000000000000000000000000000000000000000\
+                  0000000000ffffffff08044c86041b020602ffffffff0100f2052a0100000043\
+                  41041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd74575\
+                  16c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276f\
+                  df84ac00000000"
+                - "0100000001032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88\
+                  fdf357a187000000008c493046022100c352d3dd993a981beba4a63ad15c2092\
+                  75ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33e\
+                  e7055cf7b5ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d\
+                  64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c9331\
+                  586c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff0200e3232100\
+                  0000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe2\
+                  08010000001976a914948c765a6914d43f2a7ac177da2c2f6b52de3d7c88ac00\
+                  000000"
+                - "0100000001c33ebff2a709f13d9f9a7569ab16a32786af7d7e2de09265e41c61\
+                  d078294ecf010000008a4730440220032d30df5ee6f57fa46cddb5eb8d0d9fe8\
+                  de6b342d27942ae90a3231e0ba333e02203deee8060fdc70230a7f5b4ad7d7bc\
+                  3e628cbe219a886b84269eaeb81e26b4fe014104ae31c31bf91278d99b8377a3\
+                  5bbce5b27d9fff15456839e919453fc7b3f721f0ba403ff96c9deeb680e5fd34\
+                  1c0fc3a7b90da4631ee39560639db462e9cb850fffffffff0240420f00000000\
+                  001976a914b0dcbf97eabf4404e31d952477ce822dadbe7e1088acc060d21100\
+                  0000001976a9146b1281eec25ab4e1e0793ff4e08ab1abb3409cd988ac000000\
+                  00"
+                - "01000000010b6072b386d4a773235237f64c1126ac3b240c84b917a3909ba1c4\
+                  3ded5f51f4000000008c493046022100bb1ad26df930a51cce110cf44f7a48c3\
+                  c561fd977500b1ae5d6b6fd13d0b3f4a022100c5b42951acedff14abba2736fd\
+                  574bdb465f3e6f8da12e2c5303954aca7f78f3014104a7135bfe824c97ecc01e\
+                  c7d7e336185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c2\
+                  4dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f0000\
+                  0000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac000000\
+                  00"
             application/octet-stream:
               schema:
                 type: string
@@ -1810,8 +2676,12 @@ paths:
         - Transaction
       operationId: getRawTransactions
       summary: Raw Transactions
+      description: |
+        Several transactions by id, serialized as in the peer-to-peer protocol. Ids
+        that are not known are left out.
       parameters:
         - $ref: '#/components/parameters/txidsParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: >
@@ -1824,8 +2694,20 @@ paths:
                 items:
                   type: string
               example:
-                - 02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af626fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
-                - 0200000001a65bd9dd41ea0baf7b41b02c25e59e1ef6838b666e47173a74dcf218919f31a7010000006441f1489e83baad016eb63e3ebfe6bda264652fa188877e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a4524a8d8182b6de761f6af3b8c6ba8f0000000002cf0400000000000017a914d1b0b139593754efcaab5ad20d13dd3be82e5bfe875e1c8900000000001976a914dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000
+                - "02000000018f41695a0a550da609efd0d2810dc5ec9f722d4bbb2b2815f2b160\
+                  ffdf64ea02010000006441e3dc2001cffff05e62751c071ac05dee8511b9af62\
+                  6fe5b07bf271ce48df66cf4013d4b4b280bb74eac6206d772aa24f1e766bc813\
+                  dc68a461736392ce97f8a04121028d75bdff57fcecff68f2927092b15074a452\
+                  4a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7\
+                  f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a9\
+                  14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
+                - "0200000001a65bd9dd41ea0baf7b41b02c25e59e1ef6838b666e47173a74dcf2\
+                  18919f31a7010000006441f1489e83baad016eb63e3ebfe6bda264652fa18887\
+                  7e2efed9261566265cb31cff5091878f6a965b7184d538d8fe285b1ba4e3f18f\
+                  53f44a30de3a36635750c34121028d75bdff57fcecff68f2927092b15074a452\
+                  4a8d8182b6de761f6af3b8c6ba8f0000000002cf0400000000000017a914d1b0\
+                  b139593754efcaab5ad20d13dd3be82e5bfe875e1c8900000000001976a914dd\
+                  1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
             application/octet-stream:
               schema:
                 type: string
@@ -1843,6 +2725,12 @@ paths:
         - Transaction
       operationId: getMempool
       summary: Mempool Transaction Hashes
+      description: |
+        The ids of the unconfirmed transactions, newest first, by the time this
+        server first saw them.
+
+        There is no maximum `limit` here: the mempool is bounded by the network, and
+        ids are small.
       parameters:
         - $ref: '#/components/parameters/limitParam'
         - $ref: '#/components/parameters/offsetParam'
@@ -1864,7 +2752,7 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/events':
     get:
       tags:
@@ -1873,7 +2761,169 @@ paths:
       operationId: getEventStream
       parameters:
         - $ref: '#/components/parameters/prettyParam'
+        - name: after
+          in: query
+          required: false
+          description: |
+            Hash of the last event heard, a block or a transaction: the stream
+            starts with what came after it.
+          schema:
+            type: string
+          example: 3e225aa5d41b0f7560ee641f86b00728adc626102b348f9d319e0fdfd848a0db
+        - name: quiet
+          in: query
+          required: false
+          description: |
+            `true` to hear of blocks alone, until something is watched.
+          schema:
+            type: boolean
+            default: false
+        - name: addresses
+          in: query
+          required: false
+          description: Addresses to watch from the start, separated by commas.
+          schema:
+            type: string
+        - name: xpub
+          in: query
+          required: false
+          description: Extended public key to watch from the start.
+          schema:
+            type: string
+        - name: derive
+          in: query
+          required: false
+          description: |
+            Types of the addresses of `xpub`: `legacy`, `compat` or `segwit`,
+            one or several separated by commas. `legacy` when left out.
+          schema:
+            type: string
+          example: legacy,segwit
+        - name: filter
+          in: query
+          required: false
+          description: |
+            Bloom filter to start with, in hex, with `functions`, and `tweak`
+            and `flags` when they are not 0.
+          schema:
+            type: string
+        - name: functions
+          in: query
+          required: false
+          description: Number of hash functions of `filter`.
+          schema:
+            type: integer
+        - name: tweak
+          in: query
+          required: false
+          description: Tweak of `filter`.
+          schema:
+            type: integer
+        - name: flags
+          in: query
+          required: false
+          description: Flags of `filter`.
+          schema:
+            type: integer
       summary: Stream Blocks and Transactions
+      description: |
+        A stream of what happens on the network: one event per new block and per
+        transaction that enters or leaves the mempool, as one line of JSON each.
+
+        ```
+        {"type":"tx","id":"9a5c…"}
+        {"type":"block","id":"0000000000000000000a1b…"}
+        ```
+
+        An event names what changed and nothing else, which keeps the stream
+        small; fetch the block or transaction if you need it. A transaction
+        that a block confirms has no event of its own: the block is the event.
+
+        ## Taking up where you left
+
+        The server keeps its last 10,000 events, fewer when their transactions
+        are very large. With `after` the stream starts after the event with
+        that hash, so a client that reconnects misses nothing. If the server
+        does not have that event the answer is 404: read again what you
+        follow, and connect without `after`. A client that falls further
+        behind than the server keeps is disconnected.
+
+        A transaction that entered the mempool and left it unconfirmed has two
+        events with the same hash. The stream starts after the first of them,
+        so an event may come twice, and none is left out.
+
+        In a fleet every server keeps the same events, also from before it
+        started: come back to any of them.
+
+        ## WebSocket
+
+        The same events are sent over a **WebSocket** at the same path, one
+        message each, and `after` works the same. The server pings every 30
+        seconds and drops clients that do not answer within 60.
+
+        Messages are JSON in text frames or binary in binary frames ("Binary
+        format" above). The server answers in the kind of frame that the
+        client last sent; before the client has sent any, in binary if the
+        `Accept` header of the handshake asked for it, else in JSON.
+
+        ## Choosing transactions
+
+        Over the WebSocket a client can say which transactions it wants to
+        hear about, with these messages. Blocks are always sent. A client that
+        sends none of them hears of every transaction.
+
+        | Message | Does |
+        | --- | --- |
+        | `{"type":"watch","addresses":["…"]}` | Watch these addresses too. |
+        | `{"type":"unwatch","addresses":["…"]}` | Stop watching them. |
+        | `{"type":"watch","xpub":"…","derive":"segwit"}` | Watch a key too. |
+        | `{"type":"unwatch","xpub":"…","derive":"segwit"}` | Stop watching it. |
+        | `{"type":"filterload","filter":"hex","functions":11,"tweak":0,"flags":0}` | Set the Bloom filter. |
+        | `{"type":"filteradd","data":"hex"}` | Add an element to the filter. |
+        | `{"type":"filterclear"}` | Remove the filter. |
+        | `{"type":"all"}` | Forget all of it: every transaction again. |
+        | `{"type":"none"}` | Forget all of it: blocks alone. |
+
+        A transaction is sent when it pays to or spends from a watched address
+        or an address of a watched key, or when it matches the filter.
+
+        ## Choosing from the start
+
+        A client that connects and then sends its messages is sent every
+        transaction until the first of them is read. To avoid that, say in the
+        URL what to start with, on the WebSocket or on the HTTP stream:
+
+        ```
+        /events?quiet=true
+        /events?addresses=bc1q…,1A1z…
+        /events?xpub=xpub6C…&derive=legacy,segwit
+        /events?filter=b50f8a…&functions=11
+        ```
+
+        `quiet=true` starts with blocks alone; send messages afterwards to
+        watch more. The others watch what they name, and can be combined. A
+        list of addresses too long for a URL goes in messages after
+        `quiet=true`, or, for the HTTP stream, in the form of a `POST`.
+
+        - **Keys.** `derive` is `legacy`, `compat` or `segwit`, as on the
+          `/xpub` endpoints, and `legacy` when left out. To watch one key under
+          several types of address, send a message for each. The server
+          watches the addresses in use and the gap of unused ones after them,
+          and moves the gap on as payments come. At most 100 keys.
+        - **Addresses.** At most 100,000.
+        - **Bloom filter.** The filter of BIP 37, matched as a node matches it
+          for an SPV client: against the hash of the transaction, the data in
+          its output scripts, the outputs it spends and the data in its input
+          scripts. One filter to a connection. The server never changes it:
+          `flags` is accepted, but the outputs of matching transactions are
+          not added, so add what you want to follow with `filteradd`. An empty
+          filter matches everything.
+        - **No answers.** As between a node and an SPV client, nothing is sent
+          back. A message that the server cannot read or will not do closes
+          the connection with code 1008 and the reason.
+        - When the server does not know the transaction of an event, which
+          happens when one leaves the mempool long after it entered, the event
+          goes to every client.
       responses:
         '200':
           description: Events stream each on one line.
@@ -1888,7 +2938,19 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+        '400':
+          description: A parameter could not be read, or names too much to watch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The server has no event with the hash given in `after`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   '/peers':
     get:
       tags:
@@ -1897,6 +2959,10 @@ paths:
       parameters:
         - $ref: '#/components/parameters/prettyParam'
       summary: Connected Network Peers
+      description: |
+        The nodes of the peer-to-peer network that this server is connected to. It
+        is where blocks and transactions come from, and where broadcast transactions
+        go.
       responses:
         '200':
           description: List of peer objects.
@@ -1926,13 +2992,21 @@ paths:
               schema:
                 type: string
                 format: binary
-                
+
   '/xpub/{xpub}':
     get:
       tags:
         - Address
       operationId: getXPubSummary
       summary: Extended Public Key Summary
+      description: |
+        The summary of a wallet: its balance, and the index of the last used address
+        of the receiving and of the change chain, so the wallet knows where to derive
+        its next address.
+
+        It is the cheapest way to check a wallet: it does not list transactions or
+        outputs. See *Extended public keys* at the top for how the addresses are
+        found.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -1958,6 +3032,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -1969,10 +3057,18 @@ paths:
         - Address
       operationId: deleteCachedXPub
       summary: Delete Cached Extended Key
+      description: |
+        Remove a wallet from the Redis cache of this server, if it has one. The
+        answer says whether it was cached.
+
+        There is rarely a reason to call this: cached wallets are kept up to date
+        with every block and transaction, and the least recently used ones are
+        evicted when the cache is full. It is there to free memory, or to rule out
+        the cache when looking into a problem.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
-        - $ref: '#/components/parameters/nocacheParam'
+        - $ref: '#/components/parameters/prettyParam'
       responses:
         '200':
           description: True if xpub got deleted from cache.
@@ -2004,6 +3100,9 @@ paths:
         - Address
       operationId: getXPubTransactionsFull
       summary: Detailed Extended Public Key Transactions
+      description: |
+        Like `/xpub/{xpub}/transactions`, with the full transactions instead of
+        their ids, and the lower maximum of full transactions.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2031,7 +3130,10 @@ paths:
                     - coinbase: false
                       txid: ae3fc465a80264f45fa6f865ede43017d9826560299b6fb344d5cde84416b931
                       output: 1
-                      sigscript: 473044022073b48b298df7ffb4ed5bb54ae939968e82fa966bc92d61728c8f7e6e6d914e1b022042164959fdbbd3cda2cdaf541a2143be79f4be85144bfef7906223c8a8cb2b2a4121029c71d9b4b94e8aa48072d1affba3432560d3e79648491d4b6351d3ddff51aa8f
+                      sigscript: "473044022073b48b298df7ffb4ed5bb54ae939968e82fa966bc92d61728c8f7e\
+                                 6e6d914e1b022042164959fdbbd3cda2cdaf541a2143be79f4be85144bfef790\
+                                 6223c8a8cb2b2a4121029c71d9b4b94e8aa48072d1affba3432560d3e7964849\
+                                 1d4b6351d3ddff51aa8f"
                       sequence: 4294967295
                       pkscript: 76a91474e607acf5ecdef5f9746ffa280744413a595cdb88ac
                       value: 70000
@@ -2040,7 +3142,10 @@ paths:
                     - coinbase: false
                       txid: 6fc0394cea4f5f82fe8f332118a9079469336be53bc73975e9d58a99fbbc7ca2
                       output: 1
-                      sigscript: 47304402204dc38ccbb6b3f6dcf496b7405bfc3f1942c3834197a32af9e07e6a1f2d916c9502203a9f536951cb672b76111ec58cca35971c06af2bfaa481bd1aee67a03428e78341210250dce9058b388bbc4014d3600770b9bb59b7636a2eef591797d9572014065c94
+                      sigscript: "47304402204dc38ccbb6b3f6dcf496b7405bfc3f1942c3834197a32af9e07e6a\
+                                 1f2d916c9502203a9f536951cb672b76111ec58cca35971c06af2bfaa481bd1a\
+                                 ee67a03428e78341210250dce9058b388bbc4014d3600770b9bb59b7636a2eef\
+                                 591797d9572014065c94"
                       sequence: 4294967295
                       pkscript: 76a91473cdab4b3e2486f7cbe618845f106109e5920aa588ac
                       value: 546
@@ -2080,7 +3185,10 @@ paths:
                     - coinbase: false
                       txid: 26ce9896f0f64349670735bdc30fb42adadac61348e403e78c5f92c3fb697355
                       output: 0
-                      sigscript: 483045022100b8feba7bfc7a0809c616694237bd5e82f6f3a5fafbe0bad0366879732fa829bc02203dce83fe508b86a1449c404756c274e11ea47decc4f8802cfd2ab7e92ed7b51b41210388e0b3a8e3aa50414ac8c03ae02ac1c9931d901ad7b6c1b7b83d50554fb592d8
+                      sigscript: "483045022100b8feba7bfc7a0809c616694237bd5e82f6f3a5fafbe0bad03668\
+                                 79732fa829bc02203dce83fe508b86a1449c404756c274e11ea47decc4f8802c\
+                                 fd2ab7e92ed7b51b41210388e0b3a8e3aa50414ac8c03ae02ac1c9931d901ad7\
+                                 b6c1b7b83d50554fb592d8"
                       sequence: 4294967295
                       pkscript: 76a914c58a0c635b60d94498c416d32d4a2c15b36f8a2388ac
                       value: 40537
@@ -2089,7 +3197,10 @@ paths:
                     - coinbase: false
                       txid: 41a422e6c003596954f07eb5021d9a2d6951da297dd519a5de3885772ac60e7c
                       output: 1
-                      sigscript: 483045022100ad61cb3b0f08af0ada0ebb5be16213377fa193c9da16e4dca58a9350724106330220089ac5eea5193f0926a483668eef219c7add5fa7d2be99a63e41da985fc104a241210223dc345218b6feb1815f0f103bc30a8508e3e248c4f9b4bfdfed1d4498f879b4
+                      sigscript: "483045022100ad61cb3b0f08af0ada0ebb5be16213377fa193c9da16e4dca58a\
+                                 9350724106330220089ac5eea5193f0926a483668eef219c7add5fa7d2be99a6\
+                                 3e41da985fc104a241210223dc345218b6feb1815f0f103bc30a8508e3e248c4\
+                                 f9b4bfdfed1d4498f879b4"
                       sequence: 4294967295
                       pkscript: 76a9145590a6b61c7d22a199692ce9c55cef294acebbeb88ac
                       value: 40000
@@ -2098,7 +3209,10 @@ paths:
                     - coinbase: false
                       txid: de01f52644b2610d491d28ce474382c57655f102974526a3fba6b5a48f8ea812
                       output: 0
-                      sigscript: 483045022100d29b0dd38462a33eac65eb8df53ba2b2905bac923057f5b37e2094f1a6072355022017480d0f2eedaa5f3ff2ca620a7b5b9301292524dfcaaa9c97859ee074f92b6e412102db25e4df201e02e95f167f63e06c55febe81fd07133fb09f65b07a356aa645ec
+                      sigscript: "483045022100d29b0dd38462a33eac65eb8df53ba2b2905bac923057f5b37e20\
+                                 94f1a6072355022017480d0f2eedaa5f3ff2ca620a7b5b9301292524dfcaaa9c\
+                                 97859ee074f92b6e412102db25e4df201e02e95f167f63e06c55febe81fd0713\
+                                 3fb09f65b07a356aa645ec"
                       sequence: 4294967295
                       pkscript: 76a91457725700f16eda53d75608972ff322dd05642a8f88ac
                       value: 3000
@@ -2107,7 +3221,10 @@ paths:
                     - coinbase: false
                       txid: de01f52644b2610d491d28ce474382c57655f102974526a3fba6b5a48f8ea812
                       output: 1
-                      sigscript: 4830450221008ee0107bfc71e063ff8d5ab98f83bb63f17bda387d049b2c9e7ff885941a3859022015baabbc9280c70a19a6047f1028f261f5686b8342273316b4e2d703ab72d6264121027b884db5a796d7f96412a2efbf5961ef824323c8b064e375c3e0dd512c6a010a
+                      sigscript: "4830450221008ee0107bfc71e063ff8d5ab98f83bb63f17bda387d049b2c9e7f\
+                                 f885941a3859022015baabbc9280c70a19a6047f1028f261f5686b8342273316\
+                                 b4e2d703ab72d6264121027b884db5a796d7f96412a2efbf5961ef824323c8b0\
+                                 64e375c3e0dd512c6a010a"
                       sequence: 4294967295
                       pkscript: 76a9145f8e761ff252d3349c32e6bc12a5e11ba20aa3f188ac
                       value: 4130
@@ -2116,7 +3233,10 @@ paths:
                     - coinbase: false
                       txid: b0fddc9d29b86c695af3dd66b1834256c362698532585a597de9c800f04fde06
                       output: 401
-                      sigscript: 473044022034251190cae8ba9197f81756778d5fbf071e63bb7460386fbb36cd74d47560a9022050a1cfec6076b8e7f23cd6e843b64cb2582476fd4b44fadb387803ed9ad4f1e54121037779735684011f62563197944da9f9e074b17813c0c62e79aeac7d875f9b8bf2
+                      sigscript: "473044022034251190cae8ba9197f81756778d5fbf071e63bb7460386fbb36cd\
+                                 74d47560a9022050a1cfec6076b8e7f23cd6e843b64cb2582476fd4b44fadb38\
+                                 7803ed9ad4f1e54121037779735684011f62563197944da9f9e074b17813c0c6\
+                                 2e79aeac7d875f9b8bf2"
                       sequence: 4294967295
                       pkscript: 76a91475dcf340cbb686b30bdaf6a2c8f8c68dadf93a5a88ac
                       value: 546
@@ -2158,7 +3278,10 @@ paths:
                     - coinbase: false
                       txid: 41a422e6c003596954f07eb5021d9a2d6951da297dd519a5de3885772ac60e7c
                       output: 0
-                      sigscript: 473044022029a10619e7e98a3e7cb17821ab0725ef25b700a9b943965c8762ee3b4e19546202200be34da0f640cd3209e5f11a3b1824409df92cae6a0efd8449d8e22faaae7865412103b3a86c342fd06c33e94dcbe2565fc3d9d6c4c081caa0f1ec42bb45bbbbaf2e43
+                      sigscript: "473044022029a10619e7e98a3e7cb17821ab0725ef25b700a9b943965c8762ee\
+                                 3b4e19546202200be34da0f640cd3209e5f11a3b1824409df92cae6a0efd8449\
+                                 d8e22faaae7865412103b3a86c342fd06c33e94dcbe2565fc3d9d6c4c081caa0\
+                                 f1ec42bb45bbbbaf2e43"
                       sequence: 4294967295
                       pkscript: 76a9144abb2deefe6ca46c695132adafd70f72d50cab2688ac
                       value: 7805
@@ -2167,7 +3290,10 @@ paths:
                     - coinbase: false
                       txid: 9a396103f3656b4e119f166610d7e41e24c01a5c45200a8fcb58d3b79fb0dcaf
                       output: 315
-                      sigscript: 4730440220271872d09da2cc13b764b5bf13cc373da53d89421e0d31ac33a73420c5e6a03902206e01bf837db72fa4340428e3d061685cc49ec156a65e4b48babcfd5d6c89018f4121033da5e50b4615d790b9b755cf5db213b0d08d489587d8946a7dfd1b8dc76a1829
+                      sigscript: "4730440220271872d09da2cc13b764b5bf13cc373da53d89421e0d31ac33a734\
+                                 20c5e6a03902206e01bf837db72fa4340428e3d061685cc49ec156a65e4b48ba\
+                                 bcfd5d6c89018f4121033da5e50b4615d790b9b755cf5db213b0d08d489587d8\
+                                 946a7dfd1b8dc76a1829"
                       sequence: 4294967295
                       pkscript: 76a914485103c1b046fe0f3ca0ed9ced338b53437c0c8288ac
                       value: 546
@@ -2207,6 +3333,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2220,6 +3360,10 @@ paths:
         - Address
       operationId: getXPubTransactions
       summary: Extended Public Key Transaction List
+      description: |
+        The transactions of every address of a wallet, merged into one list, newest
+        first, as transaction ids with their place in the chain. A transaction
+        between two addresses of the wallet appears once.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2254,6 +3398,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2267,6 +3425,11 @@ paths:
         - Address
       operationId: getXPubBalances
       summary: Extended Public Key Balances
+      description: |
+        The balance of every address of a wallet that the server looked at, with its
+        derivation path: each used address, and the unused ones of the gap, with
+        zeros, so a wallet can see which addresses it may still hand out. For the
+        total, use `/xpub/{xpub}`.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2316,6 +3479,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2329,6 +3506,9 @@ paths:
         - Address
       operationId: getXPubUnspent
       summary: Extended Public Key Unspent Outputs
+      description: |
+        The unspent outputs of a wallet, newest first, each with the derivation path
+        of its address, so the wallet knows which key signs for it.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2387,6 +3567,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid extended public key.
           content:
@@ -2400,11 +3594,15 @@ paths:
         - Blockchain
       operationId: getBinfoBalance
       summary: Address or XPub Balances
+      description: |
+        Short balances of addresses and wallets, keyed by the address or xpub as it
+        was given, as Blockchain.info answers.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
         - $ref: '#/components/parameters/binfoActiveBech32'
         - $ref: '#/components/parameters/binfoCashAddr'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Balance object map.
@@ -2415,7 +3613,9 @@ paths:
                 additionalProperties:
                   $ref: '#/components/schemas/BinfoShortBalance'
               example:
-                xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ:
+                ? "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                  ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
+                :
                   final_balance: 84994
                   n_tx: 123
                   total_received: 137003577
@@ -2430,6 +3630,9 @@ paths:
         - Blockchain
       operationId: postBinfoBalance
       summary: Address or XPub Balances
+      description: |
+        Like the `GET`, with the parameters in a form in the body, for requests with
+        too many addresses to fit in a URL.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -2445,7 +3648,9 @@ paths:
                 additionalProperties:
                   $ref: '#/components/schemas/BinfoShortBalance'
               example:
-                xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ:
+                ? "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                  ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
+                :
                   final_balance: 84994
                   n_tx: 123
                   total_received: 137003577
@@ -2462,12 +3667,17 @@ paths:
         - Blockchain
       operationId: getBinfoRawAddr
       summary: Address Balance & Transactions
+      description: |
+        The balance and transactions of an address or an xpub, as Blockchain.info
+        answers. Also served at `/blockchain/address/{address}` and
+        `/blockchain/xpub/{address}`, for clients that use those paths.
       parameters:
         - $ref: '#/components/parameters/binfoAddr'
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoOffset'
         - $ref: '#/components/parameters/xpubDerive'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Address balance & transactions.
@@ -2501,7 +3711,10 @@ paths:
                     inputs:
                       - sequence: 4294967294
                         witness: ""
-                        script: 47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6cad0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d755b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d4c07b9f8c3d04327794c
+                        script: "47304402206a11f253c8035be2d9f5958a9ca838b3fd5a1a120441885e10e6ca\
+                                d0fef3911f02202056263939a88fe06e7fc94368ff44c46f71e7daa603936d75\
+                                5b35b8b2a21c154121027eb504988cbc043dd4c9fac51685d68718a24d7f9f1d\
+                                4c07b9f8c3d04327794c"
                         index: 0
                         prev_out:
                           spent: true
@@ -2552,7 +3765,10 @@ paths:
                     inputs:
                       - sequence: 4294967294
                         witness: ""
-                        script: 4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae62749d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66a1f2407442f7a6d39ad2
+                        script: "4730440220298e397d155bcd0c3371a17f11d6dc06392c72c6d4646ac27fad72\
+                                e86e7f18f50220471c7338a0f4573955e52a95c4c2717f5ae5d369ad153ae627\
+                                49d0dcd9250482412103c60a0fd16eaf3c72dee4bf12a566ee3a6ae181a29b66\
+                                a1f2407442f7a6d39ad2"
                         index: 0
                         prev_out:
                           spent: true
@@ -2587,6 +3803,20 @@ paths:
                     result: 2275183814
                     balance: 2275183814
 
+        '400':
+          description: |
+            The wallet has no transactions with this `derive`, but has some with
+            another kind of address; the message names it. A query parameter
+            that does not parse also gives 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: user-error
+                message: >-
+                  This xpub has no transactions with derive=legacy, but has
+                  some with derive=segwit; ask with derive=segwit.
         '404':
           description: Invalid argument.
           content:
@@ -2600,10 +3830,13 @@ paths:
         - Blockchain
       operationId: getBinfoMempool
       summary: Mempool Transactions
+      description: |
+        Unconfirmed transactions, newest first, as Blockchain.info answers.
       parameters:
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoOffset'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Mempool transactions array.
@@ -2632,7 +3865,10 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 473044022027aaf94096c0b4c3e0a8405078db67f3c8680b0e1def70c5dac307cd0f4f6c4b022079ce8b9dbf26f9114a9a16575b478214294274d4158672ffaa758c8904aff91b4121031b3c18ce8efcf9a1ce214cb5c62489e842663b47908b43f3af789d840af71efb
+                        script: "473044022027aaf94096c0b4c3e0a8405078db67f3c8680b0e1def70c5dac307\
+                                cd0f4f6c4b022079ce8b9dbf26f9114a9a16575b478214294274d4158672ffaa\
+                                758c8904aff91b4121031b3c18ce8efcf9a1ce214cb5c62489e842663b47908b\
+                                43f3af789d840af71efb"
                         index: 0
                         prev_out:
                           spent: true
@@ -2679,7 +3915,10 @@ paths:
                     inputs:
                       - sequence: 0
                         witness: ""
-                        script: 41c49770d0b68eb9d4552a45d3ce23ab7dc84ecded730f76903b9a4ff948ace292ba282b63ea1fa3a4203f79edffc8d00b7ef68be4a42bc530be9e9c9a6a0d2cd4412102ed4717b0f0ae1fd42423d8fa2c9ae36783bc53f7acd8839f68dc5ad58a9cf8b2
+                        script: "41c49770d0b68eb9d4552a45d3ce23ab7dc84ecded730f76903b9a4ff948ace2\
+                                92ba282b63ea1fa3a4203f79edffc8d00b7ef68be4a42bc530be9e9c9a6a0d2c\
+                                d4412102ed4717b0f0ae1fd42423d8fa2c9ae36783bc53f7acd8839f68dc5ad5\
+                                8a9cf8b2"
                         index: 0
                         prev_out:
                           spent: true
@@ -2717,6 +3956,15 @@ paths:
         - Blockchain
       operationId: getBinfoMultiAddr
       summary: Wallet Data
+      description: |
+        The balances and transactions of a wallet made of addresses and xpubs, as
+        Blockchain.info answers, with the current price of the coin in a currency
+        of your choice.
+
+        Transactions show the change to the balance of the wallet as a whole, and,
+        by default, incoming transactions leave out outputs to other addresses
+        (`noCompact` keeps them): a payment from an exchange can have hundreds of
+        outputs to other people, which the wallet has no use for.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -2729,6 +3977,7 @@ paths:
         - $ref: '#/components/parameters/binfoCashAddr'
         - $ref: '#/components/parameters/binfoTxIdIndex'
         - $ref: '#/components/parameters/binfoFilter'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Wallet information object.
@@ -2747,6 +3996,9 @@ paths:
         - Blockchain
       operationId: postBinfoMultiAddr
       summary: Wallet Data
+      description: |
+        Like the `GET`, with the parameters in a form in the body, for wallets with
+        too many addresses to fit in a URL.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -2761,7 +4013,8 @@ paths:
                 $ref: '#/components/schemas/BinfoMultiAddr'
               example:
                 addresses:
-                  - address: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                  - address: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                     change_index: 28
                     account_index: 74
                     final_balance: 84994
@@ -2792,14 +4045,18 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 47304402200e85d6f05cf9675f60382fda3e245695e12bb478128c701447e8b85d0321921d02200a8624652009ce2413718d748194ab020aef2945721c9a29e859de034a00291841210266490eabd32e0a0eb4de6089590e6dbf5bd8b5411a3ec4b78cf40091e7200c23
+                        script: "47304402200e85d6f05cf9675f60382fda3e245695e12bb478128c701447e8b8\
+                                5d0321921d02200a8624652009ce2413718d748194ab020aef2945721c9a29e8\
+                                59de034a00291841210266490eabd32e0a0eb4de6089590e6dbf5bd8b5411a3e\
+                                c4b78cf40091e7200c23"
                         index: 0
                         prev_out:
                           spent: true
                           script: 76a91437be7ac52f6f08899051efe89f228c14a171bb2588ac
                           xpub:
                             path: M/0/66
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 2c7316f0b66bf4c5a2078cdaacd679d96c2249a32736ea7d3ce36af8b6a215c0
                               n: 0
@@ -2810,7 +4067,10 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 473044022030ade2f8405e47001dfe816fb2047cb4f6beff185c942e325d7b3070dca66622022001c0bb027e88d3ea2fce18c47553461dd063a0a26aa0f69252dcce8e26fe8cbc41210269115d4edff9823c494195a0e3a9497d868c61c43c76c37f851e28655d4fad60
+                        script: "473044022030ade2f8405e47001dfe816fb2047cb4f6beff185c942e325d7b30\
+                                70dca66622022001c0bb027e88d3ea2fce18c47553461dd063a0a26aa0f69252\
+                                dcce8e26fe8cbc41210269115d4edff9823c494195a0e3a9497d868c61c43c76\
+                                c37f851e28655d4fad60"
                         index: 1
                         prev_out:
                           spent: true
@@ -2836,7 +4096,8 @@ paths:
                         addr: bitcoincash:qp70y7gsc24raphf6604hwxupanh5r5rlvh3jvjjan
                         xpub:
                           path: M/0/68
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: true
                         value: 15840
@@ -2849,7 +4110,8 @@ paths:
                         addr: bitcoincash:qpthgd2875vw784lj28qqegrvgc0y3ngqga8fpcy8k
                         xpub:
                           path: M/1/22
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: false
                         value: 546
@@ -2877,14 +4139,18 @@ paths:
                     inputs:
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100a3d05e493ed722b9c9519ea77d2d3c139d70bb117497d8e517fb8b5b196ceeaf0220608a93847c452c461ad841eabccc75e065c310e8ae93ad6e60953e6c089a297c412103b4c6da6474554411af1f6ed8deeeafab9848bc6bfc6cb716f135e7dd674f7a26
+                        script: "483045022100a3d05e493ed722b9c9519ea77d2d3c139d70bb117497d8e517fb\
+                                8b5b196ceeaf0220608a93847c452c461ad841eabccc75e065c310e8ae93ad6e\
+                                60953e6c089a297c412103b4c6da6474554411af1f6ed8deeeafab9848bc6bfc\
+                                6cb716f135e7dd674f7a26"
                         index: 0
                         prev_out:
                           spent: true
                           script: 76a9141369d9bd3ea79896797c4143c97e9748cc06262d88ac
                           xpub:
                             path: M/0/65
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 0
@@ -2895,14 +4161,18 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100b2e36d340c3ba421f762ce1e4adde0a8c7cf550aa30022a4add6ac1003ea1a7d02200cd9d8ccba03a33eccd6f4108189962067597d25d969b9f3ab019212a0bb6824412102e14eaaa6cec9deefe5983dec61bbb2c9fc82dbbc124d395d97d26494864f30ec
+                        script: "483045022100b2e36d340c3ba421f762ce1e4adde0a8c7cf550aa30022a4add6\
+                                ac1003ea1a7d02200cd9d8ccba03a33eccd6f4108189962067597d25d969b9f3\
+                                ab019212a0bb6824412102e14eaaa6cec9deefe5983dec61bbb2c9fc82dbbc12\
+                                4d395d97d26494864f30ec"
                         index: 1
                         prev_out:
                           spent: true
                           script: 76a9148ecd9c021c8650db874940103f1f77e6da14d88e88ac
                           xpub:
                             path: M/1/19
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 1
@@ -2913,14 +4183,18 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 483045022100ff406af352e0680f20c3efcf8a7915ee8c2f1322073fce5736cdc7d264576ad00220637cec6bd985f68395bc5a29e7c15fd8a5b74dafd169c2aed86e453c91eb196a4121025b8a5938fad2f4e6cc7d7a32dd2b6a206a0082e2c6ecdd5ab5a15e855e1a2ff3
+                        script: "483045022100ff406af352e0680f20c3efcf8a7915ee8c2f1322073fce5736cd\
+                                c7d264576ad00220637cec6bd985f68395bc5a29e7c15fd8a5b74dafd169c2ae\
+                                d86e453c91eb196a4121025b8a5938fad2f4e6cc7d7a32dd2b6a206a0082e2c6\
+                                ecdd5ab5a15e855e1a2ff3"
                         index: 2
                         prev_out:
                           spent: true
                           script: 76a914bcd2b9001eea656e1a69f280cdc8dd86dbc8bf9288ac
                           xpub:
                             path: M/1/20
-                            m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                            m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                               ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                           spending_outpoints:
                             - tx_index: 0e81fa97ae5106f6e967de912908ee261473575e890e815fa78084f9d1b68382
                               n: 2
@@ -2931,7 +4205,10 @@ paths:
                           type: 0
                       - sequence: 4294967295
                         witness: ""
-                        script: 4730440220445da9cea01832fbb4882b8aeb12189a91f32c9e0eec42c2b8ab0f5af40c38de02202378f8f3e774c3515e7082460c34faf5631dbadc0fff0720849aabcc70b41dc44121028c8ec4b2d812141f34ecc23ed6b533ee1c36e165461905dae99595072529957e
+                        script: "4730440220445da9cea01832fbb4882b8aeb12189a91f32c9e0eec42c2b8ab0f\
+                                5af40c38de02202378f8f3e774c3515e7082460c34faf5631dbadc0fff072084\
+                                9aabcc70b41dc44121028c8ec4b2d812141f34ecc23ed6b533ee1c36e1654619\
+                                05dae99595072529957e"
                         index: 3
                         prev_out:
                           spent: true
@@ -2957,7 +4234,8 @@ paths:
                         addr: bitcoincash:qzlqxg40wp06qng92psxmmjzrklu9rtanyazwxtjqa
                         xpub:
                           path: M/1/21
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: true
                         value: 70000
@@ -2970,7 +4248,8 @@ paths:
                         addr: bitcoincash:qrjnhz7f6q32ajcvm5hnawr5km2k8eea3u5mcg7n9s
                         xpub:
                           path: M/0/67
-                          m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                          m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                             ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       - type: 0
                         spent: false
                         value: 546
@@ -3018,6 +4297,9 @@ paths:
         - Blockchain
       operationId: getBinfoBlock
       summary: Raw Block
+      description: |
+        A block with its transactions, by hash or height, as Blockchain.info answers.
+        With `format=hex`, the block serialized as in the peer-to-peer protocol.
       parameters:
         - $ref: '#/components/parameters/binfoBlockId'
         - $ref: '#/components/parameters/binfoFormat'
@@ -3076,12 +4358,20 @@ paths:
                             n: 24
                         n: 0
                         tx_index: 3395786307389866
-                        script: 4104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c0c9dac
+                        script: "4104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835\
+                                d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c\
+                                0c9dac"
                         addr: bitcoincash:qr52xkse9lqlpmfuzlx2lshmx4qnchljns9fmxxydw
             application/text:
               schema:
                 type: string
-                example: 010000008e0fe627641104e55f51a736f19b4246ff5cf2830d82c6317b51450800000000608398e4ae4d57758ad0054900534d957e64cb8d50924e0f28e51e8a6fd6f127baa5c04b15112a1cb2787c030101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff080415112a1c02c100ffffffff0100f2052a01000000434104a9d6840fdd1497b3067b8066db783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c39718f7bc7486d389cd0047f53785f9a63c0c9dac00000000
+                example: "010000008e0fe627641104e55f51a736f19b4246ff5cf2830d82c6317b514508\
+                         00000000608398e4ae4d57758ad0054900534d957e64cb8d50924e0f28e51e8a\
+                         6fd6f127baa5c04b15112a1cb2787c0301010000000100000000000000000000\
+                         00000000000000000000000000000000000000000000ffffffff080415112a1c\
+                         02c100ffffffff0100f2052a01000000434104a9d6840fdd1497b3067b8066db\
+                         783acf90bf42071a38fe2cf6d2d8a04835d0b5c45716d8d6012ab5d56c7824c3\
+                         9718f7bc7486d389cd0047f53785f9a63c0c9dac00000000"
         '404':
           description: Block not found.
           content:
@@ -3095,8 +4385,12 @@ paths:
         - Blockchain
       operationId: getBinfoLatest
       summary: Latest Block
+      description: |
+        The newest block, as Blockchain.info answers, with the ids of its
+        transactions.
       parameters:
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Latest block and list of transactions.
@@ -3248,6 +4542,9 @@ paths:
         - Blockchain
       operationId: getBinfoBlocksDay
       summary: Blocks for a Day
+      description: |
+        The blocks of the 24 hours before a time, newest first, as Blockchain.info
+        answers. The time is in **milliseconds**, as Blockchain.info takes it.
       parameters:
         - name: milliseconds
           in: path
@@ -3255,6 +4552,7 @@ paths:
           schema:
             type: integer
             example: 1304208000000
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: List of blocks for a 24 hour period ending at given timestamp.
@@ -4028,6 +5326,8 @@ paths:
         - Blockchain
       operationId: getBinfoBlockHeight
       summary: Blocks at Height
+      description: |
+        The blocks at a height, with their transactions, as Blockchain.info answers.
       parameters:
         - name: height
           in: path
@@ -4036,6 +5336,7 @@ paths:
             type: integer
             example: 100
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: List of blocks with transaction data.
@@ -4096,7 +5397,9 @@ paths:
                             spending_outpoints: []
                             n: 0
                             tx_index: 3589906961130271
-                            script: 4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac
+                            script: "4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff999\
+                                    5fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d\
+                                    8a93ac"
                             addr: bitcoincash:qqt6g6wul02yakpt05amm0hey67lhh7wagrrqxcmys
 
   '/blockchain/rawtx/{txid}':
@@ -4105,6 +5408,11 @@ paths:
         - Blockchain
       operationId: getBinfoRawTx
       summary: Transaction Data
+      description: |
+        A transaction by id or by short number, as Blockchain.info answers. With
+        `format=hex`, the transaction serialized as in the peer-to-peer protocol.
+
+        A short number that matches several transactions gives 409 with their ids.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
         - $ref: '#/components/parameters/binfoFormat'
@@ -4144,12 +5452,18 @@ paths:
                     spending_outpoints: []
                     n: 0
                     tx_index: 3589906961130271
-                    script: 4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac
+                    script: "4104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff999\
+                            5fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d\
+                            8a93ac"
                     addr: bitcoincash:qqt6g6wul02yakpt05amm0hey67lhh7wagrrqxcmys
             application/text:
               schema:
                 type: string
-                example: 01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d014dffffffff0100f2052a01000000434104e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995fc5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a93ac00000000
+                example: "0100000001000000000000000000000000000000000000000000000000000000\
+                         0000000000ffffffff0704ffff001d014dffffffff0100f2052a010000004341\
+                         04e70a02f5af48a1989bf630d92523c9d14c45c75f7d1b998e962bff6ff9995f\
+                         c5bdb44f1793b37495d80324acba7c8f537caaf8432b8d47987313060cc82d8a\
+                         93ac00000000"
         '404':
           description: Transaction not found.
           content:
@@ -4172,6 +5486,9 @@ paths:
         - Blockchain
       operationId: getBinfoUnspent
       summary: Unspent Outputs
+      description: |
+        The unspent outputs of addresses and xpubs, newest first, as Blockchain.info
+        answers. At most 1,000 per call, 250 by default.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -4179,6 +5496,7 @@ paths:
         - $ref: '#/components/parameters/binfoLimit'
         - $ref: '#/components/parameters/binfoConfirmations'
         - $ref: '#/components/parameters/binfoTxIdIndex'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Unspent outputs.
@@ -4207,7 +5525,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/0/73
                   - tx_hash_big_endian: f2ffa044fa3851c88e739ef76f13b960a828b5c1c7a71005a9315969c4924103
                     tx_hash: 034192c4695931a90510a7c7c1b528a860b9136ff79e738ec85138fa44a0fff2
@@ -4218,7 +5537,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/27
                   - tx_hash_big_endian: ae3fc465a80264f45fa6f865ede43017d9826560299b6fb344d5cde84416b931
                     tx_hash: 31b91644e8cdd544b36f9b29606582d91730e4ed65f8a65ff46402a865c43fae
@@ -4229,7 +5549,8 @@ paths:
                     confirmations: 9853
                     tx_index: 1749472394418618
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/26
         '404':
           description: Invalid argument.
@@ -4242,6 +5563,8 @@ paths:
         - Blockchain
       operationId: postBinfoUnspent
       summary: Unspent Outputs
+      description: |
+        Like the `GET`, with the parameters in a form in the body.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -4275,7 +5598,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/0/73
                   - tx_hash_big_endian: f2ffa044fa3851c88e739ef76f13b960a828b5c1c7a71005a9315969c4924103
                     tx_hash: 034192c4695931a90510a7c7c1b528a860b9136ff79e738ec85138fa44a0fff2
@@ -4286,7 +5610,8 @@ paths:
                     confirmations: 8557
                     tx_index: 114565443300134
                     xpub:
-                      m: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+                      m: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                         ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
                       path: M/1/27
         '404':
           description: Invalid argument.
@@ -4301,6 +5626,13 @@ paths:
         - Blockchain
       operationId: getBinfoHistory
       summary: Transaction History
+      description: |
+        The history of a wallet between two dates, one entry per transaction, with
+        its value in a currency at the time and now, for accounting.
+
+        Prices come from the price service that the operator configured
+        (Blockchain.info by default). If it cannot be reached, the prices are zero
+        and the rest of the history is still there.
       parameters:
         - $ref: '#/components/parameters/binfoActive'
         - $ref: '#/components/parameters/binfoActiveP2SH'
@@ -4308,6 +5640,7 @@ paths:
         - $ref: '#/components/parameters/binfoStart'
         - $ref: '#/components/parameters/binfoEnd'
         - $ref: '#/components/parameters/binfoCurrency'
+        - $ref: '#/components/parameters/binfoJsonFormat'
       responses:
         '200':
           description: Transaction history with price.
@@ -4347,6 +5680,8 @@ paths:
         - Blockchain
       operationId: postBinfoHistory
       summary: Transaction History
+      description: |
+        Like the `GET`, with the parameters in a form in the body.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -4393,6 +5728,12 @@ paths:
         - Blockchain
       operationId: getAddressHash
       summary: Address Hash
+      description: |
+        The hash160 of an address, in hexadecimal, as plain text.
+
+        The `/blockchain/q/` endpoints answer in plain text rather than JSON, as
+        those of Blockchain.info do, so that a shell script can use the answer as it
+        is.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4416,6 +5757,8 @@ paths:
         - Blockchain
       operationId: getHashAddress
       summary: Hash Address
+      description: |
+        The pay-to-public-key-hash address of a hash160, as plain text.
       parameters:
         - $ref: '#/components/parameters/hashParam'
       responses:
@@ -4439,6 +5782,8 @@ paths:
         - Blockchain
       operationId: getPubKeyAddress
       summary: Public Key Address
+      description: |
+        The pay-to-public-key-hash address of a public key, as plain text.
       parameters:
         - $ref: '#/components/parameters/pubKeyParam'
       responses:
@@ -4462,6 +5807,13 @@ paths:
         - Blockchain
       operationId: getAddressPubKey
       summary: Address Public Key
+      description: |
+        The public key of an address, in hexadecimal, as plain text.
+
+        An address is a hash of its public key, so the key can only be found once the
+        address has spent something: the server looks for an input that spends from
+        the address among its recent transactions, and reads the key from it. An
+        address that has never spent gives 404.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4485,6 +5837,8 @@ paths:
         - Blockchain
       operationId: getPubKeyHash
       summary: Public Key Hash
+      description: |
+        The hash160 of a public key, in hexadecimal, as plain text.
       parameters:
         - $ref: '#/components/parameters/pubKeyParam'
       responses:
@@ -4508,6 +5862,9 @@ paths:
         - Blockchain
       operationId: getBlockCount
       summary: Block Count
+      description: |
+        The height of the newest block header, as plain text. Headers arrive before
+        blocks, so it can be ahead of `/block/best`.
       responses:
         '200':
           description: Height of block chain.
@@ -4523,6 +5880,8 @@ paths:
         - Blockchain
       operationId: getLatestHash
       summary: Latest Block Hash
+      description: |
+        The hash of the newest block header, as plain text.
       responses:
         '200':
           description: Latest block hash.
@@ -4538,6 +5897,9 @@ paths:
         - Blockchain
       operationId: getBlockSubsidy
       summary: Block Subsidy
+      description: |
+        The subsidy of the next block, in satoshis, as plain text: the new coins its
+        miner will create, which halve every 210,000 blocks.
       responses:
         '200':
           description: Block subsidy for next block.
@@ -4553,6 +5915,8 @@ paths:
         - Blockchain
       operationId: getTotalOutput
       summary: Total Output
+      description: |
+        The total value of the outputs of a transaction, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4576,6 +5940,9 @@ paths:
         - Blockchain
       operationId: getTotalInput
       summary: Total Spent
+      description: |
+        The total value of the outputs that a transaction spends, in satoshis, as
+        plain text.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4599,6 +5966,9 @@ paths:
         - Blockchain
       operationId: getTxFee
       summary: Transaction Fee
+      description: |
+        The fee of a transaction, in satoshis, as plain text: what it spends minus
+        what it pays out.
       parameters:
         - $ref: '#/components/parameters/binfoTxId'
       responses:
@@ -4622,6 +5992,9 @@ paths:
         - Blockchain
       operationId: getTxResult
       summary: Transaction Address Amount
+      description: |
+        How much a transaction changes the balance of an address, in satoshis, as
+        plain text: what it pays to the address minus what it spends from it.
       parameters:
         - $ref: '#/components/parameters/addressParam'
         - $ref: '#/components/parameters/binfoTxId'
@@ -4646,6 +6019,8 @@ paths:
         - Blockchain
       operationId: getReceivedByAddress
       summary: Total Received by Address
+      description: |
+        The total ever received by an address, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4669,6 +6044,8 @@ paths:
         - Blockchain
       operationId: getSentByAddress
       summary: Total Sent by Address
+      description: |
+        The total ever sent from an address, in satoshis, as plain text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4692,6 +6069,9 @@ paths:
         - Blockchain
       operationId: getAddressBalance
       summary: Balance for Address
+      description: |
+        The balance of an address, confirmed and unconfirmed, in satoshis, as plain
+        text.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4715,6 +6095,9 @@ paths:
         - Blockchain
       operationId: getAddressFirstSeen
       summary: Address First Seen
+      description: |
+        The time of the first block with a transaction of an address, as a Unix
+        timestamp in plain text, or `0` if it has none.
       parameters:
         - $ref: '#/components/parameters/addressParam'
       responses:
@@ -4731,41 +6114,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-    
+
+
+  '/dbstats':
+    get:
+      tags:
+        - Network
+      summary: Database Statistics
+      operationId: getDbStats
+      description: |
+        How the database of this server uses memory, by column family, and the
+        statistics that RocksDB keeps, as plain text for the operator to read. The
+        format is that of RocksDB and may change between versions, so do not parse
+        it.
+      responses:
+        '200':
+          description: Memory use and statistics of RocksDB.
+          content:
+            text/plain:
+              schema:
+                type: string
 
 components:
   schemas:
-  
+
     BlockRef:
+      description: |
+        Where a transaction or output is: in a block, with its height and position,
+        or in the mempool, with the time this server first saw it. A transaction
+        moves from one form to the other when it is confirmed, or back after a
+        reorganisation.
       oneOf:
         - $ref: '#/components/schemas/Block'
         - $ref: '#/components/schemas/Mempool'
 
     Block:
       type: object
+      description: |
+        A place in a block.
       required:
         - height
         - position
       properties:
         height:
-          description: Block height.
           type: integer
+          description: |
+            Height of the block.
         position:
-          description: Position of transaction within block.
           type: integer
+          description: |
+            Position of the transaction in the block, from 0.
 
     Mempool:
       type: object
+      description: |
+        A place in the mempool.
       required:
         - mempool
       properties:
         mempool:
-          description: Time when transaction was accepted in local mempool.
           type: integer
+          description: |
+            Unix time when this server first saw the transaction. Other servers may
+            have seen it at another time; it orders the unconfirmed transactions.
           format: int64
 
     XPubBalance:
       type: object
+      description: |
+        The balance of one address of a wallet, with its derivation path below the
+        extended public key.
       required:
         - path
         - balance
@@ -4777,12 +6195,18 @@ components:
 
     XPubPath:
       type: array
-      description: Extended public key derivation path for an address.
+      description: |
+        Derivation path of an address below the extended public key: the chain
+        (`0` receiving, `1` change) and the index of the address in it, so `[1, 4]`
+        is the fifth change address.
       items:
         type: integer
 
     XPubUnspent:
       type: object
+      description: |
+        An unspent output of a wallet, with the derivation path of its address, so
+        the wallet knows which key signs for it.
       required:
         - path
         - unspent
@@ -4794,13 +6218,18 @@ components:
 
     XPubSummary:
       type: object
+      description: |
+        The balance of a wallet and how far it has used its addresses.
       required:
         - balance
         - indices
       properties:
         balance:
           type: object
-          description: Aggregate balance for all addresses in extended public key.
+          description: |
+            Totals over every address of the wallet, in satoshis: `confirmed`,
+            `unconfirmed` and `received` as in an address balance, and `utxo`, the
+            number of unspent outputs.
           required:
             - confirmed
             - unconfirmed
@@ -4821,9 +6250,9 @@ components:
               type: integer
         indices:
           type: object
-          description: >-
-            Highest derivation indices used on extended public key.
-            See: [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)
+          description: |
+            Index of the last used address of the receiving chain (`external`) and of
+            the change chain (`change`). The next unused address is one past it.
           required:
             - external
             - change
@@ -4835,7 +6264,10 @@ components:
 
     TxRef:
       type: object
-      description: Transaction hash and blockchain position or mempool timestamp.
+      description: |
+        A transaction id and where the transaction is. Lists of transactions return
+        these rather than full transactions, which are much larger; fetch the ones
+        you need.
       required:
         - block
         - txid
@@ -4844,9 +6276,15 @@ components:
           $ref: '#/components/schemas/BlockRef'
         txid:
           type: string
+          description: |
+            Transaction id.
 
     Balance:
       type: object
+      description: |
+        The balance of an address. `confirmed` plus `unconfirmed` is what the address
+        holds now, counting unconfirmed transactions; `confirmed` alone is what it
+        holds in coins that are in blocks and are not being spent.
       required:
         - address
         - confirmed
@@ -4857,30 +6295,41 @@ components:
       properties:
         address:
           type: string
+          description: |
+            The address.
         confirmed:
           type: integer
+          description: |
+            Sum of the unspent outputs of the address that are confirmed, in satoshis.
+            An output spent by an unconfirmed transaction no longer counts.
           format: int64
-          description: Sum of confirmed unspent output values.
         unconfirmed:
           type: integer
+          description: |
+            Sum of the unspent outputs of the address that are not confirmed yet, in
+            satoshis.
           format: int64
-          description: Sum of unconfirmed unspent output values.
         utxo:
-          description: Total number of unspent outputs.
           type: integer
+          description: |
+            Number of unspent outputs.
           format: int64
         received:
-          description: Total received by this address including spent.
           type: integer
+          description: |
+            Total ever paid to the address, spent or not, confirmed or not, in
+            satoshis.
           format: int64
         txs:
-          description: Number of transactions affecting this address.
           type: integer
+          description: |
+            Number of transactions that pay to or spend from the address.
           format: int64
 
     Unspent:
       type: object
-      description: Information about unspent output.
+      description: |
+        An output that is not spent yet: a coin that can be spent.
       required:
         - address
         - block
@@ -4891,23 +6340,34 @@ components:
       properties:
         address:
           type: string
+          description: |
+            Address of the output. Null for scripts that have no address, such as
+            data outputs or bare multisig.
           nullable: true
-          description: Null when the script has no address on the network.
         block:
           $ref: '#/components/schemas/BlockRef'
         txid:
           type: string
+          description: |
+            Id of the transaction that created the output.
         index:
           type: integer
+          description: |
+            Position of the output in that transaction, from 0.
         pkscript:
           type: string
+          description: |
+            Output script in hexadecimal, needed to sign a spend.
         value:
           type: integer
+          description: |
+            Value in satoshis.
           format: int64
-          description: Value in satoshi.
 
     BlockData:
       type: object
+      description: |
+        A block, with its header and what the server computed from it.
       required:
         - hash
         - height
@@ -4927,57 +6387,85 @@ components:
       properties:
         hash:
           type: string
+          description: |
+            Block hash.
         size:
           type: integer
-          description: >-
-            Raw size of a block, including witness data. This is not the virtual
-            size and does not compute segwit discounts.
+          description: |
+            Size of the serialized block, in bytes, witness data included.
         height:
           type: integer
+          description: |
+            Height in its chain.
         mainchain:
           type: boolean
-          description: This block is part of the main chain.
+          description: |
+            Whether the block is in the chain with the most work. Blocks of chains
+            abandoned in a reorganisation are kept, with `false`.
         previous:
           type: string
+          description: |
+            Hash of the previous block.
         time:
           type: integer
+          description: |
+            Timestamp set by the miner, as a Unix time. Only roughly right.
           format: int64
         version:
           type: integer
+          description: |
+            Block version.
           format: int64
         bits:
           type: integer
+          description: |
+            Proof-of-work target, in compact form.
           format: int64
         nonce:
           type: integer
+          description: |
+            Nonce found by the miner.
           format: int64
         tx:
           type: array
+          description: |
+            Ids of the transactions, in order; the first is the coinbase.
           items:
             type: string
         merkle:
           type: string
+          description: |
+            Merkle root of the transactions.
         subsidy:
           type: integer
+          description: |
+            New coins created by the block, in satoshis.
           format: int64
-          description: Total block subsidy in satoshi.
         fees:
           type: integer
+          description: |
+            Sum of the fees of its transactions, in satoshis.
           format: int64
-          description: Total transaction fees in satoshi.
         outputs:
           type: integer
+          description: |
+            Sum of the outputs of its transactions, in satoshis.
           format: int64
-          description: Total outputs from this block, including spent.
         weight:
           type: integer
-          description: Segwit block weight. Only on segwit networks.
+          description: |
+            Block weight, on networks with SegWit only.
         work:
           type: integer
-          description: Accumulated proof-of-work.
+          description: |
+            Proof of work accumulated by the chain up to this block.
 
     Input:
       type: object
+      description: |
+        An input of a transaction, with the address and value of the output it
+        spends, which the raw transaction does not contain and which the server
+        looks up.
       required:
         - coinbase
         - txid
@@ -4991,47 +6479,69 @@ components:
       properties:
         coinbase:
           type: boolean
+          description: |
+            Whether this is the input of a coinbase, which spends nothing.
         txid:
           type: string
+          description: |
+            Id of the transaction whose output is spent.
         output:
           type: integer
+          description: |
+            Position of that output in its transaction.
         sigscript:
           type: string
+          description: |
+            Input script in hexadecimal.
         value:
           type: integer
+          description: |
+            Value of the output spent, in satoshis.
           format: int64
           nullable: true
         sequence:
           type: integer
+          description: |
+            Sequence number.
           format: int64
         address:
           type: string
+          description: |
+            Address of the output spent; null if it has none.
           nullable: true
-          description: Null when the script has no address on the network.
         pkscript:
           type: string
+          description: |
+            Script of the output spent, in hexadecimal.
           nullable: true
         witness:
-          description: Witness Data if applies.
           type: array
+          description: |
+            Witness stack, each item in hexadecimal; empty without SegWit.
           items:
             type: string
 
     Spender:
       type: object
-      description: Reference to a transaction input.
+      description: |
+        The input that spends an output.
       required:
         - txid
         - input
       properties:
         txid:
           type: string
+          description: |
+            Id of the spending transaction.
         input:
           type: integer
+          description: |
+            Position of the input in that transaction.
 
     Output:
       type: object
-      description: Transactiotn output data.
+      description: |
+        An output of a transaction, with whether and by what it is spent.
       required:
         - address
         - pkscript
@@ -5040,21 +6550,34 @@ components:
       properties:
         address:
           type: string
+          description: |
+            Address of the output; null for scripts without one.
           nullable: true
-          description: Null when the script has no address on the network.
         pkscript:
           type: string
+          description: |
+            Output script in hexadecimal.
         value:
           type: integer
+          description: |
+            Value in satoshis.
           format: int64
         spent:
           type: boolean
+          description: |
+            Whether a transaction spends it, confirmed or not.
         spender:
-          $ref: '#/components/schemas/Spender'
+          description: |
+            The input that spends it, if any.
+          allOf:
+            - $ref: '#/components/schemas/Spender'
 
     Transaction:
       type: object
-      description: Detailed transaction information.
+      description: |
+        A transaction with what the server knows about it beyond its raw form: its
+        place in the chain, its fee, and, for each input and output, the address and
+        value involved.
       required:
         - txid
         - size
@@ -5071,19 +6594,26 @@ components:
       properties:
         txid:
           type: string
+          description: |
+            Transaction id.
         size:
           type: integer
-          description: >-
-            Raw transaction size including witness data but excluding segwit
-            discount calculations.
+          description: |
+            Size of the serialized transaction, in bytes, witness data included.
         version:
           type: integer
+          description: |
+            Transaction version.
           format: int64
         locktime:
           type: integer
+          description: |
+            Lock time.
           format: int64
         fee:
           type: integer
+          description: |
+            Fee in satoshis: inputs minus outputs; 0 for a coinbase.
           format: int64
         inputs:
           type: array
@@ -5097,34 +6627,57 @@ components:
           $ref: '#/components/schemas/BlockRef'
         deleted:
           type: boolean
-          description: This transaction is no longer valid.
+          description: |
+            Always false. The server no longer returns transactions that were
+            removed: replaced by fee, double-spent by a confirmed transaction, or
+            the coinbase of a block that left the main chain. The field is kept so
+            that clients that read it go on working.
         time:
           type: integer
+          description: |
+            Timestamp of its block, or, if unconfirmed, the Unix time this server first
+            saw it; in a fleet, the time at which the first server of the fleet did. A
+            confirmed transaction has the time of its block on every server, whether
+            the server saw it before the block or not: until database version 22 a
+            server that had seen it unconfirmed went on giving the time of that. A
+            transaction that goes back to the mempool because its block left the main
+            chain keeps the time of that block.
           format: int64
         rbf:
           type: boolean
-          description: Vulnerable to replace-by-fee.
+          description: |
+            Whether the transaction can still be replaced by one paying a higher fee:
+            it signals replace-by-fee (BIP 125), or spends an unconfirmed transaction
+            that does. Only meaningful while unconfirmed, and on BTC.
         weight:
           type: integer
-          description: Segwit transaction weight.
+          description: |
+            Transaction weight, as SegWit counts it.
 
     Event:
       type: object
+      description: |
+        Something that happened, as `/events` sends it.
       required:
         - type
         - id
       properties:
         type:
           type: string
+          description: |
+            `block` for a new best block, `tx` for a mempool change.
           enum:
             - tx
             - block
         id:
           type: string
-          description: Block or transaction hash
+          description: |
+            Hash of the block or id of the transaction.
 
     Peer:
       type: object
+      description: |
+        A node of the peer-to-peer network that the server is connected to.
       required:
         - useragent
         - address
@@ -5134,23 +6687,30 @@ components:
       properties:
         useragent:
           type: string
+          description: |
+            Software of the peer, as it announces itself.
         address:
           type: string
+          description: |
+            Network address of the peer.
         version:
           type: integer
+          description: |
+            Protocol version from the version message of the peer.
           format: int32
-          description: >-
-            Protocol version from the peer's version message. It is a signed
-            number, so it is negative for a peer that sends a version above
-            2147483647.
         services:
           type: string
+          description: |
+            Services the peer offers, as a bit field in hexadecimal.
         relay:
           type: boolean
-          description: This peer will relay transactions.
+          description: |
+            Whether the peer relays transactions.
 
     BlockHealth:
       type: object
+      description: |
+        Whether the blocks are caught up with the headers.
       required:
         - headers
         - blocks
@@ -5160,17 +6720,29 @@ components:
       properties:
         headers:
           type: integer
+          description: |
+            Height of the newest header.
         blocks:
           type: integer
+          description: |
+            Height of the newest imported block.
         diff:
           type: integer
+          description: |
+            Headers minus blocks.
         max:
           type: integer
+          description: |
+            Most blocks the server may be behind and still be healthy.
         ok:
           type: boolean
+          description: |
+            Whether `diff` is at most `max`.
 
     TimeHealth:
       type: object
+      description: |
+        Whether something happened recently enough.
       required:
         - age
         - max
@@ -5178,13 +6750,21 @@ components:
       properties:
         age:
           type: integer
+          description: |
+            Seconds since it happened.
         max:
           type: integer
+          description: |
+            Most seconds allowed.
         ok:
           type: boolean
+          description: |
+            Whether `age` is at most `max`.
 
     CountHealth:
       type: object
+      description: |
+        Whether there are enough of something.
       required:
         - count
         - min
@@ -5192,13 +6772,21 @@ components:
       properties:
         count:
           type: integer
+          description: |
+            How many there are.
         min:
           type: integer
+          description: |
+            How many are needed.
         ok:
           type: boolean
+          description: |
+            Whether `count` is at least `min`.
 
     MaxHealth:
       type: object
+      description: |
+        Whether there are not too many of something.
       required:
         - count
         - max
@@ -5206,13 +6794,22 @@ components:
       properties:
         count:
           type: integer
+          description: |
+            How many there are.
         max:
           type: integer
+          description: |
+            Most allowed.
         ok:
           type: boolean
+          description: |
+            Whether `count` is at most `max`.
 
     HealthCheck:
       type: object
+      description: |
+        The result of the latest health check. `ok` is true when every check passes.
+        The limits are set by the operator of the server.
       required:
         - blocks
         - last-block
@@ -5224,40 +6821,89 @@ components:
         - ok
       properties:
         blocks:
-          $ref: '#/components/schemas/BlockHealth'
+          description: |
+            Whether the imported blocks have caught up with the headers.
+          allOf:
+            - $ref: '#/components/schemas/BlockHealth'
         last-block:
-          $ref: '#/components/schemas/TimeHealth'
+          description: |
+            Age of the newest header. A network that has found no block for hours
+            usually means the server lost touch with it.
+          allOf:
+            - $ref: '#/components/schemas/TimeHealth'
         last-tx:
-          $ref: '#/components/schemas/TimeHealth'
+          description: |
+            Age of the newest unconfirmed transaction (or block, if newer). A busy
+            network sends transactions all the time, so silence means trouble.
+          allOf:
+            - $ref: '#/components/schemas/TimeHealth'
         pending-txs:
-          $ref: '#/components/schemas/MaxHealth'
+          description: |
+            Transactions received but not imported yet.
+          allOf:
+            - $ref: '#/components/schemas/MaxHealth'
         peers:
-          $ref: '#/components/schemas/CountHealth'
+          description: |
+            Connected peers.
+          allOf:
+            - $ref: '#/components/schemas/CountHealth'
+        redis:
+          type: object
+          description: |
+            Whether the Redis cache answers. Only for a server that has one. It does
+            not count towards `ok`: a server without its Redis still answers every
+            request, from its own database, and `/health` gives 203.
+          required:
+            - ok
+          properties:
+            ok:
+              type: boolean
         net:
           type: string
+          description: |
+            Network of the server.
         version:
           type: string
+          description: |
+            Version of Haskoin Store.
         ok:
           type: boolean
+          description: |
+            Whether every check passed.
+        time:
+          type: string
+          description: |
+            When the check ran.
 
     Error:
       type: object
+      description: |
+        An error. `error` is a stable code for programs to test; `message` is for
+        people and may change. See *Errors* at the top.
       required:
         - error
       properties:
         error:
           type: string
+          description: |
+            Error code, such as `not-found-or-invalid-arg` or `user-error`.
           example: not-found-or-invalid-arg
         message:
           type: string
+          description: |
+            What went wrong, for people.
           example: Item not found or argument invalid
     TxId:
       type: object
+      description: |
+        The id of a transaction.
       required:
         - txid
       properties:
         txid:
           type: string
+          description: |
+            Transaction id.
 
     BinfoTxIdHash:
       type: string
@@ -5266,6 +6912,9 @@ components:
       type: integer
 
     BinfoTxId:
+      description: |
+        A transaction id in hexadecimal, or its short number (see the `txidindex`
+        parameter).
       oneOf:
         - $ref: '#/components/schemas/BinfoTxIdHash'
         - $ref: '#/components/schemas/BinfoTxIdIndex'
@@ -5284,8 +6933,15 @@ components:
           type: integer
         n_tx:
           type: integer
+          description: |
+            Number of transactions of the addresses and extended public keys
+            shown (`onlyShow`, or all the active ones), each counted once, not
+            only those on this page.
         n_tx_filtered:
           type: integer
+          description: |
+            Number of those transactions that pass the `filter`, not only
+            those on this page.
         total_received:
           type: integer
         total_sent:
@@ -5425,6 +7081,9 @@ components:
           type: string
         n_tx:
           type: integer
+          description: |
+            Number of transactions of the address or extended public key, not
+            only those on this page.
         n_unredeemed:
           type: integer
         total_received:
@@ -5779,7 +7438,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5799,7 +7459,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5825,7 +7486,8 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
@@ -5868,16 +7530,13 @@ components:
           type: array
           items:
             type: string
-            example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+            example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                     ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
         activeP2SH:
           type: array
           items:
             type: string
         activeBech32:
-          type: array
-          items:
-            type: string
-        onlyShow:
           type: array
           items:
             type: string
@@ -5896,6 +7555,8 @@ components:
     pubKeyParam:
       name: pubkey
       in: path
+      description: |
+        A public key in hexadecimal, compressed or not.
       required: true
       schema:
         type: string
@@ -5904,6 +7565,9 @@ components:
     addressParam:
       name: address
       in: path
+      description: |
+        An address of the network of the server. An address that does not parse,
+        or is of another network, gives 404.
       required: true
       schema:
         type: string
@@ -5912,6 +7576,8 @@ components:
     hashParam:
       name: hash
       in: path
+      description: |
+        A hash160 (20 bytes) in hexadecimal.
       required: true
       schema:
         type: string
@@ -5920,6 +7586,10 @@ components:
     addressesParam:
       name: addresses
       in: query
+      description: |
+        Addresses, separated by commas. Every address must be valid: one that is not
+        fails the whole request with 400, rather than giving an answer that silently
+        leaves it out.
       explode: false
       required: true
       schema:
@@ -5933,62 +7603,74 @@ components:
     limitParam:
       name: limit
       in: query
+      description: |
+        How many items to return at most. Without it, the server's default (100
+        unless the operator changed it). `0` asks for the server's maximum. A
+        larger number is lowered to the maximum rather than refused. See *Paging* at
+        the top.
       required: false
       schema:
         type: integer
-      description: Maximum number of entries to return.
 
     heightParam:
       name: height
       in: query
+      description: |
+        Where the page starts: a transaction id (included), a block hash, a block
+        height (transactions confirmed at or below it), or a Unix time (the last
+        block at or before it). Numbers up to 1,230,768,000 are heights, larger ones
+        times. Unconfirmed transactions come first in every list, and a page that
+        starts at a height, a block or a time has none of them, even when the height
+        is above the best block.
+
+        To get the next page, pass the id of the last transaction you received here,
+        with `offset=1`. See *Paging* at the top for why this is better than a large
+        offset.
       required: false
       schema:
         oneOf:
           - type: integer
           - type: string
-      description: |
-        * If a block height is specified, only entities confirmed at or below
-          that height will be returned.
-
-        * If a block hash is specified, only entities confirmed at or below that
-          block's height will be returned. No filtering will be done if the
-          block cannot be found.
-
-        * If a Unix timestamp is specified, find the last block mined at or
-          before that time and return entries confirmed up to that block's
-          height. No filtering will be done if the block cannot be found.
-
-        * If a transaction hash is specified, only entries at or below that
-          transaction's place in the block chain will be returned. No filtering
-          will be done if the transaction cannot be found or is not confirmed.
 
     offsetParam:
       name: offset
       in: query
+      description: |
+        How many items to skip after the start. Above the server's maximum (50,000
+        unless the operator changed it), the request fails with 400; use `height` to
+        go further back.
       required: false
       schema:
         type: integer
-      description: Skip this many entries at the start of the result set.
 
     nocacheParam:
       name: nocache
       in: query
+      description: |
+        Answer from the database of this server, without reading the Redis cache and
+        without caching the wallet. The answer is the same; this is for comparing,
+        and for servers whose cache is shared with others that may be ahead of or
+        behind this one. A server of a fleet still answers from the block and the
+        mempool that the fleet shares, only without its cache of wallets.
       required: false
       schema:
         type: boolean
-      description: Do not use the cache for this query.
 
     notxParam:
       name: notx
       in: query
+      description: |
+        Leave out the transaction ids, except the first (the coinbase). A block can
+        have thousands of transactions, and pages that list blocks rarely need them.
       required: false
       schema:
         type: boolean
-      description: Do not include transactions other than coinbase.
 
     blockParam:
       name: block
       in: path
+      description: |
+        A block hash in hexadecimal.
       required: true
       schema:
         type: string
@@ -5997,6 +7679,8 @@ components:
     blocksParam:
       name: blocks
       in: query
+      description: |
+        Block hashes in hexadecimal, separated by commas.
       explode: false
       required: true
       schema:
@@ -6010,6 +7694,8 @@ components:
     blockHeightParam:
       name: height
       in: path
+      description: |
+        A block height. The first block is at height 0.
       required: true
       schema:
         type: integer
@@ -6018,6 +7704,8 @@ components:
     blockHeightsParam:
       name: heights
       in: query
+      description: |
+        Block heights, separated by commas.
       explode: false
       required: true
       schema:
@@ -6032,6 +7720,8 @@ components:
     txidParam:
       name: txid
       in: path
+      description: |
+        A transaction id in hexadecimal.
       required: true
       schema:
         type: string
@@ -6040,6 +7730,8 @@ components:
     timeParam:
       name: time
       in: path
+      description: |
+        A Unix timestamp, in seconds.
       required: true
       schema:
         type: integer
@@ -6048,6 +7740,8 @@ components:
     txidsParam:
       name: txids
       in: query
+      description: |
+        Transaction ids in hexadecimal, separated by commas.
       explode: false
       required: true
       schema:
@@ -6061,200 +7755,265 @@ components:
     xpubParam:
       name: xpub
       in: path
+      description: |
+        An extended public key of the network of the server: `xpub` on BTC and BCH,
+        `tpub` on test networks. Keys that wallets export as `ypub` or `zpub` are
+        not accepted; export them as `xpub` and say the kind of address with
+        `derive`.
       required: true
       schema:
         type: string
-        example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
+        example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                 ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
 
     xpubDerive:
       name: derive
       in: query
+      description: |
+        The kind of address the wallet derives from the key:
+
+        - `legacy`: pay-to-public-key-hash (P2PKH), addresses starting with `1`
+          on BTC; the default, and the only kind on networks without SegWit, such as
+          BCH. `normal`, its name up to version 1.8, is still accepted, so old
+          URLs keep working;
+        - `compat`: SegWit nested in pay-to-script-hash (P2SH-P2WPKH), addresses
+          starting with `3`, as BIP 49 wallets use;
+        - `segwit`: native SegWit (P2WPKH), addresses starting with `bc1q`, as BIP
+          84 wallets use.
+
+        An xpub does not record which kind its wallet uses, and each kind gives
+        different addresses from the same key. When the wallet has no
+        transactions with this kind but has some with another, the request
+        fails with 400 and a message that names the right kind, rather than
+        answering with an empty wallet.
       required: false
       schema:
         type: string
-        enum: [segwit, compat, normal]
-      description: |
-        * `normal`: derive regular P2PKH addresses.
-        * `segwit`: derive segwit P2WPKH addresses.
-        * `compat`: derive P2SH-P2WPKH backwards-compatible segwit addresses.
+        enum: [legacy, compat, segwit, normal]
+        default: legacy
 
     prettyParam:
       name: pretty
       in: query
+      description: |
+        Indent the JSON, for people to read. Responses are compact by default to
+        save bandwidth.
       required: false
       schema:
         type: boolean
-      description: Pretty-print JSON output.
 
     binfoAddr:
       name: address
       in: path
+      description: |
+        An address or an extended public key.
       required: true
       schema:
         type: string
-      description: >
-        Address or extended public key.
       example: qqmaqu9nceck5ct5pqrjy4ulhhw66wdlkv2s7f2l9u
 
     binfoActive:
       name: active
       in: query
+      description: |
+        Addresses and extended public keys of the wallet, separated by `|` or `,`.
+        Extended public keys here derive legacy (P2PKH) addresses.
       required: false
       schema:
         type: string
-        example: xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84KZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ
-      description: >
-        Addresses or extended public keys.
-        Separate by vertical line `|` or comma `,`.
-  
+        example: "xpub6By8JDaPr5L6oHfgQDc47quD69qH1hTwnFYbuia8paiYxSE9u84K\
+                 ZfYqn6xLMUqxKK3wNpsgP4Kwu1gzXHD5xBxj5HrLposEYL6PwZzpAMZ"
+
     binfoActiveP2SH:
       name: activeP2SH
       in: query
+      description: |
+        Extended public keys that derive SegWit addresses nested in
+        pay-to-script-hash (P2SH-P2WPKH), separated by `|` or `,`.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys for P2WPKH-on-P2SH address derivation.
-        Separate by vertical line `|` or comma `,`.
-  
+
     binfoActiveBech32:
       name: activeBech32
       in: query
+      description: |
+        Extended public keys that derive native SegWit (P2WPKH) addresses, separated
+        by `|` or `,`.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys for P2WPKH Bech32 address derivation.
-        Separate by vertical line `|` or comma `,`.
-  
+
     binfoOnlyShow:
       name: onlyShow
       in: query
+      description: |
+        The addresses and extended public keys, among the active ones, whose
+        balances to list and from whose point of view to compute the result of each
+        transaction, separated by `|` or `,`. All the active ones if left out.
       required: false
       schema:
         type: string
-      description: >
-        Extended public keys and addresses for computing balances in transactions
-        and showing in the address section of the wallet.
-        If omitted use all active* addresses.
-        Separate by vertical line `|` or comma `,`.
 
     binfoFilter:
       name: filter
       in: query
+      description: |
+        Which transactions to list (`0` or `6` for all of them):
+
+        - `1`: those that send coins out of the wallet;
+        - `2`: those that bring coins into the wallet;
+        - `3`: those that move coins within the wallet, changing its balance by
+          the fee only;
+        - `5`: confirmed ones;
+        - `7`: unconfirmed ones.
       required: false
       schema:
         type: integer
         enum: [0,1,2,3,5,7]
-      description: |
-        Filter only these types of transaction with respect to active addresses
-        (0 for no filtering):
-
-        1. Only outgoing transactions (sent) (result + fee < 0)
-        2. Only incoming transactions (received) (result + fee > 0)
-        3. Only internal transfers (result + fee = 0)
-        4. No filtering
-        5. Only confirmed transactions
-        6. No filtering
-        7. Only unconfirmed transactions
       example: 5
-  
+
     binfoLimit:
       name: limit
       in: query
+      description: |
+        How many items to return at most. The default and maximum are those of the
+        server.
       required: false
       schema:
         type: integer
         example: 2
-      description: Only retrieve up to this many items.
-  
+
     binfoCount:
       name: n
       in: query
+      description: |
+        How many transactions to return at most. The default and maximum are those
+        of the server for full transactions.
       required: false
       schema:
         type: integer
         example: 2
-      description: Only retrieve up to this many items.
-  
+
     binfoOffset:
       name: offset
       in: query
+      description: |
+        How many items to skip at the start. Above the server's maximum, the request
+        fails with 400.
       required: false
       schema:
         type: integer
-      description: Skip this many items at the beginning.
 
     binfoConfirmations:
       name: confirmations
       in: query
+      description: |
+        Only return outputs with at least this many confirmations. `0`, the default,
+        includes unconfirmed ones.
       required: false
       schema:
         type: integer
-      description: Only return items with at least this many confirmations.
-  
+
     binfoNoCompact:
       name: noCompact
       in: query
+      description: |
+        Keep the outputs of incoming transactions that pay to other addresses. They
+        are left out by default, as they belong to other people and can be many.
+        `no_compact` is accepted as another name for it; `noCompact` wins if both
+        are given.
       required: false
       schema:
         type: boolean
         example: false
-      description: >
-        Filter out outputs not going to this wallet on incoming transactions.
-  
+
     binfoCurrency:
       name: currency
       in: query
+      description: |
+        The currency for the `info` section, such as `USD`, `EUR` or `GBP`, in any
+        case. `USD` by default. A currency that the price service does not list
+        is refused. Until the server has prices, which it does not if the price
+        service cannot be reached, every currency is accepted with a price of
+        zero.
       required: false
       schema:
         type: string
         example: eur
-      description: Local currency to display in info section.
-  
+
     binfoCashAddr:
       name: cashaddr
       in: query
+      description: |
+        Write Bitcoin Cash addresses in CashAddr format. They are in the legacy
+        format by default, as Blockchain.info writes them, so that software written
+        for it reads them.
       required: false
       schema:
         type: boolean
         example: true
-      description: Show Bitcoin Cash addresses in CashAddr format.
-  
+
     binfoTxIdIndex:
       name: txidindex
       in: query
+      description: |
+        Identify transactions by their id (`true`) rather than by a short number
+        (the default).
+
+        Blockchain.info identifies transactions by a number, and software written
+        for it expects one. The server derives it from the transaction id: the first
+        64 bits, shifted right by 11, so that it fits in the 53 bits that numbers in
+        JavaScript hold exactly. Two transactions can share a number, rarely; the
+        ids never collide, so use them when you can.
       required: false
       schema:
         type: boolean
         example: true
-      description: Use string with hex-encoded txid in tx_index field.
 
     binfoBlockId:
       name: block
       in: path
+      description: |
+        A block hash in hexadecimal, or a block height.
       required: true
       schema:
         oneOf:
           - type: string
           - type: integer
-      description: Hex-encoded txid or integer block height.
       example: 50000
-  
+
     binfoTxId:
       name: txid
       in: path
+      description: |
+        A transaction id in hexadecimal, or the short number of a transaction (see
+        `txidindex`).
       required: true
       schema:
         oneOf:
           - type: string
           - type: integer
-      description: Hex-encoded txid or integer from tx_index.
       example: 369c2a28fc84b060e4423e26ac898fa4ce9eda8943a36d0a48df66e6a6275aa6
-  
+
+    binfoJsonFormat:
+      name: format
+      in: query
+      description: |
+        Only `json` is accepted. Software written for Blockchain.info often sends
+        `format=json`, so it is accepted; any other value is refused rather than
+        answered in JSON anyway.
+      required: false
+      schema:
+        type: string
+        enum: [json]
+
     binfoFormat:
       name: format
       in: query
+      description: |
+        `json`, the default, or `hex` for the data serialized as in the peer-to-peer
+        protocol.
       required: false
       schema:
         type: string
@@ -6265,6 +8024,8 @@ components:
     binfoStart:
       name: start
       in: query
+      description: |
+        The first day of the history, as `dd-mm-yyyy` or `dd/mm/yyyy`.
       required: true
       schema:
         type: string
@@ -6273,6 +8034,8 @@ components:
     binfoEnd:
       name: end
       in: query
+      description: |
+        The last day of the history, included, as `dd-mm-yyyy` or `dd/mm/yyyy`.
       required: true
       schema:
         type: string

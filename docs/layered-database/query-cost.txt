@@ -1,0 +1,239 @@
+Output of docs/layered-database/QueryCost.hs, 2026-11-10.
+
+AMD Ryzen 9 3900X, RocksDB 11.1.1 through rocksdb-haskell-jprupp 2.6.3, the
+store's default settings, databases on tmpfs, one thread. Each database has
+a chain of 200,000 transactions, then 50,000 transactions taken into the
+mempool, then ten blocks that confirm the oldest 10,000 of them.
+
+##### make mixed, no filters on the chain
+importing a chain: 37.9 seconds, 189 microseconds for each transaction
+taking transactions into the mempool: 14.7 seconds, 294 microseconds for each transaction
+importing blocks that confirm mempool transactions: 2.1 seconds, 205 microseconds for each transaction
+211 blocks, 40000 transactions left in the mempool
+
+##### seeks in today's layout with filters on its indices by address
+
+Measured before those filters were taken out of the store's configuration,
+with the same steps: 2,000 seeks in the index of transactions by address.
+
+as it was left       mean      9.4, longest     45.1 microseconds
+5000 of the 40000 mempool transactions confirmed by a block
+after the block      mean     10.3, longest     41.0 microseconds
+5000 of the 40000 mempool transactions deleted
+after the deletions  mean    809.8, longest   1884.1 microseconds
+
+
+With a summary for each address and lists read by the page, 2026-11-10.
+The same machine and settings. The database of version 20 is the one
+above; the layered one was written again by the rules that keep summaries.
+
+##### make layered, no filters on the chain
+importing a chain: 35.0 seconds, 175 microseconds for each transaction
+taking transactions into the mempool: 12.2 seconds, 243 microseconds for each transaction
+importing blocks that confirm mempool transactions: 4.3 seconds, 434 microseconds for each transaction
+211 blocks, 40000 transactions left in the mempool
+
+##### time, filters on the chain
+today's database, table files of tx: 326478 keys, 326478 of them in 408207 bytes of Bloom filters
+today's database, table files of addr-tx: 899352 keys, 507146 of them in 633989 bytes of Bloom filters
+today's database, table files of balance: 111848 keys, 111848 of them in 139850 bytes of Bloom filters
+today's database, table files of mempool: 100000 keys, 100000 of them in 125061 bytes of Bloom filters
+the layered database, table files of tx: 248701 keys, 248701 of them in 310922 bytes of Bloom filters
+the layered database, table files of addr-tx: 699474 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of balance: 116217 keys, 116217 of them in 145354 bytes of Bloom filters
+the layered database, table files of mempool: 249994 keys, 249994 of them in 312517 bytes of Bloom filters
+the layered database, table files of mempool-addr: 523830 keys, 615796 of them in 769866 bytes of Bloom filters
+211 blocks, 40000 transactions in the mempool
+the busiest address: 17342 transactions, 6216 entries in the mempool area
+the cold wallet: 464 addresses read, 19499 transactions, 0 entries in the mempool area
+the quiet wallet: 464 addresses read, 19630 transactions, 10 entries in the mempool area
+the busy wallet: 464 addresses read, 42035 transactions, 16368 entries in the mempool area
+the small wallet: 84 addresses read, 399 transactions, 4 entries in the mempool area
+
+microseconds for each                                           today    layered   ratio
+balance: address with nothing in the mempool                      3.4       10.6    3.09
+balance: address with a transaction or two in the mempool         3.4       12.5    3.66
+balance: the busiest address                                      3.1       11.5    3.72
+balance: address that was never used                              1.9        8.8    4.70
+balances of 100 addresses with nothing in the mempool           183.2      289.3    1.58
+transaction: confirmed                                            4.7       13.4    2.87
+transaction: in the mempool                                       4.9       16.6    3.41
+100 transactions: confirmed                                     271.9      404.3    1.49
+100 transactions: in the mempool                                288.5      623.3    2.16
+spender of an output of a confirmed transaction                   4.5       10.3    2.29
+unspent output, if it is                                          3.8        9.8    2.60
+address with nothing in the mempool: its transactions            42.8       55.1    1.29
+address with a little in the mempool: its transactions           52.4       85.7    1.63
+busiest address: first 100 transactions                         522.1      576.0    1.10
+busiest address: 100 transactions, far back                     531.4      574.2    1.08
+busiest address: first 100 unspent outputs                      714.1     1360.5    1.91
+cold wallet: balances                                           852.5     1318.2    1.55
+cold wallet: first 100 transactions                            7149.8     7195.7    1.01
+cold wallet: 100 transactions, far back                        9228.5     7036.2    0.76
+cold wallet: first 100 unspent outputs                        10522.6    11326.6    1.08
+cold wallet: number of transactions                           77049.6    78404.4    1.02
+quiet wallet: balances                                          864.5     1306.5    1.51
+quiet wallet: first 100 transactions                           6702.9     7329.3    1.09
+quiet wallet: 100 transactions, far back                       9069.5     7019.5    0.77
+quiet wallet: first 100 unspent outputs                       10223.2    11575.0    1.13
+quiet wallet: number of transactions                          76778.5    79181.3    1.03
+busy wallet: balances                                           835.2     1822.3    2.18
+busy wallet: first 100 transactions                            6844.2    11150.7    1.63
+busy wallet: 100 transactions, far back                        9436.4     7166.4    0.76
+busy wallet: first 100 unspent outputs                        11332.1    23357.3    2.06
+busy wallet: number of transactions                          176022.1   220646.8    1.25
+small wallet: balances                                           90.1      166.1    1.84
+small wallet: first 100 transactions                            796.4      914.6    1.15
+small wallet: 100 transactions, far back                        904.8      872.8    0.96
+small wallet: first 100 unspent outputs                        1121.4     1235.8    1.10
+small wallet: number of transactions                           1651.1     1640.8    0.99
+
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.6
+balances of 100 addresses: the chain's part                                208.4
+balances of 100 addresses: the mempool's part                              468.0
+  100 seeks of one iterator that find nothing                              284.6
+  100 keys that are not there, in one multi-get                             89.0
+busiest address: its mempool entries, read and decoded                   35083.8
+  the same entries, read and not decoded                                 28062.1
+
+##### seeks layered, 5,000 transactions confirmed by a block
+as it was left, seek           mean      3.5, median      3.3, 99th of 100      6.8, longest     38.0 microseconds
+as it was left, balance        mean     16.1, median     15.5, 99th of 100     27.0, longest     50.1 microseconds
+5000 of the 40000 mempool transactions confirmed by a block
+after the block, seek          mean      4.5, median      4.4, 99th of 100      8.0, longest     74.4 microseconds
+after the block, balance       mean     16.9, median     16.3, 99th of 100     27.8, longest     58.9 microseconds
+
+##### seeks mixed, 5,000 transactions confirmed by a block
+as it was left, seek           mean      6.6, median      6.6, 99th of 100     10.3, longest     45.0 microseconds
+as it was left, balance        mean      5.0, median      4.8, 99th of 100      6.9, longest     32.9 microseconds
+5000 of the 40000 mempool transactions confirmed by a block
+after the block, seek          mean      6.9, median      6.8, 99th of 100      9.8, longest     39.1 microseconds
+after the block, balance       mean      5.4, median      5.2, 99th of 100      7.5, longest     33.1 microseconds
+
+
+With rocksdb-haskell-jprupp 2.6.4, 2026-11-10. The same databases.
+
+##### time, no filters on the chain
+today's database, table files of tx: 326478 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of addr-tx: 899352 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of balance: 112108 keys, 0 of them in 0 bytes of Bloom filters
+today's database, table files of mempool: 100000 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of tx: 248701 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of addr-tx: 699474 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of balance: 116217 keys, 0 of them in 0 bytes of Bloom filters
+the layered database, table files of mempool: 249994 keys, 249994 of them in 312517 bytes of Bloom filters
+the layered database, table files of mempool-addr: 523830 keys, 615796 of them in 769866 bytes of Bloom filters
+211 blocks, 40000 transactions in the mempool
+the busiest address: 17342 transactions, 6216 entries in the mempool area
+the cold wallet: 464 addresses read, 19499 transactions, 0 entries in the mempool area
+the quiet wallet: 464 addresses read, 19630 transactions, 10 entries in the mempool area
+the busy wallet: 464 addresses read, 42035 transactions, 16368 entries in the mempool area
+the small wallet: 84 addresses read, 399 transactions, 4 entries in the mempool area
+
+microseconds for each                                           today    layered   ratio
+balance: address with nothing in the mempool                      4.3       11.5    2.66
+balance: address with a transaction or two in the mempool         4.2       13.4    3.16
+balance: the busiest address                                      3.1       11.7    3.79
+balance: address that was never used                              4.1       12.1    2.97
+balances of 100 addresses with nothing in the mempool           244.1      344.9    1.41
+transaction: confirmed                                            5.7       13.1    2.28
+transaction: in the mempool                                       5.2       16.4    3.18
+100 transactions: confirmed                                     352.4      402.0    1.14
+100 transactions: in the mempool                                293.1      680.9    2.32
+spender of an output of a confirmed transaction                   5.7       10.2    1.80
+unspent output, if it is                                          4.6       12.3    2.65
+address with nothing in the mempool: its transactions            19.2       30.8    1.61
+address with a little in the mempool: its transactions           24.8       47.1    1.90
+busiest address: first 100 transactions                         174.6      221.3    1.27
+busiest address: 100 transactions, far back                     180.5      203.4    1.13
+busiest address: first 100 unspent outputs                      365.2      660.1    1.81
+cold wallet: balances                                          1380.6     1627.8    1.18
+cold wallet: first 100 transactions                            4293.7     4710.6    1.10
+cold wallet: 100 transactions, far back                        6968.5     4468.8    0.64
+cold wallet: first 100 unspent outputs                         7865.4     8737.9    1.11
+cold wallet: number of transactions                           33853.9    34308.6    1.01
+quiet wallet: balances                                         1254.6     1656.7    1.32
+quiet wallet: first 100 transactions                           4189.8     4810.1    1.15
+quiet wallet: 100 transactions, far back                       7005.9     4469.6    0.64
+quiet wallet: first 100 unspent outputs                        7641.4     8929.3    1.17
+quiet wallet: number of transactions                          35231.8    34495.7    0.98
+busy wallet: balances                                           967.3     1888.1    1.95
+busy wallet: first 100 transactions                            4439.6     7544.0    1.70
+busy wallet: 100 transactions, far back                        7467.2     4516.9    0.60
+busy wallet: first 100 unspent outputs                         7756.2    15945.9    2.06
+busy wallet: number of transactions                           70825.8    84261.8    1.19
+small wallet: balances                                          212.4      284.8    1.34
+small wallet: first 100 transactions                            376.5      430.5    1.14
+small wallet: 100 transactions, far back                        528.5      442.3    0.84
+small wallet: first 100 unspent outputs                         673.4      721.5    1.07
+small wallet: number of transactions                            668.1      705.0    1.06
+
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.8
+balances of 100 addresses: the chain's part                                257.6
+balances of 100 addresses: the mempool's part                              263.0
+  100 seeks of one iterator that find nothing                              203.5
+  100 keys that are not there, in one multi-get                             90.4
+busiest address: its mempool entries, read and decoded                   10160.0
+  the same entries, read and not decoded                                  6734.9
+
+##### gets and multi-gets, with rocksdb-haskell-jprupp 2.6.4
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.6
+balances of 100 addresses: the chain's part                                247.7
+balances of 100 addresses: the mempool's part                              267.9
+  100 seeks of one iterator that find nothing                              202.5
+  100 keys that are not there, in one multi-get                             84.4
+  the same 100 keys, a get for each                                        225.7
+  the same 100 keys, in multi-gets of 1                                    342.3
+  the same 100 keys, in multi-gets of 2                                    222.9
+  the same 100 keys, in multi-gets of 4                                    141.1
+  the same 100 keys, in multi-gets of 8                                    109.6
+  the same 100 keys, in multi-gets of 16                                    92.1
+100 balances of the chain, in one multi-get                                213.1
+  the same 100 balances, a get for each                                    376.4
+  the same 100 balances, in multi-gets of 2                                362.7
+  the same 100 balances, in multi-gets of 4                                273.3
+  the same 100 balances, in multi-gets of 8                                237.4
+busiest address: its mempool entries, read and decoded                   10199.3
+  the same entries, read and not decoded                                  6867.6
+
+
+Output of scripts/bench-web.sh 1000 5s 8, 2026-11-10, with wrk in a container.
+
+##### before the switch: commit 1a99590c, database version 20, binding 2.6.3
+health            21774.29 req/s  p50 363.00us  p99 510.00us  cpu   0.070 ms/req non-2xx 111046
+block-best        22064.04 req/s  p50 389.00us  p99 648.00us  cpu   0.077 ms/req 
+block-latest       1720.72 req/s  p50   4.66ms  p99  10.26ms  cpu   1.326 ms/req 
+block-txs          3922.75 req/s  p50   2.07ms  p99   3.44ms  cpu   0.433 ms/req 
+tx                17751.10 req/s  p50 503.00us  p99   1.11ms  cpu   0.093 ms/req 
+addr-balance      21243.55 req/s  p50 371.00us  p99 640.00us  cpu   0.075 ms/req 
+addr-txs           4981.05 req/s  p50   1.61ms  p99   3.64ms  cpu   0.443 ms/req 
+addr-txs-full       663.28 req/s  p50  11.36ms  p99  26.16ms  cpu   3.684 ms/req 
+addr-unspent       2398.47 req/s  p50   3.49ms  p99   6.58ms  cpu   0.893 ms/req 
+xpub-summary       6232.83 req/s  p50   1.33ms  p99   2.91ms  cpu   0.358 ms/req 
+xpub-txs           1762.05 req/s  p50   4.28ms  p99  10.87ms  cpu   1.485 ms/req 
+xpub-txs-full       955.38 req/s  p50   7.92ms  p99  18.90ms  cpu   2.706 ms/req 
+xpub-unspent        949.79 req/s  p50   8.01ms  p99  20.36ms  cpu   2.604 ms/req 
+binfo-multiaddr      62.17 req/s  p50 122.11ms  p99 227.41ms  cpu  46.399 ms/req 
+binfo-rawaddr       929.30 req/s  p50   8.07ms  p99  20.55ms  cpu   2.783 ms/req 
+binfo-unspent       651.17 req/s  p50  11.45ms  p99  29.17ms  cpu   4.188 ms/req
+
+##### now: database version 21, binding 2.6.4
+health            21014.58 req/s  p50 404.00us  p99 825.00us  cpu   0.076 ms/req non-2xx 107173
+block-best        21518.56 req/s  p50 418.00us  p99   0.94ms  cpu   0.081 ms/req 
+block-latest       1639.87 req/s  p50   5.10ms  p99  10.32ms  cpu   1.339 ms/req 
+block-txs          3755.75 req/s  p50   2.19ms  p99   3.58ms  cpu   0.478 ms/req 
+tx                15873.25 req/s  p50 576.00us  p99   1.57ms  cpu   0.111 ms/req 
+addr-balance      18310.01 req/s  p50 441.00us  p99 668.00us  cpu   0.089 ms/req 
+addr-txs           5629.87 req/s  p50   1.54ms  p99   2.72ms  cpu   0.358 ms/req 
+addr-txs-full       620.19 req/s  p50  12.22ms  p99  30.27ms  cpu   3.975 ms/req 
+addr-unspent       1975.29 req/s  p50   4.03ms  p99   6.25ms  cpu   0.896 ms/req 
+xpub-summary       4262.98 req/s  p50   1.91ms  p99   4.54ms  cpu   0.528 ms/req 
+xpub-txs           1677.74 req/s  p50   4.54ms  p99  10.77ms  cpu   1.507 ms/req 
+xpub-txs-full       860.45 req/s  p50   8.76ms  p99  20.15ms  cpu   2.972 ms/req 
+xpub-unspent        900.41 req/s  p50   8.33ms  p99  20.47ms  cpu   2.675 ms/req 
+binfo-multiaddr      95.90 req/s  p50  80.11ms  p99 136.79ms  cpu  29.479 ms/req 
+binfo-rawaddr       790.06 req/s  p50  10.09ms  p99  20.85ms  cpu   2.966 ms/req 
+binfo-unspent       527.22 req/s  p50  14.40ms  p99  30.80ms  cpu   4.865 ms/req

@@ -1,0 +1,490 @@
+cabal-version: 2.0
+
+-- This file has been generated from package.yaml by hpack version 0.39.6.
+--
+-- see: https://github.com/sol/hpack
+
+name:           haskoin-store
+version:        1.9.0
+synopsis:       Storage and index for Bitcoin and Bitcoin Cash
+description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
+                transactions from the peer-to-peer network, indexes them in RocksDB, and
+                serves a REST API with balances, transactions and unspent outputs of
+                addresses and extended public keys, a Blockchain.info compatible API, and
+                events over WebSockets. An optional Redis cache, shared by several stores,
+                keeps large wallets fast. See the README for installation and
+                configuration.
+category:       Bitcoin, Finance, Network
+homepage:       https://github.com/jprupp/haskoin-store#readme
+bug-reports:    https://github.com/jprupp/haskoin-store/issues
+author:         JP Rupp
+maintainer:     jprupp@protonmail.ch
+copyright:      (c) Haskoin Developers
+license:        MIT
+license-file:   LICENSE
+build-type:     Simple
+tested-with:
+    GHC == 9.12.4
+extra-source-files:
+    src/Haskoin/Store/Cache/lua/bodies.lua
+    src/Haskoin/Store/Cache/lua/commit.lua
+    src/Haskoin/Store/Cache/lua/delete.lua
+    src/Haskoin/Store/Cache/lua/evict.lua
+    src/Haskoin/Store/Cache/lua/page.lua
+    src/Haskoin/Store/Cache/lua/spends.lua
+    src/Haskoin/Store/Cache/lua/unlock.lua
+    src/Haskoin/Store/Fleet/lua/move.lua
+    src/Haskoin/Store/Fleet/lua/pool.lua
+    src/Haskoin/Store/Fleet/lua/read.lua
+    src/Haskoin/Store/Fleet/lua/report.lua
+    src/Haskoin/Store/Fleet/lua/xpub.lua
+    stress/wrk.lua
+    swagger.yaml
+extra-doc-files:
+    README.md
+    CHANGELOG.md
+
+source-repository head
+  type: git
+  location: https://github.com/jprupp/haskoin-store
+
+library
+  exposed-modules:
+      Haskoin.Store
+      Haskoin.Store.BlockStore
+      Haskoin.Store.BlockStore.Pending
+      Haskoin.Store.BlockStore.Sync
+      Haskoin.Store.Cache
+      Haskoin.Store.Cache.Protocol
+      Haskoin.Store.Common
+      Haskoin.Store.Database.Mempool
+      Haskoin.Store.Database.Migrate
+      Haskoin.Store.Database.Query
+      Haskoin.Store.Database.Query.Layered
+      Haskoin.Store.Database.Query.Pooled
+      Haskoin.Store.Database.Reader
+      Haskoin.Store.Database.Types
+      Haskoin.Store.Database.Views
+      Haskoin.Store.Database.Writer
+      Haskoin.Store.Fleet
+      Haskoin.Store.Fleet.Member
+      Haskoin.Store.Fleet.Pool
+      Haskoin.Store.Fleet.Redis
+      Haskoin.Store.Fleet.XPub
+      Haskoin.Store.Logic
+      Haskoin.Store.Logic.Layered
+      Haskoin.Store.Manager
+      Haskoin.Store.Web
+      Haskoin.Store.Web.Docs
+      Haskoin.Store.Web.Events
+      Haskoin.Store.Web.Router
+  other-modules:
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      src
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , http-types >=0.12.6 && <0.13
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024
+
+library integration
+  exposed-modules:
+      Haskoin.Store.Integration.Image
+      Haskoin.Store.Integration.Node
+      Haskoin.Store.Integration.Podman
+      Haskoin.Store.Integration.Valkey
+  other-modules:
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      integration
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , http-types >=0.12.6 && <0.13
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , process >=1.6.26.1 && <1.7
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024
+
+executable haskoin-store
+  main-is: Main.hs
+  other-modules:
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      app
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N --disable-delayed-os-memory-return"
+  build-depends:
+      aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
+    , filepath >=1.5.5.0 && <1.6
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , http-types >=0.12.6 && <0.13
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , optparse-applicative >=0.19.0.0 && <0.20
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024
+
+test-suite spec
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Haskoin.Store.BlockStore.PendingSpec
+      Haskoin.Store.BlockStore.SyncSpec
+      Haskoin.Store.Cache.ProtocolSpec
+      Haskoin.Store.CacheSpec
+      Haskoin.Store.CommonSpec
+      Haskoin.Store.Database.MigrateSpec
+      Haskoin.Store.Database.Query.LayeredSpec
+      Haskoin.Store.Database.ViewsSpec
+      Haskoin.Store.Fleet.MemberSpec
+      Haskoin.Store.Fleet.PoolSpec
+      Haskoin.Store.Fleet.RedisSpec
+      Haskoin.Store.Fleet.XPubSpec
+      Haskoin.Store.FleetSpec
+      Haskoin.Store.Histories
+      Haskoin.Store.IntegrationSpec
+      Haskoin.Store.Logic.LayeredSpec
+      Haskoin.Store.LogicSpec
+      Haskoin.Store.TestBlocks
+      Haskoin.Store.Web.EventsSpec
+      Haskoin.Store.Web.RouterSpec
+      Haskoin.Store.WebSpec
+      Haskoin.StoreSpec
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      test
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N4 -T -M4g"
+  build-depends:
+      QuickCheck >=2.17.1.0 && <2.18
+    , aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , base64 >=1.0.1 && <1.1
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , fast-logger >=3.2.9 && <3.3
+    , file-embed >=0.0.16.0 && <0.1
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , hspec >=2.11.18 && <2.12
+    , http-types >=0.12.6 && <0.13
+    , integration
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , process >=1.6.26.1 && <1.7
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024
+  build-tool-depends: hspec-discover:hspec-discover
+
+benchmark haskoin-store-bench
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  other-modules:
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      bench
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , http-types >=0.12.6 && <0.13
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , vector >=0.13.2.0 && <0.14
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024
+
+benchmark haskoin-store-stress
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  other-modules:
+      Paths_haskoin_store
+  autogen-modules:
+      Paths_haskoin_store
+  hs-source-dirs:
+      stress
+  default-extensions:
+      DuplicateRecordFields
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N2
+  build-depends:
+      aeson >=2.2.5.1 && <2.3
+    , aeson-pretty >=0.8.11 && <0.9
+    , base >=4.21.2.0 && <4.22
+    , base16 ==2.0.*
+    , bytes >=0.17.5 && <0.18
+    , bytestring >=0.12.2.0 && <0.13
+    , case-insensitive >=1.2.1.0 && <1.3
+    , cereal >=0.5.8.3 && <0.6
+    , conduit >=1.3.6.1 && <1.4
+    , containers ==0.7.*
+    , data-default >=0.8.0.2 && <0.9
+    , deepseq >=1.5.1.0 && <1.6
+    , file-embed >=0.0.16.0 && <0.1
+    , hashable >=1.5.1.0 && <1.6
+    , hashtables >=1.4.2 && <1.5
+    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-node ==2.5.*
+    , haskoin-store
+    , haskoin-store-data ==1.11.*
+    , hedis >=0.16.4 && <0.17
+    , http-types >=0.12.6 && <0.13
+    , integration
+    , lens >=5.3.6 && <5.4
+    , monad-control >=1.0.3.1 && <1.1
+    , mtl >=2.3.2 && <2.4
+    , network >=3.2.12.0 && <3.3
+    , nqe >=0.6.9 && <0.7
+    , optparse-applicative >=0.19.0.0 && <0.20
+    , process >=1.6.26.1 && <1.7
+    , random >=1.3.1 && <1.4
+    , rocksdb-haskell-jprupp >=2.7.1 && <2.8
+    , rocksdb-query >=0.6.1 && <0.7
+    , statsd-rupp >=0.5.0.2 && <0.6
+    , stm >=2.5.3.1 && <2.6
+    , string-conversions >=0.4.0.1 && <0.5
+    , text >=2.1.4 && <2.2
+    , time ==1.14.*
+    , transformers >=0.6.3.0 && <0.7
+    , unliftio >=0.2.25.1 && <0.3
+    , unordered-containers >=0.2.21 && <0.3
+    , vault >=0.3.2.0 && <0.4
+    , wai >=3.2.5 && <3.3
+    , wai-extra >=3.1.18 && <3.2
+    , wai-websockets >=3.0.1.2 && <3.1
+    , warp >=3.4.17 && <3.5
+    , warp-tls >=3.4.14 && <3.5
+    , websockets >=0.13.0.0 && <0.14
+    , wreq >=0.5.4.5 && <0.6
+  default-language: GHC2024

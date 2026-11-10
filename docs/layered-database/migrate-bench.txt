@@ -1,0 +1,12 @@
+Output of docs/layered-database/MigrateBench.hs, 2026-11-09.
+
+AMD Ryzen 9 3900X, RocksDB 11.1.1, database on tmpfs. A database of version
+20 with 30,000 mempool transactions, each spending one output of an earlier
+one and creating two, was copied; one copy had its mempool wiped by the
+rules of version 20, the other was migrated to the layered layout.
+
+adding 30000 transactions to the mempool: 10.92 seconds
+30000 transactions in the mempool
+wiping 30000 transactions, as version 20 does: 4.21 seconds
+migrating: 5.03 seconds
+Migration {moved = 30000, batches = 30, checked = 30000}
