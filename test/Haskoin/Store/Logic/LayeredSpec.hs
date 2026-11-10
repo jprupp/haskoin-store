@@ -101,7 +101,7 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
             keysOf tx = do
               Just td <- M.getMempoolTx db (txHash tx)
               let r = M.mempoolRecords db.net db.ctx 1000 td
-              return (M.recordEntries r)
+              return (fst (M.recordEntries r), M.addressArea [r])
         forM_ [parent, child] $ \tx ->
           (.result) <$> apply layeredRules db (Pay tx 1000) `shouldReturn` Right "True"
         (general, byAddress) <- keysOf child
@@ -157,6 +157,7 @@ sameHistory ctx net number choices =
                   upgraded op was hist answers = do
                     now <- apply layeredRules up op
                     (show op, now) `shouldBe` (show op, was)
+                    M.wrongSummaries up `shouldReturn` []
                     layered up (ask hist) `shouldReturn` answers
               half <- foldM (next old new today) ([], hist0) earlier
               void (migrateLayered up)
@@ -189,6 +190,8 @@ sameHistory ctx net number choices =
           was <- apply mixedRules old op
           now <- apply layeredRules new op
           (show op, now) `shouldBe` (show op, was)
+          -- each summary is what the entries of its address add up to
+          M.wrongSummaries new `shouldReturn` []
           -- and every answer is the same after it
           let hist'' = record old hist' op was
           answers <- mixed old (ask hist'')

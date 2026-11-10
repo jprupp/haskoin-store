@@ -82,6 +82,7 @@ module Haskoin.Store.Database.Types
     MemSpenderKey (..),
     MemAddrKey (..),
     MemAddrVal (..),
+    MemSummary (..),
     MemDeletedKey (..),
     MigrationKey (..),
     TxKey (..),
@@ -451,6 +452,12 @@ data MemAddrKey
   | -- | an output that a mempool transaction pays to the address, spent or
     -- not, by the time the transaction entered the mempool
     MemAddrOutKey !Address !UnixTime !OutPoint
+  | -- | what the entries of an address add up to; see t'MemSummary'
+    MemAddrSumKey !Address
+  | -- | short key that matches the transactions of an address
+    MemAddrTxKeyA !Address
+  | -- | short key that matches the outputs paid to an address
+    MemAddrOutKeyA !Address
   | -- | short key that matches every entry of an address
     MemAddrKeyA !Address
   | -- | short key that matches the entries of every address
@@ -475,6 +482,18 @@ instance Serialize MemAddrKey where
     putWord8 0x02
     putWord64be (maxBound - t)
     put p
+  -- 0x0d · Address · 0x03
+  put (MemAddrSumKey a) = do
+    put (MemAddrKeyA a)
+    putWord8 0x03
+  -- 0x0d · Address · 0x00
+  put (MemAddrTxKeyA a) = do
+    put (MemAddrKeyA a)
+    putWord8 0x00
+  -- 0x0d · Address · 0x02
+  put (MemAddrOutKeyA a) = do
+    put (MemAddrKeyA a)
+    putWord8 0x02
   -- 0x0d · Address
   put (MemAddrKeyA a) = do
     put MemAddrKeyS
@@ -488,6 +507,7 @@ instance Serialize MemAddrKey where
       0x00 -> MemAddrTxKey a . (maxBound -) <$> getWord64be <*> get
       0x01 -> MemAddrSpentKey a <$> get
       0x02 -> MemAddrOutKey a . (maxBound -) <$> getWord64be <*> get
+      0x03 -> return (MemAddrSumKey a)
       _ -> fail "Cannot decode MemAddrKey"
 
 instance Key MemAddrKey
@@ -503,17 +523,50 @@ data MemAddrVal
     MemAddrSpentVal !Word64
   | -- | value of a 'MemAddrOutKey': amount and script of the output
     MemAddrOutVal !Word64 !ByteString
+  | -- | value of a 'MemAddrSumKey'
+    MemAddrSumVal !MemSummary
   deriving (Show, Read, Eq, Ord, Generic, Hashable, NFData)
+
+-- | What the entries of an address in the mempool area add up to, kept so
+-- that its balance is one read by key however many entries there are, and
+-- so that an address with nothing in the mempool is found by a key that is
+-- not there instead of a scan.
+--
+-- It is a function of the entries of the address, and of nothing else: not
+-- of the chain. Whether an output that the mempool spends is one of the
+-- chain or one that the mempool made is the difference between 'spent' and
+-- 'both', and 'both' only changes when one of the two transactions enters
+-- or leaves the mempool. So the summary stays right when a block confirms
+-- some transactions and not others, like the entries themselves.
+data MemSummary = MemSummary
+  { -- | mempool transactions that touch the address
+    txs :: !Word64,
+    -- | amount of the outputs that the mempool pays to the address
+    paid :: !Word64,
+    -- | number of those outputs
+    paidCount :: !Word64,
+    -- | amount of the outputs of the address that the mempool spends
+    spent :: !Word64,
+    -- | number of those outputs
+    spentCount :: !Word64,
+    -- | amount of the outputs that the mempool both pays and spends
+    both :: !Word64,
+    -- | number of those outputs
+    bothCount :: !Word64
+  }
+  deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
 
 instance Serialize MemAddrVal where
   put MemAddrTxVal = putWord8 0x00
   put (MemAddrSpentVal v) = putWord8 0x01 >> putWord64be v
   put (MemAddrOutVal v s) = putWord8 0x02 >> putWord64be v >> put s
+  put (MemAddrSumVal s) = putWord8 0x03 >> put s
   get =
     getWord8 >>= \case
       0x00 -> return MemAddrTxVal
       0x01 -> MemAddrSpentVal <$> getWord64be
       0x02 -> MemAddrOutVal <$> getWord64be <*> get
+      0x03 -> MemAddrSumVal <$> get
       _ -> fail "Cannot decode MemAddrVal"
 
 instance KeyValue MemAddrKey MemAddrVal

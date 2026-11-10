@@ -103,7 +103,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 let records = [M.mempoolRecords net ctx time td | td <- moved, MemRef time <- [td.block]]
                 length records `shouldBe` length old.mempool
                 dump db (mempoolCF db.db) `shouldReturn` sort (concatMap (fst . M.recordEntries) records)
-                dump db (mempoolAddrCF db.db) `shouldReturn` sort (concatMap (snd . M.recordEntries) records)
+                dump db (mempoolAddrCF db.db) `shouldReturn` sort (M.addressArea records)
                 -- without the mempool area, the answers are those of the chain
                 void (M.wipeMempoolArea db)
                 wiped <- layered db (ask hist)

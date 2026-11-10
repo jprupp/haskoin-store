@@ -75,6 +75,7 @@ import Data.List (nub)
 import Data.Maybe
   ( catMaybes,
     fromMaybe,
+    isJust,
     isNothing,
     mapMaybe,
   )
@@ -110,6 +111,7 @@ import Haskoin.Node (LogLevel (..), logAt)
 import Haskoin.Store.Common (nub', sortTxs)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Mempool (MemRecords (..), mempoolRecords)
+import Haskoin.Store.Database.Types (MemAddrKey (..), MemAddrVal (..), MemSummary (..))
 import Haskoin.Store.Database.Writer
 import Haskoin.Store.Logic (ImportException (..))
 import UnliftIO (throwIO)
@@ -539,6 +541,7 @@ addMempoolTx wr time td = do
   insertMempoolTx wr r.body
   forM_ r.spends (uncurry (insertMempoolSpender wr))
   forM_ r.addresses (uncurry (insertMempoolAddr wr))
+  adjustSummaries wr (+) r
   addToMempool wr r.txid r.time
   -- it may have been deleted from the mempool before
   getDeletedTx wr r.txid >>= mapM_ (\_ -> deleteDeletedTx wr r.txid)
@@ -552,12 +555,58 @@ removeMempoolTx wr td = do
   deleteMempoolTx wr r.txid
   forM_ r.spends (deleteMempoolSpender wr . fst)
   forM_ r.addresses (deleteMempoolAddr wr . fst)
+  adjustSummaries wr (less "mempool summary") r
   deleteFromMempool wr r.txid
   where
     time = case td.block of
       MemRef t -> t
       BlockRef {} -> td.timestamp
     r = mempoolRecords (writerNet wr) (writerCtx wr) time td
+
+-- | Add what a transaction does at each address it touches to the summary
+-- of the address, or take it off again, given how to combine a number of
+-- the summary with one of the transaction.
+--
+-- Everything is in the entries of the transaction but one thing: whether an
+-- output that it spends was made by the mempool, and whether an output that
+-- it makes is spent by the mempool, which is what 'both' counts. Each is a
+-- read by key of what another transaction wrote. An output is counted in
+-- 'both' while both of its transactions are in the mempool, so it is added
+-- by the second of them to arrive and taken off by the first to leave,
+-- whichever that is.
+adjustSummaries :: Writer -> (Word64 -> Word64 -> Word64) -> MemRecords -> IO ()
+adjustSummaries wr op r = do
+  deltas <- forM r.addresses $ \case
+    (MemAddrTxKey a _ _, _) -> return (a, MemSummary 1 0 0 0 0 0 0)
+    (MemAddrSpentKey a p, MemAddrSpentVal v) -> do
+      made <- isJust <$> getMempoolTx wr p.hash
+      return (a, if made then MemSummary 0 0 0 v 1 v 1 else MemSummary 0 0 0 v 1 0 0)
+    (MemAddrOutKey a _ p, MemAddrOutVal v _) -> do
+      taken <- isJust <$> getMempoolSpender wr p
+      return (a, if taken then MemSummary 0 v 1 0 0 v 1 else MemSummary 0 v 1 0 0 0 0)
+    (k, _) -> error ("Not an entry of a transaction: " <> show k)
+  forM_ (M.toList (M.fromListWith plus deltas)) $ \(a, d) -> do
+    old <-
+      getMempoolAddr wr (MemAddrSumKey a) <&> \case
+        Just (MemAddrSumVal s) -> s
+        _ -> zero
+    let new = combine op old d
+    if new == zero
+      then deleteMempoolAddr wr (MemAddrSumKey a)
+      else insertMempoolAddr wr (MemAddrSumKey a) (MemAddrSumVal new)
+  where
+    zero = MemSummary 0 0 0 0 0 0 0
+    plus = combine (+)
+    combine f x y =
+      MemSummary
+        { txs = f x.txs y.txs,
+          paid = f x.paid y.paid,
+          paidCount = f x.paidCount y.paidCount,
+          spent = f x.spent y.spent,
+          spentCount = f x.spentCount y.spentCount,
+          both = f x.both y.both,
+          bothCount = f x.bothCount y.bothCount
+        }
 
 -- | Delete a mempool transaction that nothing spends, and keep its body as
 -- that of a deleted transaction. Throws 'TxSpent' if something spends it.

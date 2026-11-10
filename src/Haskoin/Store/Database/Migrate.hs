@@ -114,7 +114,7 @@ import Haskoin.Store.Data
     UnixTime,
     confirmed,
   )
-import Haskoin.Store.Database.Mempool (insertRecordOps, mempoolRecords)
+import Haskoin.Store.Database.Mempool (insertRecordOps, mempoolRecords, rebuildSummaries)
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     addrOutCF,
@@ -235,6 +235,9 @@ migrateLayeredWith opts r = do
       mapM_ (moveTx env) listed
       flush env
       mapM_ (verify r) listed
+      -- the summaries are worked out from the entries, all at once: doing it
+      -- again after an interruption gives the same
+      void (rebuildSummaries r)
       writeBatch db [deleteOp MigrationKey]
       moved <- readIORef env.total
       batches <- readIORef env.written

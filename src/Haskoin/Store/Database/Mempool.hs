@@ -52,6 +52,21 @@
 --
 -- * an output that the mempool both creates and spends shows up in neither,
 --   and only counts towards what the address received.
+--
+-- = The summary of an address
+--
+-- The entries of an address are few for nearly every address, and many
+-- thousands for some. So each address that the mempool touches also has a
+-- t'MemSummary', one key with what its entries add up to ('summarise'). A
+-- balance is the balance of the chain and the summary ('applySummary'), and
+-- the queries read the entries themselves only for lists, as far as a page
+-- goes.
+--
+-- The summary is not the key of one transaction, but it is a function of
+-- the entries of its address and of nothing else, so it shares what makes
+-- them safe: nothing that happens to the chain makes it wrong.
+-- 'wrongSummaries' checks that, and 'rebuildSummaries' writes them all
+-- again from the entries.
 module Haskoin.Store.Database.Mempool
   ( -- * What a transaction contributes
     MemRecords (..),
@@ -74,6 +89,16 @@ module Haskoin.Store.Database.Mempool
     hiddenOutputs,
     applyMempool,
     mergeBalance,
+
+    -- * The summary of an address
+    summarise,
+    summaryEntries,
+    applySummary,
+    summaryBalance,
+    getSummaries,
+    rebuildSummaries,
+    wrongSummaries,
+    addressArea,
   )
 where
 
@@ -85,7 +110,7 @@ import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Maybe (fromMaybe, isNothing, mapMaybe)
-import Data.Serialize (Serialize, encode)
+import Data.Serialize (Serialize, decode, encode)
 import Data.Word (Word32, Word64)
 import Database.RocksDB
   ( BatchOp (..),
@@ -95,6 +120,7 @@ import Database.RocksDB
     iterFirst,
     iterKey,
     iterNext,
+    multiGetCF,
     withIterCF,
   )
 import Database.RocksDB.Query
@@ -139,6 +165,7 @@ import Haskoin.Store.Database.Types
     MemAddrVal (..),
     MemDeletedKey (..),
     MemSpenderKey (..),
+    MemSummary (..),
     MemTimeKey (..),
     MemTxKey (..),
     TxKey (..),
@@ -353,19 +380,7 @@ hiddenOutputs m = HashMap.filterWithKey (\p _ -> not (HashSet.member p made)) m.
 -- as every output that the mempool spends exists. If they ever are, the
 -- result stops at zero rather than wrapping around.
 applyMempool :: Balance -> AddressMempool -> Balance
-applyMempool c m =
-  Balance
-    { address = c.address,
-      confirmed = c.confirmed `minus` sum (HashMap.elems hidden),
-      unconfirmed = c.unconfirmed + sum (map (.value) fresh),
-      utxo = (c.utxo `minus` fromIntegral (HashMap.size hidden)) + fromIntegral (length fresh),
-      txs = c.txs + fromIntegral (length m.txs),
-      received = c.received + sum (map (.value) m.created)
-    }
-  where
-    hidden = hiddenOutputs m
-    fresh = mempoolUnspents m
-    minus x y = if y > x then 0 else x - y
+applyMempool c m = applySummary c (summarise m)
 
 -- | Balance of an address as the API gives it, from its balance in the
 -- chain, if it has one, and what the mempool does at it ('applyMempool').
@@ -379,3 +394,112 @@ mergeBalance :: Address -> Maybe Balance -> AddressMempool -> Maybe Balance
 mergeBalance a chain m
   | isNothing chain && null m.txs && HashMap.null m.spent && null m.created = Nothing
   | otherwise = Just (applyMempool (fromMaybe (zeroBalance a) chain) m)
+
+-------------------------------------------------------------------------------
+-- The summary of an address
+-------------------------------------------------------------------------------
+
+-- | What the entries of an address add up to.
+summarise :: AddressMempool -> MemSummary
+summarise m =
+  MemSummary
+    { txs = fromIntegral (length m.txs),
+      paid = sum (map (.value) m.created),
+      paidCount = fromIntegral (length m.created),
+      spent = sum (HashMap.elems m.spent),
+      spentCount = fromIntegral (HashMap.size m.spent),
+      both = sum (map (.value) inside),
+      bothCount = fromIntegral (length inside)
+    }
+  where
+    inside = [u | u <- m.created, HashMap.member u.outpoint m.spent]
+
+-- | The summaries that go with some entries by address, which may be of
+-- many addresses: what the column family must have next to them, for the
+-- migration, for repairs and for the tests.
+summaryEntries :: [(MemAddrKey, MemAddrVal)] -> [(MemAddrKey, MemAddrVal)]
+summaryEntries rows =
+  [ (MemAddrSumKey a, MemAddrSumVal (summarise m))
+  | (a, m) <- HashMap.toList (HashMap.fromListWith (flip merge) (mapMaybe single rows))
+  ]
+  where
+    entries ts sp cr = AddressMempool {txs = ts, spent = sp, created = cr}
+    merge x y = entries (x.txs <> y.txs) (x.spent <> y.spent) (x.created <> y.created)
+    single = \case
+      (MemAddrTxKey a t h, _) -> Just (a, entries [TxRef {block = MemRef t, txid = h}] HashMap.empty [])
+      (MemAddrSpentKey a p, MemAddrSpentVal v) -> Just (a, entries [] (HashMap.singleton p v) [])
+      (MemAddrOutKey a t p, MemAddrOutVal v s) ->
+        let u = Unspent {block = MemRef t, outpoint = p, value = v, script = s, address = Just a}
+         in Just (a, entries [] HashMap.empty [u])
+      _ -> Nothing
+
+-- | The balance that the chain has for an address with the summary of what
+-- the mempool does at it applied: what 'applyMempool' gives, from the
+-- summary instead of the entries.
+applySummary :: Balance -> MemSummary -> Balance
+applySummary c s =
+  Balance
+    { address = c.address,
+      confirmed = c.confirmed `minus` (s.spent `minus` s.both),
+      unconfirmed = c.unconfirmed + (s.paid `minus` s.both),
+      utxo = (c.utxo `minus` (s.spentCount `minus` s.bothCount)) + (s.paidCount `minus` s.bothCount),
+      txs = c.txs + s.txs,
+      received = c.received + s.paid
+    }
+  where
+    minus x y = if y > x then 0 else x - y
+
+-- | Balance of an address as the API gives it, from its balance in the
+-- chain and its summary in the mempool, either of which it may not have:
+-- what 'mergeBalance' gives, without reading the entries.
+summaryBalance :: Address -> Maybe Balance -> Maybe MemSummary -> Maybe Balance
+summaryBalance _ chain Nothing = chain
+summaryBalance a chain (Just s) = Just (applySummary (fromMaybe (zeroBalance a) chain) s)
+
+-- | The summaries of addresses, in their order, read by key with one
+-- multi-get: 'Nothing' for an address that the mempool does not touch,
+-- which is nearly all of them, and which the filter of the column family
+-- answers.
+getSummaries :: DatabaseReader -> [Address] -> IO [Maybe MemSummary]
+getSummaries _ [] = return []
+getSummaries r as = map (>>= decoded) <$> multiGetCF r.db (mempoolAddrCF r.db) (map (encode . MemAddrSumKey) as)
+  where
+    decoded bytes = case decode bytes of
+      Right (MemAddrSumVal s) -> Just s
+      _ -> Nothing
+
+-- | The addresses whose summary is not what their entries add up to, each
+-- with the summary that it should have and the one that it has. There are
+-- none unless something is broken: this is what the tests hold the rules
+-- to after every operation.
+wrongSummaries :: DatabaseReader -> IO [(MemAddrKey, Maybe MemAddrVal, Maybe MemAddrVal)]
+wrongSummaries r = do
+  rows <- matchingAsListCF r.db (mempoolAddrCF r.db) MemAddrKeyS
+  let found = HashMap.fromList [(k, v) | (k@MemAddrSumKey {}, v) <- rows]
+      expected = HashMap.fromList (summaryEntries rows)
+  return
+    [ (k, HashMap.lookup k expected, HashMap.lookup k found)
+    | k <- HashMap.keys (HashMap.union expected found),
+      HashMap.lookup k expected /= HashMap.lookup k found
+    ]
+
+-- | Everything that the column family of entries by address holds for a
+-- mempool of some transactions, serialized, in no order: the entries of
+-- each, and the summaries of the addresses that they touch.
+addressArea :: [MemRecords] -> [(ByteString, ByteString)]
+addressArea records = [(encode k, encode v) | (k, v) <- entries <> summaryEntries entries]
+  where
+    entries = concatMap (.addresses) records
+
+-- | Work every summary out again from the entries, and say how many
+-- addresses have one. The migration does this once everything is moved, and
+-- it is what puts the summaries right if they are ever in doubt.
+rebuildSummaries :: DatabaseReader -> IO Int
+rebuildSummaries r = do
+  rows <- matchingAsListCF r.db cf MemAddrKeyS
+  let old = [DelCF cf (encode k) | (k@MemAddrSumKey {}, _ :: MemAddrVal) <- rows]
+      new = summaryEntries rows
+  writeBatch r.db (old <> [PutCF cf (encode k) (encode v) | (k, v) <- new])
+  return (length new)
+  where
+    cf = mempoolAddrCF r.db

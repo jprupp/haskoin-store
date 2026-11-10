@@ -42,9 +42,21 @@
 -- than any block. The list of an address is therefore what the mempool has
 -- for it followed by what the chain has, and that is the sequence that the
 -- single index of today's layout holds. A page is cut from it by the same
--- rules: where it starts, then the offset, then the limit. The mempool's part
--- is small and read whole. The chain's part is streamed from its index, only
--- as far as the page needs.
+-- rules: where it starts, then the offset, then the limit. Both parts are
+-- streamed, each from its own index, only as far as the page needs.
+--
+-- = Reading no more than the answer
+--
+-- Nearly every address has nothing in the mempool, and a few have thousands
+-- of entries there. Each address that the mempool touches has a summary of
+-- its entries, a t'MemSummary', which every query about an address reads
+-- first, by key. A balance is the chain's balance with the summary applied.
+-- A list reads the entries only of the addresses that have a summary, and
+-- the summary says how many outputs the mempool spends, so that no more are
+-- looked for. The first version of these queries scanned the entries of
+-- every address for every question, which measured ten thousand times
+-- slower for a busy address, and a hundred times slower for any address
+-- after a block, when the scan steps over all that the block deleted.
 module Haskoin.Store.Database.Query.Layered
   ( -- * A view of the database
     View,
@@ -86,14 +98,17 @@ where
 
 import Conduit
   ( ConduitT,
+    await,
+    awaitForever,
     concatMapC,
-    filterC,
+    lift,
     mapC,
     runConduit,
     sinkList,
-    yieldMany,
+    yield,
     (.|),
   )
+import Control.Monad (forM)
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.Functor ((<&>))
@@ -106,7 +121,6 @@ import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
-import Data.Ord (Down (..))
 import Data.Serialize (Serialize, encode)
 import Data.Word (Word32, Word64)
 import Database.RocksDB (ColumnFamily, Iterator, withSnapshot)
@@ -152,7 +166,6 @@ import Haskoin.Store.Data
     XPubSpec,
     XPubUnspent (..),
   )
-import Haskoin.Store.Database.Mempool (AddressMempool (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
@@ -162,14 +175,18 @@ import Haskoin.Store.Database.Reader
     addrOutCF,
     addrTxCF,
     derivedAddrs,
+    mempoolAddrCF,
     mempoolCF,
     txCF,
   )
 import Haskoin.Store.Database.Types
   ( AddrOutKey (..),
     AddrTxKey (..),
+    MemAddrKey (..),
+    MemAddrVal (..),
     MemDeletedKey (..),
     MemSpenderKey (..),
+    MemSummary (..),
     OutVal,
     TxKey (..),
     decodeTxKey,
@@ -384,13 +401,22 @@ withSpenders spent h td = case HashMap.lookup h spent of
 -- | Balance of an address, with the mempool applied. 'Nothing' if neither
 -- the chain nor the mempool has anything for the address; see
 -- 'M.mergeBalance' for where version 20 says zero instead.
+--
+-- It is two reads by key, the balance of the chain and the summary of the
+-- mempool, however much the mempool does at the address.
 getBalance :: View -> Address -> IO (Maybe Balance)
-getBalance (View r) a = M.mergeBalance a <$> Q.getBalance r a <*> M.getAddressMempool r a
+getBalance (View r) a = M.summaryBalance a <$> Q.getBalance r a <*> (only <$> M.getSummaries r [a])
+  where
+    only = \case
+      [s] -> s
+      _ -> Nothing
 
 -- | Balances of addresses, in the same order, with the mempool applied.
--- Addresses never used get a zero balance.
+-- Addresses never used get a zero balance. Two multi-gets, one in each area.
 getBalances :: View -> [Address] -> IO [Balance]
-getBalances (View r) as = zipWith M.applyMempool <$> Q.getBalances r as <*> M.getAddressMempools r as
+getBalances (View r) as = zipWith apply <$> Q.getBalances r as <*> M.getSummaries r as
+  where
+    apply c = maybe c (M.applySummary c)
 
 -- | Unspent output, if it exists and neither a block nor the mempool spends
 -- it: one that the chain has, or one of a mempool transaction.
@@ -422,9 +448,9 @@ getAddressTxs v a = getAddressesTxs v [a]
 -- | Transactions of any of the addresses, newest first, each once.
 getAddressesTxs :: View -> [Address] -> Limits -> IO [TxRef]
 getAddressesTxs (View r) as limits = paged r limits $ \from -> do
-  unconfirmed <- mempoolTxs r from as
-  txs <- Q.withManyIters r (addrTxCF r.db) (length as) $ \its ->
-    Q.joinConduits txRefKey (zipWith3 (addressTxsC from) as unconfirmed its) limits
+  txs <- withMempoolIters r from as (const True) $ \mempools ->
+    Q.withManyIters r (addrTxCF r.db) (length as) $ \its ->
+      Q.joinConduits txRefKey (zipWith3 (addressTxsC from) as (map (fmap snd) mempools) its) limits
   Q.count r $ \s -> incrementCounter s.dataAddrTxCount (length txs)
   return txs
 
@@ -435,9 +461,8 @@ getAddressUnspents v a = getAddressesUnspents v [a]
 -- | Unspent outputs of any of the addresses, newest first.
 getAddressesUnspents :: View -> [Address] -> Limits -> IO [Unspent]
 getAddressesUnspents (View r) as limits = paged r limits $ \from -> do
-  mempools <- M.getAddressMempools r as
-  us <- Q.withManyIters r (addrOutCF r.db) (length as) $ \its ->
-    Q.joinConduits unspentKey (zipWith3 (addressUnspentsC r from) as mempools its) limits
+  us <- withUnspentStreams r from as $ \streams ->
+    Q.joinConduits unspentKey streams limits
   Q.count r $ \s -> incrementCounter s.dataUnspentCount (length us)
   return us
 
@@ -475,25 +500,41 @@ pageStart r (Just (AtTx h)) =
 paged :: DatabaseReader -> Limits -> (From -> IO [a]) -> IO [a]
 paged r limits answer = pageStart r limits.start >>= maybe (return []) answer
 
--- | The mempool transactions of each address that belong in a list that
--- starts somewhere, newest first. The mempool area is not read for a list
--- that starts in the chain, which is what every page after the first of a
--- long history does.
-mempoolTxs :: DatabaseReader -> From -> [Address] -> IO [[TxRef]]
-mempoolTxs r from as = case from of
-  Top -> map (.txs) <$> M.getAddressMempools r as
-  InMempool time h -> map (dropWhile (newer time h) . (.txs)) <$> M.getAddressMempools r as
-  InChain _ -> return (map (const []) as)
+-- | Run an action with, for each address, its summary and an iterator on
+-- its entries in the mempool area, or 'Nothing' for an address whose
+-- entries the list does not need: one that the mempool does not touch, which
+-- is nearly all of them, one whose summary says that there is nothing of
+-- the kind wanted, and any address when the page starts in the chain, as
+-- every page after the first of a long history does.
+--
+-- The summaries are read by key in one multi-get, which the filter of the
+-- column family answers for the addresses that have none. No iterator is
+-- moved to an address with nothing there: such a seek costs ten times a
+-- read by key, and far more when it has to step over what a block just
+-- deleted.
+withMempoolIters ::
+  DatabaseReader ->
+  From ->
+  [Address] ->
+  (MemSummary -> Bool) ->
+  ([Maybe (MemSummary, Iterator)] -> IO a) ->
+  IO a
+withMempoolIters r from as wanted action = do
+  summaries <- case from of
+    InChain _ -> return (map (const Nothing) as)
+    _ -> map (>>= \s -> if wanted s then Just s else Nothing) <$> M.getSummaries r as
+  Q.withManyIters r (mempoolAddrCF r.db) (length (catMaybes summaries)) (action . pair summaries)
   where
-    -- those that entered the mempool in the same second are in the order of
-    -- their hashes
-    newer time h t = txRefKey t > (MemRef time, Down h)
+    pair (Just s : rest) (it : its) = Just (s, it) : pair rest its
+    pair (_ : rest) its = Nothing : pair rest its
+    pair [] _ = []
 
 -- | Transactions of an address, newest first, from where a page starts:
--- those of the mempool that belong in it, as 'mempoolTxs' gives them, then
--- those of the chain, streamed from the index of the address.
-addressTxsC :: From -> Address -> [TxRef] -> Iterator -> ConduitT i TxRef IO ()
-addressTxsC from a unconfirmed it = yieldMany unconfirmed >> (chain .| concatMapC ref)
+-- those of the mempool that belong in it, streamed from the entries of the
+-- address if it has any, then those of the chain, streamed from its index.
+-- Neither is read further than the page goes.
+addressTxsC :: From -> Address -> Maybe Iterator -> Iterator -> ConduitT i TxRef IO ()
+addressTxsC from a mempool it = mapM_ (mempoolTxsC from a) mempool >> (chain .| concatMapC ref)
   where
     chain = case from of
       InChain position -> matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a position)
@@ -502,27 +543,92 @@ addressTxsC from a unconfirmed it = yieldMany unconfirmed >> (chain .| concatMap
     ref (AddrTxKey _ t, ()) = Just t
     ref _ = Nothing
 
--- | Unspent outputs of an address, newest first, from where a page starts,
--- given what the mempool does at the address: the outputs that the mempool
--- created and has not spent, then those of the chain that the mempool does
--- not spend, streamed from the index of the address.
-addressUnspentsC :: DatabaseReader -> From -> Address -> AddressMempool -> Iterator -> ConduitT i Unspent IO ()
-addressUnspentsC r from a m it = yieldMany fresh >> (chain .| concatMapC output .| filterC visible)
+-- | Mempool transactions of an address, newest first, from where a page
+-- starts. Those that entered the mempool in the same second are in the
+-- order of their hashes, which is the order of their keys.
+mempoolTxsC :: From -> Address -> Iterator -> ConduitT i TxRef IO ()
+mempoolTxsC from a it = rows .| concatMapC ref
   where
-    fresh = case from of
-      Top -> M.mempoolUnspents m
-      InMempool time h -> dropWhile (newer time h) (M.mempoolUnspents m)
-      InChain _ -> []
+    rows = case from of
+      Top -> matching it (MemAddrTxKeyA a)
+      InMempool time h -> matchingSkip it (MemAddrTxKeyA a) (MemAddrTxKey a time h)
+      InChain _ -> return ()
+    ref :: (MemAddrKey, MemAddrVal) -> Maybe TxRef
+    ref (MemAddrTxKey _ t h, _) = Just TxRef {block = MemRef t, txid = h}
+    ref _ = Nothing
+
+-- | Run an action with the stream of unspent outputs of each address, from
+-- where a page starts.
+--
+-- The summaries are read whatever the start of the page: the chain still
+-- has, as unspent, the outputs that the mempool spends, on every page.
+withUnspentStreams ::
+  DatabaseReader ->
+  From ->
+  [Address] ->
+  ([ConduitT i Unspent IO ()] -> IO a) ->
+  IO a
+withUnspentStreams r from as action = do
+  summaries <- M.getSummaries r as
+  let fresh = case from of
+        InChain _ -> map (const Nothing) as
+        _ -> map (>>= \s -> if s.paidCount > s.bothCount then Just s else Nothing) summaries
+  Q.withManyIters r (mempoolAddrCF r.db) (length (catMaybes fresh)) $ \mits ->
+    Q.withManyIters r (addrOutCF r.db) (length as) $ \its ->
+      action (zipWith3 stream (zip as summaries) (pair fresh mits) its)
+  where
+    stream (a, s) = addressUnspentsC r from a s
+    pair (Just _ : rest) (it : its) = Just it : pair rest its
+    pair (_ : rest) its = Nothing : pair rest its
+    pair [] _ = []
+
+-- | Unspent outputs of an address, newest first, from where a page starts,
+-- given the summary of what the mempool does at the address, if anything,
+-- and an iterator on its entries if the page has some: the outputs that the
+-- mempool created and has not spent, then those of the chain that the
+-- mempool does not spend, streamed from the index of the address.
+--
+-- Whether the mempool spends an output is a read by key, and the summary
+-- says how many of them there are to find: none for nearly every address,
+-- so that nothing is read, and when the last one is found the reads stop.
+addressUnspentsC ::
+  DatabaseReader ->
+  From ->
+  Address ->
+  Maybe MemSummary ->
+  Maybe Iterator ->
+  Iterator ->
+  ConduitT i Unspent IO ()
+addressUnspentsC r from a summary mempool it = do
+  mapM_ (\mit -> fresh mit .| concatMapC created .| hide (maybe 0 (.bothCount) summary)) mempool
+  chain .| concatMapC output .| hide (maybe 0 (\s -> s.spentCount - s.bothCount) summary)
+  where
     -- the outputs of the transaction that the page starts at come first
     -- among those of the same second whose hashes are not smaller
-    newer time h u = unspentKey u > (MemRef time, Down (encode (OutPoint h 0)))
+    fresh mit = case from of
+      Top -> matching mit (MemAddrOutKeyA a)
+      InMempool time h -> matchingSkip mit (MemAddrOutKeyA a) (MemAddrOutKey a time (OutPoint h 0))
+      InChain _ -> return ()
+    created :: (MemAddrKey, MemAddrVal) -> Maybe Unspent
+    created (MemAddrOutKey _ t p, MemAddrOutVal v s) =
+      Just Unspent {block = MemRef t, outpoint = p, value = v, script = s, address = Just a}
+    created _ = Nothing
     chain = case from of
       InChain position -> matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a position)
       _ -> matching it (AddrOutKeyA a)
     output :: (AddrOutKey, OutVal) -> Maybe Unspent
     output = uncurry (toUnspent r.net r.ctx)
-    -- the chain still has, as unspent, the outputs that the mempool spends
-    visible u = not (HashMap.member u.outpoint m.spent)
+    -- let outputs through, but for those that the mempool spends, of which
+    -- there are no more than a number
+    hide :: Word64 -> ConduitT Unspent Unspent IO ()
+    hide 0 = awaitForever yield
+    hide n =
+      await >>= \case
+        Nothing -> return ()
+        Just u ->
+          lift (retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a u.outpoint)) >>= \case
+            Just (_ :: MemAddrVal) -> hide (n - 1)
+            Nothing -> yield u >> hide n
 
 -------------------------------------------------------------------------------
 -- Mempool
@@ -557,16 +663,13 @@ xPubBals v@(View r) xpub = do
 -- as the page needs, as 'Q.xPubUnspents' reads them.
 xPubUnspents :: View -> [XPubBal] -> Limits -> IO [XPubUnspent]
 xPubUnspents (View r) xbals limits = paged r limits $ \from -> do
-  mempools <- M.getAddressMempools r (map (.balance.address) funded)
   let quota = case (deOffset limits).limit of
         0 -> Nothing
         l -> Just l
-      stream b m it =
-        addressUnspentsC r from b.balance.address m it
-          .| mapC (\u -> XPubUnspent {path = b.path, unspent = u})
-  us <- Q.withManyIters r (addrOutCF r.db) (length funded) $ \its ->
+      tag b = mapC (\u -> XPubUnspent {path = b.path, unspent = u})
+  us <- withUnspentStreams r from (map (.balance.address) funded) $ \streams ->
     runConduit $
-      mergeDescGroups (.unspent.block) (unspentKey . (.unspent)) quota (zipWith3 stream funded mempools its)
+      mergeDescGroups (.unspent.block) (unspentKey . (.unspent)) quota (zipWith (\b s -> s .| tag b) funded streams)
         .| applyLimitsC limits
         .| sinkList
   Q.count r $ \s -> incrementCounter s.dataXPubUnspents (length us)
@@ -594,11 +697,19 @@ xPubTxCount v@(View r) xbals = do
 --
 -- Those of the chain are counted from the keys of its index, as
 -- 'Q.getAddressesTxCount' counts them, and those of the mempool from the
--- entries of the addresses. No transaction is in both.
+-- summaries of the addresses: nothing more is read when none of them, or
+-- only one, has transactions in the mempool, and otherwise the transactions
+-- of those that have are read, to count each once. No transaction is in
+-- both areas.
 getAddressesTxCount :: View -> [Address] -> IO Word32
 getAddressesTxCount _ [] = return 0
 getAddressesTxCount (View r) as = do
   inBlocks <- Q.getAddressesTxCount r as
-  mempools <- M.getAddressMempools r as
-  let inMempool = HashSet.fromList [t.txid | m <- mempools, t <- m.txs]
-  return (inBlocks + fromIntegral (HashSet.size inMempool))
+  inMempool <- withMempoolIters r Top as ((> 0) . (.txs)) $ \mempools ->
+    case [(a, m) | (a, Just m) <- zip as mempools] of
+      [] -> return 0
+      [(_, (s, _))] -> return (fromIntegral s.txs)
+      several -> do
+        txs <- forM several $ \(a, (_, it)) -> runConduit (mempoolTxsC Top a it .| mapC (.txid) .| sinkList)
+        return (HashSet.size (HashSet.fromList (concat txs)))
+  return (inBlocks + fromIntegral inMempool)

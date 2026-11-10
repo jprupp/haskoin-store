@@ -47,7 +47,7 @@ that could be built and proved ahead of the switch.
 | Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, measured: right, and too slow in two cases; not used by the store |
 | Tests against today's database, rules and queries | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs`, `test/Haskoin/Store/Database/Query/LayeredSpec.hs` | passing |
 | Cost of lookups, of whole queries and of writing | `docs/layered-database/` | measured |
-| A summary for each address, and lists read by the page | | proposed below, not started |
+| A summary for each address, and lists read by the page | `MemSummary`, `Haskoin.Store.Database.Mempool`, `Haskoin.Store.Database.Query.Layered` | written, tested: each summary is what its entries add up to after every operation |
 | The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web` | not started |
 | The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
 
@@ -251,7 +251,10 @@ change to the API. This design keeps the first-seen time.
 1. The chain's column families hold what follows from the blocks of the main
    chain up to the best block, and nothing else, except the two things
    above: first-seen times, and bodies deleted by version 20.
-2. The mempool area is the union of the keys of the mempool's transactions.
+2. The mempool area is the union of the keys of the mempool's transactions,
+   and for each address that they touch a
+   [summary](#1-a-summary-for-each-address-that-the-mempool-touches) that
+   is a function of the entries of that address.
 3. Every output that a mempool transaction spends exists: the chain has it
    as unspent, or another mempool transaction creates it.
 4. No two mempool transactions spend the same output.
@@ -782,7 +785,9 @@ The queries as built give the right answers, and take far too long in two
 cases: about an address that the mempool touches a lot, and about any
 address right after a block. Both come from one choice: to read everything
 that the mempool has for an address, with a scan, for every question about
-that address. Four changes follow from the measurements. None is built.
+that address. Four changes follow from the measurements. The first two are
+built, and the queries measured above are the ones from before them; the
+other two are changes to the binding.
 
 ### 1. A summary for each address that the mempool touches
 
@@ -833,6 +838,19 @@ received    = chain.received + paid
 - **It costs the rules a read and a write for each address** that a mempool
   transaction touches, as today's rules pay for its balance.
 
+Built: the summary is `MemSummary`, under `MemAddrSumKey`, the last key of
+an address in `mempool-addr`. The rules of `Haskoin.Store.Logic.Layered`
+change it with every transaction that enters or leaves the mempool
+(`adjustSummaries`), and the migration writes all of them at the end from
+the entries that it moved (`rebuildSummaries`), which is also how they
+would be put right. The tests work every summary out again from the entries
+after each operation of their random histories (`wrongSummaries`), and
+compare the summaries that the rules kept with those that the migration
+wrote for the same history, byte for byte. Being the last key of an
+address, the summary is also what a scan of the address's transactions or
+outputs runs into when they end, instead of the deleted keys of the next
+address.
+
 ### 2. Lists read in proportion to the page
 
 - **Transactions.** The entries of an address are already in the order of
@@ -845,6 +863,12 @@ received    = chain.received + paid
   `both` that nothing of the chain is hidden.
 - **Several addresses.** The summaries, read together, say which addresses
   have anything in the mempool. Only those get a stream.
+
+Built, as described. The reads of hidden outputs stop when as many were
+found as the summary counts. The number of transactions of several
+addresses is the sum of the chain's count and the summaries' when at most
+one of the addresses has transactions in the mempool, and otherwise the
+mempool transactions of those that have are read to count each once.
 
 ### 3. Bounded iterators in the binding
 
@@ -1399,13 +1423,13 @@ Each step ends with something that can be tested against today's behaviour.
 6. **The cache on two layers**, specified and model-tested in
    `Haskoin.Store.Cache.Protocol` first.
 
-Before step 5, the read path has to change as
+Before step 5, the read path had to change as
 [the measurements ask](#what-has-to-change-before-the-switch): a summary for
-each address, and lists read by the page. Where the mempool that answers
-queries is kept, in RocksDB or in Redis for a fleet of stores, decides
-where that summary goes, so it is settled first. The two changes to the
-binding are independent and help today's store. A mirror in memory is no
-longer planned.
+each address, and lists read by the page. That is done for the mempool that
+a store keeps in RocksDB, which is what it answers from alone and when
+Redis is down; the shared pool of a fleet needs the same in Redis. The two
+changes to the binding are independent and help today's store. A mirror in
+memory is no longer planned.
 
 Steps 1, 3 and 4 are done, and step 2 as far as it can be before the
 switch. Step 6 is where the concurrency problems of the cache are actually

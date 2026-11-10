@@ -203,6 +203,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     upgraded in the middle of a history. They also check that an open view
     goes on answering from its moment while blocks and transactions are
     written.
+- A summary for each address that the mempool touches, in the layered
+  layout (`MemSummary`, under `MemAddrSumKey`): the number of its mempool
+  transactions, and the amounts and numbers of the outputs that the mempool
+  pays to it, spends, and both pays and spends. The measurements showed the
+  queries of that layout to be too slow for an address with much in the
+  mempool, and for any address right after a block, because they scanned
+  everything that the mempool has for an address to answer anything.
+  - A balance is now two reads by key, and an address with nothing in the
+    mempool is found by a key that is not there.
+  - Lists of transactions and of unspent outputs read the mempool's entries
+    only for addresses that have some, and only as far as the page goes.
+  - The rules keep the summary with every transaction that enters or leaves
+    the mempool, and the migration writes all of them from the entries that
+    it moved. The tests work every summary out again after each operation.
 - `docs/layered-database/QueryCost.hs` writes one synthetic history into a
   database of each layout and times the rules and the queries of both,
   checking that the answers agree. `docs/layered-database.md` has the

@@ -492,9 +492,9 @@ chain's data, and so that the cache can be split the same way. Four parts
 of it are written and tested, and the store does not use them yet:
 
 - the migration from the present layout (`Haskoin.Store.Database.Migrate`);
-- the keys that a mempool transaction writes, and what the mempool does to
-  the balance and the unspent outputs of an address
-  (`Haskoin.Store.Database.Mempool`);
+- the keys that a mempool transaction writes, the summary that is kept for
+  each address they touch, and what the mempool does to the balance and the
+  unspent outputs of an address (`Haskoin.Store.Database.Mempool`);
 - the rules that import blocks and transactions in that layout
   (`Haskoin.Store.Logic.Layered`), which the tests hold to the results of
   today's rules, operation by operation and key by key;

@@ -86,6 +86,7 @@ module Haskoin.Store.Database.Writer
     deleteMempoolSpender,
     insertMempoolAddr,
     deleteMempoolAddr,
+    getMempoolAddr,
     insertDeletedTx,
     deleteDeletedTx,
   )
@@ -308,6 +309,11 @@ insertMempoolAddr w k v = H.insert w.memory.memAddrTable k (Just v)
 -- | Remove an entry of the mempool by address.
 deleteMempoolAddr :: Writer -> MemAddrKey -> IO ()
 deleteMempoolAddr w k = H.insert w.memory.memAddrTable k Nothing
+
+-- | An entry of the mempool by address, with the changes of the batch
+-- applied.
+getMempoolAddr :: Writer -> MemAddrKey -> IO (Maybe MemAddrVal)
+getMempoolAddr w k = getLayered w (\s -> H.lookup s.memAddrTable k) (\r -> retrieveCF r.db (mempoolAddrCF r.db) k)
 
 -- | Keep the body of a transaction that left the mempool unconfirmed.
 insertDeletedTx :: Writer -> TxData -> IO ()
