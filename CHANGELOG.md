@@ -72,8 +72,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   uses an iterator that RocksDB stops where the address ends, so that a
   scan cannot walk over deleted keys that follow it. The migration reads
   the transactions with an iterator that is asked for the order of them
-  all. `haskoin-node` still asks for a binding below 2.7: `stack.yaml`
-  lifts that bound, and a build with Cabal waits for `haskoin-node`.
+  all.
+- Built with `haskoin-node` 2.5.0, which has the fixes of its security
+  review: among them, a block from a peer is checked against its header
+  before the store sees it, so a peer can no longer pass off transactions
+  of its choice under a real header. It also allows the new binding. On
+  regtest its discovery no longer finds a node on this machine: name the
+  node with `--peer`.
 - **`/events` agrees across a fleet.** The servers of a fleet send the
   events of the block and the mempool that they share, read from a stream
   in Redis that the pool's script writes as it makes each change, and no

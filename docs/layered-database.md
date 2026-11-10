@@ -466,11 +466,4 @@ Not shown: load, and a database of real size.
 - **Spenders next to their record**, read with one seek, would bring a
   page of full transactions back to about what it cost.
 - **Bloom filters on a full database** were not measured for memory.
-- **`haskoin-node` has to allow version 2.7 of the binding.** The store
-  is built with 2.7.1, whose iterators stop at a bound: every scan by
-  address ends where its address does. `haskoin-node` asks for a version
-  below 2.7, so `stack.yaml` lifts that one bound; a build with Cabal
-  needs `haskoin-node` to allow it.
 - **How long a store may lag** before it leaves the fleet is not a setting.
-- **The size of the fleet's cache** is not in its metrics
-  (`fleet.cache.*`). The number of entries is `ZCARD` of `fx:lru` in Redis.

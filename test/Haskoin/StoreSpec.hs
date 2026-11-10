@@ -134,8 +134,10 @@ withTestStoreBlocks blocks net ctx t f =
         cfg =
           StoreConfig
             { maxPeers = 20,
-              initPeers = [],
-              discover = True,
+              -- the mock peer, by name: since haskoin-node 2.5 the seed of
+              -- a regtest network is not an address that discovery takes
+              initPeers = ["127.0.0.1:18444"],
+              discover = False,
               db = w,
               net = net,
               ctx = ctx,

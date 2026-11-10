@@ -27,12 +27,5 @@ extra-deps:
   - rocksdb-query-0.6.1
   - nqe-0.6.9
   - haskoin-core-1.6.1
-  # The fix of the header sync stall, until it is released.
-  - git: https://github.com/jprupp/haskoin-node.git
-    commit: 10d6a3ce22822be0a08e8b11ce909888f813ac65
+  - haskoin-node-2.5.0
   - haskoin-store-data-1.9.0
-# haskoin-node asks for rocksdb-haskell-jprupp below 2.7 and works with 2.7
-# unchanged. This lifts that one bound until haskoin-node allows it itself.
-allow-newer: true
-allow-newer-deps:
-  - haskoin-node

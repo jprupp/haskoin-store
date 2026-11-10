@@ -267,7 +267,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | --- | --- | --- | --- |
 | `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, or a test network (see `--help`) |
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
-| `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses |
+| `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER` |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `120` | Seconds before an unresponsive peer is dropped |
