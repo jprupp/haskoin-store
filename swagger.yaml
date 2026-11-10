@@ -222,9 +222,15 @@ info:
 
     Instead of polling, keep `/events` open: it sends a line for every new block
     and every change to the mempool, as a stream of JSON lines or over a
-    WebSocket. Events carry only the hash; fetch what you need from it. A client
-    that falls more than 10,000 events behind is disconnected, so that one slow
-    client cannot make the server hold an ever-growing queue for it.
+    WebSocket. Events carry only the hash; fetch what you need from it.
+
+    The server keeps its last 10,000 events. A client that lost its connection
+    comes back with `?after=` and the hash of the last event it heard, and gets
+    what came after it. A client that falls further behind than that is
+    disconnected, so that a slow client costs the server nothing.
+
+    Over the WebSocket a client can choose the transactions it hears about: by
+    address, by extended public key, or with a Bloom filter. See `/events`.
 
     The servers of a fleet all send the same events in the same order: those of
     the block and the mempool that the fleet shares, not what each server's own
@@ -291,8 +297,10 @@ info:
     - The only endpoint that reads a body is `POST /transactions`: one
       transaction as in the peer-to-peer protocol, as raw bytes or as hex. The
       server tells them apart by content, not by `Content-Type`.
-    - The Blockchain.info endpoints and `/dbstats` have no binary form. Events
-      over a WebSocket are JSON.
+    - The Blockchain.info endpoints and `/dbstats` have no binary form.
+    - Over the WebSocket at `/events`, binary is binary frames: the server
+      sends them when the handshake asked for binary, and from the first binary
+      frame that the client sends.
 
     ### Primitives
 
@@ -446,6 +454,33 @@ info:
     | `TxId` | `hash256`. |
     | `Event` | Tag `00` new best block or `01` mempool transaction, then `hash256`. 33 bytes. |
     | `PeerInfo` | `bytes` user agent, `text` address, `i32` version, `u64` services, `bool` relay. |
+
+    ### Commands of the event WebSocket
+
+    What a client sends in a binary frame over the WebSocket at `/events`, one
+    command to a frame: a tag, then what it carries.
+
+    | Tag | Then | Command |
+    | --- | --- | --- |
+    | `00` | `list Address` | Watch these addresses too. |
+    | `01` | `list Address` | Stop watching these addresses. |
+    | `02` | `XPub`, `u8` derivation | Watch this extended public key too. |
+    | `03` | `XPub`, `u8` derivation | Stop watching this key. |
+    | `04` | `Filter` | Set the Bloom filter, in place of the one before. |
+    | `05` | `bytes`, 520 at most | Add an element to the Bloom filter. |
+    | `06` | | Remove the Bloom filter. |
+    | `07` | | Forget all of it, and hear of every transaction. |
+    | `08` | | Forget all of it, and hear of blocks alone. |
+
+    `XPub` is the 78 bytes of the key as BIP 32 serializes it, which is what
+    the Base58Check of its text decodes to: `u32` version of the network, `u8`
+    depth, 4 bytes fingerprint of the parent, `u32` index, 32 bytes chain code,
+    33 bytes compressed public key. The derivation is `00` legacy, `01` compat,
+    `02` segwit.
+
+    `Filter` is the `filterload` message of the peer-to-peer protocol (BIP 37):
+    `varint` length and that many bytes of filter, 36,000 at most, `u32le`
+    number of hash functions, 50 at most, `u32le` tweak, `u8` flags.
 
     ### Health
 
@@ -2726,6 +2761,70 @@ paths:
       operationId: getEventStream
       parameters:
         - $ref: '#/components/parameters/prettyParam'
+        - name: after
+          in: query
+          required: false
+          description: |
+            Hash of the last event heard, a block or a transaction: the stream
+            starts with what came after it.
+          schema:
+            type: string
+          example: 3e225aa5d41b0f7560ee641f86b00728adc626102b348f9d319e0fdfd848a0db
+        - name: quiet
+          in: query
+          required: false
+          description: |
+            `true` to hear of blocks alone, until something is watched.
+          schema:
+            type: boolean
+            default: false
+        - name: addresses
+          in: query
+          required: false
+          description: Addresses to watch from the start, separated by commas.
+          schema:
+            type: string
+        - name: xpub
+          in: query
+          required: false
+          description: Extended public key to watch from the start.
+          schema:
+            type: string
+        - name: derive
+          in: query
+          required: false
+          description: |
+            Types of the addresses of `xpub`: `legacy`, `compat` or `segwit`,
+            one or several separated by commas. `legacy` when left out.
+          schema:
+            type: string
+          example: legacy,segwit
+        - name: filter
+          in: query
+          required: false
+          description: |
+            Bloom filter to start with, in hex, with `functions`, and `tweak`
+            and `flags` when they are not 0.
+          schema:
+            type: string
+        - name: functions
+          in: query
+          required: false
+          description: Number of hash functions of `filter`.
+          schema:
+            type: integer
+        - name: tweak
+          in: query
+          required: false
+          description: Tweak of `filter`.
+          schema:
+            type: integer
+        - name: flags
+          in: query
+          required: false
+          description: Flags of `filter`.
+          schema:
+            type: integer
       summary: Stream Blocks and Transactions
       description: |
         A stream of what happens on the network: one event per new block and per
@@ -2736,15 +2835,95 @@ paths:
         {"type":"block","id":"0000000000000000000a1b…"}
         ```
 
-        The same events are sent over a **WebSocket** at the same path, one JSON
-        message each, for browsers. The server pings WebSocket clients every 30
-        seconds and drops those that do not answer within 60.
+        An event names what changed and nothing else, which keeps the stream
+        small; fetch the block or transaction if you need it. A transaction
+        that a block confirms has no event of its own: the block is the event.
 
-        An event names what changed and nothing else, which keeps the stream small
-        and the same for everyone; fetch the block or transaction if you need it. A
-        client that falls more than 10,000 events behind is disconnected rather than
-        having the server queue events for it without limit; reconnect, and catch up
-        with the normal endpoints.
+        ## Taking up where you left
+
+        The server keeps its last 10,000 events, fewer when their transactions
+        are very large. With `after` the stream starts after the event with
+        that hash, so a client that reconnects misses nothing. If the server
+        does not have that event the answer is 404: read again what you
+        follow, and connect without `after`. A client that falls further
+        behind than the server keeps is disconnected.
+
+        A transaction that entered the mempool and left it unconfirmed has two
+        events with the same hash. The stream starts after the first of them,
+        so an event may come twice, and none is left out.
+
+        In a fleet every server keeps the same events, also from before it
+        started: come back to any of them.
+
+        ## WebSocket
+
+        The same events are sent over a **WebSocket** at the same path, one
+        message each, and `after` works the same. The server pings every 30
+        seconds and drops clients that do not answer within 60.
+
+        Messages are JSON in text frames or binary in binary frames ("Binary
+        format" above). The server answers in the kind of frame that the
+        client last sent; before the client has sent any, in binary if the
+        `Accept` header of the handshake asked for it, else in JSON.
+
+        ## Choosing transactions
+
+        Over the WebSocket a client can say which transactions it wants to
+        hear about, with these messages. Blocks are always sent. A client that
+        sends none of them hears of every transaction.
+
+        | Message | Does |
+        | --- | --- |
+        | `{"type":"watch","addresses":["…"]}` | Watch these addresses too. |
+        | `{"type":"unwatch","addresses":["…"]}` | Stop watching them. |
+        | `{"type":"watch","xpub":"…","derive":"segwit"}` | Watch a key too. |
+        | `{"type":"unwatch","xpub":"…","derive":"segwit"}` | Stop watching it. |
+        | `{"type":"filterload","filter":"hex","functions":11,"tweak":0,"flags":0}` | Set the Bloom filter. |
+        | `{"type":"filteradd","data":"hex"}` | Add an element to the filter. |
+        | `{"type":"filterclear"}` | Remove the filter. |
+        | `{"type":"all"}` | Forget all of it: every transaction again. |
+        | `{"type":"none"}` | Forget all of it: blocks alone. |
+
+        A transaction is sent when it pays to or spends from a watched address
+        or an address of a watched key, or when it matches the filter.
+
+        ## Choosing from the start
+
+        A client that connects and then sends its messages is sent every
+        transaction until the first of them is read. To avoid that, say in the
+        URL what to start with, on the WebSocket or on the HTTP stream:
+
+        ```
+        /events?quiet=true
+        /events?addresses=bc1q…,1A1z…
+        /events?xpub=xpub6C…&derive=legacy,segwit
+        /events?filter=b50f8a…&functions=11
+        ```
+
+        `quiet=true` starts with blocks alone; send messages afterwards to
+        watch more. The others watch what they name, and can be combined. A
+        list of addresses too long for a URL goes in messages after
+        `quiet=true`, or, for the HTTP stream, in the form of a `POST`.
+
+        - **Keys.** `derive` is `legacy`, `compat` or `segwit`, as on the
+          `/xpub` endpoints, and `legacy` when left out. To watch one key under
+          several types of address, send a message for each. The server
+          watches the addresses in use and the gap of unused ones after them,
+          and moves the gap on as payments come. At most 100 keys.
+        - **Addresses.** At most 100,000.
+        - **Bloom filter.** The filter of BIP 37, matched as a node matches it
+          for an SPV client: against the hash of the transaction, the data in
+          its output scripts, the outputs it spends and the data in its input
+          scripts. One filter to a connection. The server never changes it:
+          `flags` is accepted, but the outputs of matching transactions are
+          not added, so add what you want to follow with `filteradd`. An empty
+          filter matches everything.
+        - **No answers.** As between a node and an SPV client, nothing is sent
+          back. A message that the server cannot read or will not do closes
+          the connection with code 1008 and the reason.
+        - When the server does not know the transaction of an event, which
+          happens when one leaves the mempool long after it entered, the event
+          goes to every client.
       responses:
         '200':
           description: Events stream each on one line.
@@ -2759,6 +2938,18 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: A parameter could not be read, or names too much to watch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The server has no event with the hash given in `after`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   '/peers':
     get:

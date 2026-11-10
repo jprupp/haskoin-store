@@ -411,22 +411,32 @@ memberLoop m nextBlock complain = go
 
 -- | Hear what happens to the fleet, for as long as the store runs: each
 -- move of the tip and each transaction that enters or leaves the pool is
--- told to a function, in the order in which Redis has them, from the
--- moment that this starts. Every store of the fleet hears the same, which
--- is what its clients are told ('FleetEvent'). When Redis cannot be read
--- a function is told why, and listening starts again from what is newest
--- then: the events in between are not told.
-memberEvents :: Member -> (FleetEvent -> IO ()) -> (String -> IO ()) -> IO a
-memberEvents m tell complain = start
+-- told to a function, in the order in which Redis has them. Every store of
+-- the fleet hears the same, which is what its clients are told
+-- ('FleetEvent').
+--
+-- The telling starts from now, or from the oldest event that Redis keeps:
+-- the second is for a listener that wants to hold the same history as the
+-- other stores whenever it started, as the log of events of the web server
+-- does. When Redis cannot be read a function is told why, and listening
+-- goes on from the last event heard, so nothing is left out unless Redis
+-- dropped it meanwhile.
+memberEvents :: Member -> Bool -> (FleetEvent -> IO ()) -> (String -> IO ()) -> IO a
+memberEvents m whole tell complain = newIORef (if whole then Just "0-0" else Nothing) >>= start
   where
-    start = do
-      handleAny (complain . show) (fleetEventsEnd m.redis m.keys >>= listen)
+    start at = do
+      handleAny (complain . show) $ do
+        from <- readIORef at >>= maybe (fleetEventsEnd m.redis m.keys) return
+        writeIORef at (Just from)
+        listen at from
       void (timeout 1000000 (atomically retrySTM) :: IO (Maybe ()))
-      start
-    listen from = do
+      start at
+    listen at from = do
       events <- fleetEventsAfter m.redis m.keys from 1000
       mapM_ (tell . snd) events
-      listen (foldl (\_ (at, _) -> at) from events)
+      let next = foldl (\_ (place, _) -> place) from events
+      writeIORef at (Just next)
+      listen at next
 
 -- | Report the blocks of the main chain that the store has views of, newest
 -- first.

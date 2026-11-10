@@ -40,6 +40,8 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as C8
 import Data.ByteString.Lazy qualified as BL
+import Data.Bytes.Put (runPutS)
+import Data.Bytes.Serial (serialize)
 import Data.Default (def)
 import Data.Either (isRight)
 import Data.Foldable (toList)
@@ -58,7 +60,8 @@ import Data.Text qualified as T
 import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
-  ( Address,
+  ( Address (..),
+    BloomFlags (..),
     Ctx,
     Network,
     OutPoint (..),
@@ -67,10 +70,15 @@ import Haskoin
     addrToText,
     addressToScriptBS,
     blockHashToHex,
+    bloomCreate,
+    bloomInsert,
     deriveXPubKey,
     encodeHex,
+    hexToBlockHash,
     hexToTxHash,
     makeXPrvKey,
+    marshal,
+    marshalJSON,
     prepareContext,
     prvSubKey,
     pubSubKey,
@@ -106,7 +114,16 @@ import Haskoin.Store.Cache
     xpubId,
   )
 import Haskoin.Store.Common (StoreEvent (..))
-import Haskoin.Store.Data (Balance (..), BlockRef (..), Except (..), Spender (..), TxData (..), XPubBal (..))
+import Haskoin.Store.Data
+  ( Balance (..),
+    BlockRef (..),
+    Event (..),
+    EventCommand (..),
+    Except (..),
+    Spender (..),
+    TxData (..),
+    XPubBal (..),
+  )
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Fleet.Member (memberTip)
@@ -116,13 +133,14 @@ import Haskoin.Store.Integration.Podman
 import Haskoin.Store.Integration.Valkey
 import NQE (receive, withSubscription)
 import Network.Socket qualified as Socket
+import Network.WebSockets qualified as WS
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
-import UnliftIO (async, bracket, cancel, link, tryAny, withAsync, withSystemTempDirectory)
+import UnliftIO (async, bracket, cancel, link, throwIO, try, tryAny, withAsync, withSystemTempDirectory)
 import UnliftIO.Concurrent (threadDelay)
 
 spec :: Spec
@@ -159,6 +177,7 @@ chainSpec kind = do
   it "answers an error in the format that was asked for" errorFormatTest
   it "speaks HTTP as browsers, proxies and long requests need it" httpTest
   it "serves HTTPS, and nothing else, when given a certificate" tlsTest
+  it "tells each client of the transactions it chose, and takes up where it left" eventsTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
   it "applies each change once with two stores sharing Redis" onceTest
   it "does not replace what it does not know" unknownTest
@@ -1618,6 +1637,122 @@ httpTest env = do
   statusOf reference `shouldBe` 200
   BL.toStrict (reference ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "description: This server"
 
+-- | The events of the server over a WebSocket. A client that says nothing
+-- hears of every transaction; one that names an extended public key, an
+-- address or a Bloom filter hears of the transactions that touch them, in
+-- JSON or in binary as it spoke, and all hear of the block. The key is
+-- followed past the gap it had when it was named. A client that comes
+-- back with the hash of an event hears what came after it, and one that
+-- sends what the server cannot read is disconnected.
+eventsTest :: Env -> IO ()
+eventsTest env = do
+  let x = newXPub env "events" DeriveNormal
+      y = newXPub env "events-other" DeriveNormal
+      port = read (reverse (takeWhile (/= ':') (reverse env.plain))) :: Int
+      client path = WS.runClient "127.0.0.1" port path
+      json = BL.toStrict . marshalJSON (env.net, env.ctx)
+      binary = marshal (env.net, env.ctx)
+      -- every event that a client hears after saying something, in order
+      hearing path say heard = client path $ \c -> do
+        mapM_ (either (WS.sendTextData c) (WS.sendBinaryData c)) (say :: [Either C8.ByteString C8.ByteString])
+        forever $
+          WS.receiveDataMessage c >>= \case
+            WS.Text bytes _ -> modifyIORef' heard (either error id (eitherDecode bytes) :)
+            WS.Binary bytes -> modifyIORef' heard (either error id (decode (BL.toStrict bytes)) :)
+      eventId = \case
+        EventTx h -> txHashToHex h
+        EventBlock h -> blockHashToHex h
+      element = \case
+        PubKeyAddress h -> runPutS (serialize h)
+        _ -> error "Not the hash of a key"
+      bloom = bloomInsert (bloomCreate 10 0.0000001 0 BloomUpdateNone) (element (addrOf env y [0, 1]))
+  [all', key, address, filtered, quiet, keyFirst, addressFirst] <- mapM (const (newIORef [])) [1 .. 7 :: Int]
+  listeners <-
+    mapM
+      async
+      [ hearing "/events" [] all',
+        hearing "/events" [Left (json (EventWatchXPub x.spec))] key,
+        hearing "/events" [Right (binary (EventWatch [addrOf env y [0, 0]]))] address,
+        hearing "/events" [Right (binary (EventFilterLoad bloom))] filtered,
+        -- chosen in the URL, before the first event: blocks alone, a key
+        -- under a type of address, an address
+        hearing "/events?quiet=true" [] quiet,
+        hearing ("/events?derive=legacy&xpub=" <> x.text) [] keyFirst,
+        hearing ("/events?addresses=" <> T.unpack (at env y [0, 0])) [] addressFirst
+      ]
+  mapM_ link listeners
+  threadDelay 1000000
+  ref <- newLedger
+  other <- newLedger
+  let told heard n = waitFor "a client to hear of the events" ((>= n) . length <$> readIORef heard)
+      paid who ledger path = do
+        txid <- pay env who ledger [(path, 100000)]
+        -- one at a time, so that the order of the events is known
+        told all' . (+ 1) . length =<< readIORef all'
+        maybe (fail "Not a hash") (return . EventTx) (hexToTxHash txid)
+  one <- paid x ref [0, 0]
+  two <- paid y other [0, 0]
+  three <- paid y other [0, 1]
+  -- past the gap of the key as it was named, within it since its payment
+  four <- paid x ref [0, gap]
+  [mined] <- mine env 1
+  block <- maybe (fail "Not a hash") (return . EventBlock) (hexToBlockHash mined)
+  told all' 5
+  told key 3
+  told address 2
+  told filtered 2
+  told quiet 1
+  told keyFirst 3
+  told addressFirst 2
+  threadDelay 500000
+  mapM_ cancel listeners
+  (reverse <$> readIORef all') `shouldReturn` [one, two, three, four, block]
+  (reverse <$> readIORef key) `shouldReturn` [one, four, block]
+  (reverse <$> readIORef address) `shouldReturn` [two, block]
+  (reverse <$> readIORef filtered) `shouldReturn` [three, block]
+  (reverse <$> readIORef quiet) `shouldReturn` [block]
+  (reverse <$> readIORef keyFirst) `shouldReturn` [one, four, block]
+  (reverse <$> readIORef addressFirst) `shouldReturn` [two, block]
+  -- from an event on: what came after it
+  let since = "/events?after=" <> T.unpack (eventId one)
+  again <- newIORef []
+  resumed <- async (hearing since [] again)
+  told again 4
+  cancel resumed
+  (reverse <$> readIORef again) `shouldReturn` [two, three, four, block]
+  -- and the same without a WebSocket, one event to a line
+  streamed <- eventLines (env.plain <> since) 4
+  map (either error id . eitherDecode . BL.fromStrict) streamed `shouldBe` [two, three, four, block]
+  -- the stream too can be of what touches an address
+  chosen <- eventLines (env.plain <> since <> "&addresses=" <> T.unpack (at env y [0, 1])) 2
+  map (either error id . eitherDecode . BL.fromStrict) chosen `shouldBe` [three, block]
+  fst <$> getJSON env.plain "/events?addresses=nonsense" `shouldReturn` 400
+  fst <$> getJSON env.plain "/events?derive=segwit" `shouldReturn` 400
+  -- an event that the server does not have, and a hash that is not one
+  fst <$> getJSON env.plain ("/events?after=" <> replicate 64 '0') `shouldReturn` 404
+  fst <$> getJSON env.plain "/events?after=nonsense" `shouldReturn` 400
+  refused <- tryAny (client ("/events?after=" <> replicate 64 '0') (\_ -> return ()))
+  either (const True) (const False) refused `shouldBe` True
+  -- a command that cannot be read ends the connection, with the reason
+  closed <- try . client "/events" $ \c -> do
+    WS.sendTextData c ("{\"type\":\"nonsense\"}" :: C8.ByteString)
+    void (WS.receiveDataMessage c)
+  case closed of
+    Left (WS.CloseRequest code why) -> (code, why) `shouldBe` (1008, "Could not read the command")
+    wrong -> expectationFailure ("Not closed: " <> show wrong)
+
+-- | The first lines of a stream of events, which has no end: the request
+-- is given up once they are there.
+eventLines :: String -> Int -> IO [C8.ByteString]
+eventLines url n = do
+  got <- newIORef C8.empty
+  let collect () chunk = do
+        modifyIORef' got (<> chunk)
+        enough <- (>= n) . C8.count '\n' <$> readIORef got
+        when enough (throwIO (userError "enough"))
+  _ <- tryAny (Wreq.foldGet collect () url)
+  take n . C8.lines <$> readIORef got
+
 -- | Two more stores, each with its own database, syncing from the same
 -- node, as members of one fleet on the Redis of the tests, each with a web
 -- server. The fleet agrees on the best block; a payment that both stores
@@ -1733,6 +1868,11 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   toldA `shouldBe` ["new " <> txid, "block " <> best]
   cancel listenA
   cancel listenB
+  -- and a client that heard of the payment from one takes up on the other
+  let since = "/events?after=" <> T.unpack txid
+      then' = "{\"type\":\"block\",\"id\":\"" <> cs best <> "\"}"
+  eventLines (urlA <> since) 1 `shouldReturn` [then']
+  eventLines (urlB <> since) 1 `shouldReturn` [then']
   (_, confirmed) <- getJSON urlB ("/transaction/" <> T.unpack txid)
   (confirmed ! "block") `shouldSatisfy` \case
     Object o -> KeyMap.member "height" o

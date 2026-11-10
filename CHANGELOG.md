@@ -84,6 +84,26 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   in Redis that the pool's script writes as it makes each change, and no
   longer those of their own nodes. A block is told when the fleet has
   moved to it, with every block that it moved through.
+- **`/events` takes up where a client left.** `?after=` with the hash of
+  the last event heard starts the stream after it, over HTTP and over the
+  WebSocket. The server keeps its last 10,000 events in one log that all
+  clients read (`Haskoin.Store.Web.Events`), in place of a queue for each.
+  It answers 404 when it does not have the event. The servers of a fleet
+  keep the same events, so a client may come back to another one.
+- **A WebSocket client chooses the transactions it hears about**: by
+  address, by extended public key with a type of address, or with a Bloom
+  filter as in BIP 37, with the commands of `EventCommand` in
+  `haskoin-store-data` 1.11. Blocks are always sent, and a client that
+  sends no command hears everything, as before. A key is watched up to its
+  gap, which moves on with its payments.
+- **The choice can be in the URL of `/events`**, so that it holds from
+  the first event: `quiet=true` for blocks alone, `addresses`, `xpub` with
+  `derive` (one type or several), and `filter` with `functions`, `tweak`
+  and `flags`. The HTTP stream takes them too, also under `POST` with a
+  form. `{"type":"none"}` goes back to blocks alone.
+- **The WebSocket speaks binary too**: binary frames when the handshake
+  asks for binary or the client sends a binary frame, for events and
+  commands alike.
 - **HTTPS**, optional and off by default: `--tls-cert` and `--tls-key`
   (`TLS_CERT`, `TLS_KEY`) make the server speak HTTPS on its port.
 - **The reference of the API at the root of the server.** `/` is a page
@@ -117,6 +137,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the cache of a fleet holds, and how many addresses between them.
 
 ### Changed
+
+- A WebSocket client of `/events` that sends something the server cannot
+  read as a command is disconnected, with code 1008 and the reason. What
+  clients sent used to be ignored.
+- The HTTP stream of `/events` no longer holds a view of the database for
+  as long as its client listens.
 
 - Since version 2.6.4 the binding reads the key and the value of a row of
   an iterator without the cost of a safe foreign call.

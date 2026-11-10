@@ -99,7 +99,9 @@ import Control.Lens ((.~), (^.))
 import Control.Monad
   ( filterM,
     forM_,
+    forever,
     guard,
+    join,
     unless,
     void,
     when,
@@ -121,6 +123,7 @@ import Data.Aeson.Encoding
   ( encodingToLazyByteString,
     list,
   )
+import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
 import Data.ByteString.Builder (lazyByteString)
 import Data.ByteString.Char8 qualified as C
@@ -147,7 +150,7 @@ import Data.Maybe
     maybeToList,
   )
 import Data.Proxy (Proxy (..))
-import Data.Serialize (decode, encode)
+import Data.Serialize (Serialize, decode, encode)
 import Data.String (fromString)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -197,21 +200,25 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Fleet.Member (Member (..), TipMoved (..), answeringCached, memberAlive, memberTip)
+import Haskoin.Store.Fleet.Member
+  ( Member (..),
+    TipMoved (..),
+    answeringCached,
+    memberAlive,
+    memberEvents,
+    memberTip,
+  )
+import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
+import Haskoin.Store.Web.Events
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.Web.Router qualified as Router
 import Haskoin.Store.WebCommon
 import Haskoin.Transaction
 import Haskoin.Util
 import NQE
-  ( Publisher,
-    mailboxFullSTM,
-    newBoundedInbox,
-    receiveSTM,
-    sendSTM,
-    subscribe,
+  ( subscribe,
     unsubscribe,
   )
 import Network.HTTP.Types
@@ -219,6 +226,7 @@ import Network.HTTP.Types
     hContentType,
     methodGet,
     methodPost,
+    parseQuery,
     renderStdMethod,
     status200,
     status203,
@@ -263,6 +271,7 @@ import Network.WebSockets
     pendingRequest,
     rejectRequestWith,
     requestPath,
+    sendBinaryData,
     sendTextData,
   )
 import Network.WebSockets qualified as WebSockets
@@ -283,22 +292,25 @@ import UnliftIO
     atomically,
     bracket,
     bracket_,
+    catch,
     catchAny,
-    checkSTM,
     fromException,
     handleAny,
+    link,
     newIORef,
+    newTQueueIO,
     newTVarIO,
-    orElse,
     race_,
     readIORef,
-    readTVar,
+    readTQueue,
     readTVarIO,
+    stateTVar,
     throwIO,
     timeout,
     try,
     withAsync,
     writeIORef,
+    writeTQueue,
     writeTVar,
   )
 import UnliftIO.Concurrent (threadDelay)
@@ -404,7 +416,9 @@ data WebState = WebState
     direct :: !StoreRead,
     -- | whether Redis answered the last time it was asked; always 'True'
     -- for a store without a cache
-    cacheUp :: !(TVar Bool)
+    cacheUp :: !(TVar Bool),
+    -- | the events that the clients of @\/events@ read ('feedEvents')
+    eventLog :: !EventLog
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
@@ -632,6 +646,7 @@ serveWeb config serve = do
   session <- Wreq.Session.newAPISession
   health <- runHealthCheck >>= newTVarIO
   cacheUp <- cacheCheck >>= newTVarIO
+  eventLog <- newEventLog
   let db = config.store.db
       stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
       routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
@@ -685,15 +700,23 @@ serveWeb config serve = do
                   False
                     | tries > 0 -> shared member (tries - 1) True answer
                     | otherwise -> behind answer
-      behind answer = answer [r {handler = behindResponse st} :: Route | r <- routesOf st]
-      app = routerScoped (routesOf st) scoped notFound
+      behind answer = answer [r {handler = behindResponse st} :: Route | r <- routes]
+      -- the stream of events never ends, and reads nothing from the
+      -- database: answered like the rest it would hold a view, and the
+      -- data under it, for as long as its client listens
+      app request
+        | pathInfo request == ["events"] = routerScoped routes ($ routes) notFound request
+        | otherwise = routerScoped routes scoped notFound request
+      routes = routesOf st
       notFound req NoRoute = errorResponse st req ThingNotFound
       notFound req (Unknown ks) =
         errorResponse st req . UserError $
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health cacheUp) $ \_a2 ->
-      serve . webSocketEvents st . logIt config.logger . anyOrigin . preflight . autohead . compressed $ app
+      withAsync (feedEvents st) $ \a3 ->
+        link a3 >> do
+          serve . webSocketEvents st . logIt config.logger . anyOrigin . preflight . autohead . compressed $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -882,6 +905,11 @@ withPost r
   where
     takesList = any (`elem` r.accepts) ["addresses", "blocks", "heights", "txids"]
 
+-- | The parameters of @\/events@ that say what a client hears about from
+-- the start ('eventsOpen').
+eventParams :: [Text]
+eventParams = ["quiet", "addresses", "xpub", "derive", "filter", "functions", "tweak", "flags"]
+
 -- | The routes of every endpoint, except those disabled in the configuration.
 handlePaths :: WebState -> WebConfig -> [Route]
 handlePaths st cfg =
@@ -917,7 +945,7 @@ handlePaths st cfg =
     marshalledList ("addresses" : limits) (\r -> GetAddrsTxsFull <$> need r <*> lim r) (handleAddrsTxsFull st),
     marshalledList ["addresses"] (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
     marshalledList ("addresses" : limits) (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
-    get "/events" ["pretty"] (handleEvents st),
+    get "/events" ("pretty" : "after" : eventParams) (handleEvents st),
     get "/dbstats" [] (handleDbStats st),
     -- the reference of the API, as a page and as the file that it shows
     get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage),
@@ -1488,68 +1516,113 @@ handleMempool st (GetMempool limitM (OffsetParam o)) =
         l = Limits (validateLimit wl' False limitM) (fromIntegral o) Nothing
     map snd <$> st.query.getMempoolPage l
 
--- | Middleware that serves @\/events@ over a WebSocket: each new block or mempool
--- transaction is sent as a JSON message. Clients that do not answer pings, or
--- that fall more than 10000 events behind, are disconnected.
+-- | Middleware that serves @\/events@ over a WebSocket: each new block and
+-- each transaction that enters or leaves the mempool is a message, from the
+-- log of events ("Haskoin.Store.Web.Events").
+--
+-- The client may send the commands of t'EventCommand' to choose the
+-- transactions that it hears about. Each side speaks JSON in text frames
+-- or binary in binary frames, and the server speaks as it was last spoken
+-- to; before the client has said anything, as the @Accept@ header of the
+-- handshake asks, like any request. A command that the server cannot read
+-- or cannot do closes the connection with the reason, as a node does with
+-- an SPV client: there are no answers to wait for.
+--
+-- @?after=@ with the hash of the last event heard takes up from there
+-- ('eventsStart'). Clients that do not answer pings, or that fall off the
+-- start of the log, are disconnected.
 webSocketEvents :: WebState -> Middleware
 webSocketEvents s =
   websocketsOr defaultConnectionOptions (wrap . events)
   where
-    pub = s.config.store.events
     pingPong = defaultPingPongOptions {pingInterval = 30, pongTimeout = 60}
     gauge = (.events) <$> s.metrics
+    net = s.config.store.net
+    ctx = s.config.store.ctx
+    gap = s.query.maxGap
     wrap f = case gauge of
       Nothing -> f
       Just g -> withGaugeIO g f
     events pending = do
-      let path = requestPath $ pendingRequest pending
-      if path == "/events"
-        then withEventSubscription pub $ \nextEvent -> do
-          conn <- acceptRequest pending
-          -- Drop clients that stop answering pings, and clients that fall
-          -- so far behind that their event queue fills up.
-          -- websockets only sees pongs while reading, hence the reader.
-          withPingPong pingPong conn $ \c ->
-            let send_events =
-                  nextEvent >>= \case
-                    Nothing ->
-                      WebSockets.sendClose c ("Event queue full" :: Text)
-                    Just event -> do
-                      sendTextData c (A.encode event)
-                      send_events
-             in race_
-                  (loopForever (WebSockets.receiveDataMessage c))
-                  send_events
+      let request = pendingRequest pending
+          (path, query) = C.break (== '?') (requestPath request)
+          asked = parseQuery query
+          accept = lookup "Accept" (WebSockets.requestHeaders request)
+          binary = maybe False (acceptsBinary . T.decodeUtf8Lenient) accept
+      if path /= "/events"
+        then turnAway pending ThingNotFound
         else
-          rejectRequestWith
-            pending
-            WebSockets.defaultRejectRequest
-              { WebSockets.rejectBody =
-                  L.toStrict $ A.encode ThingNotFound,
-                WebSockets.rejectCode =
-                  404,
-                WebSockets.rejectMessage =
-                  "Not Found",
-                WebSockets.rejectHeaders =
-                  [("Content-Type", "application/json")]
-              }
+          eventsOpen s (\name -> T.decodeUtf8Lenient <$> join (lookup (T.encodeUtf8 name) asked)) >>= \case
+            Left e -> turnAway pending e
+            Right (start, watch) -> do
+              conn <- acceptRequest pending
+              format <- newTVarIO binary
+              -- websockets only sees pongs while reading, which the
+              -- thread that hears the commands does
+              withPingPong pingPong conn $ \c ->
+                race_ (hear c watch format) (tell c watch format start) `catch` gone
+    -- a client that leaves is not an error to report
+    gone :: WebSockets.ConnectionException -> IO ()
+    gone _ = return ()
+    -- the commands of the client, until one cannot be done
+    hear c watch format = do
+      message <- WebSockets.receiveDataMessage c
+      let (binary, read') = case message of
+            WebSockets.Text bytes _ -> (False, A.decode bytes >>= parseMaybe (unmarshalValue (net, ctx)))
+            WebSockets.Binary bytes -> (True, either (const Nothing) Just (unmarshal (net, ctx) (L.toStrict bytes)))
+      atomically (writeTVar format binary)
+      case read' of
+        Nothing -> refuse c "Could not read the command"
+        Just cmd ->
+          try (command ctx gap s.query.xPubBals watch cmd) >>= \case
+            Right (Right ()) -> hear c watch format
+            Right (Left why) -> refuse c why
+            Left (_ :: Except) -> refuse c "Could not do the command"
+    -- 1008: the message is against what the server allows
+    refuse c why = WebSockets.sendCloseCode c 1008 (T.pack why)
+    -- the events from a place in the log on, those that the client chose
+    tell c watch format from =
+      atomically (readEvents s.eventLog from) >>= \case
+        Nothing -> WebSockets.sendClose c ("Event queue full" :: Text)
+        Just entries -> do
+          forM_ entries $ \e -> do
+            wanted <- atomically (stateTVar watch (relevant ctx gap e.seen))
+            when wanted $
+              readTVarIO format >>= \case
+                True -> sendBinaryData c (runPutL (serialize e.event))
+                False -> sendTextData c (A.encode e.event)
+          tell c watch format (from + fromIntegral (length entries))
+    turnAway pending e =
+      rejectRequestWith
+        pending
+        WebSockets.defaultRejectRequest
+          { WebSockets.rejectBody = L.toStrict (A.encode e),
+            WebSockets.rejectCode = statusCode (errStatus e),
+            WebSockets.rejectMessage = statusMessage (errStatus e),
+            WebSockets.rejectHeaders = [("Content-Type", "application/json")]
+          }
 
--- | Handler for @GET \/events@: stream of new blocks and mempool transactions, one
--- per line in JSON, until the client falls more than 10000 events behind.
+-- | Handler for @GET \/events@: stream of new blocks and of transactions
+-- that enter or leave the mempool, one per line in JSON or one after the
+-- other in binary, until the client falls off the start of the log.
+-- @after@ takes up from an event ('eventsStart').
 handleEvents :: WebState -> Req -> IO Response
-handleEvents st req =
-  withGaugeIncrease st (.events) $ do
-    proto <- serialAs req False
-    let pub = st.config.store.events
-    return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
-      withEventSubscription pub $ \nextEvent ->
-        -- ends the response when the client falls too far behind
-        let send_events = do
-              flush'
-              nextEvent >>= \case
-                Nothing -> return ()
-                Just msg -> write (serial proto msg) >> send_events
-         in send_events
+handleEvents st req = do
+  proto <- serialAs req False
+  let asked name = lookup name req.params
+  (start, watch) <- eventsOpen st asked >>= either (raise st) return
+  return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
+    let send from = do
+          flush'
+          -- ends the response when the client falls too far behind
+          atomically (readEvents st.eventLog from) >>= \case
+            Nothing -> return ()
+            Just entries -> do
+              forM_ entries $ \e -> do
+                wanted <- atomically (stateTVar watch (relevant own.ctx st.query.maxGap e.seen))
+                when wanted (write (serial proto e.event))
+              send (from + fromIntegral (length entries))
+     in withGaugeIncrease st (.events) (send start)
   where
     serial proto e =
       lazyByteString $
@@ -1557,37 +1630,125 @@ handleEvents st req =
     newLine SerialAsBinary = mempty
     newLine SerialAsJSON = "\n"
     newLine SerialAsPrettyJSON = mempty
+    own = st.config.store
 
--- | Most events queued for one /events client. A client that does not keep
--- up is disconnected once this many are waiting, instead of the queue
--- growing without bound.
-eventQueueSize :: Natural
-eventQueueSize = 10000
-
--- | Subscribe to the store events that /events clients see. The action gets
--- a blocking read that returns the next event, or 'Nothing' once the queue
--- has overflowed, after which the client must be disconnected. Other store
--- events are dropped by the publisher instead of being queued.
-withEventSubscription ::
-  Publisher StoreEvent -> (IO (Maybe Event) -> IO a) -> IO a
-withEventSubscription pub f = do
-  inbox <- newBoundedInbox eventQueueSize
-  overflow <- newTVarIO False
-  let listen e = forM_ (toEvent e) $ \ev ->
-        mailboxFullSTM inbox >>= \case
-          True -> writeTVar overflow True
-          False -> sendSTM ev inbox
-      nextEvent =
-        atomically $
-          (readTVar overflow >>= checkSTM >> return Nothing)
-            `orElse` (Just <$> receiveSTM inbox)
-  bracket (subscribe pub listen) (unsubscribe pub) $ \_ -> f nextEvent
+-- | Where a client of the events starts reading the log, and what it hears
+-- about from the start, as the parameters of its request say: 'eventsStart'
+-- for @after@, and for the rest a choice made of the same commands that a
+-- WebSocket client sends later.
+--
+-- A WebSocket client could only choose once it was connected, and until its
+-- first command was read it was sent every transaction of a busy mempool.
+-- With these the choice is there before the first event:
+--
+-- * @quiet=true@: no transactions, only blocks, until something is watched;
+-- * @addresses@: a list of addresses to watch, separated by commas;
+-- * @xpub@ and @derive@: an extended public key and the types of its
+--   addresses, one or several separated by commas, legacy if left out;
+-- * @filter@, @functions@, @tweak@, @flags@: a Bloom filter, in hex, with
+--   its numbers.
+--
+-- Any of them but @quiet=false@ makes the client a filtered one. The HTTP
+-- stream takes them too, and it is the only way that it has to choose.
+-- The place in the log is taken first, so that nothing that happens while
+-- a key is read from the database is left out.
+eventsOpen :: WebState -> (Text -> Maybe Text) -> IO (Either Except (Word64, TVar Watch))
+eventsOpen st asked =
+  eventsStart st (asked "after") >>= \case
+    Left e -> return (Left e)
+    Right start -> case commands of
+      Left why -> return (Left (UserError why))
+      Right cmds -> do
+        watch <- newTVarIO everything
+        let run [] = return (Right (start, watch))
+            run (cmd : rest) =
+              command own.ctx st.query.maxGap st.query.xPubBals watch cmd >>= \case
+                Left why -> return (Left (UserError why))
+                Right () -> run rest
+        run cmds
   where
-    toEvent = \case
-      StoreBestBlock b -> Just (EventBlock b)
-      StoreMempoolNew t -> Just (EventTx t)
-      StoreMempoolDelete t -> Just (EventTx t)
+    own = st.config.store
+    commands = do
+      quiet <- maybe (Right False) (need "quiet" . readBool) (asked "quiet")
+      addresses <- mapM (need "addresses" . textToAddr own.net) (listed "addresses")
+      derivs <- mapM (need "derive" . textToDeriveType) (listed "derive")
+      keys <- mapM (need "xpub" . xPubImport own.net own.ctx) (maybe [] pure (asked "xpub"))
+      filters <- case asked "filter" of
+        Nothing -> Right []
+        Just hex -> do
+          let number name = maybe (Right 0) (need name . (readNum :: Text -> Maybe Word32)) (asked name)
+          functions <- number "functions"
+          tweak <- number "tweak"
+          flags <- number "flags"
+          let json =
+                A.object
+                  [ "type" A..= A.String "filterload",
+                    "filter" A..= hex,
+                    "functions" A..= functions,
+                    "tweak" A..= tweak,
+                    "flags" A..= flags
+                  ]
+          pure <$> need "filter" (parseMaybe (unmarshalValue (own.net, own.ctx)) json)
+      when (null keys && not (null derivs)) (Left "Parameter derive needs xpub")
+      let types = if null derivs then [DeriveNormal] else derivs
+      return $
+        [EventNone | quiet]
+          <> [EventWatch addresses | not (null addresses)]
+          <> [EventWatchXPub XPubSpec {key, deriv} | key <- keys, deriv <- types]
+          <> filters
+    listed name = maybe [] (filter (not . T.null) . T.splitOn ",") (asked name)
+    need :: Text -> Maybe a -> Either String a
+    need name = maybe (Left ("Could not read parameter " <> T.unpack name)) Right
+
+-- | Where a client of the events starts reading the log: at the end, or
+-- after the event that it says it heard last, named by the hash of its
+-- block or transaction. 404 when the log has no event with that hash: the
+-- client cannot know what it missed, and has to read what it follows again
+-- and listen from the end.
+eventsStart :: WebState -> Maybe Text -> IO (Either Except Word64)
+eventsStart st = \case
+  Nothing -> Right <$> atomically (eventsEnd st.eventLog)
+  Just hex -> case (H.hexToBlockHash hex, hexToTxHash hex) of
+    (Nothing, Nothing) -> return (Left (UserError "The parameter after is not a hash"))
+    (block, tx) -> maybe (Left ThingNotFound) Right <$> atomically (eventsAfter st.eventLog block tx)
+
+-- | Write what happens into the log of events for as long as the server
+-- runs, each transaction that enters with what the database has of it
+-- ('seenOf'), for the clients that choose what they hear about.
+--
+-- A store alone writes what it publishes. A member of a fleet writes what
+-- the fleet tells ('memberEvents'), from the start of what Redis keeps, so
+-- that the logs of all the servers of a fleet hold the same events and a
+-- client can take up on any of them.
+feedEvents :: WebState -> IO ()
+feedEvents st = case own.fleet of
+  Just member -> memberEvents member True (mapM_ happened . fleet) complain
+  Nothing -> do
+    queue <- newTQueueIO
+    let listen = mapM_ (writeTQueue queue) . local
+    bracket (subscribe own.pub listen) (unsubscribe own.pub) $ \_ ->
+      forever (atomically (readTQueue queue) >>= happened)
+  where
+    own = st.config.store
+    local = \case
+      StoreBestBlock b -> Just (Left b)
+      StoreMempoolNew t -> Just (Right (t, True))
+      StoreMempoolDelete t -> Just (Right (t, False))
       _ -> Nothing
+    fleet = \case
+      FleetBlock h -> Left <$> hash h
+      FleetEntered h -> Right . (,True) <$> hash h
+      FleetLeft h -> Right . (,False) <$> hash h
+    hash :: (Serialize x) => C.ByteString -> Maybe x
+    hash = either (const Nothing) Just . decode
+    happened = \case
+      Left b -> atomically (appendEvent st.eventLog (BlockArrived b))
+      Right (t, False) -> atomically (appendEvent st.eventLog (TxLeft t))
+      Right (t, True) -> do
+        -- a transaction that cannot be read is told to every client
+        known <- st.direct.getTxData t `catchAny` \_ -> return Nothing
+        atomically (appendEvent st.eventLog (TxEntered t (seenOf own.net own.ctx <$> known)))
+    complain why = logError (withSource "Events" st.config.logger) ("Could not read the events: " <> cs why)
 
 -- GET Address Transactions --
 

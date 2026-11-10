@@ -49,7 +49,7 @@ dependencies:
   - file-embed ^>= 0.0.16.0
   - hashable ^>= 1.5.1.0
   - hashtables ^>= 1.4.2
-  - haskoin-store-data ^>= 1.10
+  - haskoin-store-data ^>= 1.11
   - monad-control ^>= 1.0.3.1
   - mtl ^>= 2.3.2
   - haskoin-core ^>= 1.6.1

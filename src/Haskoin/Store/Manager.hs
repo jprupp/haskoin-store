@@ -317,7 +317,7 @@ withFleetEvents ::
 withFleetEvents _ pub Nothing action = action pub
 withFleetEvents cfg _ (Just member) action =
   withPublisher $ \shared ->
-    withAsync (memberEvents member (tell shared) complain) $ \a -> link a >> action shared
+    withAsync (memberEvents member False (tell shared) complain) $ \a -> link a >> action shared
   where
     tell shared event = forM_ (told event) (`publish` shared)
     told = \case

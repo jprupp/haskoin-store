@@ -241,6 +241,46 @@ Each line is a new block or a mempool change. A wallet back end keeps this open
 and refreshes the affected wallets when an event arrives, instead of asking
 every few seconds.
 
+After a lost connection, come back with the hash of the last event you
+heard, and the stream starts with what came after it:
+
+```sh
+curl -N "localhost:3000/events?after=9a5c…"
+```
+
+The server keeps its last 10,000 events. It answers 404 when it no longer
+has the one you name: read your wallets again, and listen without `after`.
+
+Over a WebSocket at the same path, a client can ask for only the
+transactions it cares about. It sends one or more of these, as text:
+
+```json
+{"type":"watch","addresses":["bc1q…","1A1z…"]}
+{"type":"watch","xpub":"xpub6C…","derive":"segwit"}
+{"type":"filterload","filter":"b50f","functions":11,"tweak":0,"flags":0}
+```
+
+From then on it hears of a transaction only when it touches one of the
+addresses, an address of the key, or matches the Bloom filter (BIP 37, as
+SPV wallets use). Blocks are always sent. A key is followed as a wallet
+uses it: the gap of unused addresses moves on as payments come. For a key
+with several types of address, send one message for each type.
+
+A client that connects and then sends its messages gets every transaction
+until the first message is read. To start with a choice, put it in the URL,
+of the WebSocket or of the HTTP stream:
+
+```sh
+curl -N "localhost:3000/events?quiet=true"                  # blocks only
+curl -N "localhost:3000/events?addresses=bc1q…,1A1z…"
+curl -N "localhost:3000/events?xpub=xpub6C…&derive=legacy,segwit"
+```
+
+`quiet=true` sends blocks alone until the client watches something; a
+WebSocket client with a long list connects with it and sends the list in
+messages. The [API reference](swagger.yaml) has every message and
+parameter, and the binary form of each message.
+
 ### 7. Make big wallets fast
 
 Start the store with `--redis` and a Redis (or Valkey) server. Xpubs with at
@@ -345,7 +385,8 @@ the same block and the same mempool:
   shared mempool or moves the fleet to a block writes an event to Redis
   in the same step, and every server sends those events, in that order,
   instead of what its own node saw. A block is told when the whole fleet
-  can answer about it.
+  can answer about it. Each server keeps the same last events, so a
+  client that reconnects with `after=` may land on any of them.
 - **Without Redis** each server answers from its own database, and
   `/health` says 203, as it does for the cache.
 - **Large xpubs are cached for the whole fleet**, under the same
@@ -488,6 +529,9 @@ what each endpoint returns.
   transactions included, which up to version 1.8.1 had none.
 - **`/events` is the exception**: a stream of events of 33 bytes each,
   with no count, for as long as the connection is open.
+- **Over the WebSocket** binary is binary frames, for the events and for
+  the commands that choose transactions. The server answers in the kind
+  of frame that it was last sent.
 - Everything is big-endian, except what is copied from the peer-to-peer
   protocol, such as a whole transaction or block.
 
@@ -502,7 +546,7 @@ what each endpoint returns.
 | Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
 | Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=legacy\|compat\|segwit` picks the address type (`normal`, the old name of `legacy`, still works) |
 | Network | `/peers`, `/health` (503 when unhealthy, 203 without its Redis), `/dbstats` |
-| Events | `/events`, as JSON lines over HTTP or as a WebSocket |
+| Events | `/events`, as JSON lines over HTTP or as a WebSocket; `after=` resumes, and a WebSocket client can filter by address, xpub or Bloom filter |
 | Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |
 
 Turn off the xpub endpoints with `--no-xpub` and the Blockchain.info ones
