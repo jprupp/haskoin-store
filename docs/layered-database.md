@@ -23,6 +23,7 @@ mempool, and everything it did to the chain's indices, into its own area.
 - [Reading: the mempool applied on top](#reading-the-mempool-applied-on-top)
 - [Writing](#writing)
 - [What it costs: measurements](#what-it-costs-measurements)
+- [What has to change before the switch](#what-has-to-change-before-the-switch)
 - [Keeping the mempool in memory](#keeping-the-mempool-in-memory)
 - [The cache under the same rules](#the-cache-under-the-same-rules)
 - [Migration](#migration)
@@ -42,18 +43,21 @@ that could be built and proved ahead of the switch.
 | The keys of one transaction, and what the mempool does to a balance | `Haskoin.Store.Database.Mempool` | written |
 | Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, not called by the store |
 | Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against today's rules, not used by the store |
-| Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, not used by the store |
+| Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, measured: right, and too slow in two cases; not used by the store |
 | Tests against today's database, rules and queries | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs`, `test/Haskoin/Store/Database/Query/LayeredSpec.hs` | passing |
-| Cost of the extra lookups | `docs/layered-database/` | measured |
+| Cost of lookups, of whole queries and of writing | `docs/layered-database/` | measured |
+| A summary for each address, and lists read by the page | | proposed below, not started |
 | The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web` | not started |
 | The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
 
-Five findings came out of the work, in order of how soon they matter:
+Six findings came out of the work, in order of how soon they matter:
 
-1. **Bloom filters were never built.** `--bloom` has no effect with the
-   RocksDB binding as released, on RocksDB 6.24 or later. The fix is
-   [rocksdb-haskell pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21).
-   See [Bloom filters](#bloom-filters-were-not-being-built).
+1. **Bloom filters were never built.** `--bloom` had no effect on RocksDB
+   6.24 or later, because of a wrong type in the RocksDB binding. It is
+   fixed, in
+   [rocksdb-haskell pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21),
+   and the store is built with the fixed binding. See
+   [Bloom filters](#bloom-filters-were-not-being-built).
 2. **The migration works, and the merge gives today's answers.** For
    hundreds of random histories of blocks, payments, replacements, deletions
    and reorganisations, the migrated database answers every query as the
@@ -71,10 +75,17 @@ Five findings came out of the work, in order of how soon they matter:
    extended public key, they answer as today's queries do, on migrated
    databases and on databases that the new rules built. See
    [Evidence](#evidence).
-5. **The extra lookups are cheap with filters and almost free in memory.**
-   Between 0.5 and 1.1 microseconds to find that a transaction, an output or
-   an address has nothing in the mempool area, against 0.05 to 0.1 in
-   memory. See [What it costs](#what-it-costs-measurements).
+5. **The queries as built are not ready for the switch.** They cost 10 to 15
+   microseconds more for a request when the mempool has nothing for what is
+   asked, which is fine. But they read all that the mempool has for an
+   address on every question about it, 35 milliseconds for a busy one, and
+   right after a block they take 1.6 milliseconds to find that an address
+   has nothing. See [What it costs](#what-it-costs-measurements) and
+   [What has to change before the switch](#what-has-to-change-before-the-switch).
+6. **Two things in the RocksDB layer hold back today's store as well.** A
+   scan through a Bloom filter can step over every key deleted lately, so
+   `--bloom` no longer puts filters on the indices by address. And the
+   binding reads rows three times slower than it could.
 
 ## The problem
 
@@ -347,7 +358,9 @@ the offset, then the limit.
 | a transaction that is not known | none | none |
 
 - **The mempool's part is read whole.** It is the few entries of the
-  address, read with the one scan that its balance needs too. The chain's
+  address, read with the one scan that its balance needs too. For an
+  address with thousands of entries that is far too much; see
+  [What has to change before the switch](#what-has-to-change-before-the-switch). The chain's
   part is streamed from its index only as far as the page needs, as today.
 - **Several addresses are merged as today.** For a set of addresses or an
   extended public key, the list of each address is its mempool's part
@@ -390,7 +403,7 @@ with it, because each of their answers is one key or one scan.
 So the new queries do not take the database. They take a `View`: both areas
 through one RocksDB snapshot. `withView` is the only way to make one, so a
 query cannot be run on the live database by mistake. Taking and releasing a
-snapshot took about 1.1 microseconds in the measurements.
+snapshot takes 3.7 microseconds with the ten column families of the store.
 
 - **One view for each request** is how the web server is meant to use it.
   The queries of one request then agree with each other as well: the
@@ -450,11 +463,41 @@ store that syncs from the first block:
 
 ## What it costs: measurements
 
-The cost of the design is that a query visits two places. I measured the
-second visit. `docs/layered-database/OverlayCost.hs` fills the two column
-families as laid out above with synthetic mempool transactions, 13 keys
-each, and times each kind of lookup through the Haskell binding; the output
-is in `docs/layered-database/overlay-cost.txt`.
+Three programs in `docs/layered-database/` measured it, each with its output
+next to it:
+
+- `OverlayCost.hs`, written before any of the design was built, times single
+  lookups in column families laid out like the mempool area.
+- `QueryCost.hs` writes one history into a database of each layout, with
+  each set of rules, and times both: the rules, every kind of query, and the
+  first step of a scan before and after a block.
+- `MigrateBench.hs` times the migration; see [Migration](#migration).
+
+What they found, in short, in microseconds:
+
+| | Today | Layered, as built |
+|---|---|---|
+| Importing a chain, for each transaction | 189 | 182 |
+| A mempool transaction, from its arrival to its block | 499 | 570 |
+| A request about something that the mempool does not touch | | 10 to 15 more |
+| Each address read, when it has nothing in the mempool | 2.7 | 6 more |
+| The balance of an address with 6,216 entries in the mempool | 3 | 35,000 |
+| The first step of a scan of an address that has nothing, after a block | 14 | 1,638 |
+
+The first four lines are the price that the design expected to pay. The
+last two are not acceptable. They do not come from keeping the mempool
+apart, but from two things in how the queries read it: they read all that
+the mempool has for an address on every question about the address, and
+they find out that it has nothing by scanning, through a filter.
+[What has to change before the switch](#what-has-to-change-before-the-switch)
+says what to do about each.
+
+### Single lookups
+
+`OverlayCost.hs` fills two column families laid out as the mempool area
+with synthetic mempool transactions, 13 keys each, and times each kind of
+lookup through the Haskell binding; the output is in
+`docs/layered-database/overlay-cost.txt`.
 
 Microseconds for one lookup, read through a snapshot, with the data in
 table files, RocksDB 11.1.1 configured as the store configures it:
@@ -468,33 +511,219 @@ table files, RocksDB 11.1.1 configured as the store configures it:
 | Address with one mempool transaction | 6.3 | 9.8 | 6.3 | 6.5 | 0.3–0.5 |
 | Mempool spenders of a transaction, by scan | 3.7 | 5.5 | 3.9 | 5.6 | |
 
-"No filters" is the binding as released. "With filters" is the binding with
-the fix described below. Other measurements: a snapshot costs about 1.1
-microseconds to create and release, and an iterator 1.4 to 2.0.
+"No filters" is the binding as it was released then. "With filters" is the
+binding with the fix described below.
 
-What that means for a request, with filters and 200,000 transactions in the
-mempool:
+- **Reads by key hold up in the whole queries.** A key that is not there
+  costs 0.5 to 0.7 microseconds through its filter, here and below.
+- **Scans do not.** The 0.8 to 1.1 microseconds for an address with
+  nothing were measured on a database that nothing had been deleted from.
+  The store deletes from the mempool area all the time, and that changes
+  the cost of a scan through a filter completely; see
+  [below](#a-scan-through-a-filter-can-step-over-every-deleted-key).
+- **A snapshot costs more with more column families**: 1.1 microseconds
+  with the two of this program, 3.6 with the ten of the store.
 
-| Request | Extra lookups | Extra time in RocksDB | In memory |
+### Writing, measured
+
+`QueryCost.hs make` writes a history with the rules of one layout and times
+the store's part of it: 200,000 transactions in 200 blocks, 50,000
+transactions taken into the mempool, then ten blocks that confirm the
+oldest 10,000 of those. RocksDB 11.1.1 with the store's default settings,
+database on tmpfs, one thread. Microseconds for each transaction:
+
+| | Today's rules | Layered rules |
+|---|---|---|
+| Importing a chain, with nothing in the mempool | 189 | 182 |
+| Taking a transaction into the mempool | 294 | 203 |
+| Importing a block that confirms mempool transactions | 205 | 367 |
+| A transaction over its life: the mempool, then a block | 499 | 570 |
+
+- **Syncing costs the same.** No transaction is in the mempool then.
+- **Work moves from the arrival of a transaction to its block**, as the
+  design says. Taking a transaction costs a third less. Confirming it costs
+  four fifths more, because the block writes it to the chain's indices for
+  the first time, and deletes its keys from the mempool area.
+- **Over its life a transaction costs 14% more.** It is written to the
+  large column families once instead of twice, as hoped, but the keys of the
+  mempool area and their deletion cost more than that saves.
+- **Blocks at the tip take longer to import**, by the same four fifths, for
+  the part of a block that the mempool had seen. A block of 3,000 such
+  transactions takes about 1.1 seconds instead of 0.6 on this machine.
+
+### Whole queries, measured
+
+`QueryCost.hs time` opens the two databases that `make` wrote, asks both
+the same questions, checks that the answers are the same, and times them.
+The state: 211 blocks and 40,000 transactions in the mempool. What is asked
+about:
+
+- **Addresses**: 1,000 that the mempool does not touch, 1,000 with one or
+  two mempool transactions, 1,000 that were never used, and the busiest
+  one, with 17,342 transactions and 6,216 entries in the mempool area.
+- **Wallets**: extended public keys with 200 addresses in use on each
+  chain, 464 read with the gap. The *cold* one has nothing in the mempool,
+  the *quiet* one five payments, and the *busy* one 16,368 entries.
+- **A small wallet**: 20 addresses in use, 84 read, 399 transactions, two
+  of them in the mempool.
+
+Microseconds for each question, the best of three means, the chain's
+column families without filters as by default:
+
+| Nothing in the mempool for what is asked about | Today | Layered | Times as long |
 |---|---|---|---|
-| Balance of an address | 1 scan | 1 µs | 0.1 µs |
-| Page of 100 transactions with spenders, read as first measured | 100 gets and 100 scans | 0.6 ms | about 0.02 ms |
-| The same, as the queries read it now, if each has two outputs that no block spends | 300 gets | 0.2 ms | about 0.02 ms |
-| Balances of an xpub with 1,000 addresses | 1,000 scans | 1.1 ms | 0.1 ms |
-| The same, without filters | 1,000 scans | 6.6 ms | 0.1 ms |
+| Balance of an address | 4.6 | 19 | 4.2 |
+| Balance of an address that was never used | 4.3 | 19 | 4.4 |
+| Balances of 100 addresses | 265 | 937 | 3.5 |
+| A confirmed transaction | 6.3 | 16 | 2.6 |
+| 100 confirmed transactions | 376 | 522 | 1.39 |
+| Spender of an output | 6.0 | 13 | 2.1 |
+| An unspent output | 5.0 | 15 | 3.0 |
+| Transactions of an address | 46 | 65 | 1.40 |
+| Cold wallet: balances | 1,366 | 3,768 | 2.8 |
+| Cold wallet: first 100 transactions | 7,311 | 10,438 | 1.43 |
+| Cold wallet: 100 transactions, far back | 10,545 | 8,246 | 0.78 |
+| Cold wallet: first 100 unspent outputs | 10,915 | 13,989 | 1.28 |
+| Cold wallet: number of transactions | 80,133 | 87,632 | 1.09 |
 
-These are the lookups alone, in a small benchmark. What a whole request
-gains or loses has to be measured on the real code with
-`scripts/bench-web.sh`, once the queries exist.
+| A little in the mempool | Today | Layered | Times as long |
+|---|---|---|---|
+| Balance of an address with a mempool transaction or two | 4.5 | 37 | 8.3 |
+| Its transactions | 57 | 86 | 1.52 |
+| A mempool transaction | 5.0 | 19 | 3.7 |
+| 100 mempool transactions | 308 | 688 | 2.2 |
+| Quiet wallet: balances | 1,390 | 4,837 | 3.5 |
+| Quiet wallet: first 100 transactions | 7,467 | 11,761 | 1.58 |
+| Quiet wallet: first 100 unspent outputs | 11,259 | 15,694 | 1.39 |
+| Small wallet: balances | 229 | 592 | 2.6 |
+| Small wallet: first 100 transactions | 863 | 1,011 | 1.17 |
+| Small wallet: first 100 unspent outputs | 1,174 | 1,320 | 1.12 |
 
-- **Without filters the design would be slow** for wallets with many
-  addresses. The mempool's column families must have them.
-- **With filters it costs about a microsecond to find that the mempool has
-  nothing**, which is the usual answer, and 6 for an address or a
-  transaction where it has something. That is small against reading the
-  chain's own data, which is the same work as today.
-- **Memory is about ten times faster again**, should the lookups ever need
-  to be; see the next section.
+| Much in the mempool | Today | Layered | Times as long |
+|---|---|---|---|
+| Busiest address: balance | 3.1 | 35,284 | 11,382 |
+| Busiest address: first 100 transactions | 563 | 34,414 | 61 |
+| Busiest address: 100 transactions, far back | 573 | 608 | 1.06 |
+| Busiest address: first 100 unspent outputs | 769 | 34,663 | 45 |
+| Busy wallet: balances | 1,046 | 110,348 | 105 |
+| Busy wallet: first 100 transactions | 7,470 | 166,818 | 22 |
+| Busy wallet: 100 transactions, far back | 11,104 | 8,477 | 0.76 |
+| Busy wallet: first 100 unspent outputs | 11,296 | 166,202 | 15 |
+| Busy wallet: number of transactions | 179,809 | 315,424 | 1.75 |
+
+- **Nothing in the mempool: a fixed cost for each request, and a small one
+  for each thing read.** About 10 to 15 microseconds more for a request,
+  of which 3.6 are the snapshot; about 6 more for each address;
+  about 1.5 more for each transaction body. Lists come out between
+  1.1 and 1.6 times as long.
+- **A page far back in a wallet is faster than today.** Today's query looks
+  the transaction that the page starts at up once for each address of the
+  wallet; the new one looks it up once.
+- **Much in the mempool: the time grows with what the mempool has.** Every
+  question about an address reads all the entries of the address, at about
+  5.5 microseconds each. For the busiest address that is 35 milliseconds,
+  whether the question is its balance, which today is one read of 3
+  microseconds, or a page of 100.
+- **Counting the transactions of a wallet is slow in both layouts**: 80
+  milliseconds for 19,499 transactions, 4.1 microseconds for each key read.
+
+Where the time of the layered queries goes, each part timed alone in a
+snapshot:
+
+| Part | Microseconds |
+|---|---|
+| A snapshot, taken and released | 3.7 |
+| Balances of 100 addresses: the chain's part | 273 |
+| Balances of 100 addresses: the mempool's part | 640 |
+| Of that: 100 seeks of one iterator that find nothing | 477 |
+| Instead: 100 keys that are not there, in one multi-get | 56 |
+| Busiest address: its mempool entries, read and decoded | 34,021 |
+| The same entries, read and not decoded | 29,737 |
+
+- **Finding that an address has nothing costs 4.8 microseconds by seek and
+  0.56 by key.** The queries seek.
+- **Reading an entry costs 4.8 microseconds before any of it is decoded.**
+  Decoding adds 0.7. So the cost of a scan is in getting the rows out of
+  RocksDB, not in what the store does with them; see
+  [Reading rows through the binding](#reading-rows-through-the-binding).
+
+### A scan through a filter can step over every deleted key
+
+A scan by address asks RocksDB for the first key at or after the address,
+and stops when the key it gets belongs to another address. That first step
+is a seek. In the mempool area, at rest, it took about 10 microseconds for
+nearly every address that has nothing, and up to three quarters of a
+millisecond for a few. Right after a block it took 1.6 milliseconds on
+average, for all of them.
+
+- **Why.** RocksDB keeps the newest writes in memory and the rest in table
+  files. With a filter on the prefix of the key, a seek skips every table
+  file that has nothing for the address, which is the point of the filter.
+  The newest writes have no filter, and after a block most of them are
+  deletions: the keys of the transactions that the block confirmed. The seek
+  lands on the first deleted key after the address, steps past it to the
+  next, and goes on until it finds a key that is alive. The keys that are
+  alive are in the files it skipped. So it steps over every deletion to the
+  end.
+- **Without a filter it cannot happen.** Every file takes part in the seek,
+  and the first live key after the address ends it at once.
+- **At rest it happens to a seek now and then.** A filter says "maybe" for
+  about 1% of the addresses that a file does not have, and when that file
+  holds mostly deletions it is walked in the same way.
+- **RocksDB has an answer to it**: an iterator can be told to stay within
+  the prefix it was sent to, or be given an upper bound. The Haskell binding
+  has no way to say either.
+
+`QueryCost.hs seeks` measures it: 2,000 seeks for addresses that have
+nothing, before and after 5,000 of the 40,000 mempool transactions are
+confirmed by a block, or deleted. Mean time in microseconds:
+
+| Index scanned | As it was left | After a block | After deletions |
+|---|---|---|---|
+| Today's layout, transactions by address, no filters | 13 | 14 | 14 |
+| The same, with the filters that `--bloom` asked for until now | 9 | 10 | 810 |
+| Layered layout, entries of the mempool by address | 13 | 1,638 | 1,647 |
+
+The longest seek at rest was 48 microseconds without filters and 756 in the
+mempool area.
+
+What follows from it:
+
+- **`--bloom` no longer asks for filters on the two indices by address** of
+  today's store. It always did, and none was ever built. With the fixed
+  binding they would have been, and each round of the store's own deletion
+  of old mempool transactions, a thousand at a time, would have made every
+  scan of an unused address slow until the next flush. A block does not do
+  that in today's layout, because it writes the confirmed entries of an
+  address next to the ones it deletes. `--bloom` still builds filters for
+  everything that is read by key.
+- **The mempool area cannot find out that an address has nothing by
+  scanning it.** It has to be a read by key.
+- **The binding should offer bounded iterators.** With them the filters can
+  come back for scans.
+
+### Reading rows through the binding
+
+Every scan in the store gets a row out of RocksDB with six calls: is the
+iterator valid, the key, valid again, the value, valid again, next. The
+binding makes all six as *safe* foreign calls, the kind that lets other
+Haskell threads run meanwhile, which cost about 0.4 microseconds each here.
+Five of the six only read a field of the iterator and return at once.
+
+Walking the rows of a column family of the measured databases, reading the
+key and the value of each, in nanoseconds for each row:
+
+| | `mempool-addr`, 319,908 rows | `addr-tx`, 699,474 rows |
+|---|---|---|
+| Binding as released | 2,814 | 2,839 |
+| With `valid`, `key` and `value` as unsafe calls | 914 | 803 |
+
+Three times as fast, for three words changed in the binding. This is not
+about the layered layout: it is what every page of a list and every count
+costs in the store today. A page of 100 transactions of an address takes
+563 microseconds, 5.6 for each row, and the count of a wallet above, 80
+milliseconds. The change was tried in a copy of the binding; it has not
+been proposed to it yet.
 
 ### Bloom filters were not being built
 
@@ -506,24 +735,26 @@ RocksDB reported `filter block size=0; # entries for filter=0`.
   as a `double` since RocksDB 6.24. `rocksdb-haskell-jprupp` imports it with
   a `CInt`. The two travel in different registers, so RocksDB reads
   something else as the bits per key and builds no filter. Nothing fails.
-- **Effect on the store.** `--bloom` does nothing when the store is built
-  against RocksDB 6.24 or later. It is off by default, so most stores were
-  not expecting filters anyway. I have not checked which RocksDB the
-  production build links against.
+- **Effect on the store.** `--bloom` did nothing when the store was built
+  against RocksDB 6.24 or later. The Docker image is: its Debian release has
+  RocksDB 9.10. The option is off by default, so most stores were not
+  expecting filters anyway.
 - **Fix.** [Pull request 21](https://github.com/jprupp/rocksdb-haskell/pull/21)
-  on the binding. With it, the same column family has 3,250,201 bytes of
-  filters for 2,600,000 keys, the 10 bits per key asked for, and a lookup of
-  an absent key takes 1.5 microseconds instead of 5.3 to 5.9.
+  on the binding, released as `rocksdb-haskell-jprupp` 2.6.2. With it, the
+  same column family has 3,250,201 bytes of filters for 2,600,000 keys, the
+  10 bits per key asked for, and a lookup of an absent key takes 1.5
+  microseconds instead of 5.3 to 5.9. The store is built with 2.6.3 now.
 - **Also found.** Comparing all 72 foreign imports of the binding with the C
   header showed one more that had drifted: `approximateSize` called RocksDB
   with one argument too few. The store does not use it. The pull request
   fixes it too.
-- **Before turning `--bloom` on.** Once the store is built with the fixed
-  binding, `--bloom` will build filters for the chain's column families, in
-  the table files written from then on. They take about 1.25 bytes for each
-  key, and the store keeps them in its block cache. On a chain with billions
-  of keys that is gigabytes competing with data for a cache of 1 GiB by
-  default. It should be sized before it is enabled.
+- **Before turning `--bloom` on.** With the fixed binding, `--bloom` builds
+  filters for the chain's column families, in the table files written from
+  then on. They take about 1.25 bytes for each key, and the store keeps them
+  in its block cache. On a chain with billions of keys that is gigabytes
+  competing with data for a cache of 1 GiB by default. It should be sized
+  before it is enabled, and a store that already runs with the option will
+  start building them when it is upgraded.
 - **The mempool's column families always have filters** in the layered
   layout, whatever `--bloom` says. They are small: 10 bits for each key, and
   a mempool transaction has about a dozen keys.
@@ -544,6 +775,105 @@ RocksDB reported `filter block size=0; # entries for filter=0`.
 - **More complex: the transition.** Two layouts, a migration, and a cache
   protocol to specify again.
 
+## What has to change before the switch
+
+The queries as built give the right answers, and take far too long in two
+cases: about an address that the mempool touches a lot, and about any
+address right after a block. Both come from one choice: to read everything
+that the mempool has for an address, with a scan, for every question about
+that address. Four changes follow from the measurements. None is built.
+
+### 1. A summary for each address that the mempool touches
+
+One more key for an address, next to its entries, with what they add up to:
+
+| Field | What it counts |
+|---|---|
+| `txs` | mempool transactions that touch the address |
+| `paid`, `paidCount` | outputs that the mempool pays to the address: their amount and number |
+| `spent`, `spentCount` | outputs of the address that the mempool spends |
+| `both`, `bothCount` | outputs that the mempool both pays and spends |
+
+The balance is then the chain's balance and one read by key:
+
+```
+confirmed   = chain.confirmed - (spent - both)
+unconfirmed = paid - both
+utxo        = chain.utxo - (spentCount - bothCount) + (paidCount - bothCount)
+txs         = chain.txs + txs
+received    = chain.received + paid
+```
+
+- **It answers "nothing" without a scan.** An address that the mempool does
+  not touch has no summary, and a key that is not there costs 0.56
+  microseconds to read through its filter, whatever was deleted lately.
+  That is the usual case, which the queries as built pay between 4 and 1,600
+  microseconds for.
+- **It makes a busy address cost what any other does.**
+- **It does not go stale when the chain changes**, which is why this
+  document first rejected stored balances for the mempool. Every field
+  counts things that mempool transactions do, and none says what the chain
+  holds. What depends on the chain, whether an output that the mempool
+  spends is one of the chain or one of the mempool, is the difference
+  between `spent` and `both`; and `both` changes only when one of the two
+  transactions enters or leaves the mempool. The rules are there when that
+  happens, and what they need to know then is a read by key: whether the
+  transaction that an input spends from is in the mempool, and whether a
+  mempool transaction spends an output.
+- **It is not the key of one transaction.** The invariant becomes: the
+  mempool area is the keys of its transactions, and for each address a
+  summary that is a function of the entries of that address. A test can
+  work every summary out again from the entries after every operation, and
+  the migration can write them the same way.
+- **Its counts bound every scan.** A query that knows how many entries of
+  each kind an address has reads that many rows and no more. It never asks
+  RocksDB for the key after the last one, which is the step that walks over
+  deletions.
+- **It costs the rules a read and a write for each address** that a mempool
+  transaction touches, as today's rules pay for its balance.
+
+### 2. Lists read in proportion to the page
+
+- **Transactions.** The entries of an address are already in the order of
+  the list. A page reads as many as it needs, from the top or from the
+  transaction it starts at.
+- **Unspent outputs.** The outputs that the mempool pays are in order too.
+  Whether the mempool spends one of them, or an output of the chain, is a
+  read by key, and the summary says when there is no need to ask: `both` of
+  zero means that no output of the mempool is spent, and `spent` equal to
+  `both` that nothing of the chain is hidden.
+- **Several addresses.** The summaries, read together, say which addresses
+  have anything in the mempool. Only those get a stream.
+
+### 3. Bounded iterators in the binding
+
+`rocksdb-haskell-jprupp` creates iterators with no bound, and RocksDB lets
+an iterator be told to stay within the prefix that it was sent to. With
+that, a scan through a filter stops where it should, and the filters can go
+back on the indices by address of the chain, and stay on those of the
+mempool area. It needs a new function in the binding, and the scans of the
+store have to ask for it. The summary makes the layered layout safe without
+it; today's store with `--bloom` is safe without it because the filters are
+off where it matters.
+
+### 4. Cheaper row reads in the binding
+
+The three accessors of an iterator as unsafe foreign calls: three times as
+fast for every scan, in today's store as much as in this layout. See
+[Reading rows through the binding](#reading-rows-through-the-binding).
+
+### What it should cost then
+
+Worked out from the parts that were measured, not measured itself:
+
+| | As built | With the summary and streamed lists |
+|---|---|---|
+| Balance of an address with nothing in the mempool | 19 | about 9: the snapshot, the chain's balance, a key that is not there |
+| Each address of a wallet, with nothing in the mempool | 6.4 on top of the chain's 2.7 | 0.6 on top of it |
+| Balance of the busiest address | 35,000 | about 10, as any other |
+| First 100 transactions of the busiest address | 34,000 | about what today's 563 is: 100 rows |
+| An address with nothing, right after a block | 1,600 | as at rest |
+
 ## Keeping the mempool in memory
 
 The mempool is bounded by age, not by size: `--mempool-timeout` deletes
@@ -555,8 +885,13 @@ transactions after 14 days by default. There are three ways to hold it.
 | **Mirror in memory** | The indices of the mempool area, decoded, in immutable maps, updated with every write. Bodies stay in RocksDB. | 40 to 120 nanoseconds for each lookup. | 1.8 KB for each transaction as measured: 87 MiB for 50,000, 345 MiB for 200,000. All of it live data for the garbage collector. |
 | **Memory first** | The mempool lives in memory and is saved now and then. | No write for a mempool transaction. | A restart forgets transactions that the API already showed. After a crash the saved mempool is older than the chain area and has to be checked against it. |
 
-**Recommendation: RocksDB only at first, the mirror if measurements ask for
-it, and not memory first.**
+**Recommendation: RocksDB only, with the summary of the section before,
+and not memory first.** The measurements asked for something, but not for
+the mirror. What costs too much is not the price of a lookup, which a
+mirror would cut, but reading all the entries of an address and scanning to
+find that there are none; a mirror would have to keep the same summary to
+avoid the first. Kept in RocksDB, the summary needs no memory, nothing to
+load at start, and no way to tell whether it matches a snapshot.
 
 - **Write through always.** A write to a small column family is cheap, and a
   batch that covers both areas is what keeps them in step. Saving the
@@ -571,10 +906,9 @@ it, and not memory first.**
   a cached xpub are in Redis, so a cached request does not read the store's
   own mempool area for the xpub's addresses. The mirror would help the
   queries that read the database: addresses, pages of transactions, and
-  xpubs that are not cached. There the lookups add about a millisecond for
-  1,000 addresses, to a query that already reads 1,000 balances of the
-  chain. Whether that calls for a mirror is for `scripts/bench-web.sh` to
-  say, once the queries exist.
+  xpubs that are not cached. With the summary, those pay 0.6 microseconds
+  for each address on top of the 2.7 of its balance in the chain. A mirror
+  could take that to 0.1. It is not worth its memory for that.
 - **1.8 KB for each transaction is a first measurement**, with ordinary maps
   and lists. It can be made smaller. Since the mempool has no bound on its
   size, a mirror should come with a measurement of the heap under load,
@@ -908,24 +1242,23 @@ the new ones the same questions.
 
 What this does not show:
 
-- **Performance.** Neither the new rules nor the new queries have been
-  timed. The costs above are those of single lookups.
+- **Load.** The rules and the queries were timed in one thread, on a
+  database of 200,000 transactions, not in the web server and not on a
+  database of real size, where reading the chain costs more and the mempool
+  area the same.
 - **The store itself**, which uses none of this yet.
-- **Bloom filters.** The tests ran with the binding that builds none, so
-  no read here went through a filter. The mempool's column families ask for
-  them, one by prefix of the key. A store built against RocksDB 6.24 or
-  later has never read through a filter either, whatever `--bloom` said.
-- **Long lists.** The histories are short: an address has tens of entries,
-  not thousands, and the extended public key has five addresses in use.
+- **Bloom filters in the tests.** The store is built with the binding that
+  builds them, but the tests keep nearly all their data in memory, where no
+  filter is used. `QueryCost.hs` reads through filters in table files and
+  compares every answer that it times.
 
 ## Order of work
 
 Each step ends with something that can be tested against today's behaviour.
 
-1. **Build the store with the fixed RocksDB binding.** Needed for the read
-   costs above. Independent of everything else. The fix is released, in
-   `rocksdb-haskell-jprupp` 2.6.2; `stack.yaml` still pins 2.6.1, so the
-   tests ran with no filter built.
+1. **Build the store with the fixed RocksDB binding.** Done: the store is
+   built with `rocksdb-haskell-jprupp` 2.6.3, and its whole test suite
+   passes with it.
 2. **A snapshot for each request.** The new queries already cannot be asked
    without one (`withView`). What is left is to take it in the web server,
    around each request and the sending of its response.
@@ -951,13 +1284,19 @@ Each step ends with something that can be tested against today's behaviour.
      `/blockchain/multiaddr`. In `Haskoin.Store.Cache`: every read of the
      database, some twenty of them, which today's cache needs until it is
      rebuilt on two layers.
-6. **The mirror in memory**, if the measurements of step 5 call for it.
-7. **The cache on two layers**, specified and model-tested in
+6. **The cache on two layers**, specified and model-tested in
    `Haskoin.Store.Cache.Protocol` first.
 
-Step 1 is small and useful by itself. Steps 2 to 5 are the database change,
-of which steps 3 and 4 are done, and step 2 as far as it can be before the
-switch. Step 7 is where the concurrency problems of the cache are actually
+Before step 5, the read path has to change as
+[the measurements ask](#what-has-to-change-before-the-switch): a summary for
+each address, and lists read by the page. Where the mempool that answers
+queries is kept, in RocksDB or in Redis for a fleet of stores, decides
+where that summary goes, so it is settled first. The two changes to the
+binding are independent and help today's store. A mirror in memory is no
+longer planned.
+
+Steps 1, 3 and 4 are done, and step 2 as far as it can be before the
+switch. Step 6 is where the concurrency problems of the cache are actually
 removed.
 
 ## Alternatives considered
@@ -968,16 +1307,21 @@ removed.
   the chain changes; see
   [Every key belongs to one transaction](#every-key-belongs-to-one-transaction).
 - **A stored balance delta for each address.** One point lookup for each
-  balance instead of a scan. Rejected for now: the split between confirmed
+  balance instead of a scan. Rejected at first: the split between confirmed
   and unconfirmed depends on whether a spent output's transaction is still
   in the mempool, so deltas have to be converted when a block confirms a
-  parent and not its child. A marker for "this address has mempool
-  entries" would get most of the gain without that, and the filter by
-  address already gives it.
+  parent and not its child; and the filter by address seemed to make the
+  scan cheap enough. The measurements showed that it does not, and
+  [the summary](#1-a-summary-for-each-address-that-the-mempool-touches) is
+  this alternative come back in a form that needs no conversion: it keeps
+  what the mempool spends and what it both pays and spends apart, so that
+  nothing in it says what the chain holds.
 - **One column family for the whole mempool area.** Simpler to wipe.
   Rejected because address scans could not use a filter: 4.0 to 6.3
   microseconds against 0.8 to 1.1 for an address with nothing in the
-  mempool.
+  mempool. That reason is weaker now: a scan through a filter turned out to
+  be unsafe, and the summary is read by key. The entries by address still
+  sort together in a column family of their own, which is worth keeping.
 - **Fix the cache only**, by reading spenders from the database when
   serving, as `docs/cache-consistency.md` first proposed. It closes one hole
   and leaves the chain's data as changeable as before.
@@ -998,8 +1342,11 @@ removed.
    deleted transaction is not requested again when a peer announces it, so a
    wipe that records them keeps them out until they confirm.
 2. **First-seen time or block time** for confirmed transactions.
-3. **`--bloom` for the chain**, once it works: how much memory it needs on
-   a full database, and whether it should stay off by default.
+3. **`--bloom` for the chain.** It works now, for what is read by key. On
+   the measured database it took a never-used address's balance from 4.3
+   to 2.0 microseconds, 100 balances from 265 to 185, and the balances of a
+   wallet of 464 addresses from 1.37 to 0.96 milliseconds. How much memory
+   it needs on a full database, and whether it should stay off by default,
+   are still open.
 4. **The conflict rule of the shared mempool layer**: first to reach Redis
    wins.
-5. **A bound on the size of the mempool**, if the mirror in memory is built.
