@@ -405,7 +405,7 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 | Mempool | `/mempool` |
 | Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
 | Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=legacy\|compat\|segwit` picks the address type (`normal`, the old name of `legacy`, still works) |
-| Network | `/peers`, `/health` (503 when unhealthy), `/dbstats` |
+| Network | `/peers`, `/health` (503 when unhealthy, 203 without its Redis), `/dbstats` |
 | Events | `/events`, as JSON lines over HTTP or as a WebSocket |
 | Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |
 
@@ -508,6 +508,12 @@ of it are written and tested, and the store does not use them yet:
   when every check passes and 503 otherwise. The checks are: index lag behind
   the headers, age of the last block and of the last transaction, transactions
   waiting to be imported, and connected peers. Point your load balancer at it.
+- **Without Redis** a store that has a cache goes on answering, from its own
+  database, and `/health` says 203 instead of 200, with the header
+  `Haskoin-Degraded: redis`. A request waits at most two seconds for Redis
+  before the store gives up on it, and the store tries again at every health
+  check. 203 is in the range that load balancers take for healthy, so the
+  store stays in rotation; alert on anything but 200 to hear of it.
 - **StatsD**: with `--statsd`, the store reports the timing of every kind of
   request (`web.*`), database reads (`db.*`), cache hits, misses, reloads and
   full reloads (`cache.*`),

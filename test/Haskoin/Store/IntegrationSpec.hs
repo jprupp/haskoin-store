@@ -153,6 +153,7 @@ chainSpec kind = do
   it "applies each change once with two stores sharing Redis" onceTest
   it "does not replace what it does not know" unknownTest
   it "leaves the keys of older caches alone" oldKeysTest
+  it "answers from its database, and says so, while Redis does not answer" redisDownTest
 
 -------------------------------------------------------------------------------
 -- Environment
@@ -298,7 +299,7 @@ webConfig logger store =
       priceHistoryURL = "http://127.0.0.1:9/",
       noXPub = False,
       noBlockchainInfo = False,
-      healthCheckInterval = 30,
+      healthCheckInterval = 5,
       logger = logger
     }
 
@@ -1476,6 +1477,31 @@ oldKeysTest :: Env -> IO ()
 oldKeysTest env =
   forM_ oldKeys $ \(k, v) ->
     redisRun env (Redis.get k) `shouldReturn` Just v
+
+-- | While Redis does not answer, the store answers from its own database,
+-- and its health check says that it does with status 203: not a failure,
+-- since the store works, and not the 200 of a store that has everything.
+-- When Redis is back, so is the 200. Redis is told to hold every client for
+-- a while, which is what a server that hangs looks like from outside.
+redisDownTest :: Env -> IO ()
+redisDownTest env = do
+  let x = newXPub env "redisdown" DeriveNormal
+  ref <- newLedger
+  void $ pay env x ref [([0, 0], 100000), ([1, 0], 50000)]
+  void $ mine env 1
+  checkXPub env x ref
+  fst <$> getJSON env.cached "/health" `shouldReturn` 200
+  held <- redisRun env (Redis.sendRequest ["CLIENT", "PAUSE", "12000"])
+  held `shouldBe` Redis.Ok
+  -- the first request waits two seconds for Redis and gives up on it
+  (code, _) <- getJSON env.cached ("/xpub/" <> x.text <> "/balances")
+  code `shouldBe` 200
+  waitFor "the health check to notice that Redis is gone" $
+    (== 203) . fst <$> getJSON env.cached "/health"
+  checkXPub env x ref
+  waitFor "the health check to notice that Redis is back" $
+    (== 200) . fst <$> getJSON env.cached "/health"
+  checkXPub env x ref
 
 -- | Run a second store, with its own database, syncing from the same node
 -- and sharing the same Redis, while an action runs.

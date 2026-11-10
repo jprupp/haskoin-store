@@ -208,6 +208,7 @@ import Network.HTTP.Types
     hContentType,
     renderStdMethod,
     status200,
+    status203,
     status400,
     status404,
     status409,
@@ -274,6 +275,7 @@ import UnliftIO
     readTVar,
     readTVarIO,
     throwIO,
+    timeout,
     withAsync,
     writeTVar,
   )
@@ -370,7 +372,10 @@ data WebState = WebState
     -- | result of the latest health check
     health :: !(TVar HealthCheck),
     -- | the queries to answer with, the cache included ('webQuery')
-    query :: !StoreRead
+    query :: !StoreRead,
+    -- | whether Redis answered the last time it was asked; always 'True'
+    -- for a store without a cache
+    cacheUp :: !(TVar Bool)
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
@@ -583,7 +588,8 @@ serveWeb config serve = do
   metrics <- mapM createMetrics config.stats
   session <- Wreq.Session.newAPISession
   health <- runHealthCheck >>= newTVarIO
-  let query = webQuery config.store
+  cacheUp <- cacheCheck >>= newTVarIO
+  let query = webQuery config.store cacheUp
       st = WebState {..}
       app = router (map (guarded st) (handlePaths st config)) notFound
       notFound _ NoRoute = errorResponse st ThingNotFound
@@ -591,7 +597,7 @@ serveWeb config serve = do
         errorResponse st . UserError $
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   withAsync (priceUpdater session ticker) $ \_a1 ->
-    withAsync (healthCheckLoop health) $ \_a2 ->
+    withAsync (healthCheckLoop health cacheUp) $ \_a2 ->
       serve . webSocketEvents st . logIt config.logger . anyOrigin $ app
   where
     priceUpdater session =
@@ -603,9 +609,11 @@ serveWeb config serve = do
           config.tickerURL
           config.tickerRefresh
     runHealthCheck = healthCheck config
-    healthCheckLoop v = loopForever $ do
+    cacheCheck = maybe (return True) cacheAlive config.store.cache
+    healthCheckLoop v up = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       runHealthCheck >>= atomically . writeTVar v
+      cacheCheck >>= atomically . writeTVar up
     anyOrigin = modifyResponse (mapResponseHeaders (("Access-Control-Allow-Origin", "*") :))
 
 -- | Answer the errors of the handler of a route: an 'Except' with its
@@ -712,7 +720,7 @@ handlePaths st cfg =
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
     marshalledList limits (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
     plainList [] (\_ -> return GetPeers) (handlePeers st),
-    pathStatus st [] (\_ -> return GetHealth) (handleHealth st) healthStatus toEncoding toJSON,
+    pathHealth st,
     plainList ["limit", "offset"] (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
     marshalledList ["blocks", "notx"] (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
     plain [] (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
@@ -750,7 +758,6 @@ handlePaths st cfg =
     balanceParams = "format" : "cashaddr" : active
     unspentParams = "format" : "limit" : "confirmations" : "txidindex" : active
     historyParams = "format" : "start" : "end" : "currency" : active
-    healthStatus h = if isOK h then status200 else status503
     -- the parameters of a request
     cap, need :: (Param a) => Req -> IO a
     cap = paramCapture st
@@ -863,21 +870,6 @@ pathCompact ::
   Route
 pathCompact st ps parser action encJson encValue =
   pathCommon st ps parser action (const status200) encJson encValue False
-
--- | Like 'pathCompact', with the status of the response depending on it, as
--- the health check answers 503 when the store is not healthy.
-pathStatus ::
-  (ApiResource a b) =>
-  WebState ->
-  [Text] ->
-  (Req -> IO a) ->
-  (a -> IO b) ->
-  (b -> Status) ->
-  (b -> Encoding) ->
-  (b -> Value) ->
-  Route
-pathStatus st ps parser action status encJson encValue =
-  pathCommon st ps parser action status encJson encValue False
 
 -- | The route of an API resource: parse the request, run the handler, and
 -- encode the response as JSON or binary, as the client asked. It accepts the
@@ -2787,6 +2779,43 @@ getPeersInformation mgr =
             relay = ver.relay
           }
 
+-- | The route of @GET \/health@. Its status says in one number what a load
+-- balancer needs to know:
+--
+-- * 200: every check passes;
+--
+-- * 203: every check passes, but Redis does not answer, so the store
+--   answers from its own database and mempool alone;
+--
+-- * 503: a check fails.
+--
+-- = Why 203 for a store without its Redis
+--
+-- Such a store is not broken: its answers are right for what it has seen. A
+-- load balancer should go on sending it requests, which it does for any
+-- status in the 200s, so the status cannot be an error. But the answers are
+-- no longer those of the fleet: they do not come from the copy that the
+-- stores share. That is what 203, Non-Authoritative Information, says of a
+-- response, and a monitor that expects exactly 200 will notice it. 207 was
+-- the other candidate, for a body with a status for each part; it promises
+-- a format that this body does not have. The response also names what is
+-- missing in a @Haskoin-Degraded@ header, since the body, whose encoding is
+-- shared with other programs, has no place for it yet.
+pathHealth :: WebState -> Route
+pathHealth st =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ["pretty"] $ \req -> do
+    proto <- serialAs req False
+    h <- handleHealth st GetHealth
+    up <- readTVarIO st.cacheUp
+    let (status, extra)
+          | not (isOK h) = (status503, [])
+          | not up = (status203, [("Haskoin-Degraded", "redis")])
+          | otherwise = (status200, [])
+    return $
+      responseLBS status ((hContentType, serialType proto) : extra) (protoSerial proto toEncoding toJSON h)
+  where
+    proxy = Proxy :: Proxy GetHealth
+
 -- | Handler for @GET \/health@: health of the store.
 handleHealth ::
   WebState ->
@@ -3024,43 +3053,59 @@ validateLimit wl full limitM =
 -- with the Redis cache, if there is one, in front of the queries about xpubs
 -- and of the bodies of transactions. An xpub that the cache does not have is
 -- read from the database, and cached for next time if it is large enough.
-webQuery :: Store -> StoreRead
-webQuery s = case s.cache of
+--
+-- When Redis does not answer, every query is answered from the database, as
+-- if the store had no cache. The variable says whether Redis answered the
+-- last time: a query that fails clears it, so that the next ones do not wait
+-- for Redis in turn, and the health check sets it again when Redis is back.
+webQuery :: Store -> TVar Bool -> StoreRead
+webQuery s up = case s.cache of
   Nothing -> base
   Just c ->
     (base :: StoreRead)
       { getTxData = fmap listToMaybe' . txData c . pure,
         getManyTxData = txData c,
         xPubBals = \x ->
-          cacheXPubBals c x >>= \case
+          cached (cacheXPubBals c x) >>= \case
             Just bals -> return bals
             Nothing -> do
               bals <- base.xPubBals x
-              cacheRequest c x bals
+              _ <- cached (Just <$> cacheRequest c x bals)
               return bals,
         xPubUnspents = \x bals l ->
-          cacheXPubUnspents c x bals l >>= maybe (base.xPubUnspents x bals l) return,
+          cached (cacheXPubUnspents c x bals l) >>= maybe (base.xPubUnspents x bals l) return,
         xPubTxs = \x bals l ->
-          cacheXPubTxs c x l >>= maybe (base.xPubTxs x bals l) return,
+          cached (cacheXPubTxs c x l) >>= maybe (base.xPubTxs x bals l) return,
         xPubTxCount = \x bals ->
-          cacheXPubTxCount c x >>= maybe (base.xPubTxCount x bals) return
+          cached (cacheXPubTxCount c x) >>= maybe (base.xPubTxCount x bals) return
       }
   where
     base = Q.databaseRead s.db
+    -- ask Redis, unless it is down, and take a failure, or no answer within
+    -- two seconds, for "not cached"
+    cached :: IO (Maybe a) -> IO (Maybe a)
+    cached ask =
+      readTVarIO up >>= \case
+        False -> return Nothing
+        True ->
+          (timeout 2000000 ask `catchAny` \_ -> return Nothing) >>= \case
+            Just answer -> return answer
+            Nothing -> atomically (writeTVar up False) >> return Nothing
     -- bodies from Redis when the cache has them, so that the transactions
     -- of a cached xpub are served in full even before this store has
     -- imported them, and from the database otherwise
     txData _ [] = return []
     txData c ths = do
-      cached <- cacheTxData c ths
-      let missing = [h | (h, Nothing) <- zip ths cached]
+      found <- cached (Just <$> cacheTxData c ths)
+      let fromCache = fromMaybe (map (const Nothing) ths) found
+          missing = [h | (h, Nothing) <- zip ths fromCache]
       fromDB <- HashMap.fromList . zip missing <$> Q.getManyTxData s.db missing
       -- deleted ones are left out, wherever they come from
       return $
         zipWith
           (\h m -> notDeleted (maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m))
           ths
-          cached
+          fromCache
 
 -- | The state of the web server, answering without the cache if the flag is
 -- 'True', as @nocache=true@ asks.

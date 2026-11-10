@@ -1080,8 +1080,9 @@ aside for these reasons:
 ### What it costs, and what is open
 
 - **A round trip to Redis for every request**, and Redis in the way of all
-  of them. With Redis down the fleet is down, or answers from each store's
-  own mempool and is no longer consistent. Which, is a decision.
+  of them. With Redis down each store answers from its own tip and its own
+  mempool, so the fleet is no longer consistent, and says so: `/health`
+  answers 203 instead of 200. Today's store already does this for its cache.
 - **The fleet is one import behind its fastest store.**
 - **Redis must not lose writes.** A failover that loses the last second
   loses mempool transactions and can move the tip back.

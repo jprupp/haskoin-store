@@ -140,6 +140,9 @@ info:
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
     | 503 | | Only from `/health`: the server is not ready. |
 
+    `/health` also answers 203 for a server that works but cannot reach its
+    Redis; see there.
+
     A value in the path that does not parse, such as a misspelt address, gives
     404 rather than 400. Paths are matched by the shape of what is in them, and
     a segment that does not parse may belong to another endpoint (`/block/best`
@@ -268,6 +271,15 @@ paths:
         still catching up with the network answers 503, so a load balancer stops
         sending it traffic until its answers are current.
 
+        A server that has a Redis cache and cannot reach it answers **203** when
+        every check passes, with the header `Haskoin-Degraded: redis`. It goes on
+        answering every request, from its own database: the answers are right for
+        what this server has seen, but they are no longer the ones that the servers
+        sharing that Redis give together, and requests about large wallets are
+        slower. A load balancer that takes any status in the 200s for healthy keeps
+        sending it traffic, which is what it should do; a monitor that expects 200
+        sees that something is wrong.
+
         The checks are run in the background every 30 seconds (unless the operator
         changed it), and this endpoint returns the latest result. It does no work of
         its own, so it is safe to call as often as a load balancer likes.
@@ -275,6 +287,19 @@ paths:
       parameters:
         - $ref: '#/components/parameters/prettyParam'
       responses:
+        '203':
+          description: |
+            Every check passes, but the server cannot reach its Redis and answers
+            from its own database alone. The body is that of 200.
+          headers:
+            Haskoin-Degraded:
+              description: What the server is doing without; `redis`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthCheck'
         '200':
           description: success
           content:

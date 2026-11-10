@@ -117,6 +117,7 @@ module Haskoin.Store.Cache
     Cache,
     CacheConfig (..),
     withCache,
+    cacheAlive,
 
     -- * Reading
     cacheXPubBals,
@@ -227,6 +228,7 @@ import UnliftIO
     pooledForConcurrentlyN_,
     readIORef,
     readTVar,
+    timeout,
     tryAny,
     withAsync,
     writeIORef,
@@ -399,6 +401,16 @@ count c f n = mapM_ (\m -> incrementCounter (f m) n) c.metrics
 
 log' :: Cache -> LogLevel -> Text -> IO ()
 log' c l = logAt l c.logger
+
+-- | Whether Redis answers a ping within two seconds. The health check of
+-- the web server asks, so that a store whose Redis is gone says that it is
+-- answering from its own database alone.
+cacheAlive :: Cache -> IO Bool
+cacheAlive c =
+  handleAny (\_ -> return False) $
+    timeout 2000000 (R.runRedis c.redis R.ping) <&> \case
+      Just (Right _) -> True
+      _ -> False
 
 -- | Run Redis commands, throwing if Redis answers with an error.
 run :: Cache -> Redis (Either Reply a) -> IO a
