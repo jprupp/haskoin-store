@@ -398,7 +398,7 @@ Up to and including version 1.8.1 the option had no effect when the store
 was built against RocksDB 6.24 or later, as the Docker image is:
 `rocksdb-haskell-jprupp` passed the size of the filter to RocksDB with the
 wrong type, and RocksDB built none, without an error. The store is now built
-with `rocksdb-haskell-jprupp` 2.6.3, which has the fix. A store that already
+with `rocksdb-haskell-jprupp` 2.6.4, which has the fix since 2.6.3. A store that already
 runs with `--bloom` therefore starts building filters, and using that memory,
 when it is upgraded; turn the option off to keep it as it was.
 

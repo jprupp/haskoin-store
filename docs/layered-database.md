@@ -730,8 +730,26 @@ Three times as fast, for three words changed in the binding. This is not
 about the layered layout: it is what every page of a list and every count
 costs in the store today. A page of 100 transactions of an address takes
 563 microseconds, 5.6 for each row, and the count of a wallet above, 80
-milliseconds. The change was tried in a copy of the binding; it has not
-been proposed to it yet.
+milliseconds.
+
+The change is in `rocksdb-haskell-jprupp` 2.6.4
+([pull request 22](https://github.com/jprupp/rocksdb-haskell/pull/22)),
+which the store is built with. The same program, on the same databases,
+with nothing else changed, in microseconds:
+
+| | Version 20, binding 2.6.3 | Layered, 2.6.3 | Version 20, 2.6.4 | Layered, 2.6.4 |
+|---|---|---|---|---|
+| Transactions of an address | 43 | 55 | 19 | 31 |
+| Busiest address: first 100 transactions | 574 | 575 | 175 | 221 |
+| Busiest address: first 100 unspent outputs | 758 | 1,402 | 365 | 660 |
+| Cold wallet: first 100 transactions | 6,641 | 7,197 | 4,294 | 4,711 |
+| Cold wallet: number of transactions | 76,742 | 77,799 | 33,854 | 34,309 |
+| Busy wallet: first 100 transactions | 6,758 | 10,271 | 4,440 | 7,544 |
+| Busy wallet: first 100 unspent outputs | 10,208 | 22,622 | 7,756 | 15,946 |
+| Busy wallet: number of transactions | 165,063 | 221,701 | 70,826 | 84,262 |
+
+Every list and every count takes between a half and a third of the time.
+What is read by key, a balance or a transaction, is as it was.
 
 ### Bloom filters were not being built
 
@@ -751,7 +769,7 @@ RocksDB reported `filter block size=0; # entries for filter=0`.
   on the binding, released as `rocksdb-haskell-jprupp` 2.6.2. With it, the
   same column family has 3,250,201 bytes of filters for 2,600,000 keys, the
   10 bits per key asked for, and a lookup of an absent key takes 1.5
-  microseconds instead of 5.3 to 5.9. The store is built with 2.6.3 now.
+  microseconds instead of 5.3 to 5.9. The store is built with 2.6.4 now.
 - **Also found.** Comparing all 72 foreign imports of the binding with the C
   header showed one more that had drifted: `approximateSize` called RocksDB
   with one argument too few. The store does not use it. The pull request
@@ -791,7 +809,7 @@ address right after a block. Both come from one choice: to read everything
 that the mempool has for an address, with a scan, for every question about
 that address. Four changes follow from the measurements. The first two are
 built, and the queries measured above are the ones from before them; the
-other two are changes to the binding.
+other two are changes to the binding, of which the fourth is made.
 
 ### 1. A summary for each address that the mempool touches
 
@@ -888,7 +906,8 @@ off where it matters.
 ### 4. Cheaper row reads in the binding
 
 The three accessors of an iterator as unsafe foreign calls: three times as
-fast for every scan, in today's store as much as in this layout. See
+fast for every scan, in today's store as much as in this layout. Done, in
+version 2.6.4 of the binding, and measured: see
 [Reading rows through the binding](#reading-rows-through-the-binding).
 
 ### What it costs now, measured
@@ -1578,8 +1597,9 @@ What this does not show:
 Each step ends with something that can be tested against today's behaviour.
 
 1. **Build the store with the fixed RocksDB binding.** Done: the store is
-   built with `rocksdb-haskell-jprupp` 2.6.3, and its whole test suite
-   passes with it.
+   built with `rocksdb-haskell-jprupp` 2.6.4, which has the fix of 2.6.3
+   and reads rows three times as fast, and its whole test suite passes
+   with it.
 2. **A snapshot for each request.** Done: the new queries cannot be asked
    without one (`withView`), and the web server takes it around each
    request and the sending of its response.

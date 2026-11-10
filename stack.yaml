@@ -23,7 +23,7 @@ extra-deps:
   - hashtables-1.4.2
   - statsd-rupp-0.5.0.2
   - secp256k1-haskell-2.0.1
-  - rocksdb-haskell-jprupp-2.6.3
+  - rocksdb-haskell-jprupp-2.6.4
   - rocksdb-query-0.6.1
   - nqe-0.6.9
   - haskoin-core-1.6.1

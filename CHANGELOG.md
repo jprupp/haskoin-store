@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Built with `rocksdb-haskell-jprupp` 2.6.4, which reads the key and the
+  value of a row of an iterator without the cost of a safe foreign call.
+  Every list and every count takes between a half and a third of the time:
+  the first 100 transactions of a busy address 221 microseconds instead of
+  575, and the number of transactions of a wallet with 19,499 of them 34
+  milliseconds instead of 78.
 - **Database version 21: the mempool has an area of its own.** Unconfirmed
   transactions are no longer written into the indices of the chain. They
   are kept apart and applied on top when a query is answered
