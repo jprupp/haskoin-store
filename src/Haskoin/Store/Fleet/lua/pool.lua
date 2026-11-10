@@ -50,6 +50,11 @@
 -- spends it, so it is added by the second to come and taken off by the
 -- first to go.
 --
+-- Every move of the tip is counted, in 'fleet:moves'. The cache of extended
+-- public keys answers at one move of the tip and not at one block, since
+-- the tip can leave a block and come back to it, and what the pool did to
+-- the entries on the way is not undone by coming back.
+--
 -- The cache of extended public keys (xpub.lua) has, for each key that it
 -- holds, the transactions of its addresses and the outputs paid to them,
 -- those of the pool among them. So what the pool puts in or takes out at an
@@ -59,6 +64,7 @@ local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local osize = tsize + 4
 local key = {
   tip = prefix .. 'fleet:tip',
+  moves = prefix .. 'fleet:moves',
   lease = prefix .. 'fleet:lease',
   recent = prefix .. 'fleet:recent',
   spends = prefix .. 'pool:spends',
@@ -394,6 +400,7 @@ if ARGV[8] == '1' then
     redis.call('DEL', k)
   end
   redis.call('SET', key.tip, target)
+  redis.call('INCR', key.moves)
   return {'moved'}
 end
 
@@ -439,4 +446,5 @@ end
 withdraw(clashing)
 
 redis.call('SET', key.tip, target)
+redis.call('INCR', key.moves)
 return {'moved'}

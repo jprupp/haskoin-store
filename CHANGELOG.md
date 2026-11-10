@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     that moves the tip brings the cache along, with what the new blocks
     did at the addresses that entries have. If it does not, or after a
     reorganisation, the cache is emptied.
+  - The cache is at a move of the fleet tip, which the pool counts, and
+    not just at a block: the tip can leave a block and come back to it.
   - Every read of balances runs the scan of the xpub over the entry and
     misses unless it reads exactly the addresses of the entry, so a
     payment in the pool to an unused address cannot leave the gap wrong.

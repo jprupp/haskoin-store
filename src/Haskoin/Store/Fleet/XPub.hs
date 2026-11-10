@@ -46,8 +46,12 @@
 --   addresses. Any store computes the same, so it does not matter which one
 --   writes, and there is nothing for stores to disagree on.
 --
--- * __A read answers only at the block that the cache is at__, and only
---   when that is the fleet tip. When the tip moves, the store that moved it
+-- * __A read answers only where the cache is__, which is a move of the
+--   fleet tip and the block that it went to, and only while the tip is
+--   there. A block alone would not do: the tip can leave a block and come
+--   back to it, as when a block is reverted and mined again, and on the
+--   way the pool takes that block's transactions out of the entries and
+--   puts them back as unconfirmed. When the tip moves, the store that moved it
 --   brings the cache there, with what the blocks in between did to the
 --   addresses that entries have ('cacheAdvance'). Until it has, every read
 --   is a miss and the store answers from its database. If it never does, or
@@ -581,9 +585,12 @@ cacheEvict :: Connection -> FleetKeys -> Int -> IO Int
 cacheEvict conn keys most =
   fromInteger <$> run conn (R.eval xpubScript [] ["evict", keys.prefix, "32", num most])
 
--- | The block that the cache is at, if it has one.
+-- | The block that the cache is at, if it is where the fleet tip is: at
+-- the same block, by the same move of the tip.
 cacheTip :: Connection -> FleetKeys -> IO (Maybe ByteString)
-cacheTip conn keys = run conn (R.get (keys.prefix <> "fx:tip"))
+cacheTip conn keys =
+  run conn (R.eval xpubScript [] ["where", keys.prefix, "32"]) <&> \block ->
+    if B.null block then Nothing else Just block
 
 -------------------------------------------------------------------------------
 -- Helpers

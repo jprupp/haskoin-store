@@ -6,6 +6,7 @@ import Data.Either (isRight)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Serialize (encode)
 import Data.Text qualified as T
+import Data.Word (Word16)
 import Haskoin (btcRegTest, prepareContext, txHash)
 import Haskoin.Node (LogLevel (..))
 import Haskoin.Store.Common (Limits (..), Start (..), StoreRead)
@@ -21,7 +22,7 @@ import Haskoin.Store.Histories
 import Haskoin.Store.Integration.Podman (podmanUsable)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
-import Test.QuickCheck (forAll, ioProperty, property, vectorOf)
+import Test.QuickCheck (forAll, ioProperty, property, sized, vectorOf)
 import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
@@ -104,131 +105,204 @@ spec = prepareContext $ \ctx -> do
           -- between moving the tip and bringing the cache along. The
           -- cache is then at another block than the tip, and must not
           -- answer.
-          property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
-            withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-              openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
-                keys <- fresh
-                said <- newIORef []
-                let config =
-                      MemberConfig
-                        { prefix = keys.prefix,
-                          name = "a",
-                          lease = 60000,
-                          depth = 6,
-                          expiry = 0,
-                          cacheMax = 10,
-                          cacheMinAddrs = 0,
-                          cacheMinTxs = 0,
-                          stats = Nothing,
-                          note = \level line -> modifyIORef' said ((level, line) :)
-                        }
-                    best = Q.getBestBlock db >>= maybe (fail "no best block") return
-                    key = wallet ctx
-                m <- newMember config conn db
-                -- the same store, as it takes its turns without the cache
-                bare <- newMember (config {cacheMax = 0} :: MemberConfig) conn db
-                hits <- newIORef (0 :: Int)
-                hist0 <- start layeredRules db
-                best >>= \b -> noteBest m b >> noteBest bare b
-                memberTick m
-                let tipNow = memberTip m >>= maybe (fail "the fleet has no tip") return
-                    inFleet :: (StoreRead -> StoreRead -> IO a) -> IO a
-                    inFleet action = do
-                      tip <- tipNow
-                      answeringCached m tip (\plain cached _ -> action plain cached)
-                        >>= maybe (fail "the store has no view of the fleet tip") return
-                    turn hist seed =
-                      plan shadow hist seed >>= \case
-                        (hist', Nothing) -> return hist'
-                        (hist', Just op) -> do
-                          void (apply mixedRules shadow op)
-                          out <- apply layeredRules db op
-                          let hist'' = record db hist' op out
-                          memberForget m out.removed
-                          memberForget bare out.removed
-                          when (isRight out.result) $ case op of
-                            Mine _ _ -> best >>= \b -> noteBest m b >> noteBest bare b
-                            Revert _ -> best >>= \b -> noteBest m b >> noteBest bare b
-                            Delete _ -> void (poolWithdraw conn keys 32 (map encode out.removed))
-                            Pay _ _ -> return ()
-                          if seed `mod` 5 == 0
-                            then do
-                              -- the tip moves, if the step made a block,
-                              -- and the cache stays where it was: not in
-                              -- every history, but in most
-                              memberTick bare
-                              -- the member with the cache learns the tip
-                              memberTick m
-                            else memberTick m
-                          let made = map txHash hist''.made
-                              pick xs = xs !! (fromIntegral seed `mod` length xs)
-                              starts =
-                                [Nothing, Just (AtBlock (fromIntegral seed `mod` 8))]
-                                  <> [Just (AtTx (pick made)) | not (null made)]
-                              limits =
-                                [ Limits {limit, offset, start = from}
-                                | from <- starts,
-                                  (limit, offset) <- [(0, 0), (2, 0), (3, fromIntegral seed `mod` 3)]
-                                ]
-                              asked =
-                                [WalletBalances, WalletCount]
-                                  <> map WalletTxs limits
-                                  <> map WalletUnspents limits
-                          (direct, cached) <- inFleet $ \plain cached ->
-                            (,) <$> mapM (answer plain) asked <*> mapM (answer cached) asked
-                          (show op, differences asked direct cached) `shouldBe` (show op, [])
-                          -- cache the wallet after two steps of three
-                          when (seed `mod` 3 /= 0) $ do
-                            tip <- tipNow
-                            built <- answeringAt m tip (\r pool _ -> cacheBuild conn keys tip r pool 1 key)
-                            at <- cacheTip conn keys
-                            if at /= Just tip
-                              then do
-                                -- the cache is behind the tip: nothing is
-                                -- written to it, and it does not answer
-                                built `shouldSatisfy` (`elem` [Just Abandoned, Just (Built 0)])
-                                cachedEntry conn keys tip 20 32 1 key `shouldReturn` Miss
-                              else do
-                                built `shouldSatisfy` \case
-                                  Just (Built _) -> True
-                                  _ -> False
-                                cachedEntry conn keys tip 20 32 1 key >>= \case
-                                  Hit e -> do
-                                    modifyIORef' hits (+ 1)
-                                    let (n0, n1) = e.sizes
-                                        isHit = \case
-                                          Hit _ -> True
-                                          _ -> False
-                                    cachedTxs conn keys tip key (n0, n1) Top def >>= (`shouldSatisfy` isHit)
-                                    cachedCount conn keys tip key (n0, n1) >>= (`shouldSatisfy` isHit)
-                                    -- not for a caller with other addresses
-                                    cachedTxs conn keys tip key (n0 + 1, n1) Top def `shouldReturn` Miss
-                                    cachedCount conn keys tip key (n0, n1 + 1) `shouldReturn` Miss
-                                    let more = e {sizes = (n0 + 1, n1)}
-                                    cachedUnspents conn keys tip key more Top def `shouldReturn` Miss
-                                  other -> expectationFailure ("the cache did not answer: " <> show other)
-                            (direct', cached') <- inFleet $ \plain through ->
-                              (,) <$> mapM (answer plain) asked <*> mapM (answer through) asked
-                            (show op, differences asked direct' cached') `shouldBe` (show op, [])
-                          return hist''
-                foldM_ turn hist0 seeds
-                -- the least recently used entries go when there are too
-                -- many, and nothing of them is left
-                memberTick m
-                memberTick m
-                tip <- tipNow
-                cacheTip conn keys `shouldReturn` Just tip
-                _ <- answeringAt m tip (\r pool _ -> cacheBuild conn keys tip r pool 1 key)
-                cacheEvict conn keys 1 `shouldReturn` 0
-                cacheEvict conn keys 0 `shouldReturn` 1
-                cachedEntry conn keys tip 20 32 1 key `shouldReturn` Miss
-                cacheHave conn keys key `shouldReturn` (0, 0)
-                closeViews m.views
-                closeViews bare.views
-                -- what the member logged: that it emptied the cache, and
-                -- why, as information, and nothing else above debugging
-                logged <- readIORef said
-                let emptied = [line | (LevelInfo, line) <- logged]
-                [() | (level, _) <- logged, level /= LevelInfo, level /= LevelDebug] `shouldBe` []
-                emptied `shouldSatisfy` all ("Emptied the xpub cache at block " `T.isPrefixOf`)
-                readIORef hits >>= (`shouldSatisfy` (> 10))
+          --
+          -- The first history is always 'leftAndBack'.
+          let histories = sized (\n -> if n == 0 then return leftAndBack else vectorOf 60 anyNumber)
+           in property . forAll histories $ \seeds -> ioProperty $
+                withSystemTempDirectory "haskoin-store-member-" $ \dir ->
+                  openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
+                    keys <- fresh
+                    said <- newIORef []
+                    let config =
+                          MemberConfig
+                            { prefix = keys.prefix,
+                              name = "a",
+                              lease = 60000,
+                              depth = 6,
+                              expiry = 0,
+                              cacheMax = 10,
+                              cacheMinAddrs = 0,
+                              cacheMinTxs = 0,
+                              stats = Nothing,
+                              note = \level line -> modifyIORef' said ((level, line) :)
+                            }
+                        best = Q.getBestBlock db >>= maybe (fail "no best block") return
+                        key = wallet ctx
+                    m <- newMember config conn db
+                    -- the same store, as it takes its turns without the cache
+                    bare <- newMember (config {cacheMax = 0} :: MemberConfig) conn db
+                    hits <- newIORef (0 :: Int)
+                    hist0 <- start layeredRules db
+                    best >>= \b -> noteBest m b >> noteBest bare b
+                    memberTick m
+                    let tipNow = memberTip m >>= maybe (fail "the fleet has no tip") return
+                        inFleet :: (StoreRead -> StoreRead -> IO a) -> IO a
+                        inFleet action = do
+                          tip <- tipNow
+                          answeringCached m tip (\plain cached _ -> action plain cached)
+                            >>= maybe (fail "the store has no view of the fleet tip") return
+                        turn hist seed =
+                          plan shadow hist seed >>= \case
+                            (hist', Nothing) -> return hist'
+                            (hist', Just op) -> do
+                              void (apply mixedRules shadow op)
+                              out <- apply layeredRules db op
+                              let hist'' = record db hist' op out
+                              memberForget m out.removed
+                              memberForget bare out.removed
+                              when (isRight out.result) $ case op of
+                                Mine _ _ -> best >>= \b -> noteBest m b >> noteBest bare b
+                                Revert _ -> best >>= \b -> noteBest m b >> noteBest bare b
+                                Delete _ -> void (poolWithdraw conn keys 32 (map encode out.removed))
+                                Pay _ _ -> return ()
+                              if seed `mod` 5 == 0
+                                then do
+                                  -- the tip moves, if the step made a block,
+                                  -- and the cache stays where it was: not in
+                                  -- every history, but in most
+                                  memberTick bare
+                                  -- the member with the cache learns the tip
+                                  memberTick m
+                                else memberTick m
+                              let made = map txHash hist''.made
+                                  pick xs = xs !! (fromIntegral seed `mod` length xs)
+                                  starts =
+                                    [Nothing, Just (AtBlock (fromIntegral seed `mod` 8))]
+                                      <> [Just (AtTx (pick made)) | not (null made)]
+                                  limits =
+                                    [ Limits {limit, offset, start = from}
+                                    | from <- starts,
+                                      (limit, offset) <- [(0, 0), (2, 0), (3, fromIntegral seed `mod` 3)]
+                                    ]
+                                  asked =
+                                    [WalletBalances, WalletCount]
+                                      <> map WalletTxs limits
+                                      <> map WalletUnspents limits
+                              (direct, cached) <- inFleet $ \plain cached ->
+                                (,) <$> mapM (answer plain) asked <*> mapM (answer cached) asked
+                              (show op, differences asked direct cached) `shouldBe` (show op, [])
+                              -- cache the wallet after two steps of three
+                              when (seed `mod` 3 /= 0) $ do
+                                tip <- tipNow
+                                built <- answeringAt m tip (\r pool _ -> cacheBuild conn keys tip r pool 1 key)
+                                at <- cacheTip conn keys
+                                if at /= Just tip
+                                  then do
+                                    -- the cache is behind the tip: nothing is
+                                    -- written to it, and it does not answer
+                                    built `shouldSatisfy` (`elem` [Just Abandoned, Just (Built 0)])
+                                    cachedEntry conn keys tip 20 32 1 key `shouldReturn` Miss
+                                  else do
+                                    built `shouldSatisfy` \case
+                                      Just (Built _) -> True
+                                      _ -> False
+                                    cachedEntry conn keys tip 20 32 1 key >>= \case
+                                      Hit e -> do
+                                        modifyIORef' hits (+ 1)
+                                        let (n0, n1) = e.sizes
+                                            isHit = \case
+                                              Hit _ -> True
+                                              _ -> False
+                                        cachedTxs conn keys tip key (n0, n1) Top def >>= (`shouldSatisfy` isHit)
+                                        cachedCount conn keys tip key (n0, n1) >>= (`shouldSatisfy` isHit)
+                                        -- not for a caller with other addresses
+                                        cachedTxs conn keys tip key (n0 + 1, n1) Top def `shouldReturn` Miss
+                                        cachedCount conn keys tip key (n0, n1 + 1) `shouldReturn` Miss
+                                        let more = e {sizes = (n0 + 1, n1)}
+                                        cachedUnspents conn keys tip key more Top def `shouldReturn` Miss
+                                      other -> expectationFailure ("the cache did not answer: " <> show other)
+                                (direct', cached') <- inFleet $ \plain through ->
+                                  (,) <$> mapM (answer plain) asked <*> mapM (answer through) asked
+                                (show op, differences asked direct' cached') `shouldBe` (show op, [])
+                              return hist''
+                    foldM_ turn hist0 seeds
+                    -- the least recently used entries go when there are too
+                    -- many, and nothing of them is left
+                    memberTick m
+                    memberTick m
+                    tip <- tipNow
+                    cacheTip conn keys `shouldReturn` Just tip
+                    _ <- answeringAt m tip (\r pool _ -> cacheBuild conn keys tip r pool 1 key)
+                    cacheEvict conn keys 1 `shouldReturn` 0
+                    cacheEvict conn keys 0 `shouldReturn` 1
+                    cachedEntry conn keys tip 20 32 1 key `shouldReturn` Miss
+                    cacheHave conn keys key `shouldReturn` (0, 0)
+                    closeViews m.views
+                    closeViews bare.views
+                    -- what the member logged: that it emptied the cache, and
+                    -- why, as information, and nothing else above debugging
+                    logged <- readIORef said
+                    let emptied = [line | (LevelInfo, line) <- logged]
+                    [() | (level, _) <- logged, level /= LevelInfo, level /= LevelDebug] `shouldBe` []
+                    emptied `shouldSatisfy` all ("Emptied the xpub cache at block " `T.isPrefixOf`)
+                    readIORef hits >>= (`shouldSatisfy` (> 10))
+
+-- | A history that a run of the tests found: a block is mined, reverted and
+-- mined again while the cache is not brought along, so that the fleet tip
+-- comes back to the block that the cache was at. The cache then looked
+-- current, with entries that the pool had taken the transactions of that
+-- block out of on the way. It is why the cache is at a move of the tip and
+-- not at a block.
+leftAndBack :: [Word16]
+leftAndBack =
+  [ 2944,
+    33599,
+    29992,
+    62497,
+    57974,
+    57422,
+    44271,
+    60202,
+    57257,
+    19310,
+    53832,
+    39324,
+    44849,
+    28951,
+    37975,
+    2064,
+    15159,
+    34699,
+    16471,
+    3642,
+    14550,
+    867,
+    22752,
+    14436,
+    39637,
+    398,
+    25449,
+    11005,
+    20967,
+    47441,
+    46443,
+    63224,
+    4787,
+    36990,
+    56953,
+    1543,
+    36370,
+    24815,
+    19050,
+    39880,
+    16054,
+    22273,
+    62670,
+    13555,
+    30149,
+    1048,
+    1444,
+    45704,
+    39517,
+    1970,
+    43989,
+    15518,
+    54685,
+    58539,
+    63687,
+    1789,
+    3783,
+    27016,
+    43138,
+    28658
+  ]

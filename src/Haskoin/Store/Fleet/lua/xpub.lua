@@ -13,7 +13,7 @@
 -- The reads take the fleet tip that the store answers from, the id of a
 -- key, and the number of its addresses in each of its two chains as the
 -- caller has them. They answer {'raced'} if the fleet tip is another block,
--- {'miss'} if the cache is at another block, if it does not have the key,
+-- {'miss'} if the cache is not where the tip is, if it does not have the key,
 -- or if it has it with other addresses, and {'ok', ...} otherwise.
 --
 -- 'bals': the tip, the id, and the time in milliseconds, or '' not to note
@@ -50,6 +50,9 @@
 -- 'tracked': addresses. A string with '1' for each address that an entry
 -- has and '0' for the others.
 --
+-- 'where': nothing. The block that the cache is at, if it is at the fleet
+-- tip as it stands, and '' otherwise.
+--
 -- 'advance': the block that the cache is taken to be at or '', the block to
 -- bring it to, '1' to empty it or '0', the number of addresses that the
 -- blocks in between changed, and for each: the address, its balance in
@@ -59,8 +62,8 @@
 -- for each, the number of its outputs that they spent, and those outputs.
 -- Returns {'moved'}; {'stays'} if the cache is at the new block already;
 -- {'raced'} if the fleet tip is not the new block; and {'emptied'} if it
--- was asked to empty the cache, or if the cache was at another block than
--- the one given, in which case what the blocks did to it cannot be told.
+-- had entries and was asked to empty them, or was not where the tip was
+-- one move ago, in which case what happened since cannot be told.
 --
 -- 'evict': how many entries to keep. Deletes the least recently used ones
 -- past that many, and says how many it deleted.
@@ -144,18 +147,38 @@ end
 
 local fleet = redis.call('GET', key.fleet) or ''
 
+-- Where the cache is, is a move of the fleet tip and the block that it went
+-- to. A block alone would not do: the tip can leave a block and come back
+-- to it, as when a block is reverted and mined again, and a cache that was
+-- not brought along would find itself at the tip, with entries that the
+-- pool has taken the transactions of that block out of on the way.
+local moves = tonumber(redis.call('GET', prefix .. 'fleet:moves') or '0')
+local function place(n, block)
+  return n .. '@' .. block
+end
+local here = place(moves, fleet)
+
+if what == 'where' then
+  if (redis.call('GET', key.tip) or '') == here then
+    return fleet
+  end
+  return ''
+end
+
 if what == 'advance' then
   local from, to = ARGV[4], ARGV[5]
   if fleet ~= to then
     return {'raced'}
   end
   local at = redis.call('GET', key.tip) or ''
-  if at == to then
+  if at == here then
     return {'stays'}
   end
-  if ARGV[6] == '1' or (at ~= from and at ~= '') then
+  -- it can be brought along only from the move before this one
+  local held = redis.call('ZCARD', key.lru) > 0
+  if held and (ARGV[6] == '1' or at ~= place(moves - 1, from)) then
     empty()
-    redis.call('SET', key.tip, to)
+    redis.call('SET', key.tip, here)
     return {'emptied'}
   end
   local changed = tonumber(ARGV[7])
@@ -201,7 +224,7 @@ if what == 'advance' then
       end
     end
   end
-  redis.call('SET', key.tip, to)
+  redis.call('SET', key.tip, here)
   return {'moved'}
 end
 
@@ -215,9 +238,9 @@ end
 if what == 'build' then
   local at = redis.call('GET', key.tip)
   if not at then
-    -- nothing is cached yet: the cache starts at this block
-    redis.call('SET', key.tip, tip)
-  elseif at ~= tip then
+    -- nothing is cached yet: the cache starts here
+    redis.call('SET', key.tip, here)
+  elseif at ~= here then
     return {'behind'}
   end
   local n0, n1 = numbers(e)
@@ -266,7 +289,7 @@ if what == 'build' then
   return {'ok'}
 end
 
-if (redis.call('GET', key.tip) or '') ~= tip then
+if (redis.call('GET', key.tip) or '') ~= here then
   return {'miss'}
 end
 local answer = {'ok'}

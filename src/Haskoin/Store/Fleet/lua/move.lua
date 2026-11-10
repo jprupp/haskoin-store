@@ -64,6 +64,8 @@ for i = 1, #first, size do
       return {'stays'}
     end
     redis.call('SET', KEYS[1], block)
+    -- the moves of the tip are counted, next to it: see pool.lua
+    redis.call('INCR', string.sub(KEYS[1], 1, -4) .. 'moves')
     return {'moved', block}
   end
 end

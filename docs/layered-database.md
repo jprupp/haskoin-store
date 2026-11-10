@@ -1242,6 +1242,15 @@ address.
   outputs, in one script that also moves the block of the cache. Until
   then every read misses and is answered from the database, which gives
   the same answer.
+- **Where the cache is, is a move of the tip, not a block.** Every move of
+  the fleet tip is counted, and the cache is at a count and a block. The
+  first version had the block alone, and the tests found what that
+  misses, once their histories confirmed mempool transactions in earnest:
+  a block is mined, reverted and mined again while the cache is not
+  brought along. The tip is back at the block of the cache, which looks
+  current, but on the way the pool took the transactions of that block out
+  of the entries and put them back as unconfirmed. That history is now the
+  first that the test runs.
 - **No repair, because there is nothing to repair it from.** If the store
   that moved the tip stops before it brings the cache along, the next move
   finds the cache at a block that it does not start from, and empties it.

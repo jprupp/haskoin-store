@@ -1575,8 +1575,10 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
           _ <- getJSON urlA (xpub <> "/balances" <> q)
           has <- redisRun env (Redis.exists cachedKey)
           tip <- memberTip one
+          moves <- redisRun env (Redis.get (cachePrefix env.net <> "fleet:moves"))
           cached <- redisRun env (Redis.get (cachePrefix env.net <> "fx:tip"))
-          return (has && isJust tip && cached == tip)
+          let here = (\n t -> n <> "@" <> t) <$> moves <*> tip
+          return (has && isJust tip && cached == here)
         alike ("the two stores to answer alike from the cache, " <> what) about
         waitFor ("each store to answer from the cache as from its database, " <> what) $ do
           let direct = map (<> "&nocache=true") about

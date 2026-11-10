@@ -927,8 +927,7 @@ syncCache m = when (m.config.cacheMax > 0) $ do
     Just t | at /= Just t -> do
       when (before == Just t) $
         cacheAdvance m.redis m.keys Nothing t Nothing >>= \case
-          -- a cache that never had a block is not worth a line
-          CacheEmptied | isJust at -> wasEmptied m t "no store brought it to the fleet tip"
+          CacheEmptied -> wasEmptied m t "no store brought it to the fleet tip"
           _ -> return ()
       atomically (writeTVar m.lagging (Just t))
     _ -> atomically (writeTVar m.lagging Nothing)
