@@ -26,6 +26,7 @@ mempool, and everything it did to the chain's indices, into its own area.
 - [What has to change before the switch](#what-has-to-change-before-the-switch)
 - [Keeping the mempool in memory](#keeping-the-mempool-in-memory)
 - [The cache under the same rules](#the-cache-under-the-same-rules)
+- [A fleet that answers as one](#a-fleet-that-answers-as-one)
 - [Migration](#migration)
 - [Evidence](#evidence)
 - [Order of work](#order-of-work)
@@ -1013,6 +1014,83 @@ whatever their own mempools hold.
   mempool transactions it does not have, through its own rules. Then the
   stores' own mempools converge, and uncached queries agree too. This is an
   addition, not a requirement.
+
+## A fleet that answers as one
+
+This section is a proposal, written on 2026-11-10. Nothing of it is built.
+
+The aim is stronger than the cache design above: stores that share a Redis
+should give the same answer to the same request at the same time, always,
+and not only once they have all caught up. Two decisions come with it:
+
+- **Deleted transactions are no longer returned.** Some clients do not
+  check the flag. A transaction that was replaced or dropped is unknown to
+  the API, and a page that starts at one is empty. The bodies that version
+  20 left in `tx` stay there and are filtered out; the layered layout keeps
+  none. What has to be kept is the fact that the store saw the transaction,
+  so that it does not fetch it again when a peer announces it.
+- **The mempool that answers requests is the one in Redis.** A store's own
+  mempool area is then what it offers to Redis and relays to peers, not what
+  it answers from.
+
+### The idea: agree on the state, not on the moment
+
+Stores cannot commit a block at the same instant, and they do not need to.
+A response is consistent across the fleet if every store answers from the
+same block and the same mempool. So:
+
+- **Redis holds the fleet tip**: the hash and height of the newest block
+  that every live store has imported.
+- **Each store imports blocks at its own pace**, with no lock, and keeps a
+  view of its database at each block until the fleet tip has moved past it.
+- **Each store reports its own tip in a key that expires.** A store that
+  dies or falls behind drops out by itself, and answers 503 on `/health`
+  until it has caught up, so that the load balancer leaves it alone.
+- **One script moves the fleet tip.** When every live store has the next
+  block, a Lua script sets the new tip and, in the same step, takes out of
+  the shared mempool what that block confirmed or made invalid. It is a
+  compare-and-set on the tip: nothing is held, and two stores that try at
+  once do the same thing.
+- **Every request reads the fleet tip**, answers from the view at that
+  block, and applies the shared mempool on top, read in the same script.
+
+A reorganisation is the same: the tip is a hash, and the script that moves
+it to a block of another branch puts back what the old branch had confirmed.
+
+### Why not a lock and a commit in step
+
+The first suggestion was a lock in Redis for each block, the changes to
+RocksDB worked out once and shipped through Redis, and every store pausing
+its API to commit together. That is a two-phase commit, and it was set
+aside for these reasons:
+
+- **It needs to know who is in the fleet.** A store that stalls after it
+  was counted blocks all the others. A timeout unblocks them and breaks the
+  guarantee.
+- **A lock with an expiry does not exclude.** A holder that pauses past the
+  expiry carries on as if it held the lock.
+- **Stores still commit milliseconds apart**, with requests in flight on
+  each. The pause narrows the window and does not close it, and makes each
+  block a stall of the whole fleet as long as its slowest import.
+- **Shipped changes are right only for identical databases.** In the
+  layered layout each store can work the same chain area out by itself; the
+  one thing that differs between stores is the time a transaction was first
+  seen, which this design takes from Redis or drops.
+
+### What it costs, and what is open
+
+- **A round trip to Redis for every request**, and Redis in the way of all
+  of them. With Redis down the fleet is down, or answers from each store's
+  own mempool and is no longer consistent. Which, is a decision.
+- **The fleet is one import behind its fastest store.**
+- **Redis must not lose writes.** A failover that loses the last second
+  loses mempool transactions and can move the tip back.
+- **The slow reads measured above move to Redis.** The summary for each
+  address belongs with the shared mempool there, and the local mempool area
+  needs none.
+- **Conflicts between stores' mempools** are settled when a transaction is
+  offered to Redis: the first one in stays, as in the cache design above.
+- **How long a store may lag** before it is dropped from the fleet.
 
 ## Migration
 
