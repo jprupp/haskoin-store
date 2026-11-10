@@ -11,10 +11,11 @@
 --
 -- Rules to import and revert blocks and transactions in the layered layout
 -- of the database (@docs\/layered-database.md@), in which the mempool is
--- kept apart from the chain. They do what "Haskoin.Store.Logic" does for the
--- layout in use today, with the same functions, the same results and the
--- same errors, so that the block store can move from one to the other. The
--- store does not use them yet.
+-- kept apart from the chain. These are the rules that the block store
+-- imports with. They do what "Haskoin.Store.Logic" did for the layout of
+-- version 20, with the same functions, the same results and the same
+-- errors, which is how the block store moved from one to the other, and
+-- how the tests compare the two.
 --
 -- = Two sets of rules
 --
@@ -38,7 +39,7 @@
 -- transaction may spend outputs of the chain, which the chain goes on
 -- listing as unspent: only the mempool area says otherwise.
 --
--- = Same answers as today
+-- = Same answers as version 20
 --
 -- For any sequence of blocks and transactions, these rules leave the
 -- database that "Haskoin.Store.Logic" followed by
@@ -46,7 +47,7 @@
 -- the same result. The tests check that for random sequences. There is one
 -- difference by design. A block that spends an output of an unconfirmed
 -- transaction is refused here, because that output is not in the chain;
--- today it is imported, since the indices do not tell the two apart.
+-- version 20 imports it, since its indices do not tell the two apart.
 module Haskoin.Store.Logic.Layered
   ( initBest,
     revertBlock,
@@ -312,7 +313,7 @@ importChainTx wr br time tx = do
 -- | Give a confirmed transaction a new position in the chain: a block has a
 -- transaction that is already confirmed. Only two coinbases of 2010 are, on
 -- Bitcoin; the later one takes the place of the earlier, with the outputs
--- that are still unspent, as in the layout in use today.
+-- that are still unspent, as in the layout of version 20.
 moveChainTx :: Writer -> TxData -> BlockRef -> IO TxData
 moveChainTx wr t new = do
   forM_ (txDataAddresses wr t) $ \a -> do
@@ -357,7 +358,7 @@ revertBlock wr bh = do
       forM_ (reverse ordered) (leave . txHash)
       -- into the mempool, at the time each was first seen. The coinbase is
       -- still in the chain: a transaction that spends it has all its
-      -- parents while its flag is worked out, as in the layout in use today
+      -- parents while its flag is worked out, as in the layout of version 20
       forM_ (mapMaybe ((`M.lookup` returned) . txHash) ordered) $ \td -> do
         rbf <- isRBF wr td.tx
         addMempoolTx wr td.timestamp (td :: TxData) {rbf = rbf}

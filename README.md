@@ -276,7 +276,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | --- | --- | --- | --- |
 | `--no-mempool` | `NO_MEMPOOL` | off | Do not index unconfirmed transactions |
 | `--sync-mempool` | `SYNC_MEMPOOL` | off | Ask each peer for its whole mempool once in sync |
-| `--wipe-mempool` | `WIPE_MEMPOOL` | off | Delete the indexed mempool at start |
+| `--wipe-mempool` | `WIPE_MEMPOOL` | off | Empty the mempool area of the database at start |
 | `--mempool-timeout` | `MEMPOOL_TIMEOUT` | `14` | Days after which unconfirmed transactions are deleted (0 = never) |
 
 ### Web server and limits
@@ -423,8 +423,8 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 - **haskoin-node** keeps a pool of peers and syncs block headers.
 - The **block store** (`Haskoin.Store.BlockStore`) downloads blocks from one
   peer at a time and mempool transactions from all of them, and imports them
-  with the rules in `Haskoin.Store.Logic`. Each import is one atomic RocksDB
-  batch, so a crash never leaves a half-written block.
+  with the rules in `Haskoin.Store.Logic.Layered`. Each import is one atomic
+  RocksDB batch, so a crash never leaves a half-written block.
 - Reorganisations are handled by reverting blocks until the best block is
   back on the main chain of headers.
 - The **cache** (`Haskoin.Store.Cache`) keeps xpubs with many used addresses
@@ -484,23 +484,33 @@ address.
 
 The database layout is described in `Haskoin.Store.Database.Types`.
 
-Today unconfirmed transactions are written into the same indices as the
-block chain. `docs/layered-database.md` is a design, partly built, for
-keeping them in an area of their own and applying them on top of the chain
-when a query is answered, so that nothing the mempool does changes the
-chain's data, and so that the cache can be split the same way. Four parts
-of it are written and tested, and the store does not use them yet:
+Unconfirmed transactions are kept in an area of their own, and applied on
+top of the chain when a query is answered, so that nothing the mempool does
+changes the chain's data. This is version 21 of the database, the layered
+layout of `docs/layered-database.md`, which has the reasons, the
+measurements and the evidence. Up to version 20 they were written into the
+same indices as the block chain. A database of version 20 is migrated the
+first time this version of the store opens it: its mempool is moved to the
+new area, in batches that can be interrupted, and the log says how many
+transactions were moved. **There is no way back**: an older store refuses
+the database afterwards, so take a copy of a production database first.
+The parts:
 
-- the migration from the present layout (`Haskoin.Store.Database.Migrate`);
+- the migration from version 20 (`Haskoin.Store.Database.Migrate`);
 - the keys that a mempool transaction writes, the summary that is kept for
   each address they touch, and what the mempool does to the balance and the
   unspent outputs of an address (`Haskoin.Store.Database.Mempool`);
 - the rules that import blocks and transactions in that layout
   (`Haskoin.Store.Logic.Layered`), which the tests hold to the results of
-  today's rules, operation by operation and key by key;
+  the rules of version 20, operation by operation and key by key;
 - the queries over both areas (`Haskoin.Store.Database.Query.Layered`), each
-  on a snapshot of the database, which the tests hold to the answers of
-  today's queries, page by page.
+  on a snapshot of the database, one for each request of the web server,
+  which the tests hold to the answers of the queries of version 20, page by
+  page.
+
+The rules and queries of version 20 (`Haskoin.Store.Logic`,
+`Haskoin.Store.Database.Query`) stay in the library for those tests, and
+nothing in the store calls them.
 
 ## Monitoring
 
@@ -560,8 +570,9 @@ api.haskoin.com. To reach your own server, put it behind a proxy that maps
 
 Or embed the indexer in your own program with `haskoin-store`: `withStore`
 starts the node, the block store and the cache from a `StoreConfig`, and the
-functions of `Haskoin.Store.Database.Query`, such as `getBalance store.db
-addr` or `xPubTxs store.db bals limits`, query its database in `IO`.
+functions of `Haskoin.Store.Database.Query.Layered` query its database in
+`IO`, on a view of it taken with `withView`, such as
+`withView store.db (\v -> getBalance v addr)`.
 Subscribe to `Store.pub` to receive `StoreEvent`s.
 
 Every module has Haddock documentation; build it with `stack haddock`.

@@ -40,6 +40,7 @@ module Haskoin.Store.Database.Reader
     createDataMetrics,
     withDatabaseReader,
     withLayeredReader,
+    initRocksDB,
     memoryReport,
     addrTxCF,
     addrOutCF,
@@ -180,8 +181,16 @@ createDataMetrics s = do
   where
     n = 10
 
--- | Version of the database layout. Databases of versions 18 and 19 are
--- migrated when opened; other versions are refused.
+-- | Version of the layout that 'withDatabaseReader' opens, in which the
+-- mempool is written into the indices of the chain. Databases of versions
+-- 18 and 19 are migrated to it when opened that way; other versions are
+-- refused.
+--
+-- The store runs on the version after it,
+-- 'Haskoin.Store.Database.Migrate.layeredVersion', and opens its database
+-- with 'withLayeredReader' and 'Haskoin.Store.Database.Migrate.upgradeDatabase'.
+-- This version is kept for the tests, which hold the new layout to the
+-- answers of this one, and as the way through for databases of 18 and 19.
 --
 -- Bumping the version is how a change to the database layout is made safe: an
 -- old database is either migrated in place when it is opened or refused, never
@@ -218,16 +227,16 @@ withDatabaseReader = withReader columnFamilyConfig initRocksDB
 -- for what the mempool does at each address. The arguments are those of
 -- 'withDatabaseReader'.
 --
--- It neither checks nor sets the version of the database. It is for
--- "Haskoin.Store.Database.Migrate", which moves a database of version 20 to
--- that layout, and for reading the result with
--- "Haskoin.Store.Database.Mempool". The store itself does not use it yet.
+-- It neither checks nor sets the version of the database:
+-- 'Haskoin.Store.Database.Migrate.upgradeDatabase' does, and has to be
+-- called before anything reads the database. The store opens its database
+-- with the two.
 --
 -- Opening a database this way adds the column family to it. RocksDB only
 -- opens a database when given all its column families, so a store that does
--- not know this one, such as this version through 'withDatabaseReader', can
--- no longer open the database afterwards. That is the point of no return of
--- the migration, and the reason why nothing calls this by itself.
+-- not know this one, such as any through 'withDatabaseReader', can no
+-- longer open the database afterwards. That is the point of no return of
+-- the migration.
 withLayeredReader ::
   Network ->
   Ctx ->

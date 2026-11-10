@@ -22,7 +22,8 @@ module Haskoin.Store.Manager
   )
 where
 
-import Control.Monad (unless)
+import Control.Monad (unless, when)
+import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word32)
 import Haskoin
@@ -45,6 +46,7 @@ import Haskoin
 import Haskoin.Node
   ( Chain,
     ChainEvent (..),
+    LogLevel (..),
     Logger,
     Node (..),
     NodeConfig (..),
@@ -52,6 +54,7 @@ import Haskoin.Node
     PeerEvent (..),
     PeerMgr,
     WithConnection,
+    logAt,
     withNode,
     withSource,
   )
@@ -72,10 +75,11 @@ import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
   )
+import Haskoin.Store.Database.Migrate (Migration (..), upgradeDatabase)
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     createDataMetrics,
-    withDatabaseReader,
+    withLayeredReader,
   )
 import NQE
   ( Inbox,
@@ -237,14 +241,18 @@ withStoreCache cfg db chain pub action =
         (withSource "Cache" cfg.logger)
         (action . Just)
 
--- | Open the database described by the configuration and run an action with its reader.
+-- | Open the database described by the configuration, bring it to the
+-- layout that the store runs on ('upgradeDatabase'), and run an action with
+-- its reader. A database of version 20 has its mempool moved to an area of
+-- its own here, once, before anything reads it; older stores refuse the
+-- database from then on.
 connectDB ::
   StoreConfig ->
   (DatabaseReader -> IO a) ->
   IO a
 connectDB cfg f = do
   stats <- mapM createDataMetrics cfg.stats
-  withDatabaseReader
+  withLayeredReader
     cfg.net
     cfg.ctx
     cfg.initGap
@@ -256,7 +264,12 @@ connectDB cfg f = do
     cfg.maxWalSize
     cfg.blockCache
     stats
-    f
+    $ \db -> do
+      done <- upgradeDatabase (logAt LevelInfo (withSource "Database" cfg.logger)) db
+      when (done.moved > 0) $
+        logAt LevelInfo (withSource "Database" cfg.logger) $
+          "Moved " <> cs (show done.moved) <> " mempool transactions to their own area"
+      f db
 
 -- | Configuration of the block store, from the store configuration.
 blockStoreCfg ::

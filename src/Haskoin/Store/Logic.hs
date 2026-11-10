@@ -10,7 +10,13 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Rules to import and revert blocks and transactions.
+-- Rules to import and revert blocks and transactions in the layout of
+-- version 20 of the database, in which the mempool is written into the
+-- indices of the chain. The store no longer imports with them: it runs on
+-- the layered layout, with the rules of "Haskoin.Store.Logic.Layered".
+-- These are kept as the reference: the tests give the same random histories
+-- to both and compare every result and every answer, and that comparison is
+-- the evidence that the new layout does what the old one did.
 --
 -- These functions keep every index consistent: transactions, unspent outputs,
 -- spenders, address transactions, address unspent outputs, balances and the

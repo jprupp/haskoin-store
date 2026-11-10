@@ -8,11 +8,11 @@
 --
 -- The queries of "Haskoin.Store.Database.Query" for the layered layout of
 -- the database, in which the chain and the mempool are kept apart; see
--- @docs\/layered-database.md@. The store does not use this layout yet. Each
--- query here answers as the query of the same name answers on a database of
--- today's layout, pages included. The tests check that, on databases
--- migrated from today's layout and on databases built by the rules of
--- "Haskoin.Store.Logic.Layered".
+-- @docs\/layered-database.md@. These are the queries that the store
+-- answers with. Each answers as the query of the same name answers on a
+-- database of version 20, pages included. The tests check that, on
+-- databases migrated from that version and on databases built by the rules
+-- of "Haskoin.Store.Logic.Layered".
 --
 -- = Two sources
 --
@@ -27,21 +27,21 @@
 -- confirm a transaction between them. Read from the mempool before the block
 -- and from the chain after it, the transaction would be listed twice, and
 -- its payment counted twice in a balance; read the other way around, it
--- would be missing. Today's queries need no such care, because each of their
+-- would be missing. The queries of version 20 need no such care, because each of their
 -- answers is one key or one scan.
 --
 -- So every query takes a t'View', a snapshot of the database, and 'withView'
 -- is the only way to get one: a query cannot be given the database itself by
 -- mistake. The web server is meant to take one view for each request. That
 -- also makes the several queries of a request agree with each other, which
--- they do not have to today.
+-- they did not have to in version 20.
 --
 -- = Pages
 --
 -- Lists are ordered newest first, and unconfirmed transactions are newer
 -- than any block. The list of an address is therefore what the mempool has
 -- for it followed by what the chain has, and that is the sequence that the
--- single index of today's layout holds. A page is cut from it by the same
+-- single index of version 20 holds. A page is cut from it by the same
 -- rules: where it starts, then the offset, then the limit. Both parts are
 -- streamed, each from its own index, only as far as the page needs.
 --
@@ -62,6 +62,7 @@ module Haskoin.Store.Database.Query.Layered
     View,
     withView,
     layeredRead,
+    standaloneRead,
 
     -- * Blocks
     getBestBlock,
@@ -218,7 +219,7 @@ withView :: DatabaseReader -> (View -> IO a) -> IO a
 withView r action = withSnapshot r.db $ \snapshot -> action (View r {db = snapshot})
 
 -- | The queries of a view as a t'StoreRead', for the web server, as
--- 'Q.databaseRead' gives those of a database of today's layout.
+-- 'Q.databaseRead' gives those of a database of version 20.
 layeredRead :: View -> StoreRead
 layeredRead v@(View r) =
   StoreRead
@@ -245,8 +246,47 @@ layeredRead v@(View r) =
       xPubBals = xPubBals v,
       xPubUnspents = \_ -> xPubUnspents v,
       xPubTxs = \_ -> xPubTxs v,
-      xPubTxCount = \_ -> xPubTxCount v
+      xPubTxCount = \_ -> xPubTxCount v,
+      getAddressesTxCount = getAddressesTxCount v
     }
+
+-- | The queries of a database as a t'StoreRead', each on a view of its
+-- own, taken when it is asked. For code that asks one thing at a time and
+-- has no request to hold a view for. Queries asked one after the other may
+-- see different moments, so what needs several of them to agree takes a
+-- view with 'withView'.
+standaloneRead :: DatabaseReader -> StoreRead
+standaloneRead r =
+  StoreRead
+    { net = r.net,
+      ctx = r.ctx,
+      getBestBlock = one (.getBestBlock),
+      getBlocksAtHeight = \h -> one (\q -> q.getBlocksAtHeight h),
+      getBlock = \h -> one (\q -> q.getBlock h),
+      getTxData = \h -> one (\q -> q.getTxData h),
+      getManyTxData = \hs -> one (\q -> q.getManyTxData hs),
+      getSpender = \p -> one (\q -> q.getSpender p),
+      getBalance = \a -> one (\q -> q.getBalance a),
+      getUnspent = \p -> one (\q -> q.getUnspent p),
+      getMempool = one (.getMempool),
+      getMempoolPage = \l -> one (\q -> q.getMempoolPage l),
+      getAddressesTxs = \as l -> one (\q -> q.getAddressesTxs as l),
+      getAddressesUnspents = \as l -> one (\q -> q.getAddressesUnspents as l),
+      initialGap = r.initGap,
+      maxGap = r.maxGap,
+      getNumTxData = \n -> one (\q -> q.getNumTxData n),
+      getBalances = \as -> one (\q -> q.getBalances as),
+      getAddressTxs = \a l -> one (\q -> q.getAddressTxs a l),
+      getAddressUnspents = \a l -> one (\q -> q.getAddressUnspents a l),
+      xPubBals = \x -> one (\q -> q.xPubBals x),
+      xPubUnspents = \x bs l -> one (\q -> q.xPubUnspents x bs l),
+      xPubTxs = \x bs l -> one (\q -> q.xPubTxs x bs l),
+      xPubTxCount = \x bs -> one (\q -> q.xPubTxCount x bs),
+      getAddressesTxCount = \as -> one (\q -> q.getAddressesTxCount as)
+    }
+  where
+    one :: (StoreRead -> IO a) -> IO a
+    one f = withView r (f . layeredRead)
 
 -------------------------------------------------------------------------------
 -- Blocks
@@ -486,7 +526,7 @@ data From
 -- transaction that is not known, which makes the page empty.
 --
 -- A page can start at a transaction that was deleted. It then starts where
--- that transaction was, as it does today.
+-- that transaction was, as it did in version 20.
 pageStart :: DatabaseReader -> Maybe Start -> IO (Maybe From)
 pageStart _ Nothing = return (Just Top)
 pageStart _ (Just (AtBlock height)) = return (Just (InChain (BlockRef height maxBound)))
@@ -650,7 +690,7 @@ getMempoolPage (View r) = Q.getMempoolPage r
 
 -- | Balances of the addresses of an extended public key, derived up to the
 -- exact gap (see 'scanXPubBals'), with the mempool applied. An address that
--- only the mempool has used counts as used, as it does today.
+-- only the mempool has used counts as used, as it did in version 20.
 xPubBals :: View -> XPubSpec -> IO [XPubBal]
 xPubBals v@(View r) xpub = do
   Derived ext chg <- derivedAddrs r xpub

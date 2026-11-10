@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- **Database version 21: the mempool has an area of its own.** Unconfirmed
+  transactions are no longer written into the indices of the chain. They
+  are kept apart and applied on top when a query is answered
+  (`docs/layered-database.md`), so the chain's data changes only when a
+  block is imported or reverted.
+  - A database of version 20 is migrated the first time the store opens it,
+    and the log says how many mempool transactions were moved. **Older
+    stores refuse the database afterwards**: copy a production database
+    before upgrading.
+  - The block store imports with the rules of `Haskoin.Store.Logic.Layered`.
+    A block that spends an output of a transaction that is only in the
+    mempool is refused as an orphan; no valid block does that.
+  - Each request of the web server reads one snapshot of the database for
+    everything it answers, so the parts of a response agree with each
+    other. `routerScoped` in `Haskoin.Store.Web.Router` is what gives a
+    request its snapshot.
+  - `--wipe-mempool` deletes the keys of the mempool area, in less time
+    than it took to delete each transaction by the rules, and it no longer
+    keeps the wiped transactions as deleted ones.
+  - `StoreRead` has a new query, `getAddressesTxCount`.
+  - Programs that embed the store and read its database with
+    `Haskoin.Store.Database.Query` have to move to
+    `Haskoin.Store.Database.Query.Layered`: the old queries do not see the
+    mempool of a database of version 21.
 - Xpub addresses are derived up to an exact gap: every address up to the last
   used one of each chain, then exactly `--xpub-gap` unused ones, and always
   the first `--xpub-gap-init` addresses. Addresses used to be read 32 at a

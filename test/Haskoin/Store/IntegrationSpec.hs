@@ -106,6 +106,7 @@ import Haskoin.Store.Cache
   )
 import Haskoin.Store.Data (Balance (..), BlockRef (..), Spender (..), TxData (..), XPubBal (..))
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
@@ -675,7 +676,7 @@ checkXPub env x ref = do
     let hs = map (\t -> fromMaybe (error "bad txid") (hexToTxHash t)) e.txids
     waitFor "cached bodies" $ do
       fromCache <- cacheTxData env.redisCache hs
-      fromDB <- Q.getManyTxData env.store.db hs
+      fromDB <- L.withView env.store.db (`L.getManyTxData` hs)
       return (fromCache == fromDB && all isJust fromCache)
 
 -- | Requests about an xpub to compare between the servers. The balances come
@@ -1339,7 +1340,7 @@ incrementalTest env = do
   full1 <- meta "full"
   (full1 > full0) `shouldBe` True
   -- the wrong balance is gone: Redis has the balances of the database
-  fromDB <- Q.xPubBals env.store.db x.spec
+  fromDB <- L.withView env.store.db (`L.xPubBals` x.spec)
   Just blob' <- redisRun env (Redis.get (xpubKey env x "bal"))
   decode blob' `shouldBe` Right fromDB
 
@@ -1378,7 +1379,7 @@ catchUpTest env = do
   meta "full" `shouldReturn` full0
   redisRun env (Redis.zscore (key "txs") (encode new)) >>= (`shouldSatisfy` isJust)
   checkXPub env x ref
-  fromDB <- Q.xPubBals env.store.db x.spec
+  fromDB <- L.withView env.store.db (`L.xPubBals` x.spec)
   Just blob1 <- redisRun env (Redis.get (key "bal"))
   decode blob1 `shouldBe` Right fromDB
 
@@ -1544,7 +1545,7 @@ onceTest env = withOther env $ \other -> do
       balancesMatch =
         waitFor "the cached balances" $ do
           cached <- cacheXPubBals env.redisCache x.spec
-          stored <- Q.xPubBals env.store.db x.spec
+          stored <- L.withView env.store.db (`L.xPubBals` x.spec)
           return (cached == Just stored)
   ref <- newLedger
   void $ pay env x ref [([0, 0], 100000)]

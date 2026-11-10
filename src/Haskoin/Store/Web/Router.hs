@@ -50,6 +50,7 @@ module Haskoin.Store.Web.Router
     get,
     post,
     router,
+    routerScoped,
 
     -- * Requests
     Req (..),
@@ -146,7 +147,29 @@ next = throwIO Next
 -- request is read whole first, and parsed as a form if it is one; handlers
 -- that stream a response still stream it.
 router :: [Route] -> (Req -> Miss -> IO Response) -> Application
-router routes fallback request respond = do
+router routes = routerScoped routes ($ routes)
+
+-- | 'router' for handlers that need something that lasts as long as one
+-- request does, such as a view of a database that must be the same for
+-- everything the request reads and must be let go when it is answered.
+--
+-- The routes are given twice. The first list is used for its methods, paths
+-- and parameters only, to find the route of a request. The second argument
+-- runs an action with the same routes, in the same order, made for the one
+-- request: the handler that answers is taken from those. The response is
+-- sent inside that action, so that a handler that streams its response can
+-- go on reading while it is sent.
+--
+-- The alternative, to make the routes once and have each handler take what
+-- it needs for itself, would put that in every handler; and making all the
+-- routes again for each request, to match against, would cost more than
+-- many requests do.
+routerScoped ::
+  [Route] ->
+  (([Route] -> IO (Maybe ResponseReceived)) -> IO (Maybe ResponseReceived)) ->
+  (Req -> Miss -> IO Response) ->
+  Application
+routerScoped routes scoped fallback request respond = do
   body <- strictRequestBody request
   let form
         | lookup "Content-Type" (requestHeaders request)
@@ -157,16 +180,20 @@ router routes fallback request respond = do
       req cs as = Req {wai = request, captures = cs, params = params, body = body, accepted = as}
       path = filter (not . T.null) (pathInfo request)
       -- the parameters that the first route matching the path refused, if any
-      go unknown [] = fallback (req [] []) (maybe NoRoute Unknown unknown)
-      go unknown (r : rs)
+      go unknown [] = fallback (req [] []) (maybe NoRoute Unknown unknown) >>= respond
+      go unknown ((i, r) : rs)
         | r.method == requestMethod request,
           Just cs <- match r.pattern path =
             case nub [k | (k, _) <- params, k `notElem` r.accepts] of
-              [] -> r.handler (req cs r.accepts) `catch` \Next -> go unknown rs
+              [] -> scoped (answer i (req cs r.accepts)) >>= maybe (go unknown rs) return
               ks -> go (unknown <|> Just ks) rs
         | otherwise = go unknown rs
-  go Nothing routes >>= respond
+  go Nothing (zip [0 :: Int ..] routes)
   where
+    -- the response of the handler of a route, sent, or nothing if the
+    -- handler passed the request on
+    answer i r scopedRoutes =
+      ((Just <$> (scopedRoutes !! i).handler r) `catch` \Next -> return Nothing) >>= mapM respond
     queryToText q = [(decodeUtf8Lenient k, decodeUtf8Lenient <$> v) | (k, v) <- q]
 
 -- | The captures of a path, if it matches a pattern.

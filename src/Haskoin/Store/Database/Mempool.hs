@@ -8,10 +8,11 @@
 --
 -- The mempool area of the layered layout of the database, and how it is
 -- applied on top of the chain. The design, and the reasons for it, are in
--- @docs\/layered-database.md@. The store does not use this layout yet: these
--- are its rules, checked by the tests of "Haskoin.Store.Database.Migrate"
--- against the answers of the database as it is today. The queries that apply
--- them are in "Haskoin.Store.Database.Query.Layered".
+-- @docs\/layered-database.md@. This is the layout that the store runs on,
+-- version 21. Its rules are checked by the tests of
+-- "Haskoin.Store.Database.Migrate" against the answers of a database of
+-- version 20, in which the mempool was mixed into the chain. The queries
+-- that apply them are in "Haskoin.Store.Database.Query.Layered".
 --
 -- = Two layers
 --
@@ -372,7 +373,7 @@ hiddenOutputs m = HashMap.filterWithKey (\p _ -> not (HashSet.member p made)) m.
 -- | The balance that the chain has for an address, with what the mempool
 -- does at the address applied: the balance as the API gives it.
 --
--- As today, an output of a block that a mempool transaction spends no
+-- As in version 20, an output of a block that a mempool transaction spends no
 -- longer counts as confirmed balance, and the unconfirmed balance is what
 -- the mempool pays to the address and has not spent.
 --

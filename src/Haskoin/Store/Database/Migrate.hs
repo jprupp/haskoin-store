@@ -14,9 +14,8 @@
 -- with nothing from the mempool, and the mempool gets an area of its own
 -- ("Haskoin.Store.Database.Mempool").
 --
--- The store does not run it yet, because it cannot read the result yet.
--- It is written and tested ahead of that, since it is what makes the change
--- possible without syncing the chain again.
+-- The store runs it when it opens a database ('upgradeDatabase'). It is
+-- what makes the change of layout possible without syncing the chain again.
 --
 -- = What it does
 --
@@ -58,7 +57,8 @@
 -- removes the marker. Before the first write everything is read once, so
 -- that a database that the migration cannot handle is refused untouched.
 module Haskoin.Store.Database.Migrate
-  ( layeredVersion,
+  ( upgradeDatabase,
+    layeredVersion,
     Migration (..),
     MigrationError (..),
     MigrationOptions (..),
@@ -120,6 +120,7 @@ import Haskoin.Store.Database.Reader
     addrOutCF,
     addrTxCF,
     balanceCF,
+    initRocksDB,
     mempoolCF,
     txCF,
     unspentCF,
@@ -197,6 +198,32 @@ defaultMigrationOptions =
       afterBatch = \_ -> return (),
       report = \_ -> return ()
     }
+
+-- | Bring a database opened with
+-- 'Haskoin.Store.Database.Reader.withLayeredReader' to the layout that the
+-- store runs on, whatever it was, telling a function what is being done:
+-- a new database gets the version of the layered layout, one of version 18
+-- or 19 is first brought to version 20 as it always was, and one of
+-- version 20 is migrated ('migrateLayered'), from the start or from where
+-- an earlier run was interrupted. Throws a 'MigrationError' for any other
+-- version.
+--
+-- This is the point of no return for a database of an older version: a
+-- store older than the layered layout refuses it afterwards.
+upgradeDatabase :: (Text -> IO ()) -> DatabaseReader -> IO Migration
+upgradeDatabase report r =
+  retrieve r.db VersionKey >>= \case
+    Nothing -> do
+      writeBatch r.db [insertOp VersionKey layeredVersion]
+      return Migration {moved = 0, batches = 0, checked = 0}
+    Just v
+      | v == 18 || v == 19 -> do
+          report $ "Upgrading the database from version " <> cs (show v) <> " to " <> cs (show mixedVersion)
+          initRocksDB r
+          migrate
+    Just (_ :: Word32) -> migrate
+  where
+    migrate = migrateLayeredWith defaultMigrationOptions {report = report} r
 
 -- | Migrate a database of version 20, opened with
 -- 'Haskoin.Store.Database.Reader.withLayeredReader', to the layered layout,

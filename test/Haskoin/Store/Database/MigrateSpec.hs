@@ -8,7 +8,8 @@ import Data.Either (rights)
 import Data.List (sort)
 import Data.Maybe (catMaybes)
 import Data.Word (Word32)
-import Database.RocksDB.Query (insert, retrieve, writeBatch)
+import Database.RocksDB (BatchOp (..))
+import Database.RocksDB.Query (insert, insertOp, retrieve, writeBatch)
 import Haskoin
   ( Ctx,
     Network,
@@ -166,6 +167,41 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- the mempool column family has its list and its index by time only
         written <- dump db (mempoolCF db.db)
         written `shouldSatisfy` all ((`elem` ["\x08", "\x0b"]) . B.take 1 . fst)
+
+  it "brings a database of any version that the store knows to the layout it runs on" $ do
+    -- a new database
+    withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
+      openLayered net ctx dir $ \db -> do
+        upgradeDatabase (\_ -> return ()) db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0}
+        retrieve db.db VersionKey `shouldReturn` Just layeredVersion
+    -- one of version 20 with a mempool, and then the same one again
+    withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
+      (hist, old) <- mixedDatabase ctx dir $ \db hist0 ->
+        foldM (addTx db) hist0 (take 5 (payments (coinOf hist0)))
+      forM_ [5, 0] $ \moved ->
+        openLayered net ctx dir $ \db -> do
+          done <- upgradeDatabase (\_ -> return ()) db
+          done.moved `shouldBe` moved
+          retrieve db.db VersionKey `shouldReturn` Just layeredVersion
+          layered db (ask hist) `shouldReturn` old
+          M.wrongSummaries db `shouldReturn` []
+    -- one of version 19, which had no index of the mempool by time
+    withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
+      (hist, old) <- mixedDatabase ctx dir $ \db hist0 ->
+        foldM (addTx db) hist0 (take 3 (payments (coinOf hist0)))
+      openLayered net ctx dir $ \db -> do
+        index <- dump db (mempoolCF db.db)
+        writeBatch db.db $
+          insertOp VersionKey (19 :: Word32)
+            : [DelCF (mempoolCF db.db) k | (k, _) <- index, B.take 1 k == "\x0b"]
+        done <- upgradeDatabase (\_ -> return ()) db
+        done.moved `shouldBe` 3
+        layered db (ask hist) `shouldReturn` old
+    -- and one of a version that it does not know
+    withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
+      openLayered net ctx dir $ \db -> do
+        insert db.db VersionKey (17 :: Word32)
+        upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just 17))
 
 net :: Network
 net = btcRegTest

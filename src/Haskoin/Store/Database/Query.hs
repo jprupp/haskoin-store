@@ -9,6 +9,12 @@
 -- Queries against the RocksDB database, as plain functions in 'IO' that take
 -- the 'DatabaseReader' as their first argument.
 --
+-- These read one layer. On a database of version 20 that is everything,
+-- the mempool included, and the tests use them so. On the layout that the
+-- store runs on, they give what the chain has and nothing of the mempool,
+-- but for its list: "Haskoin.Store.Database.Query.Layered" calls them for
+-- the chain's part of its answers, and is what the store answers with.
+--
 -- = Why plain functions
 --
 -- The queries used to be the methods of two classes, run in
@@ -182,7 +188,8 @@ databaseRead r =
       xPubBals = xPubBals r,
       xPubUnspents = \_ -> xPubUnspents r,
       xPubTxs = \_ -> xPubTxs r,
-      xPubTxCount = \_ -> xPubTxCount r
+      xPubTxCount = \_ -> xPubTxCount r,
+      getAddressesTxCount = getAddressesTxCount r
     }
 
 -- | Count something in the metrics, if they are enabled.

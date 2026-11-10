@@ -176,14 +176,16 @@ import Haskoin.Store.BlockStore.Sync
 import Haskoin.Store.BlockStore.Sync qualified as Sync
 import Haskoin.Store.Common (StoreEvent (..), loopForever)
 import Haskoin.Store.Data
+import Haskoin.Store.Database.Mempool (wipeMempoolArea)
 import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool)
 import Haskoin.Store.Database.Writer qualified as W
-import Haskoin.Store.Logic
-  ( ImportException (Orphan),
-    deleteUnconfirmedTx,
+import Haskoin.Store.Logic (ImportException (..))
+import Haskoin.Store.Logic.Layered
+  ( deleteUnconfirmedTx,
     importBlock,
     initBest,
     newMempoolTx,
@@ -443,17 +445,14 @@ getBestBlock self = Q.getBestBlock self.config.db
 getBlock :: BlockStore -> BlockHash -> IO (Maybe BlockData)
 getBlock self = Q.getBlock self.config.db
 
--- | Data of a transaction in the database.
+-- | Data of a transaction in the database: confirmed, in the mempool, or
+-- deleted from it and marked so.
 getTxData :: BlockStore -> TxHash -> IO (Maybe TxData)
-getTxData self = Q.getTxData self.config.db
+getTxData self h = L.withView self.config.db (`L.getTxData` h)
 
--- | Unspent output in the database.
+-- | Unspent output in the database, of the chain or of the mempool.
 getUnspent :: BlockStore -> OutPoint -> IO (Maybe Unspent)
-getUnspent self = Q.getUnspent self.config.db
-
--- | Mempool in the database, newest first.
-getMempool :: BlockStore -> IO [(UnixTime, TxHash)]
-getMempool self = Q.getMempool self.config.db
+getUnspent self p = L.withView self.config.db (`L.getUnspent` p)
 
 -- | Network of the block store.
 getNetwork :: BlockStore -> IO Network
@@ -494,26 +493,13 @@ withBlockStore cfg action = do
       wipe
       run
       where
-        del txs wr = do
+        -- the mempool is an area of its own, so wiping it is deleting the
+        -- keys of that area: nothing of the chain has to be put right
+        wipe = when cfg.wipeMempool $ do
+          keys <- wipeMempoolArea cfg.db
+          forM_ self.metrics $ \m -> setGauge m.mempool 0
           logAt LevelInfo cfg.logger $
-            "Deleting " <> cs (show (length txs)) <> " transactions"
-          forM_ txs $ \(_, th) -> deleteUnconfirmedTx wr False th
-        wipe_it txs = do
-          net <- getNetwork self
-          ctx <- getCtx self
-          let (txs1, txs2) = splitAt 1000 txs
-          unless (null txs1) $
-            runImport self net ctx (del txs1) >>= \case
-              Left e -> do
-                logError self $
-                  "Could not wipe mempool: " <> cs (show e)
-                throwIO e
-              Right () -> wipe_it txs2
-        wipe
-          | cfg.wipeMempool =
-              getMempool self >>= wipe_it
-          | otherwise =
-              return ()
+            "Wiped the mempool: " <> cs (show keys) <> " keys deleted"
         ini = do
           net <- getNetwork self
           ctx <- getCtx self

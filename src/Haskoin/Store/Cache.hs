@@ -201,6 +201,7 @@ import Haskoin.Store.Cache.Protocol
 import Haskoin.Store.Common (Limits (..), Start (..), StoreEvent (..), loopForever)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import NQE (Inbox, Publisher, receive, withSubscription)
 import System.Metrics.StatsD
@@ -282,6 +283,15 @@ newCacheMetrics s = do
   return CacheMetrics {..}
   where
     c x = newStatCounter s ("cache." <> x) 10
+
+-- | Read the database through a view of it as it is now: the mempool is
+-- kept apart from the chain and laid over it when read, and the two have to
+-- be read as they were at one moment
+-- ("Haskoin.Store.Database.Query.Layered"). Transactions that left the
+-- mempool unconfirmed are among what these reads give, marked as deleted:
+-- the cache has to hear of them to take them out.
+viewed :: Cache -> (L.View -> IO a) -> IO a
+viewed c = L.withView c.db
 
 -- | A running cache.
 data Cache = Cache
@@ -590,7 +600,7 @@ page c x set limits tieBytes = do
     startOf th =
       cacheTxData c [th] >>= \case
         [Just td] -> return (Just td.block)
-        _ -> fmap (.block) <$> Q.getTxData c.db th
+        _ -> fmap (.block) <$> viewed c (\v -> L.getTxData v th)
 
 -- | Bodies of transactions that Redis has, in the order of the hashes, with
 -- the spenders of their outputs filled in. 'Nothing' for those it does not
@@ -727,7 +737,7 @@ cacheRefresh c x changed =
       if not (mayReplace m.stamp height False)
         then behind
         else do
-          bals <- Q.xPubBals c.db x
+          bals <- viewed c (\v -> L.xPubBals v x)
           fast <-
             if incremental m height now
               then incrementalDiff c x changed m bals
@@ -740,7 +750,7 @@ cacheRefresh c x changed =
             Nothing -> behind
             Just d -> commit tries extra m height now bals d
     commit tries extra m height now bals d = do
-      bodies <- catMaybes <$> Q.getManyTxData c.db (nub (extra <> d.wanted)) >>= rewriteBodies c
+      bodies <- catMaybes <$> viewed c (\v -> L.getManyTxData v (nub (extra <> d.wanted))) >>= rewriteBodies c
       let args =
             [c.prefix, xpubId x, num height, num now, encode x, encode bals, m.gen]
               <> [if d.full then num now else ""]
@@ -872,7 +882,7 @@ data Attempt
 incrementalFrom :: Cache -> XPubSpec -> [XPubBal] -> [XPubBal] -> HashSet TxHash -> IO Attempt
 incrementalFrom c x old bals changed = do
   let hashes = HashSet.toList changed
-  tds <- Q.getManyTxData c.db hashes
+  tds <- viewed c (\v -> L.getManyTxData v hashes)
   let newMap = HashMap.fromList [(b.balance.address, b.balance) | b <- bals]
       oldMap = HashMap.fromList [(b.balance.address, b.balance) | b <- old]
       entering = [b | (a, b) <- HashMap.toList newMap, not (HashMap.member a oldMap)]
@@ -898,7 +908,7 @@ incrementalFrom c x old bals changed = do
           else do
             let active td = not td.deleted && any ours (txAddresses c td)
                 ops = nub (concatMap (outpointsAt c ours) known)
-            us <- mapM (Q.getUnspent c.db) ops
+            us <- viewed c (\v -> mapM (L.getUnspent v) ops)
             return . Settled . Apply $
               Diff
                 { addrAdd = [encode b.address | b <- entering],
@@ -936,7 +946,7 @@ catchUp c x stamp addrs = do
   newer <- sequence <$> mapM addressNewer addrs
   pool <- run c (R.zrangebyscoreLimit (xkey c x "txs") (-1 / 0) (-0.5) 0 (toInteger catchUpMost + 1))
   let poolHashes = rights (map decode pool)
-  tds <- Q.getManyTxData c.db poolHashes
+  tds <- viewed c (\v -> L.getManyTxData v poolHashes)
   let settled = [h | (h, td) <- zip poolHashes tds, maybe True left td]
       found = HashSet.fromList (settled <> concat (fromMaybe [] newer))
   return $
@@ -955,7 +965,7 @@ catchUp c x stamp addrs = do
     addressNewer a = loop 0 []
       where
         loop off acc = do
-          ts <- Q.getAddressTxs c.db a Limits {limit = chunk, offset = off, start = Nothing}
+          ts <- viewed c (\v -> L.getAddressTxs v a Limits {limit = chunk, offset = off, start = Nothing})
           let (new, rest) = span after ts
               acc' = acc <> map (.txid) new
           if
@@ -975,16 +985,16 @@ catchUpMost = 1000
 fullDiff :: Cache -> XPubSpec -> HashSet TxHash -> Meta -> Word32 -> [XPubBal] -> Integer -> IO (Maybe Diff)
 fullDiff c x changed m height bals _ = do
   st <- readStored c x
-  txs <- Q.xPubTxs c.db bals def'
+  txs <- viewed c (\v -> L.xPubTxs v bals def')
   let newTxs = [(encode t.txid, blockRefScore t.block) | t <- txs]
       newTxSet = HashSet.fromList (map fst newTxs)
       txDel = [t | t <- HashMap.keys st.txs, not (HashSet.member t newTxSet)]
   -- a transaction that Redis has and this store has never seen
-  known <- Q.getManyTxData c.db [h | t <- txDel, Right h <- [decode t]]
+  known <- viewed c (\v -> L.getManyTxData v [h | t <- txDel, Right h <- [decode t]])
   if not (mayReplace m.stamp height (any isNothing known))
     then return Nothing
     else do
-      utxos <- Q.xPubUnspents c.db bals def'
+      utxos <- viewed c (\v -> L.xPubUnspents v bals def')
       let txAdd = [(t, sc) | (t, sc) <- newTxs, HashMap.lookup t st.txs /= Just sc]
           newUs = [(encode u.unspent.outpoint, encode u.unspent, blockRefScore u.unspent.block) | u <- utxos]
           newUSet = HashSet.fromList [u | (_, u, _) <- newUs]
@@ -1275,8 +1285,8 @@ eventChanges c lastBest e = do
       prev <- readIORef lastBest
       writeIORef lastBest (Just h)
       ("b:" <> encode h,) <$> blockTxs c prev h
-    StoreMempoolNew t -> ("t+:" <> encode t,) . maybeToList <$> Q.getTxData c.db t
-    StoreMempoolDelete t -> ("t-:" <> encode t,) . maybeToList <$> Q.getTxData c.db t
+    StoreMempoolNew t -> ("t+:" <> encode t,) . maybeToList <$> viewed c (\v -> L.getTxData v t)
+    StoreMempoolDelete t -> ("t-:" <> encode t,) . maybeToList <$> viewed c (\v -> L.getTxData v t)
     _ -> return ("", [])
   if null tds
     then return []
@@ -1342,7 +1352,7 @@ blockTxs c prev h =
       reverted <- case prev of
         Just p | p /= bd.header.prev && p /= h -> walk p
         _ -> return []
-      catMaybes <$> Q.getManyTxData c.db (bd.txs <> reverted)
+      catMaybes <$> viewed c (\v -> L.getManyTxData v (bd.txs <> reverted))
   where
     -- blocks that are no longer in the main chain, from the old best block
     walk p =

@@ -35,20 +35,22 @@ mempool, and everything it did to the chain's indices, into its own area.
 
 ## Where this stands
 
-The store still runs on version 20. What exists on this branch is the part
-that could be built and proved ahead of the switch.
+The store runs on the layered layout, version 21. A database of version 20
+is migrated when the store opens it. The rules and queries of version 20
+are still in the library, as the reference that the tests hold the new ones
+to.
 
 | Piece | Where | State |
 |---|---|---|
 | Keys of the mempool area | `Haskoin.Store.Database.Types` | written |
 | The keys of one transaction, and what the mempool does to a balance | `Haskoin.Store.Database.Mempool` | written |
-| Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, not called by the store |
-| Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against today's rules, not used by the store |
+| Migration from version 20 | `Haskoin.Store.Database.Migrate` | written, tested, run when the store opens a database (`upgradeDatabase`) |
+| Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` | written, tested against the rules of version 20, used by the block store |
 | Every query of the store over both areas, pages included, on a snapshot | `Haskoin.Store.Database.Query.Layered` | written, tested against today's queries, measured: right, and too slow in two cases; not used by the store |
 | Tests against today's database, rules and queries | `test/Haskoin/Store/Database/MigrateSpec.hs`, `test/Haskoin/Store/Logic/LayeredSpec.hs`, `test/Haskoin/Store/Database/Query/LayeredSpec.hs` | passing |
 | Cost of lookups, of whole queries and of writing | `docs/layered-database/` | measured |
 | A summary for each address, and lists read by the page | `MemSummary`, `Haskoin.Store.Database.Mempool`, `Haskoin.Store.Database.Query.Layered` | written, tested: each summary is what its entries add up to after every operation |
-| The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web` | not started |
+| The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web`, `routerScoped` | done |
 | The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
 
 Six findings came out of the work, in order of how soon they matter:
@@ -1212,10 +1214,11 @@ transactions that the mempool spends have to be read.
 
 ### Running it
 
-It is not wired in. `withLayeredReader` opens a database with the new column
-family, and `migrateLayered` does the rest. When the store moves to version
-21, `initRocksDB` will call it for a database of version 20, as it calls the
-migrations from versions 18 and 19 today.
+The store runs it when it opens a database (`upgradeDatabase`, called by
+`Haskoin.Store.Manager`): a new database gets version 21, one of version 18
+or 19 is first brought to version 20 by the migrations that those always
+had, and one of version 20 is migrated, from the start or from where an
+earlier run stopped. The log says how many transactions were moved.
 
 - **There is no way back.** RocksDB opens a database only when given all its
   column families, so a store of version 20 cannot open one that has
@@ -1382,7 +1385,8 @@ What this does not show:
   database of 200,000 transactions, not in the web server and not on a
   database of real size, where reading the chain costs more and the mempool
   area the same.
-- **The store itself**, which uses none of this yet.
+- **A database of real size.** The integration tests run the whole store
+  on the layout, against real nodes on regtest chains.
 - **Bloom filters in the tests.** The store is built with the binding that
   builds them, but the tests keep nearly all their data in memory, where no
   filter is used. `QueryCost.hs` reads through filters in table files and
@@ -1395,9 +1399,9 @@ Each step ends with something that can be tested against today's behaviour.
 1. **Build the store with the fixed RocksDB binding.** Done: the store is
    built with `rocksdb-haskell-jprupp` 2.6.3, and its whole test suite
    passes with it.
-2. **A snapshot for each request.** The new queries already cannot be asked
-   without one (`withView`). What is left is to take it in the web server,
-   around each request and the sending of its response.
+2. **A snapshot for each request.** Done: the new queries cannot be asked
+   without one (`withView`), and the web server takes it around each
+   request and the sending of its response.
 3. **New rules, beside the old.** Done: `Haskoin.Store.Logic.Layered`.
    Chain rules that import and revert blocks in the chain area alone;
    mempool rules that add and remove keys. Tested: for random histories, the
@@ -1406,20 +1410,27 @@ Each step ends with something that can be tested against today's behaviour.
    `Haskoin.Store.Database.Query.Layered`. Tested: the same pages as today's
    queries, for random limits, offsets and starts, on migrated databases and
    on databases built by the new rules.
-5. **The switch.** Version 21: the store opens with `mempool-addr`, runs the
-   migration, uses the new rules and queries; `--wipe-mempool` empties the
-   mempool area; the old paths are deleted. Then measure with
-   `scripts/bench-web.sh` and the stress test. What that takes in the web
+5. **The switch.** Done. Version 21: the store opens with `mempool-addr`,
+   runs the migration, and uses the new rules and queries;
+   `--wipe-mempool` empties the mempool area. What it took in the web
    server and the cache:
-   - the record of queries is built once today, when the server starts
-     (`webQuery`); it has to be built for each request, from its view;
-   - some reads go to the database beside that record, with today's
-     queries, and have to go through a view too. In the web server: the
-     bodies that the cache does not have, the queries of a request with
-     `nocache=true`, and the count of transactions of
-     `/blockchain/multiaddr`. In `Haskoin.Store.Cache`: every read of the
-     database, some twenty of them, which today's cache needs until it is
-     rebuilt on two layers.
+   - the record of queries was built once, when the server started
+     (`webQuery`); it is built for each request, from its view. The router
+     finds the route of a request in a list made once, and takes the
+     handler from the same list made for the request (`routerScoped`), so
+     that no handler had to change and the response is sent, streamed or
+     not, while the view is open;
+   - the reads that went to the database beside that record go through the
+     same view: the bodies that the cache does not have, the queries of a
+     request with `nocache=true`, and the count of transactions of
+     `/blockchain/multiaddr`, which is now one of the queries;
+   - `Haskoin.Store.Cache` reads the database through a view for each of
+     its reads.
+
+   The rules and queries of version 20 (`Haskoin.Store.Logic`,
+   `Haskoin.Store.Database.Query`) are not deleted: the tests run every
+   random history through both and compare, which is the evidence that the
+   new layout answers as the old one did. Nothing in the store calls them.
 6. **The cache on two layers**, specified and model-tested in
    `Haskoin.Store.Cache.Protocol` first.
 
@@ -1431,9 +1442,8 @@ Redis is down; the shared pool of a fleet needs the same in Redis. The two
 changes to the binding are independent and help today's store. A mirror in
 memory is no longer planned.
 
-Steps 1, 3 and 4 are done, and step 2 as far as it can be before the
-switch. Step 6 is where the concurrency problems of the cache are actually
-removed.
+Steps 1 to 5 are done. Step 6 is where the concurrency problems of the cache
+are actually removed.
 
 ## Alternatives considered
 

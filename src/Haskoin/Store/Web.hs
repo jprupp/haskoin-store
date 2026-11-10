@@ -187,6 +187,7 @@ import Haskoin.Store.Common hiding
 import Haskoin.Store.Common qualified as C
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Router hiding (header)
@@ -371,8 +372,11 @@ data WebState = WebState
     session :: !Wreq.Session,
     -- | result of the latest health check
     health :: !(TVar HealthCheck),
-    -- | the queries to answer with, the cache included ('webQuery')
+    -- | the queries to answer with, the cache included ('webQuery'): those
+    -- of one view of the database, taken for the request
     query :: !StoreRead,
+    -- | the same queries without the cache, on the same view
+    direct :: !StoreRead,
     -- | whether Redis answered the last time it was asked; always 'True'
     -- for a store without a cache
     cacheUp :: !(TVar Bool)
@@ -589,9 +593,15 @@ serveWeb config serve = do
   session <- Wreq.Session.newAPISession
   health <- runHealthCheck >>= newTVarIO
   cacheUp <- cacheCheck >>= newTVarIO
-  let query = webQuery config.store cacheUp
-      st = WebState {..}
-      app = router (map (guarded st) (handlePaths st config)) notFound
+  let db = config.store.db
+      stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
+      routesOf s = map (guarded s) (handlePaths s config)
+      -- outside of a request, each query has a view of its own; a request
+      -- has one view for all that it reads, which is let go when its
+      -- response is sent
+      st = stateOf (L.standaloneRead db)
+      scoped answer = L.withView db (answer . routesOf . stateOf . L.layeredRead)
+      app = routerScoped (routesOf st) scoped notFound
       notFound _ NoRoute = errorResponse st ThingNotFound
       notFound _ (Unknown ks) =
         errorResponse st . UserError $
@@ -2062,7 +2072,7 @@ handleMultiAddr st req =
     -- database counts the distinct transactions of all their addresses
     ntx <- case (HashSet.toList sxspecs, HashSet.null saddrs) of
       ([x], True) -> return (HashMap.findWithDefault 0 x xtxns)
-      _ -> fromIntegral <$> (Q.getAddressesTxCount st.config.store.db (HashSet.toList salladdrs))
+      _ -> fromIntegral <$> st.direct.getAddressesTxCount (HashSet.toList salladdrs)
     nfiltered <- case fltr of
       BinfoFilterAll -> return ntx
       _ ->
@@ -3070,8 +3080,8 @@ validateLimit wl full limitM =
 -- if the store had no cache. The variable says whether Redis answered the
 -- last time: a query that fails clears it, so that the next ones do not wait
 -- for Redis in turn, and the health check sets it again when Redis is back.
-webQuery :: Store -> TVar Bool -> StoreRead
-webQuery s up = case s.cache of
+webQuery :: Store -> TVar Bool -> StoreRead -> StoreRead
+webQuery s up base = case s.cache of
   Nothing -> base
   Just c ->
     (base :: StoreRead)
@@ -3092,7 +3102,6 @@ webQuery s up = case s.cache of
           cached (cacheXPubTxCount c x) >>= maybe (base.xPubTxCount x bals) return
       }
   where
-    base = Q.databaseRead s.db
     -- ask Redis, unless it is down, and take a failure, or no answer within
     -- two seconds, for "not cached"
     cached :: IO (Maybe a) -> IO (Maybe a)
@@ -3111,7 +3120,7 @@ webQuery s up = case s.cache of
       found <- cached (Just <$> cacheTxData c ths)
       let fromCache = fromMaybe (map (const Nothing) ths) found
           missing = [h | (h, Nothing) <- zip ths fromCache]
-      fromDB <- HashMap.fromList . zip missing <$> Q.getManyTxData s.db missing
+      fromDB <- HashMap.fromList . zip missing <$> base.getManyTxData missing
       -- deleted ones are left out, wherever they come from
       return $
         zipWith
@@ -3123,7 +3132,7 @@ webQuery s up = case s.cache of
 -- 'True', as @nocache=true@ asks.
 cacheOr :: Bool -> WebState -> WebState
 cacheOr False st = st
-cacheOr True st = (st :: WebState) {query = Q.databaseRead st.config.store.db}
+cacheOr True st = (st :: WebState) {query = st.direct}
 
 -- | The only element of a list of one optional value.
 listToMaybe' :: [Maybe a] -> Maybe a

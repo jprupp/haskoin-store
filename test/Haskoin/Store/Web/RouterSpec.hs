@@ -3,7 +3,7 @@ module Haskoin.Store.Web.RouterSpec (spec) where
 import Control.Exception (try)
 import Data.ByteString.Builder (toLazyByteString)
 import Data.ByteString.Lazy.Char8 qualified as L8
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Haskoin.Store.Web.Router
@@ -29,6 +29,16 @@ spec = describe "router" $ do
   it "fails when a handler reads a parameter that its route does not declare" $ do
     r <- try (call "/sloppy")
     either (\(Undeclared n) -> n) (const "") r `shouldBe` "secret"
+
+  it "answers inside the scope of a request, and makes one for each route that it tries" $ do
+    events <- newIORef []
+    let note e = modifyIORef' events (<> [e])
+        scoped answer = note "open" >> answer routes <* note "close"
+        req = defaultRequest {requestMethod = methodGet, pathInfo = ["block", "best"]}
+    _ <- routerScoped routes scoped (\_ _ -> fail "no route") req $ \_ ->
+      note "respond" >> return ResponseReceived
+    -- the first route passes the request on, the second answers it
+    readIORef events `shouldReturn` ["open", "close", "open", "respond", "close" :: String]
 
 -- | Routes for the tests: the first matches any block but passes on
 -- "best", for the second to answer.

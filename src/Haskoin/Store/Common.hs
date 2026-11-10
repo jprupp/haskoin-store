@@ -225,7 +225,10 @@ data StoreRead = StoreRead
     xPubTxs :: XPubSpec -> [XPubBal] -> Limits -> IO [TxRef],
     -- | number of transactions of an extended public key, given its
     -- balances from 'xPubBals'
-    xPubTxCount :: XPubSpec -> [XPubBal] -> IO Word32
+    xPubTxCount :: XPubSpec -> [XPubBal] -> IO Word32,
+    -- | number of distinct transactions of a set of addresses, counted
+    -- without reading them
+    getAddressesTxCount :: [Address] -> IO Word32
   }
 
 -- | Data of a block, or 'Nothing' if it is unknown or not in the main chain.
