@@ -199,6 +199,7 @@ import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Fleet.Member (Member (..), TipMoved (..), answeringCached, memberAlive, memberTip)
 import Haskoin.Store.Manager
+import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.Web.Router qualified as Router
 import Haskoin.Store.WebCommon
@@ -216,9 +217,12 @@ import NQE
 import Network.HTTP.Types
   ( Status (..),
     hContentType,
+    methodGet,
+    methodPost,
     renderStdMethod,
     status200,
     status203,
+    status204,
     status400,
     status404,
     status409,
@@ -248,7 +252,11 @@ import Network.Wai.Handler.Warp
     setHost,
     setPort,
   )
+import Network.Wai.Handler.WarpTLS (runTLS, runTLSSocket, tlsSettings)
 import Network.Wai.Handler.WebSockets (websocketsOr)
+import Network.Wai.Middleware.Autohead (autohead)
+import Network.Wai.Middleware.Gzip (gzip)
+import Network.Wai.Middleware.Gzip qualified as Gzip
 import Network.WebSockets
   ( acceptRequest,
     defaultConnectionOptions,
@@ -369,6 +377,10 @@ data WebConfig = WebConfig
     noBlockchainInfo :: !Bool,
     -- | seconds between health checks
     healthCheckInterval :: !Int,
+    -- | a certificate and its private key, in files in PEM format, to
+    -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
+    -- default
+    tls :: !(Maybe (FilePath, FilePath)),
     -- | log messages here
     logger :: !Logger
   }
@@ -583,8 +595,20 @@ data SerialAs
 -- | Run the web server forever on the host and port of the configuration.
 -- Also starts a thread that updates prices, unless the Blockchain.info
 -- endpoints are disabled, and a thread that runs health checks.
+--
+-- = HTTPS
+--
+-- With a certificate and a key in 'tls', the server speaks HTTPS on that
+-- port, and nothing else: TLS 1.2 and 1.3, and HTTP\/2 for clients that
+-- ask for it. It is off by default. A public service usually sits behind
+-- a proxy that has the certificate, limits requests and spreads them over
+-- servers; this is for a server by itself, and for links between machines
+-- that should not be in the clear. The files are read when the server
+-- starts, so a renewed certificate takes a restart.
 runWeb :: WebConfig -> IO ()
-runWeb config = serveWeb config (runSettings settings)
+runWeb config = serveWeb config $ case config.tls of
+  Nothing -> runSettings settings
+  Just (certificate, key) -> runTLS (tlsSettings certificate key) settings
   where
     settings = setPort config.port . setHost (fromString config.host) $ defaultSettings
 
@@ -593,7 +617,9 @@ runWeb config = serveWeb config (runSettings settings)
 -- free port with no window in which another program can take it, which
 -- finding a free port first and binding it later has.
 runWebSocket :: WebConfig -> Socket -> IO ()
-runWebSocket config sock = serveWeb config (runSettingsSocket defaultSettings sock)
+runWebSocket config sock = serveWeb config $ case config.tls of
+  Nothing -> runSettingsSocket defaultSettings sock
+  Just (certificate, key) -> runTLSSocket (tlsSettings certificate key) defaultSettings sock
 
 -- | Run the web server with a function of Warp that serves an application.
 -- The application is the router ("Haskoin.Store.Web.Router") with the
@@ -608,7 +634,7 @@ serveWeb config serve = do
   cacheUp <- cacheCheck >>= newTVarIO
   let db = config.store.db
       stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
-      routesOf s = map (guarded s) (handlePaths s config)
+      routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
       -- outside of a request, each query has a view of its own; a request
       -- has one view for all that it reads, which is let go when its
       -- response is sent
@@ -667,7 +693,7 @@ serveWeb config serve = do
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health cacheUp) $ \_a2 ->
-      serve . webSocketEvents st . logIt config.logger . anyOrigin $ app
+      serve . webSocketEvents st . logIt config.logger . anyOrigin . preflight . autohead . compressed $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -690,11 +716,42 @@ serveWeb config serve = do
       -- its fleet, so that it does not hold the others back
       forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
       cacheCheck >>= atomically . writeTVar up
+    -- what a browser asks before a request from another site that is not
+    -- of the plainest kind: which methods and headers it may use. Without
+    -- an answer it does not send the request.
+    preflight inner req respond
+      | requestMethod req == "OPTIONS" =
+          respond $
+            responseLBS
+              status204
+              [ ("Allow", allowed),
+                ("Access-Control-Allow-Methods", allowed),
+                ("Access-Control-Allow-Headers", "Accept, Content-Type"),
+                ("Access-Control-Max-Age", "86400")
+              ]
+              ""
+      | otherwise = inner req respond
+    allowed = "GET, HEAD, POST, DELETE, OPTIONS"
+    -- answers are compressed for a client that says it reads gzip: JSON
+    -- shrinks several times over, and the binary format, which is mostly
+    -- hashes, by less. The events are a stream that has to leave as it is
+    -- written, and are left alone.
+    compressed inner req
+      | pathInfo req == ["events"] = inner req
+      | otherwise = gzip gzipSettings inner req
+    gzipSettings =
+      Gzip.defaultGzipSettings
+        { Gzip.gzipCheckMime = \m -> Gzip.defaultCheckMime m || "application/octet-stream" `C.isPrefixOf` m
+        }
     -- any origin may ask, and what is answered depends on the format that
     -- was asked for, which a cache between the client and the server has
     -- to know: it must not give the JSON of one client to another that
-    -- asked for binary
-    anyOrigin = modifyResponse (mapResponseHeaders ([("Access-Control-Allow-Origin", "*"), ("Vary", "Accept")] <>))
+    -- asked for binary. The same goes for whether it is compressed, and
+    -- the two are said in one header.
+    anyOrigin = modifyResponse (mapResponseHeaders varied)
+    varied headers =
+      [("Access-Control-Allow-Origin", "*"), ("Vary", "Accept, Accept-Encoding")]
+        <> filter ((/= "Vary") . fst) headers
 
 -- | Answer the errors of the handler of a route: an 'Except' with its
 -- status and JSON, any other error as a server error, after logging it. A
@@ -734,8 +791,13 @@ errorResponse st req e = do
         | otherwise -> Nothing
   return $
     if wantsBinary req
-      then responseLBS (errStatus e) [(hContentType, "application/octet-stream")] (runPutL (serialize e))
-      else responseLBS (errStatus e) [(hContentType, "application/json")] (A.encode e)
+      then responseLBS (errStatus e) ((hContentType, "application/octet-stream") : again) (runPutL (serialize e))
+      else responseLBS (errStatus e) ((hContentType, "application/json") : again) (A.encode e)
+  where
+    -- a server behind its fleet catches up within a block or is taken out
+    -- of rotation: a client or a load balancer that reads this header
+    -- tries again in a second, and elsewhere meanwhile
+    again = [("Retry-After", "1") | e == BehindFleet]
 
 -- | Historical prices of the coin of the network in a currency at several times. Returns an empty list on failure.
 getRates ::
@@ -803,6 +865,23 @@ errStatus ServerTimeout = status500
 errStatus RequestTooLarge = status413
 errStatus BehindFleet = status503
 
+-- | A route, and with it the same route under @POST@ if it takes a list in
+-- a parameter: addresses, blocks, heights or transactions.
+--
+-- A list in the query string has to fit in a URL, and proxies cut those
+-- off at a few thousand characters: some hundred addresses. The router
+-- reads the parameters of a form in the body as it reads those of the
+-- query string, so under @POST@ the same parameters go in the body, with
+-- @Content-Type: application\/x-www-form-urlencoded@, and have no such
+-- limit. @\/transactions@ is left out: @POST@ there publishes a
+-- transaction.
+withPost :: Route -> [Route]
+withPost r
+  | r.method == methodGet && takesList && r.pattern /= [Left "transactions"] = [r, r {method = methodPost}]
+  | otherwise = [r]
+  where
+    takesList = any (`elem` r.accepts) ["addresses", "blocks", "heights", "txids"]
+
 -- | The routes of every endpoint, except those disabled in the configuration.
 handlePaths :: WebState -> WebConfig -> [Route]
 handlePaths st cfg =
@@ -839,11 +918,15 @@ handlePaths st cfg =
     marshalledList ["addresses"] (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
     marshalledList ("addresses" : limits) (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
     get "/events" ["pretty"] (handleEvents st),
-    get "/dbstats" [] (handleDbStats st)
+    get "/dbstats" [] (handleDbStats st),
+    -- the reference of the API, as a page and as the file that it shows
+    get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage),
+    get "/swagger.yaml" [] (\_ -> file "application/yaml" swaggerYaml)
   ]
     <> (if cfg.noXPub then [] else xpubRoutes)
     <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
   where
+    file kind bytes = return (responseLBS status200 [(hContentType, kind)] (L.fromStrict bytes))
     net = cfg.store.net
     -- the parameters that routes accept, beyond those of each route
     limits = ["limit", "offset", "height"]
@@ -2942,7 +3025,7 @@ pathHealth st =
     proto <- serialAs req False
     h <- handleHealth st GetHealth
     let (status, extra)
-          | not (isOK h) = (status503, [])
+          | not (isOK h) = (status503, [("Retry-After", "5")])
           | h.redis == Just False = (status203, [("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $

@@ -128,6 +128,8 @@ data Config = Config
     noBlockchainInfo :: !Bool,
     noXPub :: !Bool,
     healthCheckInterval :: !Int,
+    tlsCert :: !String,
+    tlsKey :: !String,
     bloom :: !Bool,
     noWeb :: !Bool,
     maxOpenFiles :: !Int,
@@ -223,6 +225,10 @@ defConfig = do
     env "BLOOM" True parseBool
   noWeb <-
     env "NO_WEB" False parseBool
+  tlsCert <-
+    env "TLS_CERT" "" pure
+  tlsKey <-
+    env "TLS_KEY" "" pure
   maxOpenFiles <-
     env "MAX_OPEN_FILES" 2000 readMaybe
   writeBufferMB <-
@@ -577,6 +583,18 @@ config c = do
         <> helpEnv "HEALTH_CHECK_INTERVAL" "Background check update interval"
         <> showDefault
         <> value c.healthCheckInterval
+  tlsCert <-
+    strOption $
+      metavar "FILE"
+        <> long "tls-cert"
+        <> helpEnv "TLS_CERT" "Serve HTTPS with this certificate chain, in PEM; needs --tls-key"
+        <> value c.tlsCert
+  tlsKey <-
+    strOption $
+      metavar "FILE"
+        <> long "tls-key"
+        <> helpEnv "TLS_KEY" "Private key of the certificate of --tls-cert, in PEM"
+        <> value c.tlsKey
   noBloom <-
     switch $
       long "no-bloom"
@@ -731,6 +749,11 @@ run cfg =
             noXPub = cfg.noXPub,
             noBlockchainInfo = cfg.noBlockchainInfo,
             healthCheckInterval = cfg.healthCheckInterval,
+            tls = case (cfg.tlsCert, cfg.tlsKey) of
+              ("", "") -> Nothing
+              ("", _) -> error "--tls-key needs --tls-cert"
+              (_, "") -> error "--tls-cert needs --tls-key"
+              (certificate, key) -> Just (certificate, key),
             logger = withSource "Web" logger
           }
     with_stats logger net go

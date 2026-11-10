@@ -23,6 +23,7 @@ extra-source-files:
   - src/Haskoin/Store/Cache/lua/*.lua
   - src/Haskoin/Store/Fleet/lua/*.lua
   - stress/wrk.lua
+  - swagger.yaml
 extra-doc-files:
   - README.md
   - CHANGELOG.md
@@ -71,8 +72,10 @@ dependencies:
   - stm ^>= 2.5.3.1
   - vault ^>= 0.3.2.0
   - wai ^>= 3.2.5
+  - wai-extra ^>= 3.1.18
   - wai-websockets ^>= 3.0.1.2
   - warp ^>= 3.4.17
+  - warp-tls ^>= 3.4.14
   - websockets ^>= 0.13.0.0
   - wreq ^>= 0.5.4.5
   - lens ^>= 5.3.6
@@ -136,6 +139,7 @@ tests:
       - base64 ^>= 1.0.1
       - fast-logger ^>= 3.2.9
       - integration
+      - process ^>= 1.6.26.1
 benchmarks:
   # Load-test server: syncs a synthetic chain and serves the web API on it.
   # Build with `stack build --bench --no-run-benchmarks` and run it with

@@ -245,7 +245,29 @@ info:
     Every response has the header `Access-Control-Allow-Origin: *`, so web
     applications can call the API directly from a browser. The API needs no
     credentials and keeps no sessions, so there is nothing for another site to
-    abuse.
+    abuse. A browser that first asks what it may send, with `OPTIONS`, is told:
+    `GET`, `HEAD`, `POST` and `DELETE`, with the headers `Accept` and
+    `Content-Type`.
+
+    ## HTTP
+
+    - **`HEAD`** works wherever `GET` does, and answers with the headers alone.
+    - **Compression.** A request with `Accept-Encoding: gzip` gets its answer
+      compressed, in either format. The events are not compressed: they have
+      to leave as they happen.
+    - **Long lists.** The endpoints that take a list of addresses, blocks,
+      heights or transactions in a parameter take it under `POST` too, with
+      the same parameters in a body of type
+      `application/x-www-form-urlencoded`. A URL has room for some hundred
+      addresses; a body has no such limit. `/transactions` is the exception:
+      `POST` there publishes a transaction.
+    - **`Vary: Accept, Accept-Encoding`** is on every answer, so that a cache
+      keeps the formats apart.
+    - **`Retry-After`** is on a 503: one second from a server that is behind
+      its fleet, five from a health check that fails.
+    - **The reference itself** is at the root of every server: `/` is this
+      page, for the version that the server runs, and `/swagger.yaml` the file
+      behind it.
 
     ## Binary format
 

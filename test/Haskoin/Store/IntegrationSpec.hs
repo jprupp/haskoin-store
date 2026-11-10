@@ -119,8 +119,10 @@ import Network.Socket qualified as Socket
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
+import System.Process (readProcessWithExitCode)
 import Test.Hspec
-import UnliftIO (async, bracket, cancel, link, tryAny, withAsync)
+import UnliftIO (async, bracket, cancel, link, tryAny, withAsync, withSystemTempDirectory)
 import UnliftIO.Concurrent (threadDelay)
 
 spec :: Spec
@@ -155,6 +157,8 @@ chainSpec kind = do
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
   it "answers an error in the format that was asked for" errorFormatTest
+  it "speaks HTTP as browsers, proxies and long requests need it" httpTest
+  it "serves HTTPS, and nothing else, when given a certificate" tlsTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
   it "applies each change once with two stores sharing Redis" onceTest
   it "does not replace what it does not know" unknownTest
@@ -311,6 +315,7 @@ webConfig logger store =
       noXPub = False,
       noBlockchainInfo = False,
       healthCheckInterval = 5,
+      tls = Nothing,
       logger = logger
     }
 
@@ -1542,15 +1547,76 @@ errorFormatTest env = do
             r ^. Wreq.responseBody
           )
   (code, kind, vary, bytes) <- ask (Just "application/octet-stream")
-  (code, kind, vary) `shouldBe` (404, "application/octet-stream", "Accept")
+  (code, kind, vary) `shouldBe` (404, "application/octet-stream", "Accept, Accept-Encoding")
   -- the error, as haskoin-store-data encodes it
   decode (BL.toStrict bytes) `shouldBe` Right ThingNotFound
   -- in a list with a weight, which used to give JSON
   (_, listed, _, _) <- ask (Just "text/plain;q=0.1, application/octet-stream;q=0.9")
   listed `shouldBe` "application/octet-stream"
   (code', kind', vary', json) <- ask Nothing
-  (code', kind', vary') `shouldBe` (404, "application/json", "Accept")
+  (code', kind', vary') `shouldBe` (404, "application/json", "Accept, Accept-Encoding")
   (body json ! "error") `shouldBe` String "not-found-or-invalid-arg"
+
+-- | A web server on the store of the tests, given a certificate that is
+-- made for the occasion: it answers over HTTPS, and does not answer a
+-- request that is not encrypted. The requests are made with curl, told
+-- not to mind who signed the certificate.
+tlsTest :: Env -> IO ()
+tlsTest env = withSystemTempDirectory "haskoin-store-tls-" $ \dir -> withTestLogger $ \logger -> do
+  let certificate = dir <> "/cert.pem"
+      key = dir <> "/key.pem"
+      subject = ["-subj", "/CN=localhost", "-days", "1"]
+      files = ["-keyout", key, "-out", certificate]
+  (made, _, why) <-
+    readProcessWithExitCode "openssl" (["req", "-x509", "-newkey", "rsa:2048", "-nodes"] <> files <> subject) ""
+  (made, why) `shouldSatisfy` ((== ExitSuccess) . fst)
+  listening $ \(sock, port) -> do
+    let config = (webConfig logger env.store) {tls = Just (certificate, key)} :: WebConfig
+        status scheme = do
+          let url = scheme <> "://127.0.0.1:" <> show port <> "/health"
+          let quietly = ["-sk", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}"]
+          (_, code, _) <- readProcessWithExitCode "curl" (quietly <> [url]) ""
+          return code
+    withAsync (runWebSocket config sock) $ \web -> do
+      link web
+      waitFor "the server to answer over HTTPS" ((== "200") <$> status "https")
+      status "http" `shouldNotReturn` "200"
+
+-- | The parts of HTTP that are not about any one endpoint: a request for
+-- the headers alone, the question that a browser asks before a request
+-- from another site, compression, a list of addresses in the body of a
+-- request, and the reference of the API at the root of the server.
+httpTest :: Env -> IO ()
+httpTest env = do
+  let x = newXPub env "http" DeriveNormal
+      addresses = T.intercalate "," [at env x [0, i] | i <- [0 .. 2]]
+      quiet = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
+      statusOf r = r ^. Wreq.responseStatus . Wreq.statusCode
+  -- the headers of an answer, without the answer
+  headed <- Wreq.headWith quiet (env.plain <> "/block/best")
+  (statusOf headed, headed ^. Wreq.responseHeader "Content-Type") `shouldBe` (200, "application/json")
+  -- what may be asked from another site
+  asked <- Wreq.optionsWith quiet (env.plain <> "/transactions")
+  statusOf asked `shouldBe` 204
+  asked ^. Wreq.responseHeader "Access-Control-Allow-Methods" `shouldBe` "GET, HEAD, POST, DELETE, OPTIONS"
+  asked ^. Wreq.responseHeader "Access-Control-Allow-Origin" `shouldBe` "*"
+  -- compressed for a client that reads it, and the same answer
+  let balances = "/address/balances?addresses=" <> T.unpack addresses
+  packed <- Wreq.getWith (quiet & Wreq.header "Accept-Encoding" .~ ["gzip"]) (env.plain <> balances)
+  packed ^. Wreq.responseHeader "Content-Encoding" `shouldBe` "gzip"
+  (_, inQuery) <- getJSON env.plain balances
+  -- the same list in the body of a request, where it may be as long as it likes
+  (posted, inBody) <- postForm env.plain "/address/balances" [("addresses", addresses)]
+  posted `shouldBe` 200
+  inBody `shouldBe` inQuery
+  length (arr inBody) `shouldBe` 3
+  -- the reference of the API, as a page and as what the page shows
+  page <- Wreq.getWith quiet (env.plain <> "/")
+  (statusOf page, page ^. Wreq.responseHeader "Content-Type") `shouldBe` (200, "text/html; charset=utf-8")
+  BL.toStrict (page ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "swagger-ui"
+  reference <- Wreq.getWith quiet (env.plain <> "/swagger.yaml")
+  statusOf reference `shouldBe` 200
+  BL.toStrict (reference ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "description: This server"
 
 -- | Two more stores, each with its own database, syncing from the same
 -- node, as members of one fleet on the Redis of the tests, each with a web

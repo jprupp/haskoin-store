@@ -84,6 +84,19 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   in Redis that the pool's script writes as it makes each change, and no
   longer those of their own nodes. A block is told when the fleet has
   moved to it, with every block that it moved through.
+- **HTTPS**, optional and off by default: `--tls-cert` and `--tls-key`
+  (`TLS_CERT`, `TLS_KEY`) make the server speak HTTPS on its port.
+- **The reference of the API at the root of the server.** `/` is a page
+  that shows `swagger.yaml` as it was when the server was built, and can
+  try requests against it; `/swagger.yaml` is the file.
+- **`HEAD` and `OPTIONS`** are answered: the headers of what `GET` gives,
+  and what a browser may send from another site.
+- **Answers are compressed** with gzip for clients that accept it, but for
+  the stream of events.
+- **Lists in a body.** The endpoints that take a list of addresses,
+  blocks, heights or transactions accept `POST` with the parameters in a
+  form, so that a long list need not fit in a URL.
+- **`Retry-After`** on every 503.
 - **Errors in binary.** A request that asks for the binary format gets
   its errors in that format too, the 503 of a server behind its fleet
   included. They were JSON whatever was asked. This needs

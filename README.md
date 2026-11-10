@@ -289,6 +289,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | --- | --- | --- | --- |
 | `--host` / `--port` | `HOST` / `PORT` | `*` / `3000` | Address the API listens on |
 | `--noweb` | `NO_WEB` | off | Index only, no API |
+| `--tls-cert` / `--tls-key` | `TLS_CERT` / `TLS_KEY` | none | Serve HTTPS with this certificate chain and private key, both files in PEM |
 | `--no-xpub` | `NO_XPUB` | off | Disable the xpub endpoints |
 | `--no-blockchain-info` | `NO_BLOCKCHAIN_INFO` | off | Disable the `/blockchain/` endpoints and price lookups |
 | `--max-item-count` | `MAX_ITEM_COUNT` | `200000` | Most items in a list (0 = no limit) |
@@ -431,6 +432,8 @@ curl localhost:3000/transaction/<txid>
 curl -N localhost:3000/events              # stream of new blocks and txs
 ```
 
+- The root of the server, `/`, is the reference of its API as a page that
+  can try requests, and `/swagger.yaml` the file behind it.
 - Add `?pretty=true` for indented JSON.
 - Send `Accept: application/octet-stream` for the binary format: see
   [Binary format](#binary-format) below.
@@ -444,6 +447,24 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 - Errors come back with an HTTP status, in the format that was asked for:
   400 for bad input, 404 for unknown things, 409 when a short transaction
   number is ambiguous, 413 for requests that ask for too much.
+
+### HTTP and HTTPS
+
+- **`HEAD` and `OPTIONS`** are answered, the second with what a browser
+  may send from another site.
+- **Answers are compressed** for a client that sends
+  `Accept-Encoding: gzip`, but for the stream of events.
+- **Long lists go in a body.** The endpoints that take a list of
+  addresses, blocks, heights or transactions also take it under `POST`,
+  as a form (`application/x-www-form-urlencoded`), so that it does not
+  have to fit in a URL. `/transactions` does not: `POST` there publishes
+  a transaction.
+- **A 503 says when to try again**, in `Retry-After`.
+- **HTTPS is optional and off by default.** With `--tls-cert` and
+  `--tls-key` the server speaks HTTPS on its port, and nothing else. A
+  public service usually has a proxy in front that holds the certificate;
+  this is for a server by itself. The files are read at start, so a
+  renewed certificate takes a restart.
 
 ### Binary format
 
