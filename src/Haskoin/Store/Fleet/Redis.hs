@@ -208,7 +208,15 @@ poolWithdraw conn keys tsize ts =
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the
 -- live stores agree on, and what the blocks in between did.
-fleetAdvance :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> PoolChange -> IO Moved
+fleetAdvance ::
+  Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe Time ->
+  Maybe ByteString ->
+  ByteString ->
+  PoolChange ->
+  IO Moved
 fleetAdvance conn keys tsize clock seen target change =
   run conn (R.eval poolScript [] args) >>= \case
     ["moved"] -> return (MovedTo target)

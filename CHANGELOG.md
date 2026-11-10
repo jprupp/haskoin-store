@@ -237,6 +237,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   real Redis like the others; the comparison found a case that the rules had
   left open, a transaction that comes back from an abandoned block and
   spends what the pool already spends, which now wins.
+- `Haskoin.Store.Database.Views` keeps the database as it was at each recent
+  block, a RocksDB snapshot for each, so that a store can answer from the
+  block that its fleet agrees on and not only from its newest. Views that
+  are no longer needed are let go, and one that a request is reading is
+  released when the request is done. Nothing uses it yet.
 - A store whose Redis does not answer goes on answering from its database,
   instead of failing every request that the cache would have served. A
   request waits at most two seconds for Redis; after that the store leaves

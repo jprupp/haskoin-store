@@ -50,6 +50,9 @@
 --   "Haskoin.Store.Fleet.Redis", which carries them out.
 --   "Haskoin.Store.Fleet.Pool" has the rules of the mempool that they share.
 --   Nothing uses them yet.
+-- * "Haskoin.Store.Database.Views": the database as it was at each recent
+--   block, for a store that answers from the block its fleet agrees on.
+--   Nothing uses it yet.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.
