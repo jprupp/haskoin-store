@@ -80,6 +80,10 @@ module Haskoin.Store.Database.Writer
     getMempoolTx,
     getMempoolSpender,
     getMempoolSpenders,
+    getChainSpender,
+    getChainSpenders,
+    insertSpender,
+    deleteSpender,
     getDeletedTx,
     insertMempoolTx,
     deleteMempoolTx,
@@ -94,6 +98,7 @@ module Haskoin.Store.Database.Writer
 where
 
 import Control.Monad (forM)
+import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashTable.IO qualified as H
 import Data.IntMap.Strict (IntMap)
@@ -101,6 +106,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
 import Data.Maybe (catMaybes, isJust)
 import Data.Ord (Down (..))
+import Data.Word (Word32)
 import Database.RocksDB (BatchOp, DB)
 import Database.RocksDB.Query
   ( deleteOp,
@@ -185,6 +191,9 @@ type AddrOutTable = H.BasicHashTable (Address, BlockRef, OutPoint) (Maybe OutVal
 -- | Mempool changes in this batch: 'Nothing' for a deletion.
 type MempoolTable = H.BasicHashTable TxHash (Maybe UnixTime)
 
+-- | Changed groups of spenders of outputs in the chain.
+type SpenderTable = H.BasicHashTable (TxHash, Word32) (IntMap Spender)
+
 -- | Changed mempool spenders of outputs: 'Nothing' for a deletion.
 type MemSpenderTable = H.BasicHashTable OutPoint (Maybe Spender)
 
@@ -222,7 +231,11 @@ data Memory = Memory
     -- | entries of the mempool by address, in the mempool area
     memAddrTable :: !MemAddrTable,
     -- | bodies of transactions that left the mempool unconfirmed
-    memDeletedTable :: !TxTable
+    memDeletedTable :: !TxTable,
+    -- | inputs of blocks that spend outputs, by group of outputs
+    -- as t'SpenderKey' says, each group as the batch leaves it: empty for one
+    -- that has no spent output left
+    spenderTable :: !SpenderTable
   }
 
 -- | Set the best block.
@@ -389,7 +402,8 @@ hashMapOps db Memory {..} =
         memTxOps db memTxTable,
         memSpenderOps db memSpenderTable,
         memAddrOps db memAddrTable,
-        memDeletedOps db memDeletedTable
+        memDeletedOps db memDeletedTable,
+        spenderOps db spenderTable
       ]
 
 -- | Operation for the change of the best block, if any.
@@ -482,6 +496,14 @@ memTxOps db t = map (uncurry f) <$> H.toList t
     f h (Just td) = insertOpCF (mempoolCF db) (TxKey h) td
     f h Nothing = deleteOpCF (mempoolCF db) (TxKey h)
 
+-- | Operations for the changed groups of spenders of the chain.
+spenderOps :: DB -> SpenderTable -> IO [BatchOp]
+spenderOps db t = map (uncurry f) <$> H.toList t
+  where
+    f (h, g) m
+      | IntMap.null m = deleteOpCF (spenderCF db) (SpenderKey h g)
+      | otherwise = insertOpCF (spenderCF db) (SpenderKey h g) (SpenderVal m)
+
 -- | Operations for changed mempool spenders.
 memSpenderOps :: DB -> MemSpenderTable -> IO [BatchOp]
 memSpenderOps db t = map (uncurry f) <$> H.toList t
@@ -529,11 +551,15 @@ getBlock w bh = getLayered w (getBlockH bh) (`Q.getBlock` bh)
 -- | Data of a transaction, deleted ones included, with the changes of the
 -- batch applied.
 getTxData :: Writer -> TxHash -> IO (Maybe TxData)
-getTxData w th = getLayered w (getTxDataH th) (`Q.getTxData` th)
+getTxData w th = getLayered w (getTxDataH th) (`Q.getTxRecord` th)
 
 -- | Spender of an output, with the changes of the batch applied.
 getSpender :: Writer -> OutPoint -> IO (Maybe Spender)
-getSpender w op = getLayered w (getSpenderH op) (`Q.getSpender` op)
+getSpender w op = getLayered w (getSpenderH op) fromRecord
+  where
+    -- the rules of version 20 keep spenders in the record of the
+    -- transaction that made the output, and this is theirs
+    fromRecord r = (>>= IntMap.lookup (fromIntegral op.index) . (.spenders)) <$> Q.getTxRecord r op.hash
 
 -- | Balance of an address, with the changes of the batch applied.
 getBalance :: Writer -> Address -> IO (Maybe Balance)
@@ -578,6 +604,51 @@ getMempoolSpenders w h outputs = do
   where
     change i = fmap (i,) <$> H.lookup w.memory.memSpenderTable (OutPoint h (fromIntegral i))
 
+-- | The spenders of a group of outputs of a transaction, with the changes
+-- of the batch applied.
+spenderGroupOf :: Writer -> TxHash -> Word32 -> IO (IntMap Spender)
+spenderGroupOf w h g =
+  H.lookup w.memory.spenderTable (h, g) >>= \case
+    Just m -> return m
+    Nothing ->
+      retrieveCF w.reader.db (spenderCF w.reader.db) (SpenderKey h g) <&> \case
+        Just (SpenderVal m) -> m
+        Nothing -> IntMap.empty
+
+-- | Note that an input of a block spends an output, in the group of
+-- outputs that it belongs to. The record of the transaction that made the
+-- output is not read and not written.
+insertSpender :: Writer -> OutPoint -> Spender -> IO ()
+insertSpender w p s = do
+  let g = p.index `div` spenderGroup
+  m <- spenderGroupOf w p.hash g
+  H.insert w.memory.spenderTable (p.hash, g) (IntMap.insert (fromIntegral p.index) s m)
+
+-- | Note that no block spends an output any more.
+deleteSpender :: Writer -> OutPoint -> IO ()
+deleteSpender w p = do
+  let g = p.index `div` spenderGroup
+  m <- spenderGroupOf w p.hash g
+  H.insert w.memory.spenderTable (p.hash, g) (IntMap.delete (fromIntegral p.index) m)
+
+-- | The input of a block that spends an output, with the changes of the
+-- batch applied.
+getChainSpender :: Writer -> OutPoint -> IO (Maybe Spender)
+getChainSpender w p = IntMap.lookup (fromIntegral p.index) <$> spenderGroupOf w p.hash (p.index `div` spenderGroup)
+
+-- | The inputs of blocks that spend the outputs of a transaction, by
+-- output, with the changes of the batch applied, given the number of its
+-- outputs: what the database has, read with one scan, with the groups
+-- that the batch changed in place of the stored ones.
+getChainSpenders :: Writer -> TxHash -> Int -> IO (IntMap Spender)
+getChainSpenders w h outputs = do
+  stored <- Q.getChainSpenders w.reader h
+  let groups = [0 .. (fromIntegral (max 1 outputs) - 1) `div` spenderGroup]
+  changed <- catMaybes <$> mapM (\g -> fmap (g,) <$> H.lookup w.memory.spenderTable (h, g)) groups
+  let replaced = [g | (g, _) <- changed]
+      kept = IntMap.filterWithKey (\i _ -> (fromIntegral i `div` spenderGroup) `notElem` replaced) stored
+  return (IntMap.unions (kept : map snd changed))
+
 -- | Body of a transaction that left the mempool unconfirmed, with the
 -- changes of the batch applied.
 getDeletedTx :: Writer -> TxHash -> IO (Maybe TxData)
@@ -613,6 +684,7 @@ newMemory net ctx = do
   memSpenderTable <- liftIO H.new
   memAddrTable <- liftIO H.new
   memDeletedTable <- liftIO H.new
+  spenderTable <- liftIO H.new
   return Memory {..}
 
 -- | Read the best block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.

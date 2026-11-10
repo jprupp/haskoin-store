@@ -554,19 +554,32 @@ new area, in batches that can be interrupted, and the log says how many
 transactions were moved. **There is no way back**: an older store refuses
 the database afterwards, so take a copy of a production database first.
 
-Version 22 makes the chain's data the same on every server that has the
-same blocks: a confirmed transaction has the time of its block. Until then
-a server that had seen a transaction in its mempool kept the time of that
-when a block confirmed it, so two servers gave two times for one confirmed
-transaction, and a server that synced later gave a third. A database of
-version 21, or of version 20 once its mempool is moved, gets the new times
-the first time this version of the store opens it. Nothing lists the
-transactions that need it, so **the store reads every transaction that it
-has before it starts**, and the log says how far it is every million. It
-read 210,000 a second of a small database that was in memory; a database
-of Bitcoin has more than a billion, and a disk to read them from, so plan
-for hours. It can be interrupted, and starts again from the first
-transaction, skipping what is done.
+Version 22 makes the record of a confirmed transaction something that is
+written once, by the block that confirms it, and the same on every server
+that has that block.
+
+- **Its time is the time of its block.** Until then a server that had seen
+  a transaction in its mempool kept the time of that when a block
+  confirmed it, so two servers gave two times for one confirmed
+  transaction, and a server that synced later gave a third.
+- **The spenders of its outputs are under keys of their own**, sixteen
+  outputs to a key. Until then they were in the record, which was read and
+  written whole again each time a block spent one of its outputs. Reading
+  a confirmed transaction in full now takes a second key: 18 microseconds
+  where it took 11.5, measured, and 0.8 milliseconds for a hundred where
+  it took 0.4. Lists by address and by xpub do not read records and cost
+  the same.
+
+A database of version 21, or of version 20 once its mempool is moved, is
+brought to this the first time this version of the store opens it.
+**The store reads every transaction that it has, and writes nearly every
+one again, before it starts**: nothing lists the records that need it, and
+most have a spender in them. The log says how far it is every million
+transactions. A database of Bitcoin has more than a billion, so plan for
+many hours, and for room on the disk for a second copy of the transactions
+until RocksDB has compacted the first away. It can be interrupted, and
+starts again from the first transaction, skipping what is done. As before,
+**there is no way back**: take a copy first.
 The parts:
 
 - the migration from version 20 (`Haskoin.Store.Database.Migrate`);

@@ -135,12 +135,13 @@ import Haskoin.Store.Database.Reader
     addrOutCF,
     addrTxCF,
     balanceCF,
+    spenderCF,
     txCF,
     unspentCF,
     withDatabaseReader,
     withLayeredReader,
   )
-import Haskoin.Store.Database.Types (BalVal (..))
+import Haskoin.Store.Database.Types (BalVal (..), SpenderKey (..), SpenderVal (..))
 import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool)
 import Haskoin.Store.Logic (ImportException)
 import Haskoin.Store.Logic qualified as Mixed
@@ -714,12 +715,17 @@ shortNumber h = either error (`shiftR` 11) (runGet getWord64be (encode h))
 -- balances at zero. The time a transaction was first seen is apart from its
 -- body, because a database that never saw the mempool has another.
 data Chain = Chain
-  { bodies :: ![(ByteString, (BlockRef, Tx, IntMap Prev, Bool, IntMap Spender))],
+  { bodies :: ![(ByteString, (BlockRef, Tx, IntMap Prev, Bool))],
     firstSeen :: ![(ByteString, UnixTime)],
     addressTxs :: ![(ByteString, ByteString)],
     addressOutputs :: ![(ByteString, ByteString)],
     unspents :: ![(ByteString, ByteString)],
-    balances :: ![(ByteString, BalVal)]
+    balances :: ![(ByteString, BalVal)],
+    -- | the inputs of blocks that spend outputs, each with the output that
+    -- it spends, whether the database has it under a key of version 22 or
+    -- in the record of the transaction that made the output, as the
+    -- versions before did: where they are is not what this compares
+    spenders :: ![(ByteString, ByteString)]
   }
   deriving (Eq, Show)
 
@@ -730,15 +736,28 @@ chainOf db = do
   addressOutputs <- dump db (addrOutCF db.db)
   unspents <- dump db (unspentCF db.db)
   balances <- dump db (balanceCF db.db) >>= mapM (\(k, v) -> (k,) <$> decoded v)
+  spenders <- dump db (spenderCF db.db)
   let live = [(k, td :: TxData) | (k, td) <- txs, not td.deleted]
   return
     Chain
-      { bodies = [(k, (td.block, td.tx, td.prevs, td.rbf, td.spenders)) | (k, td) <- live],
+      { bodies = [(k, (td.block, td.tx, td.prevs, td.rbf)) | (k, td) <- live],
         firstSeen = [(k, td.timestamp) | (k, td) <- live],
         addressTxs,
         addressOutputs,
         unspents,
-        balances = filter ((/= def) . snd) balances
+        balances = filter ((/= def) . snd) balances,
+        spenders =
+          sort $
+            [ (encode (OutPoint h (fromIntegral i)), encode spender)
+            | (k, v) <- spenders,
+              Right (SpenderKey h _) <- [decode k],
+              Right (SpenderVal m) <- [decode v],
+              (i, spender) <- IntMap.toList m
+            ]
+              <> [ (encode (OutPoint (txHash td.tx) (fromIntegral i)), encode spender)
+                 | (_, td) <- live,
+                   (i, spender) <- IntMap.toList td.spenders
+                 ]
       }
   where
     decoded v = either fail return (decode v)

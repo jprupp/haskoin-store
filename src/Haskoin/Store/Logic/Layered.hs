@@ -151,7 +151,10 @@ activeTx wr h = activeBody wr h >>= mapM spent
   where
     spent td = do
       ms <- getMempoolSpenders wr h (length td.tx.outputs)
-      return (td :: TxData) {spenders = I.union td.spenders ms}
+      -- those of blocks are under keys of their own, and only a confirmed
+      -- transaction can have any
+      cs <- if confirmed td.block then getChainSpenders wr h (length td.tx.outputs) else return I.empty
+      return (td :: TxData) {spenders = I.union cs ms}
 
 -- | An output that a new mempool transaction may spend: one that the chain
 -- has as unspent, or one of a mempool transaction, that no mempool
@@ -180,7 +183,7 @@ unspentOutput wr br p o =
 
 -- | Input that spends an output, in the mempool or in a block.
 spenderOf :: Writer -> OutPoint -> IO (Maybe Spender)
-spenderOf wr p = getMempoolSpender wr p >>= maybe (getSpender wr p) (return . Just)
+spenderOf wr p = getMempoolSpender wr p >>= maybe (getChainSpender wr p) (return . Just)
 
 -- | Data of the best block. Throws 'BestBlockNotFound' if there is none.
 bestBlockData :: Writer -> IO BlockData
@@ -400,7 +403,8 @@ revertBlock wr bh = do
     -- take a transaction that nothing in the chain spends out of the chain
     leave h = do
       td <- inChain h
-      unless (I.null td.spenders) $ do
+      spent <- getChainSpenders wr h (length td.tx.outputs)
+      unless (I.null spent) $ do
         logError wr $ "Tried to revert spent tx: " <> txHashToHex h
         throwIO TxSpent
       removeChainTx wr td
@@ -468,8 +472,10 @@ addChainTx wr td = do
           Just u -> return u
           Nothing -> error $ "Could not find UTXO to spend: " <> show p
       deleteUnspent wr p
-      parent <- chainTx wr p.hash >>= maybe (throwIO TxNotFound) return
-      insertTx wr (parent :: TxData) {spenders = I.insert (fromIntegral p.index) (Spender h ix) parent.spenders}
+      -- under the key of the output: the record of the transaction that
+      -- made it is written once, when it is confirmed, and is not read
+      -- here either
+      insertSpender wr p (Spender h ix)
       forM_ u.address $ \a -> do
         deleteAddrUnspent wr a u
         modifyBalance wr a $ \b ->
@@ -505,7 +511,7 @@ removeChainTx wr td = do
         Nothing -> error $ "Could not find tx data: " <> show p.hash
     let o = fromMaybe (error ("Could not find output: " <> show p)) (getTxOut p.index parent.tx)
         u = unspentOutput wr parent.block p o
-    insertTx wr (parent :: TxData) {spenders = I.delete (fromIntegral p.index) parent.spenders}
+    deleteSpender wr p
     insertUnspent wr u
     forM_ u.address $ \a -> do
       insertAddrUnspent wr a u

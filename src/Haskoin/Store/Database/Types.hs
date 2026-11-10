@@ -69,6 +69,9 @@
 -- | 0x0f      | t'MigrationKey'  | version a migration in progress started   |
 -- |           |                  | from                                      |
 -- +-----------+------------------+-------------------------------------------+
+-- | 0x10      | t'SpenderKey'    | t'SpenderVal': inputs of blocks that      |
+-- |           |                  | spend outputs of a transaction            |
+-- +-----------+------------------+-------------------------------------------+
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),
@@ -85,6 +88,10 @@ module Haskoin.Store.Database.Types
     MemSummary (..),
     MemDeletedKey (..),
     MigrationKey (..),
+    SpenderKey (..),
+    SpenderVal (..),
+    spenderGroup,
+    spenderKey,
     TxKey (..),
     decodeTxKey,
     UnspentKey (..),
@@ -101,7 +108,7 @@ module Haskoin.Store.Database.Types
 where
 
 import Control.DeepSeq (NFData)
-import Control.Monad (guard)
+import Control.Monad (forM_, guard, replicateM)
 import Data.Bits
   ( shift,
     (.&.),
@@ -110,8 +117,11 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Default (Default (..))
 import Data.Hashable (Hashable)
+import Data.IntMap.Strict (IntMap)
+import Data.IntMap.Strict qualified as IntMap
 import Data.Serialize
-  ( Serialize (..),
+  ( Get,
+    Serialize (..),
     getBytes,
     getWord16be,
     getWord32be,
@@ -627,6 +637,81 @@ instance Serialize MigrationKey where
 instance Key MigrationKey
 
 instance KeyValue MigrationKey Word32
+
+-- | Key of the inputs of blocks that spend some outputs of a transaction,
+-- in the @spender@ column family, since database version 22: the
+-- transaction, and the number of a group of 'spenderGroup' of its outputs
+-- that follow each other. The value has the spender of each output of the
+-- group that is spent in a t'SpenderVal'.
+--
+-- Until then the spenders of the outputs of a confirmed transaction were in
+-- its own record, 'TxData', which was read and written whole again every
+-- time a block spent one of them or was reverted: once for each of its
+-- outputs, over years, for a record of any size. Now the record of a
+-- transaction is written when a block confirms it and never again, and
+-- spending an output reads and writes a value of a few dozen bytes.
+--
+-- = Why groups
+--
+-- A key for each spent output would make a spend one write that reads
+-- nothing. But a transaction is read far more often than it is spent
+-- from, and has to be read with its spenders: that would take a key for
+-- each of its outputs, with each read of it. One value
+-- for all the outputs of a transaction would cost one key to read, and
+-- bring back the trouble with large transactions: a payout to ten
+-- thousand would rewrite half a megabyte ten thousand times. With groups
+-- of sixteen nearly every transaction has one key, and no value is larger
+-- than sixteen spenders.
+--
+-- The groups of a transaction are next to each other, so all its spenders
+-- can also be read with one scan of their common prefix, which is what the
+-- prefix of the column family is.
+data SpenderKey
+  = -- | spenders of a group of outputs of a transaction
+    SpenderKey !TxHash !Word32
+  | -- | short key that matches the groups of a transaction
+    SpenderKeyS !TxHash
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize SpenderKey where
+  -- 0x10 · TxHash · group
+  put (SpenderKey h g) = do
+    put (SpenderKeyS h)
+    put g
+  -- 0x10 · TxHash
+  put (SpenderKeyS h) = do
+    putWord8 0x10
+    put h
+  get = do
+    guard . (== 0x10) =<< getWord8
+    h <- get
+    SpenderKey h <$> get
+
+instance Key SpenderKey
+
+instance KeyValue SpenderKey SpenderVal
+
+-- | The number of outputs whose spenders are under one t'SpenderKey'.
+spenderGroup :: Word32
+spenderGroup = 16
+
+-- | The key that has the spender of an output.
+spenderKey :: OutPoint -> SpenderKey
+spenderKey p = SpenderKey p.hash (p.index `div` spenderGroup)
+
+-- | The inputs of blocks that spend outputs of a group, by the number of
+-- the output in its transaction. A group none of whose outputs is spent
+-- has no key.
+newtype SpenderVal = SpenderVal (IntMap Spender)
+  deriving (Show, Eq)
+
+instance Serialize SpenderVal where
+  put (SpenderVal m) = do
+    putWord8 (fromIntegral (IntMap.size m))
+    forM_ (IntMap.toAscList m) $ \(i, spender) -> put (fromIntegral i :: Word32) >> put spender
+  get = do
+    n <- getWord8
+    SpenderVal . IntMap.fromList <$> replicateM (fromIntegral n) ((,) . fromIntegral <$> (get :: Get Word32) <*> get)
 
 -- | Block entry database key.
 newtype BlockKey = BlockKey BlockHash

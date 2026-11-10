@@ -38,7 +38,11 @@ module Haskoin.Store.Database.Query
 
     -- * Transactions
     getTxData,
+    getTxRecord,
     getManyTxData,
+    getChainSpender,
+    getChainSpenders,
+    withChainSpenders,
     getNumTxData,
     getSpender,
 
@@ -90,14 +94,14 @@ import Conduit
     yield,
     (.|),
   )
-import Control.Monad (replicateM, (>=>))
+import Control.Monad (forM, replicateM, (>=>))
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.Default (def)
 import Data.Functor ((<&>))
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, listToMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (Serialize, decode, encode)
 import Data.Word (Word32, Word64)
@@ -129,6 +133,7 @@ import Haskoin
     BlockHash,
     BlockHeight,
     OutPoint (..),
+    Tx (..),
     TxHash,
     txHash,
   )
@@ -229,22 +234,88 @@ getBlock r h =
 -- Transactions
 -------------------------------------------------------------------------------
 
--- | Data of a transaction, including deleted ones.
+-- | Data of a transaction, including deleted ones, with the inputs of
+-- blocks that spend its outputs.
 getTxData :: DatabaseReader -> TxHash -> IO (Maybe TxData)
 getTxData r th =
-  retrieveCF r.db (txCF r.db) (TxKey th) >>= \case
+  getTxRecord r th >>= \case
     Nothing -> return Nothing
     Just t -> do
       count r $ \s -> incrementCounter s.dataTxCount 1
-      return (Just t)
+      listToMaybe <$> withChainSpenders r [(th, t)]
+
+-- | The record of a transaction as the database has it, including deleted
+-- ones. Since version 22 the spenders of its outputs are not in it
+-- ('getChainSpenders'); a database of version 20 or 21 has them there.
+-- This is what the rules that write the database read: they must not
+-- write back what was read from somewhere else.
+getTxRecord :: DatabaseReader -> TxHash -> IO (Maybe TxData)
+getTxRecord r th = retrieveCF r.db (txCF r.db) (TxKey th)
 
 -- | Data of many transactions, in the order of the hashes, read with one
--- multi-get.
+-- multi-get, with the inputs of blocks that spend their outputs.
 getManyTxData :: DatabaseReader -> [TxHash] -> IO [Maybe TxData]
 getManyTxData r ths = do
-  tds <- retrieveManyCF r.db (txCF r.db) (map TxKey ths)
-  count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes tds))
-  return tds
+  found <- retrieveManyCF r.db (txCF r.db) (map TxKey ths)
+  count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes found))
+  spent <- withChainSpenders r [(h, td) | (h, Just td) <- zip ths found]
+  return (fill found spent)
+  where
+    fill (Just _ : more) (td : tds) = Just td : fill more tds
+    fill (Nothing : more) tds = Nothing : fill more tds
+    fill _ _ = []
+
+-- | The input of a block that spends an output, if one does: one read by
+-- key, of the group of outputs that it is in, in a database of version 22.
+getChainSpender :: DatabaseReader -> OutPoint -> IO (Maybe Spender)
+getChainSpender r p =
+  retrieveCF r.db (spenderCF r.db) (spenderKey p) <&> \case
+    Just (SpenderVal m) -> IntMap.lookup (fromIntegral p.index) m
+    Nothing -> Nothing
+
+-- | The inputs of blocks that spend the outputs of a transaction, by
+-- output, read with one scan of the keys of the transaction.
+getChainSpenders :: DatabaseReader -> TxHash -> IO (IntMap.IntMap Spender)
+getChainSpenders r h = do
+  rows <- matchingAsListCF r.db (spenderCF r.db) (SpenderKeyS h)
+  return (IntMap.unions [m | (_ :: SpenderKey, SpenderVal m) <- rows])
+
+-- | Records of transactions, with the inputs of blocks that spend their
+-- outputs added to whatever spenders the records have themselves, which
+-- those of a database older than version 22 do.
+--
+-- The spenders are read by the keys of the groups of outputs, all the
+-- groups of all the transactions in one multi-get. A group is sixteen
+-- outputs, so nearly every transaction is one key, and a page of a
+-- hundred transactions is one more read of a hundred keys. A scan would
+-- need an iterator for each transaction, at ten microseconds apiece. Only
+-- a transaction with more groups than 'wideTx' is scanned, so that a
+-- payout to thousands is not hundreds of keys to ask for.
+--
+-- Each record comes with the hash of its transaction, which whoever read
+-- it by its key has: working it out again from the record is two rounds
+-- of SHA-256 over the whole transaction, and cost more than everything
+-- else here together when this was first written without it.
+withChainSpenders :: DatabaseReader -> [(TxHash, TxData)] -> IO [TxData]
+withChainSpenders _ [] = return []
+withChainSpenders r tds = do
+  let groups td = (fromIntegral (length td.tx.outputs) + spenderGroup - 1) `div` spenderGroup
+      keys (h, td) = [SpenderKey h g | g <- take (fromIntegral (groups td)) [0 ..]]
+      narrow (_, td) = groups td <= wideTx
+      asked = concatMap keys (filter narrow tds)
+  found <- case asked of
+    [] -> return []
+    _ -> retrieveManyCF r.db (spenderCF r.db) asked
+  let byKey = Map.fromList [(k, m) | (k, Just (SpenderVal m)) <- zip asked found]
+      keyed x = IntMap.unions [m | k <- keys x, Just m <- [Map.lookup k byKey]]
+  forM tds $ \x@(h, td) -> do
+    chain <- if narrow x then return (keyed x) else getChainSpenders r h
+    return (td :: TxData) {spenders = IntMap.union td.spenders chain}
+
+-- | The number of groups of outputs above which the spenders of a
+-- transaction are read with a scan instead of by key.
+wideTx :: Word32
+wideTx = 16
 
 -- | Transactions whose hash, read as a number, matches a short identifier of
 -- the Blockchain.info API. There may be more than one.
@@ -252,21 +323,26 @@ getNumTxData :: DatabaseReader -> Word64 -> IO [TxData]
 getNumTxData r i = do
   let (sk, w) = decodeTxKey i
   ls <- matchingAsListCF r.db (txCF r.db) (TxKeyS sk)
-  let f t =
-        let bs = encode $ txHash t.tx
+  let f h =
+        let bs = encode h
             b = BS.head (BS.drop 6 bs)
             w' = b .&. 0xf8
          in w == w'
-      txs = filter f $ map snd ls
+      txs = [(h, td) | (TxKey h, td) <- ls, f h]
   count r $ \s -> incrementCounter s.dataTxCount (length txs)
-  return txs
+  withChainSpenders r txs
 
--- | Transaction that spends an output, if any.
+-- | Transaction that spends an output, if any: by its key, or, in a
+-- database older than version 22, from the record of the transaction that
+-- made the output.
 getSpender :: DatabaseReader -> OutPoint -> IO (Maybe Spender)
 getSpender r op =
-  getTxData r op.hash <&> \case
-    Nothing -> Nothing
-    Just td -> IntMap.lookup (fromIntegral op.index) td.spenders
+  getChainSpender r op >>= \case
+    Just s -> return (Just s)
+    Nothing ->
+      getTxRecord r op.hash <&> \case
+        Nothing -> Nothing
+        Just td -> IntMap.lookup (fromIntegral op.index) td.spenders
 
 -------------------------------------------------------------------------------
 -- Addresses
@@ -356,7 +432,7 @@ addressConduit r a s it =
       Just (AtBlock bh) ->
         matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a (BlockRef bh maxBound))
       Just (AtTx txh) ->
-        lift (getTxData r txh) >>= \case
+        lift (getTxRecord r txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
             matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a b)
           Just TxData {block = b@MemRef {}} ->
@@ -386,7 +462,7 @@ unspentConduit r a s it =
       Just (AtBlock h) ->
         matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a (BlockRef h maxBound))
       Just (AtTx txh) ->
-        lift (getTxData r txh) >>= \case
+        lift (getTxRecord r txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
             matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
           Just TxData {block = b@MemRef {}} ->

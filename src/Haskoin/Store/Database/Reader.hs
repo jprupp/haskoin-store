@@ -45,6 +45,7 @@ module Haskoin.Store.Database.Reader
     addrTxCF,
     addrOutCF,
     txCF,
+    spenderCF,
     unspentCF,
     blockCF,
     heightCF,
@@ -363,7 +364,7 @@ columnFamilyConfig bloom cached =
   [ ("addr-tx", scanned (Just 22)),
     ("addr-out", scanned (Just 22)),
     ("tx", c (Just 33)),
-    ("spender", c (Just 33)), -- unused
+    ("spender", c (Just 33)),
     ("unspent", c (Just 37)),
     ("block", c (Just 33)),
     ("height", c Nothing),
@@ -422,6 +423,11 @@ txCF db = columnFamilies db !! 2
 -- | Column family for unspent outputs ('UnspentKey').
 unspentCF :: DB -> ColumnFamily
 unspentCF db = columnFamilies db !! 4
+
+-- | Column family for the inputs of blocks that spend outputs
+-- as t'Haskoin.Store.Database.Types.SpenderKey' says.
+spenderCF :: DB -> ColumnFamily
+spenderCF db = columnFamilies db !! 3
 
 -- | Column family for blocks ('BlockKey').
 blockCF :: DB -> ColumnFamily

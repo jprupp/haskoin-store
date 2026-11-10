@@ -6,7 +6,9 @@ import Control.Monad (foldM, forM_, void, when)
 import Data.ByteString qualified as B
 import Data.Either (isRight, rights)
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Serialize (decode, encode)
 import Data.Text qualified as T
@@ -29,18 +31,20 @@ import Haskoin
     sha256,
     txHash,
   )
-import Haskoin.Store.Data (Balance (..), BlockData (..), BlockRef (..), TxData (..))
+import Haskoin.Store.Data (Balance (..), BlockData (..), BlockRef (..), Spender (..), TxData (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Migrate
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     mempoolAddrCF,
     mempoolCF,
     mempoolInsertOps,
+    spenderCF,
     txCF,
   )
-import Haskoin.Store.Database.Types (MigrationKey (..), VersionKey (..))
+import Haskoin.Store.Database.Types (MigrationKey (..), SpenderKey (..), SpenderVal (..), VersionKey (..))
 import Haskoin.Store.Histories
 import Haskoin.Store.TestBlocks (script)
 import Test.Hspec
@@ -67,7 +71,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
       numbers old.balances one `shouldBe` Just (0, 3000, 1, 1, 3000)
       numbers old.balances two `shouldBe` Just (0, 1500, 1, 1, 1500)
       openLayered net ctx dir $ \db -> do
-        migrateLayered db `shouldReturn` Migration {moved = 2, batches = 1, checked = 2, retimed = 0}
+        migrateLayered db `shouldReturn` Migration {moved = 2, batches = 1, checked = 2, rewritten = 0}
         retrieve db.db VersionKey `shouldReturn` Just layeredVersion
         (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
         -- the chain has the coin again, whole and unspent
@@ -76,9 +80,11 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         Q.getBalance db one `shouldReturn` Nothing
         Q.getBalance db two `shouldReturn` Nothing
         -- and with the mempool on top, every answer is what it was
+        -- the queries read a database of the version that the store runs on
+        settle db
         layered db (ask hist) `shouldReturn` old
         -- a second run finds nothing to do
-        migrateLayered db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+        migrateLayered db `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
 
   modifyMaxSuccess (const 50) $
     it "keeps every answer and leaves the chain as if the mempool had been wiped, for random histories" $
@@ -97,6 +103,8 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 done.checked `shouldBe` length old.mempool
                 done.moved `shouldBe` length old.mempool
                 -- every answer is what it was
+                -- the queries read a database of the version that the store runs on
+                settle db
                 layered db (ask hist) `shouldReturn` old
                 -- the chain's column families are those of the fresh database,
                 -- but for the times at which transactions were first seen
@@ -149,6 +157,8 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           done.moved `shouldBe` length old.mempool - stopAt
           done.checked `shouldBe` length old.mempool
           (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
+          -- the queries read a database of the version that the store runs on
+          settle db
           layered db (ask hist) `shouldReturn` old
 
   it "refuses a database that it cannot handle, and leaves it untouched" $ do
@@ -179,7 +189,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
       openLayered net ctx dir $ \db -> do
         upgradeDatabase (\_ -> return ()) db
-          `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+          `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
         retrieve db.db VersionKey `shouldReturn` Just currentVersion
     -- one of version 20 with a mempool, and then the same one again
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
@@ -267,13 +277,114 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                   : [PutCF (txCF db.db) k (encode (later td)) | (k, td) <- picked]
               wrongTimes db >>= (`shouldBe` length picked) . length
               done <- upgradeDatabase (\_ -> return ()) db
-              done.retimed `shouldBe` length picked
+              done.rewritten `shouldBe` length picked
               retrieve db.db VersionKey `shouldReturn` Just currentVersion
               (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
               dump db (txCF db.db) `shouldReturn` original
               -- and again, it finds nothing to do
               upgradeDatabase (\_ -> return ()) db
-                `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, retimed = 0}
+                `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
+    modifyMaxSuccess (const 20) $
+      it "is in a record that is written once, and not when its outputs are spent" $
+        -- After every step of a history, the record of each transaction
+        -- that was confirmed before the step and still is, is the same
+        -- bytes as before: blocks that spend its outputs, and blocks that
+        -- are reverted, write keys of their own and leave it alone. No
+        -- record has spenders in it.
+        property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
+          withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+              hist0 <- start layeredRules db
+              let records = do
+                    rows <- dump db (txCF db.db)
+                    return (Map.fromList [(k, v) | (k, v) <- rows, Right td <- [decode v], inChain td])
+                  turn (hist, was) seed = do
+                    hist' <- walk shadow db hist seed
+                    now <- records
+                    Map.filter id (Map.intersectionWith (/=) was now) `shouldBe` Map.empty
+                    return (hist', now)
+              first <- records
+              (_, final) <- foldM turn (hist0, first) seeds
+              [td.spenders | v <- Map.elems final, Right (td :: TxData) <- [decode v], not (IntMap.null td.spenders)]
+                `shouldBe` []
+    it "has the spenders of its outputs under a key for each sixteen of them" $
+      withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+        openLayered net ctx dir $ \db -> do
+          hist <- start layeredRules db
+          -- forty outputs, of which three are spent, in three groups
+          let wide = Tx 2 [TxIn (coinOf hist) "" maxBound] (replicate 40 (TxOut 1000 (p2pkh 1))) [] 0
+              spend i = Tx 2 [TxIn (OutPoint (txHash wide) i) "" maxBound] [TxOut 500 (p2pkh 2)] [] 0
+              spends = map spend [3, 17, 39]
+              keysNow = do
+                rows <- dump db (spenderCF db.db)
+                return
+                  [ (g, IntMap.keys m)
+                  | (k, v) <- rows,
+                    Right (SpenderKey h g) <- [decode k],
+                    h == txHash wide,
+                    Right (SpenderVal m) <- [decode v]
+                  ]
+              mine txs = do
+                mined <- blockOn db txs >>= apply layeredRules db
+                isRight mined.result `shouldBe` True
+          mine [wide]
+          record <- dump db (txCF db.db)
+          keysNow `shouldReturn` []
+          mine spends
+          keysNow `shouldReturn` [(0, [3]), (1, [17]), (2, [39])]
+          -- the record is as the first block wrote it
+          now <- dump db (txCF db.db)
+          [v | (k, v) <- now, k `elem` map fst record] `shouldBe` map snd record
+          -- and the transaction is read with its spenders, each also by itself
+          found <- L.withView db (`L.getTxData` txHash wide)
+          let expected = IntMap.fromList [(fromIntegral i, Spender (txHash (spend i)) 0) | i <- [3, 17, 39]]
+          fmap (.spenders) found `shouldBe` Just expected
+          forM_ [3, 4, 17, 39] $ \i ->
+            L.withView db (`L.getSpender` OutPoint (txHash wide) i)
+              `shouldReturn` IntMap.lookup (fromIntegral i) expected
+          -- a block that is reverted takes its spenders along, and a group
+          -- with none left has no key
+          best <- Q.getBestBlock db >>= maybe (fail "no best block") return
+          reverted <- apply layeredRules db (Revert best)
+          isRight reverted.result `shouldBe` True
+          keysNow `shouldReturn` []
+          Q.getChainSpenders db (txHash wide) `shouldReturn` IntMap.empty
+          -- the transactions that spent them are back in the mempool, and
+          -- the transaction is read with them as its spenders still
+          fmap (.spenders) <$> L.withView db (`L.getTxData` txHash wide) `shouldReturn` Just expected
+    modifyMaxSuccess (const 20) $
+      it "has the spenders of its outputs moved to keys of their own by the migration" $
+        -- A database as the layered rules write it has a key for each
+        -- spent output. The spenders are put where version 21 had them,
+        -- in the record of the transaction that made the output, the keys
+        -- are deleted, and the database is marked as of that version. The
+        -- migration must give back the records and the keys as they were.
+        property . forAll (vectorOf 40 anyNumber) $ \seeds -> ioProperty $
+          withSystemTempDirectory "haskoin-store-times-" $ \dir ->
+            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+              hist0 <- start layeredRules db
+              void (foldM (walk shadow db) hist0 seeds)
+              records <- dump db (txCF db.db)
+              keys <- dump db (spenderCF db.db)
+              let spent =
+                    [ (h, m :: IntMap.IntMap Spender)
+                    | (k, v) <- keys,
+                      Right (SpenderKey h _) <- [decode k],
+                      Right (SpenderVal m) <- [decode v]
+                    ]
+                  inside td = IntMap.unions [m | (h, m) <- spent, h == txHash td.tx]
+                  old (k, v) = case decode v of
+                    Right td | inChain td -> (k, encode (embed td (inside td)))
+                    _ -> (k, v)
+              writeBatch db.db $
+                insertOp VersionKey layeredVersion
+                  : [DelCF (spenderCF db.db) k | (k, _) <- keys]
+                    <> [PutCF (txCF db.db) k v | (k, v) <- map old records]
+              done <- upgradeDatabase (\_ -> return ()) db
+              -- every record that had a spender in it was written again
+              done.rewritten `shouldBe` length [() | (k, v) <- records, old (k, v) /= (k, v)]
+              dump db (txCF db.db) `shouldReturn` records
+              dump db (spenderCF db.db) `shouldReturn` keys
     it "is set by a migration that carries on after it was interrupted" $
       withSystemTempDirectory "haskoin-store-times-" $ \dir ->
         openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
@@ -289,7 +400,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
               <> [PutCF (txCF db.db) k (encode ((td :: TxData) {timestamp = 7})) | (k, td) <- confirmed]
           said <- newIORef []
           done <- upgradeDatabase (\line -> modifyIORef' said (line :)) db
-          done.retimed `shouldBe` length confirmed
+          done.rewritten `shouldBe` length confirmed
           dump db (txCF db.db) `shouldReturn` original
           (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
           readIORef said >>= (`shouldSatisfy` any ("Carrying on" `T.isPrefixOf`))
@@ -326,6 +437,14 @@ walk shadow db hist seed =
 -- | A transaction with a time that is not that of its block.
 later :: TxData -> TxData
 later td = (td :: TxData) {timestamp = td.timestamp + 12345}
+
+-- | Bring a database of version 21 to the version that the store runs on.
+settle :: DatabaseReader -> IO ()
+settle db = void (migrateRecords (\_ -> return ()) db)
+
+-- | A transaction with spenders of its outputs in its record.
+embed :: TxData -> IntMap.IntMap Spender -> TxData
+embed td inside = (td :: TxData) {spenders = inside}
 
 -- | Whether a transaction is in the chain.
 inChain :: TxData -> Bool

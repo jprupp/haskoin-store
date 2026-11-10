@@ -349,12 +349,14 @@ getManyTxData (View r) hs = do
 getNumTxData :: View -> Word64 -> IO [TxData]
 getNumTxData (View r) i = do
   unconfirmed <- matchingAsListCF r.db (mempoolCF r.db) (TxKeyS prefix)
-  chain <- matchingAsListCF r.db (txCF r.db) (TxKeyS prefix)
+  stored <- matchingAsListCF r.db (txCF r.db) (TxKeyS prefix)
+  let rows = [(h, td) | (TxKey h, td) <- stored]
+  chain <- zip (map fst rows) <$> Q.withChainSpenders r rows
   gone <- matchingAsListCF r.db (mempoolCF r.db) (MemDeletedKeyP prefix)
   let found =
         preferred
           (Map.fromList [(h, td) | (TxKey h, td) <- unconfirmed])
-          (Map.fromList [(h, td) | (TxKey h, td) <- chain])
+          (Map.fromList chain)
           (Map.fromList [(h, td) | (MemDeletedKey h, td) <- gone])
       matches = filter (seventh . fst) (Map.toAscList found)
   spent <- mempoolSpenders r matches
@@ -371,7 +373,7 @@ getSpender :: View -> OutPoint -> IO (Maybe Spender)
 getSpender (View r) p =
   retrieveCF r.db (mempoolCF r.db) (MemSpenderKey p) >>= \case
     Just s -> return (Just s)
-    Nothing -> Q.getSpender r p
+    Nothing -> Q.getChainSpender r p
 
 -- | The bodies of transactions by hash, each from where it is kept, with
 -- the spenders that blocks give to its outputs and without those of the
@@ -384,11 +386,16 @@ getSpender (View r) p =
 bodies :: DatabaseReader -> [TxHash] -> IO (Map TxHash TxData)
 bodies r hs = do
   unconfirmed <- look (mempoolCF r.db) TxKey hs
-  chain <- look (txCF r.db) TxKey (filter (`Map.notMember` unconfirmed) hs)
+  chain <- look (txCF r.db) TxKey (filter (`Map.notMember` unconfirmed) hs) >>= spent
   let live h = Map.member h unconfirmed || maybe False (not . (.deleted)) (Map.lookup h chain)
   gone <- look (mempoolCF r.db) MemDeletedKey (filter (not . live) hs)
   return (preferred unconfirmed chain gone)
   where
+    -- the spenders that blocks give to the outputs of confirmed
+    -- transactions are under keys of their own
+    spent found = do
+      let rows = Map.toAscList found
+      Map.fromDistinctAscList . zip (map fst rows) <$> Q.withChainSpenders r rows
     look :: (Serialize key) => ColumnFamily -> (TxHash -> key) -> [TxHash] -> IO (Map TxHash TxData)
     look _ _ [] = return Map.empty
     look cf key ks =

@@ -118,7 +118,7 @@ import Haskoin
 import Haskoin.Node (LogLevel (..), logAt)
 import Haskoin.Store.Common (nub', sortTxs)
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Writer
+import Haskoin.Store.Database.Writer hiding (deleteSpender, insertSpender)
 import UnliftIO (Exception, throwIO)
 
 -- | Log a message with the logger of the writer.

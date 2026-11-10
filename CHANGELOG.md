@@ -84,22 +84,32 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the first 100 transactions of a busy address 221 microseconds instead of
   575, and the number of transactions of a wallet with 19,499 of them 34
   milliseconds instead of 78.
-- **Database version 22: a confirmed transaction has the time of its
-  block**, on every server, so that what the chain's column families hold
-  follows from the chain alone. A server that had seen a transaction in
-  its mempool used to keep the time of that when a block confirmed it: two
-  servers then gave two values of `time` for the same confirmed
-  transaction, which the servers of a fleet must not do.
-  - A transaction that returns to the mempool when its block leaves the
-    main chain has the time of that block there, not the time at which the
-    server first saw it, which is no longer kept.
+- **Database version 22: the record of a confirmed transaction is written
+  once**, by the block that confirms it, and is the same on every server
+  that has the block, so that what the chain's column families hold
+  follows from the chain alone.
+  - **Its time is the time of its block.** A server that had seen a
+    transaction in its mempool used to keep the time of that when a block
+    confirmed it: two servers then gave two values of `time` for the same
+    confirmed transaction, which the servers of a fleet must not do. A
+    transaction that returns to the mempool when its block leaves the main
+    chain has the time of that block there.
+  - **The spenders of its outputs are under keys of their own**, in the
+    `spender` column family, sixteen outputs to a key (`SpenderKey`).
+    They were in the record, which each block that spent one of its
+    outputs read and wrote whole again. A spend now reads and writes a
+    value of a few dozen bytes and leaves the record alone.
+  - Reading a confirmed transaction in full takes a second key: 18
+    microseconds where it took 11.5, and 0.8 milliseconds for a hundred
+    where it took 0.4. Lists by address and by xpub cost the same, and so
+    does writing, on the small records of the measurements.
   - A database of version 21 is migrated the first time the store opens
-    it (`migrateTimes`). **It reads every transaction of the database**,
-    since nothing lists those that were first seen in a mempool: 210,000 a
-    second were measured on a small database in memory, so a database of
-    Bitcoin takes hours. The log says how far it is, and it can be
-    interrupted and started again. Records that have the right time are
-    not written.
+    it (`migrateRecords`). **It reads every transaction of the database
+    and writes nearly every one again**, since nothing lists those that
+    need it and most have a spender in them: many hours for a database of
+    Bitcoin, and room for a second copy of its transactions until RocksDB
+    has compacted the first away. The log says how far it is, and it can
+    be interrupted and started again.
   - The tests that run the store through random histories now choose them
     from a database of version 20 that goes through the same
     (`withShadow`). Given a layered database, the chooser found next to

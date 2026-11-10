@@ -26,7 +26,7 @@ import Haskoin
 import Haskoin.Store.Common (Start (..), StoreRead (..))
 import Haskoin.Store.Data (TxData (..), Unspent (..))
 import Haskoin.Store.Database.Mempool qualified as M
-import Haskoin.Store.Database.Migrate (migrateLayered)
+import Haskoin.Store.Database.Migrate (upgradeDatabase)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
@@ -162,7 +162,7 @@ sameHistory ctx net number choices =
                     M.wrongSummaries up `shouldReturn` []
                     layered up (ask hist) `shouldReturn` answers
               half <- foldM (next old new today) ([], hist0) earlier
-              void (migrateLayered up)
+              void (upgradeDatabase (\_ -> return ()) up)
               done@(_, hist) <- foldM (next old new upgraded) half later
               -- pages, of databases that the new rules built or carried on
               -- with, against today's
@@ -182,7 +182,7 @@ sameHistory ctx net number choices =
               shared <- pooled new (\queries -> mapM (answer queries) (kept asked))
               take 2 (differences (kept asked) (kept was) shared) `shouldBe` []
               return done
-            migrated <- openLayered net ctx dirOld $ \old -> migrateLayered old >> everything old
+            migrated <- openLayered net ctx dirOld $ \old -> upgradeDatabase (\_ -> return ()) old >> everything old
             mine <- everything new
             -- the same, but for where the bodies of deleted transactions
             -- are: the layered rules keep none of them in the chain

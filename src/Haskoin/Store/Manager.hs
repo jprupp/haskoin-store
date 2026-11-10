@@ -347,9 +347,9 @@ connectDB cfg f = do
       when (done.moved > 0) $
         logAt LevelInfo (withSource "Database" cfg.logger) $
           "Moved " <> cs (show done.moved) <> " mempool transactions to their own area"
-      when (done.retimed > 0) $
+      when (done.rewritten > 0) $
         logAt LevelInfo (withSource "Database" cfg.logger) $
-          "Gave " <> cs (show done.retimed) <> " confirmed transactions the time of their block"
+          "Wrote the records of " <> cs (show done.rewritten) <> " confirmed transactions again, to be written once"
       f db
 
 -- | Configuration of the block store, from the store configuration.

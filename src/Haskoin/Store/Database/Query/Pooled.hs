@@ -225,7 +225,10 @@ known r pool hs = do
       rest = filter (`Map.notMember` unconfirmed) hs
   chain <- case rest of
     [] -> return Map.empty
-    _ -> Map.fromList . catMaybes . zipWith (fmap . (,)) rest <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey rest)
+    _ -> do
+      found <- catMaybes . zipWith (fmap . (,)) rest <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey rest)
+      -- with the spenders that blocks give to their outputs
+      Map.fromList . zip (map fst found) <$> Q.withChainSpenders r found
   return (Map.mapWithKey (withSpenders spent) (unconfirmed <> Map.mapMaybe notDeleted' chain))
   where
     notDeleted' = notDeleted . Just
@@ -248,7 +251,7 @@ getSpender :: DatabaseReader -> PoolReads -> OutPoint -> IO (Maybe Spender)
 getSpender r pool p =
   pool.spenders [p] >>= \case
     [Just s] -> return (Just s)
-    _ -> Q.getSpender r p
+    _ -> Q.getChainSpender r p
 
 -------------------------------------------------------------------------------
 -- Addresses
