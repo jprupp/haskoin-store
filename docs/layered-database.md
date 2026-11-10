@@ -1071,9 +1071,27 @@ out again after every step and compares it with what Redis holds. The pool
 also keeps the time at which each transaction was first offered, so that
 every store lists it in the same place.
 
-What is left: a request answered from the view at the tip with the pool on
-top; and the process that reports, moves the tip, and offers the store's
-mempool to the pool.
+The queries are written for the chain as it was at a block with a pool on
+top (`Haskoin.Store.Database.Query.Pooled`). They read the chain with the
+code of the layered queries, and the pool through a handful of functions:
+summaries, the entries of an address by the page, bodies, spenders, and the
+list. One more script, `read.lua`, answers those from Redis, each with a
+check that the fleet tip is still the block that the request answers from:
+the pool goes with the tip, and laid over the chain of another block it
+would give a transaction twice or not at all. The tests hold these queries
+to the layered ones, operation by operation and page by page, with the
+store's own mempool area standing in for the pool. A transaction that left
+a mempool unconfirmed is kept by the store that deleted it and by no other,
+so these queries do not know deleted transactions: a page that starts at
+one is empty.
+
+A store that cannot say what the blocks between two tips did, because it
+does not have the old tip or the way is too long, empties the pool when it
+moves the tip, which the script allows only when no other store is live.
+That is how a fleet starts again after all its stores were away.
+
+What is left: the process that reports, moves the tip, and offers the
+store's mempool to the pool, and the web server answering through it.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,

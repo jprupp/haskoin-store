@@ -6,7 +6,7 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Containers.ListUtils (nubOrd, nubOrdOn)
 import Data.IORef (atomicModifyIORef', newIORef)
-import Data.List (sort)
+import Data.List (sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Ord (Down (..))
 import Data.Serialize (decode, encode)
@@ -80,12 +80,85 @@ spec = do
         poolOffer conn keys 4 (Just (block 1)) seven [True] [] `shouldReturn` Taken
         poolBody conn keys (block 7) `shouldReturn` Just "seven"
         -- the tip does not move to a block that the stores do not agree on
-        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) nothing `shouldReturn` Raced
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just nothing) `shouldReturn` Raced
         fleetReport conn keys Nothing 60000 "a" [block 2, block 1] [block 1] `shouldReturn` True
         let confirms = nothing {confirmed = [block 7], spent = [out 0 0]}
-        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) confirms `shouldReturn` MovedTo (block 2)
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
+      it "empties the pool for a store that is alone and does not know the way" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing `shouldReturn` MovedTo (block 1)
+        poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
+        -- with another store live, the tip waits for one that knows
+        fleetReport conn keys (Just 0) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
+        fleetReport conn keys (Just 0) 10 "b" [block 2, block 1] [block 1] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 0) (Just (block 1)) (block 2) Nothing `shouldReturn` Raced
+        map fst <$> poolSpends conn keys `shouldReturn` [block 7]
+        -- the other store's lease runs out
+        fleetReport conn keys (Just 20) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 20) (Just (block 1)) (block 2) Nothing `shouldReturn` MovedTo (block 2)
+        poolSpends conn keys `shouldReturn` []
+        (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
+          `shouldReturn` []
+      it "reads the pool by the page, as it is at the tip that is asked for" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing `shouldReturn` MovedTo (block 1)
+        let tip = Just (block 1)
+            a = address 1
+        -- nine transactions, of which the fifth spends the first output of
+        -- the first two
+        forM_ [0 .. 8] $ \t ->
+          poolOffer conn keys 4 tip (txOf t [out m 0 | t == 4, m <- [0, 1]]) [False | t == 4, _ <- [0, 1 :: Int]] []
+            `shouldReturn` Taken
+        poolRead conn keys 4 Nothing "page" ["0", "0"] `shouldReturn` Nothing
+        -- the list of the pool: newest first, and by id downwards in a second
+        Just listed <- poolRead conn keys 4 tip "page" ["0", "0"]
+        pairs listed `shouldBe` [(block t, time) | (time, t) <- sortOn Down [(timeOf t, t) | t <- [0 .. 8]]]
+        Just some <- poolRead conn keys 4 tip "page" ["2", "3"]
+        pairs some `shouldBe` take 3 (drop 2 (pairs listed))
+        -- an address: its sums, and its transactions from the top and from
+        -- one of them
+        let expected = P.addresses [(block t, timeOf t, entriesOf t [out m 0 | t == 4, m <- [0, 1]]) | t <- [0 .. 8]]
+            mine = expected Map.! a
+            totalled = P.totals mine
+        Just [sums, none] <- poolRead conn keys 4 tip "sums" [a, "nobody"]
+        map (read . C.unpack) (C.words sums)
+          `shouldBe` [ totalled.txs,
+                       totalled.paid,
+                       totalled.paidCount,
+                       totalled.spent,
+                       totalled.spentCount,
+                       totalled.both,
+                       totalled.bothCount
+                     ]
+        none `shouldBe` ""
+        totalled.bothCount `shouldSatisfy` (> 0)
+        Just txs <- poolRead conn keys 4 tip "txs" [a, "", "", "100"]
+        pairs txs `shouldBe` [(t, time) | (time, t) <- mine.txs]
+        forM_ (zip [0 ..] mine.txs) $ \(i, (time, t)) -> do
+          Just from <- poolRead conn keys 4 tip "txs" [a, C.pack (show time), t, "2"]
+          pairs from `shouldBe` take 2 (drop i [(t', time') | (time', t') <- mine.txs])
+        -- a transaction that is not there: from where it would be
+        let (time0, t0) = (fst (last mine.txs), block 99)
+        Just later <- poolRead conn keys 4 tip "txs" [a, C.pack (show time0), t0, "100"]
+        pairs later `shouldBe` [(t, time) | (time, t) <- mine.txs, (Down time, t) >= (Down time0, t0)]
+        -- its outputs, each with whether the pool spends it
+        Just outs <- poolRead conn keys 4 tip "outs" [a, "", "", "100"]
+        [(o, time, C.unpack flag) | [o, time, _, flag] <- chunks 4 outs]
+          `shouldBe` [ (o, C.pack (show time), if Map.member o mine.spent then "1" else "0")
+                     | (time, o, _) <- mine.paid
+                     ]
+        Just [flags] <- poolRead conn keys 4 tip "spent" [a, B.concat [o | (_, o, _) <- mine.paid]]
+        C.unpack flags `shouldBe` [if Map.member o mine.spent then '1' else '0' | (_, o, _) <- mine.paid]
+        -- bodies, spenders with the number of the input, and ids by prefix
+        poolRead conn keys 4 tip "bodies" [block 4 <> block 99] `shouldReturn` Just ["body", ""]
+        poolRead conn keys 4 tip "spenders" [out 1 0 <> out 0 0 <> out 5 0]
+          `shouldReturn` Just [block 4, "1", block 4, "0", "", ""]
+        poolRead conn keys 4 tip "ids" [B.take 3 (block 4)] `shouldReturn` Just (map block [0 .. 8])
+        poolRead conn keys 4 tip "ids" [block 4] `shouldReturn` Just [block 4]
   where
     -- carry a step out in Redis and in the model, and compare
     check conn keys (model, now) = \case
@@ -140,7 +213,7 @@ spec = do
                 change.confirmed
                 change.spent
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) tip target sent `shouldReturn` MovedTo target
+        fleetAdvance conn keys 4 (Just 0) tip target (Just sent) `shouldReturn` MovedTo target
         let model' = P.advance maker change model
         samePool conn keys model'
         return (model', Just target, n + 1)
@@ -168,7 +241,7 @@ spec = do
           scored :: [(ByteString, Double)] -> [(Word64, ByteString)]
           scored rows = [(round (negate s), m) | (m, s) <- rows]
       listed <- list (Redis.zrangeWithscores (key "pool:time") 0 (-1))
-      scored listed `shouldBe` [(time, t) | (Down time, t) <- sort [(Down time, t) | (t, time, _) <- members]]
+      [(round s, t) | (t, s) <- listed] `shouldBe` sort [(time, t) | (t, time, _) <- members]
       forM_ (map address [0 .. 3]) $ \a -> do
         txs <- list (Redis.zrangeWithscores (key ("pool:atx:" <> a)) 0 (-1))
         outs <- list (Redis.zrangeWithscores (key ("pool:aout:" <> a)) 0 (-1))
@@ -202,6 +275,15 @@ spec = do
       leases <- fleetLive conn keys
       Map.keys (Map.filter (> now) (Map.fromList leases)) `shouldBe` Map.keys (live now model)
     lease = 10
+
+-- | The items of a list two by two, each second one a number.
+pairs :: [ByteString] -> [(ByteString, Word64)]
+pairs rows = [(x, read (C.unpack n)) | [x, n] <- chunks 2 rows]
+
+-- | The items of a list so many at a time.
+chunks :: Int -> [a] -> [[a]]
+chunks _ [] = []
+chunks n xs = take n xs : chunks n (drop n xs)
 
 -- | A block of the tests, or a transaction: four bytes.
 block :: Word32 -> ByteString

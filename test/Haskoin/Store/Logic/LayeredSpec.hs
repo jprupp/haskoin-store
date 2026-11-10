@@ -5,6 +5,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Either (isLeft)
 import Data.List (sortOn)
+import Data.Maybe (isJust)
 import Data.Serialize (decode)
 import Haskoin
   ( Block (..),
@@ -22,6 +23,7 @@ import Haskoin
     prepareContext,
     txHash,
   )
+import Haskoin.Store.Common (Start (..), StoreRead (..))
 import Haskoin.Store.Data (TxData (..), Unspent (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Migrate (migrateLayered)
@@ -169,6 +171,16 @@ sameHistory ctx net number choices =
               forM_ [new, up] $ \db -> do
                 now <- layered db (\queries -> mapM (answer queries) asked)
                 take 2 (differences asked was now) `shouldBe` []
+              -- the queries of a fleet do not know deleted transactions, so
+              -- they are not asked for pages that start at one
+              let live queries q = case startOf q of
+                    Just (Just (AtTx h)) -> isJust <$> queries.getTxData h
+                    _ -> return True
+              fair <- layered new (\queries -> mapM (live queries) asked)
+              let kept :: [x] -> [x]
+                  kept xs = [x | (x, True) <- zip xs fair]
+              shared <- pooled new (\queries -> mapM (answer queries) (kept asked))
+              take 2 (differences (kept asked) (kept was) shared) `shouldBe` []
               return done
             migrated <- openLayered net ctx dirOld $ \old -> migrateLayered old >> everything old
             mine <- everything new
@@ -196,6 +208,9 @@ sameHistory ctx net number choices =
           let hist'' = record old hist' op was
           answers <- mixed old (ask hist'')
           layered new (ask hist'') `shouldReturn` answers
+          -- from the queries of a fleet as well, whose pool is here the
+          -- store's own mempool
+          pooled new (ask hist'') `shouldReturn` answers
           third op was hist'' answers :: IO ()
           return (was : outcomes, hist'')
 

@@ -63,6 +63,13 @@ module Haskoin.Store.Database.Query.Layered
     withView,
     layeredRead,
     standaloneRead,
+    viewReader,
+
+    -- * Parts shared with the queries of a fleet
+    From (..),
+    chainTxsC,
+    chainUnspentsC,
+    withSpenders,
 
     -- * Blocks
     getBestBlock,
@@ -203,6 +210,12 @@ import System.Metrics.StatsD (incrementCounter)
 -- areas, read through one RocksDB snapshot. Whatever is written after the
 -- view was taken, the queries on it go on answering from that moment.
 newtype View = View DatabaseReader
+
+-- | The reader of a view: the database as it was at the moment of the
+-- view. The queries of "Haskoin.Store.Database.Query" on it give what the
+-- chain had then.
+viewReader :: View -> DatabaseReader
+viewReader (View r) = r
 
 -- | Run an action with a view of a database as it is now.
 --
@@ -574,7 +587,12 @@ withMempoolIters r from as wanted action = do
 -- address if it has any, then those of the chain, streamed from its index.
 -- Neither is read further than the page goes.
 addressTxsC :: From -> Address -> Maybe Iterator -> Iterator -> ConduitT i TxRef IO ()
-addressTxsC from a mempool it = mapM_ (mempoolTxsC from a) mempool >> (chain .| concatMapC ref)
+addressTxsC from a mempool it = mapM_ (mempoolTxsC from a) mempool >> chainTxsC from a it
+
+-- | Transactions of an address in the chain, newest first, from where a
+-- page starts, streamed from the index of the address.
+chainTxsC :: From -> Address -> Iterator -> ConduitT i TxRef IO ()
+chainTxsC from a it = chain .| concatMapC ref
   where
     chain = case from of
       InChain position -> matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a position)
@@ -641,7 +659,7 @@ addressUnspentsC ::
   ConduitT i Unspent IO ()
 addressUnspentsC r from a summary mempool it = do
   mapM_ (\mit -> fresh mit .| concatMapC created .| hide (maybe 0 (.bothCount) summary)) mempool
-  chain .| concatMapC output .| hide (maybe 0 (\s -> s.spentCount - s.bothCount) summary)
+  chainUnspentsC r from a it .| hide (maybe 0 (\s -> s.spentCount - s.bothCount) summary)
   where
     -- the outputs of the transaction that the page starts at come first
     -- among those of the same second whose hashes are not smaller
@@ -653,11 +671,6 @@ addressUnspentsC r from a summary mempool it = do
     created (MemAddrOutKey _ t p, MemAddrOutVal v s) =
       Just Unspent {block = MemRef t, outpoint = p, value = v, script = s, address = Just a}
     created _ = Nothing
-    chain = case from of
-      InChain position -> matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a position)
-      _ -> matching it (AddrOutKeyA a)
-    output :: (AddrOutKey, OutVal) -> Maybe Unspent
-    output = uncurry (toUnspent r.net r.ctx)
     -- let outputs through, but for those that the mempool spends, of which
     -- there are no more than a number
     hide :: Word64 -> ConduitT Unspent Unspent IO ()
@@ -669,6 +682,18 @@ addressUnspentsC r from a summary mempool it = do
           lift (retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a u.outpoint)) >>= \case
             Just (_ :: MemAddrVal) -> hide (n - 1)
             Nothing -> yield u >> hide n
+
+-- | Unspent outputs of an address in the chain, newest first, from where a
+-- page starts, streamed from the index of the address. Those that the
+-- mempool spends are among them.
+chainUnspentsC :: DatabaseReader -> From -> Address -> Iterator -> ConduitT i Unspent IO ()
+chainUnspentsC r from a it = chain .| concatMapC output
+  where
+    chain = case from of
+      InChain position -> matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a position)
+      _ -> matching it (AddrOutKeyA a)
+    output :: (AddrOutKey, OutVal) -> Maybe Unspent
+    output = uncurry (toUnspent r.net r.ctx)
 
 -------------------------------------------------------------------------------
 -- Mempool

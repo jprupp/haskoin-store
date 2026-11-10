@@ -25,14 +25,20 @@
 --
 -- 'advance': the tip that the store saw or '', the block to move to, the
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
--- bytes, the transactions that are gone, those that are confirmed, the
--- outputs that are spent, the number of transactions that come back, and
--- those transactions. Returns {'moved'}, {'stays'} or {'raced'}.
+-- bytes, '1' to empty the pool instead of changing it or '0', the
+-- transactions that are gone, those that are confirmed, the outputs that
+-- are spent, the number of transactions that come back, and those
+-- transactions. Returns {'moved'}, {'stays'} or {'raced'}. The pool is
+-- emptied for a store that cannot say what the blocks between the two tips
+-- did, and only when no other store is live: {'raced'} otherwise.
 --
 -- What the pool holds for each address, kept in step with its transactions:
 -- its transactions and the outputs paid to it, both ordered newest first,
 -- the outputs of it that are spent, and the sums of all that, which are the
--- summary of Haskoin.Store.Database.Types.MemSummary. An output counts in
+-- summary of Haskoin.Store.Database.Types.MemSummary. It also holds every
+-- transaction by the time it entered a mempool, which is the list of the
+-- mempool, and by its id alone, to find those whose id starts with some
+-- bytes. An output counts in
 -- 'both' while the pool has both the entry that pays it and the entry that
 -- spends it, so it is added by the second to come and taken off by the
 -- first to go.
@@ -48,6 +54,7 @@ local key = {
   kids = prefix .. 'pool:kids:',
   entries = prefix .. 'pool:entries',
   time = prefix .. 'pool:time',
+  ids = prefix .. 'pool:ids',
   atx = prefix .. 'pool:atx:',
   aout = prefix .. 'pool:aout:',
   aval = prefix .. 'pool:aval:',
@@ -169,6 +176,7 @@ local function remove(t)
   account(t, kept[1], kept[2], -1)
   redis.call('HDEL', key.entries, t)
   redis.call('ZREM', key.time, t)
+  redis.call('ZREM', key.ids, t)
   for _, o in ipairs(split(inputs, osize)) do
     redis.call('HDEL', key.spender, o)
     redis.call('SREM', key.kids .. string.sub(o, 1, tsize), t)
@@ -186,7 +194,8 @@ local function insert(tx)
     redis.call('SADD', key.kids .. string.sub(o, 1, tsize), t)
   end
   redis.call('HSET', key.entries, t, cmsgpack.pack({tx.time, tx.entries}))
-  redis.call('ZADD', key.time, -tx.time, t)
+  redis.call('ZADD', key.time, tx.time, t)
+  redis.call('ZADD', key.ids, 0, t)
   account(t, tx.time, tx.entries, 1)
 end
 
@@ -298,10 +307,23 @@ if agreed ~= target then
   return {'raced'}
 end
 
+-- a store that is alone and does not know the way from the old tip starts
+-- the pool again
+if ARGV[8] == '1' then
+  if #live ~= 1 then
+    return {'raced'}
+  end
+  for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do
+    redis.call('DEL', k)
+  end
+  redis.call('SET', key.tip, target)
+  return {'moved'}
+end
+
 -- the abandoned blocks: what can come back does, and what spends the rest
 -- leaves
-local at = 12
-for _ = 1, tonumber(ARGV[11]) do
+local at = 13
+for _ = 1, tonumber(ARGV[12]) do
   local tx
   tx, at = read(at)
   if not member(tx.id) then
@@ -318,7 +340,7 @@ for _ = 1, tonumber(ARGV[11]) do
   end
 end
 local orphaned = {}
-for _, t in ipairs(split(ARGV[8], tsize)) do
+for _, t in ipairs(split(ARGV[9], tsize)) do
   for _, kid in ipairs(redis.call('SMEMBERS', key.kids .. t)) do
     orphaned[#orphaned + 1] = kid
   end
@@ -327,11 +349,11 @@ withdraw(orphaned)
 
 -- the new blocks: what they confirm leaves alone, and what spends what they
 -- spend leaves with all that spends it
-for _, t in ipairs(split(ARGV[9], tsize)) do
+for _, t in ipairs(split(ARGV[10], tsize)) do
   remove(t)
 end
 local clashing = {}
-for _, o in ipairs(split(ARGV[10], osize)) do
+for _, o in ipairs(split(ARGV[11], osize)) do
   local s = redis.call('HGET', key.spender, o)
   if s then
     clashing[#clashing + 1] = s

@@ -279,6 +279,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the outputs paid to it in the order of a list, the outputs of it that are
   spent, and their sums, so that a balance is one read and a list is read
   by the page, as in a store's own mempool area.
+- `Haskoin.Store.Database.Query.Pooled`: the queries of the store with a
+  mempool that is not its own on top of the chain, for the shared pool of a
+  fleet. `read.lua` and `poolRead` read that pool from Redis, each read
+  with a check that the fleet tip has not moved. The tests hold these
+  queries to those of the layered layout with the store's own mempool as
+  the pool. `fleetAdvance` can empty the pool for a store that is alone and
+  does not know the way from the old tip.
 - `Haskoin.Store.Database.Views` keeps the database as it was at each recent
   block, a RocksDB snapshot for each, so that a store can answer from the
   block that its fleet agrees on and not only from its newest. Views that

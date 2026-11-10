@@ -74,6 +74,7 @@ module Haskoin.Store.Fleet.Redis
     fleetAdvance,
     poolSpends,
     poolBody,
+    poolRead,
   )
 where
 
@@ -246,6 +247,13 @@ poolWithdraw conn keys tsize ts =
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the
 -- live stores agree on, and what the blocks in between did.
+--
+-- A store that cannot say what they did, because it does not have the old
+-- tip or because the way from it is too long, gives 'Nothing', and the pool
+-- is emptied: but only if no other store is live, as when a fleet comes
+-- back after all its stores were away. The stores then offer their mempools
+-- to the empty pool. With another store live the answer is 'Raced', and
+-- the tip waits for a store that knows the way.
 fleetAdvance ::
   Connection ->
   FleetKeys ->
@@ -253,9 +261,9 @@ fleetAdvance ::
   Maybe Time ->
   Maybe ByteString ->
   ByteString ->
-  PoolChange ->
+  Maybe PoolChange ->
   IO Moved
-fleetAdvance conn keys tsize clock seen target change =
+fleetAdvance conn keys tsize clock seen target known =
   run conn (R.eval poolScript [] args) >>= \case
     ["moved"] -> return (MovedTo target)
     ["stays"] -> return Stays
@@ -264,9 +272,22 @@ fleetAdvance conn keys tsize clock seen target change =
   where
     args =
       ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size]
+        <> [maybe "1" (const "0") known]
         <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
         <> [num (length change.returned)]
         <> concatMap txArgs change.returned
+
+    change = maybe (PoolChange [] [] [] []) id known
+
+-- | Read from the pool as it is at a tip: given the size of a transaction
+-- id, the tip that the caller answers from, what to read and its arguments,
+-- as @read.lua@ takes them. 'Nothing' if the tip is another one by now.
+poolRead :: Connection -> FleetKeys -> Int -> Maybe ByteString -> ByteString -> [ByteString] -> IO (Maybe [ByteString])
+poolRead conn keys tsize tip what args =
+  run conn (R.eval readScript [] (what : keys.prefix : num tsize : maybe "" id tip : args)) >>= \case
+    "ok" : rows -> return (Just rows)
+    ["raced"] -> return Nothing
+    other -> fail ("Unexpected answer of the read script: " <> show (take 1 other))
 
 -- | A transaction as the arguments of the pool script.
 txArgs :: PoolTx -> [ByteString]
@@ -308,6 +329,11 @@ reportScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/report.lua" 
 -- | 'Haskoin.Store.Fleet.move'.
 moveScript :: ByteString
 moveScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/move.lua" >>= embedFile)
+
+-- | What a store reads from the pool, each read with a check that the tip
+-- is the one that the store answers from.
+readScript :: ByteString
+readScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/read.lua" >>= embedFile)
 
 -- | 'Haskoin.Store.Fleet.Pool.offer', 'Haskoin.Store.Fleet.Pool.withdraw',
 -- and 'Haskoin.Store.Fleet.Pool.advance' with the move of the tip.

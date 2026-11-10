@@ -41,6 +41,7 @@ module Haskoin.Store.Histories
     -- * Answers
     mixed,
     layered,
+    pooled,
     Answers (..),
     ask,
 
@@ -127,6 +128,7 @@ import Haskoin.Store.Data
   )
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Database.Query.Pooled qualified as P
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     addrOutCF,
@@ -487,9 +489,12 @@ plan db hist0 seed = (hist,) <$> chosen
 -- | Run an action with the queries of a database: those of today's layout,
 -- where one set of indices has the chain and the mempool mixed, or those of
 -- the layered layout, on a view of the database as it is now.
-mixed, layered :: DatabaseReader -> (StoreRead -> IO a) -> IO a
+mixed, layered, pooled :: DatabaseReader -> (StoreRead -> IO a) -> IO a
 mixed db action = action (Q.databaseRead db)
 layered db action = L.withView db (action . L.layeredRead)
+-- the queries of a fleet, with the store's own mempool area as the pool
+pooled db action = L.withView db $ \v ->
+  let r = L.viewReader v in action (P.pooledRead r (P.localPool r))
 
 -- | Everything that the API could say about a history, in whole lists.
 data Answers = Answers
