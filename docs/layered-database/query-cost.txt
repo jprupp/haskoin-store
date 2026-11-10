@@ -393,3 +393,63 @@ balances of 100 addresses: the mempool's part                              263.0
   100 keys that are not there, in one multi-get                             90.4
 busiest address: its mempool entries, read and decoded                   10160.0
   the same entries, read and not decoded                                  6734.9
+
+##### gets and multi-gets, with rocksdb-haskell-jprupp 2.6.4
+parts of the times on the right, each in a snapshot of the layered database
+a snapshot, taken and released                                               3.6
+balances of 100 addresses: the chain's part                                247.7
+balances of 100 addresses: the mempool's part                              267.9
+  100 seeks of one iterator that find nothing                              202.5
+  100 keys that are not there, in one multi-get                             84.4
+  the same 100 keys, a get for each                                        225.7
+  the same 100 keys, in multi-gets of 1                                    342.3
+  the same 100 keys, in multi-gets of 2                                    222.9
+  the same 100 keys, in multi-gets of 4                                    141.1
+  the same 100 keys, in multi-gets of 8                                    109.6
+  the same 100 keys, in multi-gets of 16                                    92.1
+100 balances of the chain, in one multi-get                                213.1
+  the same 100 balances, a get for each                                    376.4
+  the same 100 balances, in multi-gets of 2                                362.7
+  the same 100 balances, in multi-gets of 4                                273.3
+  the same 100 balances, in multi-gets of 8                                237.4
+busiest address: its mempool entries, read and decoded                   10199.3
+  the same entries, read and not decoded                                  6867.6
+
+
+Output of scripts/bench-web.sh 1000 5s 8, 2026-11-10, with wrk in a container.
+
+##### before the switch: commit 1a99590c, database version 20, binding 2.6.3
+health            21774.29 req/s  p50 363.00us  p99 510.00us  cpu   0.070 ms/req non-2xx 111046
+block-best        22064.04 req/s  p50 389.00us  p99 648.00us  cpu   0.077 ms/req 
+block-latest       1720.72 req/s  p50   4.66ms  p99  10.26ms  cpu   1.326 ms/req 
+block-txs          3922.75 req/s  p50   2.07ms  p99   3.44ms  cpu   0.433 ms/req 
+tx                17751.10 req/s  p50 503.00us  p99   1.11ms  cpu   0.093 ms/req 
+addr-balance      21243.55 req/s  p50 371.00us  p99 640.00us  cpu   0.075 ms/req 
+addr-txs           4981.05 req/s  p50   1.61ms  p99   3.64ms  cpu   0.443 ms/req 
+addr-txs-full       663.28 req/s  p50  11.36ms  p99  26.16ms  cpu   3.684 ms/req 
+addr-unspent       2398.47 req/s  p50   3.49ms  p99   6.58ms  cpu   0.893 ms/req 
+xpub-summary       6232.83 req/s  p50   1.33ms  p99   2.91ms  cpu   0.358 ms/req 
+xpub-txs           1762.05 req/s  p50   4.28ms  p99  10.87ms  cpu   1.485 ms/req 
+xpub-txs-full       955.38 req/s  p50   7.92ms  p99  18.90ms  cpu   2.706 ms/req 
+xpub-unspent        949.79 req/s  p50   8.01ms  p99  20.36ms  cpu   2.604 ms/req 
+binfo-multiaddr      62.17 req/s  p50 122.11ms  p99 227.41ms  cpu  46.399 ms/req 
+binfo-rawaddr       929.30 req/s  p50   8.07ms  p99  20.55ms  cpu   2.783 ms/req 
+binfo-unspent       651.17 req/s  p50  11.45ms  p99  29.17ms  cpu   4.188 ms/req
+
+##### now: database version 21, binding 2.6.4
+health            21014.58 req/s  p50 404.00us  p99 825.00us  cpu   0.076 ms/req non-2xx 107173
+block-best        21518.56 req/s  p50 418.00us  p99   0.94ms  cpu   0.081 ms/req 
+block-latest       1639.87 req/s  p50   5.10ms  p99  10.32ms  cpu   1.339 ms/req 
+block-txs          3755.75 req/s  p50   2.19ms  p99   3.58ms  cpu   0.478 ms/req 
+tx                15873.25 req/s  p50 576.00us  p99   1.57ms  cpu   0.111 ms/req 
+addr-balance      18310.01 req/s  p50 441.00us  p99 668.00us  cpu   0.089 ms/req 
+addr-txs           5629.87 req/s  p50   1.54ms  p99   2.72ms  cpu   0.358 ms/req 
+addr-txs-full       620.19 req/s  p50  12.22ms  p99  30.27ms  cpu   3.975 ms/req 
+addr-unspent       1975.29 req/s  p50   4.03ms  p99   6.25ms  cpu   0.896 ms/req 
+xpub-summary       4262.98 req/s  p50   1.91ms  p99   4.54ms  cpu   0.528 ms/req 
+xpub-txs           1677.74 req/s  p50   4.54ms  p99  10.77ms  cpu   1.507 ms/req 
+xpub-txs-full       860.45 req/s  p50   8.76ms  p99  20.15ms  cpu   2.972 ms/req 
+xpub-unspent        900.41 req/s  p50   8.33ms  p99  20.47ms  cpu   2.675 ms/req 
+binfo-multiaddr      95.90 req/s  p50  80.11ms  p99 136.79ms  cpu  29.479 ms/req 
+binfo-rawaddr       790.06 req/s  p50  10.09ms  p99  20.85ms  cpu   2.966 ms/req 
+binfo-unspent       527.22 req/s  p50  14.40ms  p99  30.80ms  cpu   4.865 ms/req

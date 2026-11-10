@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- One key of a column family is read with a read, not with a multi-get of
+  one key, which measured half as much again.
 - Built with `rocksdb-haskell-jprupp` 2.6.4, which reads the key and the
   value of a row of an iterator without the cost of a safe foreign call.
   Every list and every count takes between a half and a third of the time:

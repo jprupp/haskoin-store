@@ -89,6 +89,7 @@ import Database.RocksDB
   ( ColumnFamily,
     DB,
     Property (..),
+    getCF,
     getPropertyCF,
     iterEntry,
     iterNext,
@@ -124,7 +125,7 @@ import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Database.Types (AddrTxKey (..), MemAddrKey (..))
+import Haskoin.Store.Database.Types (AddrTxKey (..), BalKey (..), MemAddrKey (..))
 import Haskoin.Store.Database.Writer (Writer, runWriter)
 import Haskoin.Store.Logic qualified as Mixed
 import Haskoin.Store.Logic.Layered qualified as Layered
@@ -502,6 +503,23 @@ time ctx bloom dirOld dirNew =
           length . filter id <$> mapM (\k -> iterSeek it k >> iterValid it) (pick calmKeys i)
       part "  100 keys that are not there, in one multi-get" $ \r i ->
         length . filter (/= Nothing) <$> multiGetCF r.db (family r) (pick calmKeys i)
+      -- a multi-get against a get for each key, to find how many keys it
+      -- takes for one to be worth it
+      let chunks n xs = if null xs then [] else take n xs : chunks n (drop n xs)
+          found = length . filter (/= Nothing)
+          balanceKeys = windows (map (encode . BalKey) calmOnes)
+      part "  the same 100 keys, a get for each" $ \r i ->
+        found <$> mapM (getCF r.db (family r)) (pick calmKeys i)
+      forM_ [1, 2, 4, 8, 16] $ \n ->
+        part ("  the same 100 keys, in multi-gets of " <> show n) $ \r i ->
+          found . concat <$> mapM (multiGetCF r.db (family r)) (chunks n (pick calmKeys i))
+      part "100 balances of the chain, in one multi-get" $ \r i ->
+        found <$> multiGetCF r.db (balanceCF r.db) (pick balanceKeys i)
+      part "  the same 100 balances, a get for each" $ \r i ->
+        found <$> mapM (getCF r.db (balanceCF r.db)) (pick balanceKeys i)
+      forM_ [2, 4, 8] $ \n ->
+        part ("  the same 100 balances, in multi-gets of " <> show n) $ \r i ->
+          found . concat <$> mapM (multiGetCF r.db (balanceCF r.db)) (chunks n (pick balanceKeys i))
       part "busiest address: its mempool entries, read and decoded" $ \r _ ->
         entries <$> M.getAddressMempool r busiest
       part "  the same entries, read and not decoded" $ \r _ ->

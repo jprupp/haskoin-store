@@ -966,6 +966,53 @@ filters:
   read a batch ahead to give one output; asking one at a time made a busy
   address a third slower.
 
+- **One key is read by itself.** A multi-get costs about 2.6 microseconds
+  to set up and 0.8 for each key that is not there, and a read of one such
+  key 2.3, so a multi-get of one key was the slow way to read it, and a
+  request about one transaction or one address made two or three.
+
+#### The web server, before and after
+
+`scripts/bench-web.sh` runs the store's web server on a synthetic chain of
+1,000 blocks, with an empty mempool, and asks it one kind of request at a
+time with eight connections. Milliseconds of the server's CPU for each
+request, for the store as it was before the switch (version 20 of the
+database, binding 2.6.3, one set of queries built when the server starts)
+and as it is now (version 21, binding 2.6.4, a view and its queries for
+each request):
+
+| Request | Before | Now | |
+|---|---|---|---|
+| `/health` | 0.070 | 0.076 | +9% |
+| `/block/best` | 0.077 | 0.081 | +5% |
+| `/transaction/:txid` | 0.093 | 0.111 | +19% |
+| `/address/:a/balance` | 0.075 | 0.089 | +19% |
+| `/address/:a/transactions`, 100 | 0.443 | 0.358 | -19% |
+| `/address/:a/transactions/full`, 100 | 3.684 | 3.975 | +8% |
+| `/address/:a/unspent`, 100 | 0.893 | 0.896 | |
+| `/xpub/:x` | 0.358 | 0.528 | +47% |
+| `/xpub/:x/transactions`, 100 | 1.485 | 1.507 | +1% |
+| `/xpub/:x/transactions/full`, 50 | 2.706 | 2.972 | +10% |
+| `/xpub/:x/unspent`, 100 | 2.604 | 2.675 | +3% |
+| `/blockchain/multiaddr` | 46.4 | 29.5 | -36% |
+| `/blockchain/rawaddr/:a` | 2.783 | 2.966 | +7% |
+| `/blockchain/unspent` | 4.188 | 4.865 | +16% |
+
+- **A request costs about 5 microseconds more before it reads anything**:
+  its view, and the queries and routes made for it.
+- **What is read by key costs a key more**: 14 to 18 microseconds for a
+  balance or a transaction, in requests that take 75 to 95 with their HTTP.
+- **Lists by address are faster or the same**, since the faster rows of
+  the binding make up for the second area, and what counts transactions is
+  much faster.
+- **Balances of a wallet are where the second area shows most**: one more
+  key for each of some 260 addresses, 0.64 microseconds each, in a request
+  that otherwise reads 260 balances. The same key for each output of each
+  transaction is what full transactions cost more.
+- **The mempool was empty**, so this is the price of asking the mempool
+  area and finding nothing, which is what most of a real store's requests
+  do. With things in the mempool, see the tables above.
+
 The summary is paid for when writing. Microseconds for each transaction:
 
 | | Version 20 | Layered, without summaries | Layered, now |

@@ -118,6 +118,7 @@ import Database.RocksDB
     ColumnFamily,
     DB,
     Iterator,
+    getCF,
     iterFirst,
     iterKey,
     iterNext,
@@ -462,8 +463,12 @@ summaryBalance a chain (Just s) = Just (applySummary (fromMaybe (zeroBalance a) 
 -- which is nearly all of them, and which the filter of the column family
 -- answers.
 getSummaries :: DatabaseReader -> [Address] -> IO [Maybe MemSummary]
-getSummaries _ [] = return []
-getSummaries r as = map (>>= decoded) <$> multiGetCF r.db (mempoolAddrCF r.db) (map (encode . MemAddrSumKey) as)
+getSummaries r as =
+  map (>>= decoded) <$> case map (encode . MemAddrSumKey) as of
+    [] -> return []
+    -- one key is cheaper to read by itself than in a multi-get
+    [key] -> pure <$> getCF r.db (mempoolAddrCF r.db) key
+    keys -> multiGetCF r.db (mempoolAddrCF r.db) keys
   where
     decoded bytes = case decode bytes of
       Right (MemAddrSumVal s) -> Just s

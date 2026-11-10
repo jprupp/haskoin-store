@@ -107,6 +107,7 @@ import Database.RocksDB
     Iterator,
     createIterator,
     destroyIterator,
+    getCF,
     iterKey,
     iterLast,
     iterNext,
@@ -579,7 +580,14 @@ gauge r n = count r $ \s ->
 
 -- | Values of many keys of a column family, read with one multi-get, in
 -- the order of the keys.
+--
+-- One key is read by itself. A multi-get costs about as much as a read to
+-- set up and a third of one for each key, by the measurements in
+-- @docs\/layered-database.md@, so it is the slower way to read one key, and
+-- most requests about one transaction or one address ask for one.
 retrieveManyCF :: (Serialize key, Serialize value) => DB -> ColumnFamily -> [key] -> IO [Maybe value]
+retrieveManyCF _ _ [] = return []
+retrieveManyCF db cf [key] = pure . fmap (either error id . decode) <$> getCF db cf (encode key)
 retrieveManyCF db cf keys =
   map (fmap (either error id . decode)) <$> multiGetCF db cf (map encode keys)
 
