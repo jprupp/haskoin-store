@@ -7,20 +7,35 @@
 -- that made it and four more bytes. Lists are their items one after the
 -- other.
 --
--- 'offer': the tip that the store saw or '', the transaction, the outputs
--- that it spends, a string with '1' for each of them that the store finds
--- unspent at the tip and '0' for the others, its body, and the transactions
--- that it replaces. Returns {'taken'}, {'known'}, {'conflict', ...},
+-- A transaction is given as its id, the time it entered a mempool, the
+-- outputs that it spends, its body, the number of its entries by address,
+-- and then five arguments for each entry: its kind, the address, an output
+-- or '', an amount or '', and a script or ''. The kinds are 't', the
+-- transaction touches the address; 's', it spends that output of the
+-- address, of that amount; and 'o', it pays that output to the address,
+-- with that amount and script.
+--
+-- 'offer': the tip that the store saw or '', a string with '1' for each
+-- output that the transaction spends and that the store finds unspent at
+-- the tip and '0' for the others, the transactions that it replaces, and
+-- the transaction. Returns {'taken'}, {'known'}, {'conflict', ...},
 -- {'orphan', ...} or {'raced'}.
 --
 -- 'withdraw': the transactions. Returns those that left.
 --
 -- 'advance': the tip that the store saw or '', the block to move to, the
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
--- bytes, the number of transactions that come back, then for each of them
--- its id, the outputs that it spends and its body, and then the
--- transactions that are gone, those that are confirmed, and the outputs
--- that are spent. Returns {'moved'}, {'stays'} or {'raced'}.
+-- bytes, the transactions that are gone, those that are confirmed, the
+-- outputs that are spent, the number of transactions that come back, and
+-- those transactions. Returns {'moved'}, {'stays'} or {'raced'}.
+--
+-- What the pool holds for each address, kept in step with its transactions:
+-- its transactions and the outputs paid to it, both ordered newest first,
+-- the outputs of it that are spent, and the sums of all that, which are the
+-- summary of Haskoin.Store.Database.Types.MemSummary. An output counts in
+-- 'both' while the pool has both the entry that pays it and the entry that
+-- spends it, so it is added by the second to come and taken off by the
+-- first to go.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local osize = tsize + 4
 local key = {
@@ -30,7 +45,14 @@ local key = {
   spends = prefix .. 'pool:spends',
   spender = prefix .. 'pool:spender',
   body = prefix .. 'pool:body',
-  kids = prefix .. 'pool:kids:'
+  kids = prefix .. 'pool:kids:',
+  entries = prefix .. 'pool:entries',
+  time = prefix .. 'pool:time',
+  atx = prefix .. 'pool:atx:',
+  aout = prefix .. 'pool:aout:',
+  aval = prefix .. 'pool:aval:',
+  aspent = prefix .. 'pool:aspent:',
+  asum = prefix .. 'pool:asum:'
 }
 
 local function split(s, n)
@@ -66,12 +88,87 @@ local function descendants(from)
   return order, seen
 end
 
+-- a transaction of the arguments, from a position, and the position after
+-- it
+local function read(at)
+  local tx = {id = ARGV[at], time = tonumber(ARGV[at + 1]), inputs = ARGV[at + 2], body = ARGV[at + 3]}
+  local entries = {}
+  local n = tonumber(ARGV[at + 4])
+  at = at + 5
+  for i = 1, n do
+    entries[i] = {ARGV[at], ARGV[at + 1], ARGV[at + 2], ARGV[at + 3], ARGV[at + 4]}
+    at = at + 5
+  end
+  tx.entries = entries
+  return tx, at
+end
+
+local function add(a, field, by)
+  redis.call('HINCRBY', key.asum .. a, field, string.format('%.0f', by))
+end
+
+-- put the entries of a transaction in, with sign 1, or take them out, with
+-- sign -1
+local function account(t, time, entries, sign)
+  local touched = {}
+  for _, e in ipairs(entries) do
+    local kind, a, o, v = e[1], e[2], e[3], tonumber(e[4])
+    touched[a] = true
+    if kind == 't' then
+      if sign > 0 then
+        redis.call('ZADD', key.atx .. a, -time, t)
+      else
+        redis.call('ZREM', key.atx .. a, t)
+      end
+      add(a, 'txs', sign)
+    elseif kind == 's' then
+      if sign > 0 then
+        redis.call('HSET', key.aspent .. a, o, e[4])
+      else
+        redis.call('HDEL', key.aspent .. a, o)
+      end
+      add(a, 'spent', sign * v)
+      add(a, 'spentCount', sign)
+      if redis.call('HEXISTS', key.aval .. a, o) == 1 then
+        add(a, 'both', sign * v)
+        add(a, 'bothCount', sign)
+      end
+    else
+      if sign > 0 then
+        redis.call('ZADD', key.aout .. a, -time, o)
+        redis.call('HSET', key.aval .. a, o, e[4] .. ' ' .. e[5])
+      else
+        redis.call('ZREM', key.aout .. a, o)
+        redis.call('HDEL', key.aval .. a, o)
+      end
+      add(a, 'paid', sign * v)
+      add(a, 'paidCount', sign)
+      if redis.call('HEXISTS', key.aspent .. a, o) == 1 then
+        add(a, 'both', sign * v)
+        add(a, 'bothCount', sign)
+      end
+    end
+  end
+  -- an address that no transaction touches has no summary
+  if sign < 0 then
+    for a, _ in pairs(touched) do
+      if tonumber(redis.call('HGET', key.asum .. a, 'txs')) == 0 then
+        redis.call('DEL', key.asum .. a)
+      end
+    end
+  end
+end
+
 -- take one transaction out, leaving what spends it
 local function remove(t)
   local inputs = redis.call('HGET', key.spends, t)
   if not inputs then
     return
   end
+  local kept = cmsgpack.unpack(redis.call('HGET', key.entries, t))
+  account(t, kept[1], kept[2], -1)
+  redis.call('HDEL', key.entries, t)
+  redis.call('ZREM', key.time, t)
   for _, o in ipairs(split(inputs, osize)) do
     redis.call('HDEL', key.spender, o)
     redis.call('SREM', key.kids .. string.sub(o, 1, tsize), t)
@@ -80,13 +177,17 @@ local function remove(t)
   redis.call('HDEL', key.body, t)
 end
 
-local function insert(t, inputs, body)
-  redis.call('HSET', key.spends, t, inputs)
-  redis.call('HSET', key.body, t, body)
-  for _, o in ipairs(split(inputs, osize)) do
+local function insert(tx)
+  local t = tx.id
+  redis.call('HSET', key.spends, t, tx.inputs)
+  redis.call('HSET', key.body, t, tx.body)
+  for _, o in ipairs(split(tx.inputs, osize)) do
     redis.call('HSET', key.spender, o, t)
     redis.call('SADD', key.kids .. string.sub(o, 1, tsize), t)
   end
+  redis.call('HSET', key.entries, t, cmsgpack.pack({tx.time, tx.entries}))
+  redis.call('ZADD', key.time, -tx.time, t)
+  account(t, tx.time, tx.entries, 1)
 end
 
 local function withdraw(from)
@@ -107,12 +208,14 @@ if tip ~= ARGV[4] then
 end
 
 if what == 'offer' then
-  local t, inputs, flags, body = ARGV[5], split(ARGV[6], osize), ARGV[7], ARGV[8]
+  local flags = ARGV[5]
+  local tx = read(7)
+  local t, inputs = tx.id, split(tx.inputs, osize)
   if member(t) then
     return {'known'}
   end
   -- what it replaces leaves first, but only if it is taken
-  local leaving, left = descendants(split(ARGV[9], tsize))
+  local leaving, left = descendants(split(ARGV[6], tsize))
   local rivals, counted = {}, {}
   for _, o in ipairs(inputs) do
     local s = redis.call('HGET', key.spender, o)
@@ -139,7 +242,7 @@ if what == 'offer' then
   for _, gone in ipairs(leaving) do
     remove(gone)
   end
-  insert(t, ARGV[6], body)
+  insert(tx)
   return {'taken'}
 end
 
@@ -197,24 +300,25 @@ end
 
 -- the abandoned blocks: what can come back does, and what spends the rest
 -- leaves
-local at = 9
-for _ = 1, tonumber(ARGV[8]) do
-  if not member(ARGV[at]) then
+local at = 12
+for _ = 1, tonumber(ARGV[11]) do
+  local tx
+  tx, at = read(at)
+  if not member(tx.id) then
     -- it was confirmed: what spends the same in the pool gives way
     local rivals = {}
-    for _, o in ipairs(split(ARGV[at + 1], osize)) do
+    for _, o in ipairs(split(tx.inputs, osize)) do
       local s = redis.call('HGET', key.spender, o)
       if s then
         rivals[#rivals + 1] = s
       end
     end
     withdraw(rivals)
-    insert(ARGV[at], ARGV[at + 1], ARGV[at + 2])
+    insert(tx)
   end
-  at = at + 3
 end
 local orphaned = {}
-for _, t in ipairs(split(ARGV[at], tsize)) do
+for _, t in ipairs(split(ARGV[8], tsize)) do
   for _, kid in ipairs(redis.call('SMEMBERS', key.kids .. t)) do
     orphaned[#orphaned + 1] = kid
   end
@@ -223,11 +327,11 @@ withdraw(orphaned)
 
 -- the new blocks: what they confirm leaves alone, and what spends what they
 -- spend leaves with all that spends it
-for _, t in ipairs(split(ARGV[at + 1], tsize)) do
+for _, t in ipairs(split(ARGV[9], tsize)) do
   remove(t)
 end
 local clashing = {}
-for _, o in ipairs(split(ARGV[at + 2], osize)) do
+for _, o in ipairs(split(ARGV[10], osize)) do
   local s = redis.call('HGET', key.spender, o)
   if s then
     clashing[#clashing + 1] = s

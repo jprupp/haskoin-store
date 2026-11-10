@@ -274,7 +274,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   changing the pool in one step, and is compared with them step by step in a
   real Redis like the others; the comparison found a case that the rules had
   left open, a transaction that comes back from an abandoned block and
-  spends what the pool already spends, which now wins.
+  spends what the pool already spends, which now wins. The pool also keeps,
+  for each address, what its transactions do there: the transactions and
+  the outputs paid to it in the order of a list, the outputs of it that are
+  spent, and their sums, so that a balance is one read and a list is read
+  by the page, as in a store's own mempool area.
 - `Haskoin.Store.Database.Views` keeps the database as it was at each recent
   block, a RocksDB snapshot for each, so that a store can answer from the
   block that its fleet agrees on and not only from its newest. Views that

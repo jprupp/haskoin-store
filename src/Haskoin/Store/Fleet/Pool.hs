@@ -73,14 +73,23 @@ module Haskoin.Store.Fleet.Pool
     -- * Following the tip
     Change (..),
     advance,
+
+    -- * What the pool holds for each address
+    Entry (..),
+    AddressPool (..),
+    Totals (..),
+    addresses,
+    totals,
   )
 where
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
+import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.Word (Word64)
 
 -- | The shared mempool, for transactions of type @t@ and outputs of type
 -- @o@. The second and third fields follow from the first, and are kept so
@@ -214,3 +223,78 @@ advance maker change pool0 = clashed
     alive = withdraw orphaned back
     settled = foldl' (flip remove) alive change.confirmed
     clashed = withdraw (mapMaybe (`Map.lookup` settled.spender) change.spent) settled
+
+-- | What a transaction does at an address, for addresses of type @a@: the
+-- entries by address of "Haskoin.Store.Database.Mempool", which a store
+-- works out from the transaction alone and gives to the pool with it.
+data Entry a o
+  = -- | it spends from the address or pays to it
+    Touches !a
+  | -- | it spends this output of the address, of this amount
+    Spends !a !o !Word64
+  | -- | it pays this output to the address, with this amount
+    Pays !a !o !Word64
+  deriving (Eq, Show)
+
+-- | What the pool holds for an address: the union of the entries of its
+-- transactions at that address, in the order in which queries list them.
+data AddressPool t o = AddressPool
+  { -- | the transactions that touch it with the time each entered a
+    -- mempool, newest first, and in the order of their ids within a time
+    txs :: ![(Word64, t)],
+    -- | the outputs paid to it, in the same order, with their amounts
+    paid :: ![(Word64, o, Word64)],
+    -- | the outputs of it that are spent, with their amounts
+    spent :: !(Map o Word64)
+  }
+  deriving (Eq, Show)
+
+-- | The sums that the pool keeps for an address, so that a balance does
+-- not take reading its entries: the summary of
+-- 'Haskoin.Store.Database.Types.MemSummary'.
+data Totals = Totals
+  { txs :: !Word64,
+    paid :: !Word64,
+    paidCount :: !Word64,
+    spent :: !Word64,
+    spentCount :: !Word64,
+    -- | amount of the outputs that the pool both pays and spends
+    both :: !Word64,
+    bothCount :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | What a pool holds for each address, given its transactions, each with
+-- the time it entered a mempool and its entries. This is the specification
+-- of what "Haskoin.Store.Fleet.Redis" keeps up to date as transactions come
+-- and go: it depends on which transactions are in the pool and on nothing
+-- else, so the tests work it out again after every step and compare.
+addresses :: (Ord a, Ord t, Ord o) => [(t, Word64, [Entry a o])] -> Map a (AddressPool t o)
+addresses members = Map.map ordered (Map.fromListWith merge (concatMap single members))
+  where
+    single (t, time, entries) = map (one t time) entries
+    one t time = \case
+      Touches a -> (a, AddressPool [(time, t)] [] Map.empty)
+      Spends a o v -> (a, AddressPool [] [] (Map.singleton o v))
+      Pays a o v -> (a, AddressPool [] [(time, o, v)] Map.empty)
+    merge x y = AddressPool (x.txs <> y.txs) (x.paid <> y.paid) (Map.union x.spent y.spent)
+    ordered p =
+      AddressPool
+        (Map.elems (Map.fromList [((Down time, t), (time, t)) | (time, t) <- p.txs]))
+        (Map.elems (Map.fromList [((Down time, o), (time, o, v)) | (time, o, v) <- p.paid]))
+        p.spent
+
+-- | The sums of what a pool holds for an address.
+totals :: (Ord o) => AddressPool t o -> Totals
+totals p =
+  Totals
+    { txs = fromIntegral (length p.txs),
+      paid = sum [v | (_, _, v) <- p.paid],
+      paidCount = fromIntegral (length p.paid),
+      spent = sum (Map.elems p.spent),
+      spentCount = fromIntegral (Map.size p.spent),
+      both = sum inside,
+      bothCount = fromIntegral (length inside)
+    }
+  where
+    inside = [v | (_, o, v) <- p.paid, Map.member o p.spent]

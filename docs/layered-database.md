@@ -1055,15 +1055,25 @@ moving the tip and changing the pool in one step. No store uses any of it.
 
 On the store's side, `Haskoin.Store.Database.Views` keeps a snapshot of the
 database for each recent block and releases those that the rules no longer
-ask for. The rest is not started, and comes after the switch to the layered
-layout: the snapshot of a block in today's layout has the store's own
-mempool mixed into the chain's indices, and nothing can be laid on top of
-that. In order: the read path of the mempool area fixed as
-[the measurements ask](#what-has-to-change-before-the-switch); the switch;
-the entries and the summary of each address in the shared pool, which a
-query about an address needs and the pool does not have yet; a request
-answered from the view at the tip with the pool on top; and the process
-that reports, moves the tip, and offers the store's mempool to the pool.
+ask for. The store runs on the layered layout, which this needs: the
+snapshot of a block in the layout of version 20 has the store's own mempool
+mixed into the chain's indices, and nothing can be laid on top of that.
+
+The pool has what a query about an address needs. A store gives each
+transaction to the pool with its entries by address, the same ones that it
+writes to its own mempool area, and the script keeps, for each address, its
+transactions and the outputs paid to it in the order of a list, the outputs
+of it that are spent, and the sums of those, which are the summary of
+[the local read path](#1-a-summary-for-each-address-that-the-mempool-touches).
+`Haskoin.Store.Fleet.Pool` says what that should be for any set of
+transactions (`addresses`, `totals`), and the test of the script works it
+out again after every step and compares it with what Redis holds. The pool
+also keeps the time at which each transaction was first offered, so that
+every store lists it in the same place.
+
+What is left: a request answered from the view at the tip with the pool on
+top; and the process that reports, moves the tip, and offers the store's
+mempool to the pool.
 
 The aim is stronger than the cache design above: stores that share a Redis
 should give the same answer to the same request at the same time, always,

@@ -8,9 +8,10 @@ import Data.Containers.ListUtils (nubOrd, nubOrdOn)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
-import Data.Serialize (encode)
+import Data.Ord (Down (..))
+import Data.Serialize (decode, encode)
 import Data.Set qualified as Set
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin.Store.Fleet (Time, empty, live, mayReport, move, report)
 import Haskoin.Store.Fleet qualified as F
@@ -74,8 +75,9 @@ spec = do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
         fleetMove conn keys Nothing Nothing `shouldReturn` MovedTo (block 1)
-        poolOffer conn keys 4 Nothing (block 7) [(out 0 0, True)] "seven" [] `shouldReturn` Late
-        poolOffer conn keys 4 (Just (block 1)) (block 7) [(out 0 0, True)] "seven" [] `shouldReturn` Taken
+        let seven = (txOf 7 [out 0 0]) {body = "seven"}
+        poolOffer conn keys 4 Nothing seven [True] [] `shouldReturn` Late
+        poolOffer conn keys 4 (Just (block 1)) seven [True] [] `shouldReturn` Taken
         poolBody conn keys (block 7) `shouldReturn` Just "seven"
         -- the tip does not move to a block that the stores do not agree on
         fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) nothing `shouldReturn` Raced
@@ -116,7 +118,7 @@ spec = do
               P.Refused P.Known -> (Known, model)
               P.Refused (P.Conflict rivals) -> (Conflict rivals, model)
               P.Refused (P.Orphan os) -> (Orphan os, model)
-        got <- poolOffer conn keys 4 tip (block t) outs "body" (map block replaced)
+        got <- poolOffer conn keys 4 tip (txOf t (map fst outs)) (map snd outs) (map block replaced)
         sorted got `shouldBe` sorted expected
         samePool conn keys model'
         return (model', tip, n)
@@ -131,7 +133,12 @@ spec = do
         let target = block (1000 + n)
             returned' = [(block t, [out a i | (a, i) <- nubOrd ins]) | (t, ins) <- back]
             change = P.Change returned' (map block dead) (map block done) [out a i | (a, i) <- used]
-            sent = PoolChange [(t, os, "back") | (t, os) <- returned'] change.gone change.confirmed change.spent
+            sent =
+              PoolChange
+                [txOf (number t) os | (t, os) <- returned']
+                change.gone
+                change.confirmed
+                change.spent
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
         fleetAdvance conn keys 4 (Just 0) tip target sent `shouldReturn` MovedTo target
         let model' = P.advance maker change model
@@ -154,6 +161,42 @@ spec = do
       forM_ (Map.toList model.children) $ \(t, expected) -> do
         members <- list (Redis.smembers (key ("pool:kids:" <> t)))
         Set.fromList members `shouldBe` expected
+      -- and what it holds for each address is what the entries of its
+      -- transactions come to
+      let members = [(t, timeOf (number t), entriesOf (number t) os) | (t, os) <- Map.toList model.spends]
+          expected = P.addresses members
+          scored :: [(ByteString, Double)] -> [(Word64, ByteString)]
+          scored rows = [(round (negate s), m) | (m, s) <- rows]
+      listed <- list (Redis.zrangeWithscores (key "pool:time") 0 (-1))
+      scored listed `shouldBe` [(time, t) | (Down time, t) <- sort [(Down time, t) | (t, time, _) <- members]]
+      forM_ (map address [0 .. 3]) $ \a -> do
+        txs <- list (Redis.zrangeWithscores (key ("pool:atx:" <> a)) 0 (-1))
+        outs <- list (Redis.zrangeWithscores (key ("pool:aout:" <> a)) 0 (-1))
+        values <- Map.fromList <$> list (Redis.hgetall (key ("pool:aval:" <> a)))
+        spent <- list (Redis.hgetall (key ("pool:aspent:" <> a)))
+        sums <- Map.fromList <$> list (Redis.hgetall (key ("pool:asum:" <> a)))
+        let amount o = maybe 0 (read . C.unpack . C.takeWhile (/= ' ')) (Map.lookup o values)
+            found =
+              P.AddressPool
+                { txs = scored txs,
+                  paid = [(time, o, amount o) | (time, o) <- scored outs],
+                  spent = Map.fromList [(o, read (C.unpack v)) | (o, v) <- spent]
+                }
+            sumOf f = maybe 0 (read . C.unpack) (Map.lookup f sums)
+            totalled =
+              P.Totals
+                { txs = sumOf "txs",
+                  paid = sumOf "paid",
+                  paidCount = sumOf "paidCount",
+                  spent = sumOf "spent",
+                  spentCount = sumOf "spentCount",
+                  both = sumOf "both",
+                  bothCount = sumOf "bothCount"
+                }
+        case Map.lookup a expected of
+          Nothing -> (a, found, Map.null sums) `shouldBe` (a, P.AddressPool [] [] Map.empty, True)
+          Just p -> (a, found, totalled) `shouldBe` (a, p, P.totals p)
+        Map.keysSet values `shouldBe` Set.fromList [o | (_, o) <- scored outs]
     same conn keys now model = do
       fleetTip conn keys `shouldReturn` (model :: F.Fleet ByteString ByteString).tip
       leases <- fleetLive conn keys
@@ -167,6 +210,54 @@ block = encode
 -- | An output of a transaction of the tests.
 out :: Word32 -> Word32 -> ByteString
 out t i = encode t <> encode i
+
+-- | The number of a block or of a transaction of the tests.
+number :: ByteString -> Word32
+number = either error id . decode
+
+-- | One of the four addresses of the tests.
+address :: Word32 -> ByteString
+address n = C.pack ("address " <> show (n `mod` 4))
+
+-- | The address that an output of the tests is paid to, and its amount.
+-- Outputs of different transactions go to the same addresses, and a
+-- transaction that spends an output does so at the address that it was
+-- paid to, so that the pool has addresses with outputs both paid and spent.
+paidTo :: ByteString -> (ByteString, Word64)
+paidTo o = (address (t + i), fromIntegral (t * 10 + i + 1))
+  where
+    (t, i) = (number (B.take 4 o), number (B.drop 4 o))
+
+-- | The time at which a transaction of the tests entered a mempool: one of
+-- three, so that several have the same.
+timeOf :: Word32 -> Word64
+timeOf t = fromIntegral (t `mod` 3) + 100
+
+-- | What a transaction of the tests that spends some outputs does at each
+-- address: it pays two outputs of its own.
+entriesOf :: Word32 -> [ByteString] -> [P.Entry ByteString ByteString]
+entriesOf t spends =
+  map P.Touches (nubOrd (map (fst . paidTo) (spends <> made)))
+    <> [P.Spends a o v | o <- spends, let (a, v) = paidTo o]
+    <> [P.Pays a o v | o <- made, let (a, v) = paidTo o]
+  where
+    made = [out t 0, out t 1]
+
+-- | A transaction of the tests as the pool takes it.
+txOf :: Word32 -> [ByteString] -> PoolTx
+txOf t spends =
+  PoolTx
+    { txid = block t,
+      time = timeOf t,
+      inputs = spends,
+      body = "body",
+      entries = map entry (entriesOf t spends)
+    }
+  where
+    entry = \case
+      P.Touches a -> PoolTouches a
+      P.Spends a o v -> PoolSpends a o v
+      P.Pays a o v -> PoolPays a o v "script"
 
 -- | A step of the shared mempool, with transactions numbered from 0 to 11.
 data PoolStep

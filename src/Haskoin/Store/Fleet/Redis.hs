@@ -10,7 +10,7 @@
 --
 -- The rules of "Haskoin.Store.Fleet" carried out against Redis: the state
 -- of a fleet in three keys, and a Lua script for each step that has to be
--- one step. Nothing in the store calls this yet.
+-- one step.
 --
 -- = Why scripts
 --
@@ -44,6 +44,17 @@
 -- was unspent at one block may be spent at the next. Moving the tip and
 -- changing the pool for the blocks in between is one step ('fleetAdvance'),
 -- so that no request finds a block without what it did to the pool.
+--
+-- A transaction comes with what it does at each address (t'PoolEntry'),
+-- and the script keeps what the pool holds for each address in step: its
+-- transactions and the outputs paid to it, each in a sorted set ordered as
+-- queries list them, the outputs of it that are spent, and the sums that a
+-- balance needs. 'Haskoin.Store.Fleet.Pool.addresses' says what those
+-- should be. Kept as the transactions come and go, they cost a few commands
+-- for each entry; worked out when asked, a balance would cost a read of
+-- every entry of the address, which is what the store's own mempool area
+-- did at first and was measured to be thousands of times too slow for a
+-- busy address.
 module Haskoin.Store.Fleet.Redis
   ( FleetKeys (..),
     fleetKeys,
@@ -56,6 +67,8 @@ module Haskoin.Store.Fleet.Redis
     -- * The shared mempool
     Offered (..),
     PoolChange (..),
+    PoolTx (..),
+    PoolEntry (..),
     poolOffer,
     poolWithdraw,
     fleetAdvance,
@@ -68,6 +81,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
+import Data.Word (Word64)
 import Database.Redis (Connection, Redis, Reply)
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
@@ -156,12 +170,39 @@ data Offered
     Late
   deriving (Eq, Show)
 
+-- | What a transaction does at an address; see
+-- 'Haskoin.Store.Fleet.Pool.Entry'. Addresses, outputs and scripts are
+-- whatever bytes the stores of a fleet agree on.
+data PoolEntry
+  = -- | it spends from the address or pays to it
+    PoolTouches !ByteString
+  | -- | it spends this output of the address, of this amount
+    PoolSpends !ByteString !ByteString !Word64
+  | -- | it pays this output to the address, with this amount and script
+    PoolPays !ByteString !ByteString !Word64 !ByteString
+  deriving (Eq, Show)
+
+-- | A transaction as the pool keeps it.
+data PoolTx = PoolTx
+  { txid :: !ByteString,
+    -- | when it entered the mempool of the store that offers it. The pool
+    -- keeps the time of the first offer, so that every store lists the
+    -- transaction in the same place.
+    time :: !Word64,
+    -- | the outputs that it spends, in the order of its inputs
+    inputs :: ![ByteString],
+    -- | what a store needs to answer about it
+    body :: !ByteString,
+    -- | what it does at each address
+    entries :: ![PoolEntry]
+  }
+  deriving (Eq, Show)
+
 -- | What the blocks between two tips did; see
 -- 'Haskoin.Store.Fleet.Pool.Change'.
 data PoolChange = PoolChange
-  { -- | transactions that come back, each with the outputs that it spends
-    -- and its body
-    returned :: ![(ByteString, [ByteString], ByteString)],
+  { -- | transactions that come back
+    returned :: ![PoolTx],
     -- | transactions of abandoned blocks that cannot come back
     gone :: ![ByteString],
     -- | transactions that the new blocks confirm
@@ -172,20 +213,19 @@ data PoolChange = PoolChange
   deriving (Eq, Show)
 
 -- | Offer a transaction to the pool: given the size of a transaction id,
--- the tip that the store checked against, the id, each output that the
--- transaction spends with whether the store finds it unspent at that tip,
--- the body to keep, and the transactions that it replaces.
+-- the tip that the store checked against, the transaction, whether the
+-- store finds each output that it spends unspent at that tip, in the order
+-- of its inputs, and the transactions that it replaces.
 poolOffer ::
   Connection ->
   FleetKeys ->
   Int ->
   Maybe ByteString ->
-  ByteString ->
-  [(ByteString, Bool)] ->
-  ByteString ->
+  PoolTx ->
+  [Bool] ->
   [ByteString] ->
   IO Offered
-poolOffer conn keys tsize seen t inputs body replaced =
+poolOffer conn keys tsize seen tx unspents replaced =
   run conn (R.eval poolScript [] args) >>= \case
     ["taken"] -> return Taken
     ["known"] -> return Known
@@ -194,10 +234,8 @@ poolOffer conn keys tsize seen t inputs body replaced =
     ["raced"] -> return Late
     other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
   where
-    flags = C.pack [if unspent then '1' else '0' | (_, unspent) <- inputs]
-    args =
-      ["offer", keys.prefix, num tsize, maybe "" id seen, t, B.concat (map fst inputs), flags, body]
-        <> [B.concat replaced]
+    flags = C.pack [if unspent then '1' else '0' | unspent <- unspents]
+    args = ["offer", keys.prefix, num tsize, maybe "" id seen, flags, B.concat replaced] <> txArgs tx
 
 -- | Take transactions out of the pool, with all that spends them. Gives
 -- those that left.
@@ -226,9 +264,19 @@ fleetAdvance conn keys tsize clock seen target change =
   where
     args =
       ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size]
-        <> [num (length change.returned)]
-        <> concat [[t, B.concat inputs, body] | (t, inputs, body) <- change.returned]
         <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
+        <> [num (length change.returned)]
+        <> concatMap txArgs change.returned
+
+-- | A transaction as the arguments of the pool script.
+txArgs :: PoolTx -> [ByteString]
+txArgs tx =
+  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, num (length tx.entries)] <> concatMap entry tx.entries
+  where
+    entry = \case
+      PoolTouches a -> ["t", a, "", "", ""]
+      PoolSpends a o v -> ["s", a, o, num v, ""]
+      PoolPays a o v s -> ["o", a, o, num v, s]
 
 -- | The transactions of the pool, each with the outputs that it spends one
 -- after the other.
