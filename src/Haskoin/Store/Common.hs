@@ -245,8 +245,9 @@ getActiveBlock r bh =
 -- that a wallet could say what became of a payment. Some clients do not
 -- look at the mark, and took a payment that will never happen for one that
 -- is pending. So every 'StoreRead' leaves them out, and to the API a
--- deleted transaction is one that the store does not know. Their bodies
--- stay in the database, where the rules that import transactions use them.
+-- deleted transaction is one that the store does not know. Since database
+-- version 22 nothing is kept of them at all; this is for the bodies that
+-- version 20 left in a database that was migrated.
 notDeleted :: Maybe TxData -> Maybe TxData
 notDeleted (Just td) | td.deleted = Nothing
 notDeleted found = found

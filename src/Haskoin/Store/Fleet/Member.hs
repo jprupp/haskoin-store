@@ -295,7 +295,12 @@ data Member = Member
     -- the last turn
     lagging :: !(TVar (Maybe ByteString)),
     -- | the metrics of the cache, if the configuration has a StatsD client
-    metrics :: !(Maybe CacheMetrics)
+    metrics :: !(Maybe CacheMetrics),
+    -- | transactions that the store deleted from its mempool since it
+    -- started, up to a hundred thousand. The database keeps nothing of
+    -- them, and the rule for conflicts in the pool asks about them
+    -- ('offerMempool').
+    gone :: !(TVar (HashSet TxHash))
   }
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
@@ -314,6 +319,7 @@ newMember config redis db = do
   wanted <- newTVarIO HashMap.empty
   lagging <- newTVarIO Nothing
   metrics <- mapM newCacheMetrics config.stats
+  gone <- newTVarIO HashSet.empty
   return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
@@ -337,6 +343,9 @@ memberForget :: Member -> [TxHash] -> IO ()
 memberForget m hs = atomically $ do
   modifyTVar' m.offered (\have -> foldr HashSet.delete have hs)
   modifyTVar' m.waiting (\held -> foldr HashMap.delete held hs)
+  modifyTVar' m.gone $ \seen ->
+    let more = foldr HashSet.insert seen hs
+     in if HashSet.size more > 100000 then HashSet.fromList hs else more
 
 -- | Let go of the views that the rules do not ask for: all but those of
 -- the recent blocks, of the last report, and of the tip read after it.
@@ -639,7 +648,13 @@ offerMempool m =
     forget h = atomically (modifyTVar' m.waiting (HashMap.delete h))
     deletedHere rival = case decode rival of
       Left _ -> return False
-      Right h -> maybe False (.deleted) <$> L.withView m.db (`L.getTxData` h)
+      -- it deleted it, and has not taken it back since. A store that was
+      -- started again does not remember, and leaves the conflict as it
+      -- is: the first of the two stays in the pool.
+      Right h -> do
+        deleted <- HashSet.member h <$> readTVarIO m.gone
+        back <- isJust <$> M.getMempoolTx m.db h
+        return (deleted && not back)
 
 -- | How many rounds of offers go by between two that read the whole
 -- mempool: five minutes of them.

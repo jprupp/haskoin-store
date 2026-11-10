@@ -43,6 +43,7 @@ import Options.Applicative
     header,
     help,
     helper,
+    hidden,
     info,
     long,
     many,
@@ -218,7 +219,7 @@ defConfig = do
   healthCheckInterval <-
     env "HEALTH_CHECK_INTERVAL" 30 readMaybe
   bloom <-
-    env "BLOOM" False parseBool
+    env "BLOOM" True parseBool
   noWeb <-
     env "NO_WEB" False parseBool
   maxOpenFiles <-
@@ -568,10 +569,13 @@ config c = do
         <> help "Background check update interval"
         <> showDefault
         <> value c.healthCheckInterval
-  bloom <-
-    flag c.bloom True $
-      long "bloom"
-        <> help "RocksDB Bloom filters, on the data that is read by key"
+  noBloom <-
+    switch $
+      long "no-bloom"
+        <> help "No RocksDB Bloom filters on the data that is read by key, which are on by default"
+  -- it was the way to turn them on, and commands that have it must still
+  -- start
+  _ <- switch (long "bloom" <> hidden)
   maxOpenFiles <-
     option auto $
       metavar "COUNT"
@@ -611,7 +615,7 @@ config c = do
           )
         <> showDefault
         <> value c.blockCacheMB
-  pure Config {..}
+  pure Config {bloom = c.bloom && not noBloom, ..}
 
 -- | Network by name.
 networkReader :: String -> Either String Network

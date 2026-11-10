@@ -84,6 +84,29 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the first 100 transactions of a busy address 221 microseconds instead of
   575, and the number of transactions of a wallet with 19,499 of them 34
   milliseconds instead of 78.
+- **Bloom filters are on by default**, as was always meant: until the
+  binding was fixed, `--bloom` built none. `--no-bloom`, or `BLOOM=false`,
+  turns them off; `--bloom` is still accepted. An existing database gets
+  filters, and the memory that they take in the block cache, as its table
+  files are written again.
+- **Transactions that leave the mempool unconfirmed are no longer kept.**
+  The API already answered 404 for them, but their bodies stayed in the
+  database, marked as deleted, for ever, and each server had its own.
+  - A server remembers the last hundred thousand that it deleted, in
+    memory, so as not to fetch them again from its peers. The fleet's rule
+    for conflicting transactions and the cache of a server alone, which
+    both asked the database whether a transaction had been deleted, ask
+    that memory instead.
+  - The cache of a server alone takes a transaction that Redis has as
+    unconfirmed for more than ten minutes, and that the database does not
+    have, for deleted and not for one that it has not seen yet.
+  - Bodies that version 20 marked as deleted stay in a migrated database
+    and are ignored. A page that starts at a deleted transaction is empty.
+- Removed reports that no longer describe the store: five intermediate
+  stress runs, the measurement of a mempool mirrored in memory, and the
+  superseded runs in `docs/layered-database/query-cost.txt`.
+  `docs/layered-database.md` is rewritten as a description of what
+  exists, a quarter of its length.
 - **Database version 22: the record of a confirmed transaction is written
   once**, by the block that confirms it, and is the same on every server
   that has the block, so that what the chain's column families hold

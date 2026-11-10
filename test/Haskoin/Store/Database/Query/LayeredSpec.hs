@@ -26,7 +26,7 @@ import Haskoin.Store.Data
     Unspent (..),
     confirmed,
   )
-import Haskoin.Store.Database.Migrate (migrateLayered)
+import Haskoin.Store.Database.Migrate (upgradeDatabase)
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import Haskoin.Store.Histories
@@ -48,17 +48,22 @@ spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
             withSystemTempDirectory "haskoin-store-pages-" $ \dir -> do
               -- anything at first, then payments, so that the mempool has
               -- something; and questions about what came of it
-              (asked, was, starts) <- open20 net ctx dir $ \db -> do
+              (asked, was, starts, fair) <- open20 net ctx dir $ \db -> do
                 hist <- start mixedRules db >>= \hist0 -> foldM (step db) hist0 (seeds <> onlyPayments last')
                 let asked = unGen (questions net ctx hist 150) (mkQCGen seed) 30
                 was <- replies mixed db asked
                 starts <- mixed db (\queries -> mapM (from queries) asked)
-                return (asked, was, starts)
+                -- pages that start at a deleted transaction are not
+                -- compared: the layered layout does not know those
+                fair <- mapM (startsKnown db) asked
+                return (asked, was, starts, fair)
               now <- openLayered net ctx dir $ \db -> do
-                void (migrateLayered db)
+                void (upgradeDatabase (\_ -> return ()) db)
                 replies layered db asked
               length now `shouldBe` length was
-              take 2 (differences (asked <> asked) was now) `shouldBe` []
+              let kept :: [x] -> [x]
+                  kept xs = [x | (x, True) <- zip xs (fair <> fair)]
+              take 2 (differences (kept (asked <> asked)) (kept was) (kept now)) `shouldBe` []
               let content reply = if size reply == 0 then "nothing in it" else "something in it"
                   pages = [place <> ", " <> content reply | (Just place, reply) <- zip starts was]
               return (tabulate "pages that start at" pages True)

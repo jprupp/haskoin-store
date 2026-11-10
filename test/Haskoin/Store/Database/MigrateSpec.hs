@@ -328,13 +328,13 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 mined <- blockOn db txs >>= apply layeredRules db
                 isRight mined.result `shouldBe` True
           mine [wide]
-          record <- dump db (txCF db.db)
+          written <- dump db (txCF db.db)
           keysNow `shouldReturn` []
           mine spends
           keysNow `shouldReturn` [(0, [3]), (1, [17]), (2, [39])]
           -- the record is as the first block wrote it
           now <- dump db (txCF db.db)
-          [v | (k, v) <- now, k `elem` map fst record] `shouldBe` map snd record
+          [v | (k, v) <- now, k `elem` map fst written] `shouldBe` map snd written
           -- and the transaction is read with its spenders, each also by itself
           found <- L.withView db (`L.getTxData` txHash wide)
           let expected = IntMap.fromList [(fromIntegral i, Spender (txHash (spend i)) 0) | i <- [3, 17, 39]]
@@ -434,9 +434,10 @@ walk shadow db hist seed =
       void (apply mixedRules shadow op)
       record db hist' op <$> apply layeredRules db op
 
--- | A transaction with a time that is not that of its block.
+-- | A transaction with a time that is not that of its block, and marked as
+-- one that can be replaced, which a confirmed transaction cannot be.
 later :: TxData -> TxData
-later td = (td :: TxData) {timestamp = td.timestamp + 12345}
+later td = (td :: TxData) {timestamp = td.timestamp + 12345, rbf = True}
 
 -- | Bring a database of version 21 to the version that the store runs on.
 settle :: DatabaseReader -> IO ()

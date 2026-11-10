@@ -53,6 +53,7 @@ module Haskoin.Store.Histories
     answer,
     differences,
     startOf,
+    startsKnown,
     size,
 
     -- * Column families
@@ -624,6 +625,16 @@ answer queries = \case
     -- the queries about an extended public key take the balances of its
     -- addresses, so any addresses can be given to them
     set as = zipWith (\i b -> XPubBal {path = [0, i], balance = b}) [0 ..] <$> queries.getBalances as
+
+-- | Whether the page of a question starts somewhere that both layouts
+-- know, given a database of version 20: not at a transaction that left
+-- the mempool unconfirmed. Version 20 keeps the bodies of those, and
+-- starts a page where such a transaction was; the layered layout keeps
+-- nothing of them, and its page is empty.
+startsKnown :: DatabaseReader -> Question -> IO Bool
+startsKnown db question = case startOf question of
+  Just (Just (AtTx h)) -> maybe True (not . (.deleted)) <$> Q.getTxRecord db h
+  _ -> return True
 
 -- | The questions that two databases answer differently, with the answers
 -- of both.

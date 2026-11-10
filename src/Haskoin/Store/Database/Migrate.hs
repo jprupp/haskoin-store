@@ -356,8 +356,10 @@ migrateRecords report r = do
                         [ insertOpCF (spenderCF db) (SpenderKey h (fromIntegral g)) (SpenderVal m)
                         | (g, m) <- IntMap.toList grouped
                         ]
-                      record = (td :: TxData) {timestamp = t, spenders = IntMap.empty}
-                  when (td.timestamp /= t || not (null keys)) $ do
+                      -- a confirmed transaction cannot be replaced, and the
+                      -- rules write it so: one that says otherwise is put right
+                      record = (td :: TxData) {timestamp = t, spenders = IntMap.empty, rbf = False}
+                  when (td.timestamp /= t || td.rbf || not (null keys)) $ do
                     modifyIORef' pending ((insertOpCF (txCF db) (TxKey h) record : keys) <>)
                     modifyIORef' changed (+ 1)
                     n <- length <$> readIORef pending

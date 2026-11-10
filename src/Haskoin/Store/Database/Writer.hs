@@ -84,7 +84,6 @@ module Haskoin.Store.Database.Writer
     getChainSpenders,
     insertSpender,
     deleteSpender,
-    getDeletedTx,
     insertMempoolTx,
     deleteMempoolTx,
     insertMempoolSpender,
@@ -92,8 +91,6 @@ module Haskoin.Store.Database.Writer
     insertMempoolAddr,
     deleteMempoolAddr,
     getMempoolAddr,
-    insertDeletedTx,
-    deleteDeletedTx,
   )
 where
 
@@ -230,8 +227,6 @@ data Memory = Memory
     memSpenderTable :: !MemSpenderTable,
     -- | entries of the mempool by address, in the mempool area
     memAddrTable :: !MemAddrTable,
-    -- | bodies of transactions that left the mempool unconfirmed
-    memDeletedTable :: !TxTable,
     -- | inputs of blocks that spend outputs, by group of outputs
     -- as t'SpenderKey' says, each group as the batch leaves it: empty for one
     -- that has no spent output left
@@ -329,15 +324,6 @@ deleteMempoolAddr w k = H.insert w.memory.memAddrTable k Nothing
 getMempoolAddr :: Writer -> MemAddrKey -> IO (Maybe MemAddrVal)
 getMempoolAddr w k = getLayered w (\s -> H.lookup s.memAddrTable k) (\r -> retrieveCF r.db (mempoolAddrCF r.db) k)
 
--- | Keep the body of a transaction that left the mempool unconfirmed.
-insertDeletedTx :: Writer -> TxData -> IO ()
-insertDeletedTx w t = H.insert w.memory.memDeletedTable (txHash t.tx) (Just t)
-
--- | Forget the body of a transaction that left the mempool unconfirmed, as
--- when it comes back.
-deleteDeletedTx :: Writer -> TxHash -> IO ()
-deleteDeletedTx w h = H.insert w.memory.memDeletedTable h Nothing
-
 -- | Read a value from the changes of the batch, or from the database if the
 -- batch did not change it.
 getLayered :: Writer -> (Memory -> IO (Maybe a)) -> (DatabaseReader -> IO a) -> IO a
@@ -402,7 +388,6 @@ hashMapOps db Memory {..} =
         memTxOps db memTxTable,
         memSpenderOps db memSpenderTable,
         memAddrOps db memAddrTable,
-        memDeletedOps db memDeletedTable,
         spenderOps db spenderTable
       ]
 
@@ -519,13 +504,6 @@ memAddrOps db t = map (uncurry f) <$> H.toList t
   where
     f k (Just v) = insertOpCF (mempoolAddrCF db) k v
     f k Nothing = deleteOpCF (mempoolAddrCF db) k
-
--- | Operations for changed bodies of deleted transactions.
-memDeletedOps :: DB -> TxTable -> IO [BatchOp]
-memDeletedOps db t = map (uncurry f) <$> H.toList t
-  where
-    f h (Just td) = insertOpCF (mempoolCF db) (MemDeletedKey h) td
-    f h Nothing = deleteOpCF (mempoolCF db) (MemDeletedKey h)
 
 -- | Operations for changed unspent outputs.
 unspentOps :: DB -> UnspentTable -> IO [BatchOp]
@@ -649,11 +627,6 @@ getChainSpenders w h outputs = do
       kept = IntMap.filterWithKey (\i _ -> (fromIntegral i `div` spenderGroup) `notElem` replaced) stored
   return (IntMap.unions (kept : map snd changed))
 
--- | Body of a transaction that left the mempool unconfirmed, with the
--- changes of the batch applied.
-getDeletedTx :: Writer -> TxHash -> IO (Maybe TxData)
-getDeletedTx w h = getLayered w (\s -> H.lookup s.memDeletedTable h) (`M.getDeletedTx` h)
-
 -- | The mempool in the database with the changes of this batch applied,
 -- newest first.
 getMempool :: Writer -> IO [(UnixTime, TxHash)]
@@ -683,7 +656,6 @@ newMemory net ctx = do
   memTxTable <- liftIO H.new
   memSpenderTable <- liftIO H.new
   memAddrTable <- liftIO H.new
-  memDeletedTable <- liftIO H.new
   spenderTable <- liftIO H.new
   return Memory {..}
 

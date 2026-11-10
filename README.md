@@ -354,8 +354,6 @@ the same block and the same mempool:
   empties the cache. With it a request about a wallet of 464 addresses
   and 19,499 transactions takes 1.3 to 2.2 milliseconds, where it took 5
   to 38.
-- **Deleted transactions** are not known to a fleet: a page that starts at
-  one is empty.
 
 The rules, and the tests that hold Redis to them, are described in "A fleet
 that answers as one" in `docs/layered-database.md`.
@@ -386,7 +384,7 @@ that answers as one" in `docs/layered-database.md`.
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--bloom` | `BLOOM` | off | Bloom filters on what is read by key, for faster lookups at the cost of memory |
+| `--no-bloom` | `BLOOM` | on | No Bloom filters on what is read by key; `BLOOM=false` is the same |
 | `--max-open-files` | `MAX_OPEN_FILES` | `2000` | Open files; bounds index and filter memory (0 = unlimited) |
 | `--write-buffer-mb` | `WRITE_BUFFER_MB` | `256` | Memtables across all column families (0 = unlimited) |
 | `--max-wal-mb` | `MAX_WAL_MB` | `1024` | Write-ahead log size that forces flushes (0 = RocksDB default) |
@@ -395,26 +393,24 @@ that answers as one" in `docs/layered-database.md`.
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
 
-`--bloom` builds Bloom filters for the table files written while it is on.
-They need about 1.25 bytes for each key and are held in the block cache: on a
-chain with billions of keys, size that before turning the option on.
+Bloom filters are on by default. They let RocksDB skip the table files that
+cannot have a key, which is most of what a lookup of a transaction, an
+output or a balance would otherwise read.
 
-The filters are for the data that is read by key: transactions, unspent
-outputs, blocks, balances and the mempool. The two indices by address, which
-are scanned, never get them. With a filter RocksDB skips the files that
-cannot have an address, and then a scan of an address that has nothing can
-no longer see the keys that would stop it: it steps over every key deleted
-since the last flush. With 5,000 mempool transactions just deleted, such a
-scan took 810 microseconds with filters on those indices and 13 without.
-`docs/layered-database.md` has the measurements.
-
-Up to and including version 1.8.1 the option had no effect when the store
-was built against RocksDB 6.24 or later, as the Docker image is:
-`rocksdb-haskell-jprupp` passed the size of the filter to RocksDB with the
-wrong type, and RocksDB built none, without an error. The store is now built
-with `rocksdb-haskell-jprupp` 2.6.4, which has the fix since 2.6.3. A store that already
-runs with `--bloom` therefore starts building filters, and using that memory,
-when it is upgraded; turn the option off to keep it as it was.
+- **What has them:** the data that is read by key: transactions, spenders,
+  unspent outputs, blocks, balances and the mempool. The two indices by
+  address, which are scanned, do not.
+- **What they cost:** about 1.25 bytes for each key, held in the block
+  cache. On a chain with billions of keys that is gigabytes: size
+  `--block-cache-mb` for it, or turn them off with `--no-bloom`.
+- **An existing database** gets filters for the table files that are
+  written from now on, so their memory comes gradually, as RocksDB
+  compacts. The migration to database version 22 rewrites nearly every
+  transaction, and with it most of the filters arrive at once.
+- **`--bloom`** was the way to turn them on, and is still accepted. Up to
+  version 1.8.1 it built no filters at all on RocksDB 6.24 or later,
+  because of a wrong type in the binding, fixed in
+  `rocksdb-haskell-jprupp` 2.6.3.
 
 ## API
 
@@ -569,6 +565,13 @@ that has that block.
   where it took 11.5, measured, and 0.8 milliseconds for a hundred where
   it took 0.4. Lists by address and by xpub do not read records and cost
   the same.
+
+A transaction that leaves the mempool unconfirmed, because it was replaced,
+double-spent by a block or too old, is no longer kept: the store forgets
+it, and the API answers 404 for it, as it already did. Until version 22
+its body stayed in the database, marked as deleted, for ever. The bodies
+that are there in a migrated database are left where they are and
+ignored, since finding them would mean reading every transaction.
 
 A database of version 21, or of version 20 once its mempool is moved, is
 brought to this the first time this version of the store opens it.
@@ -791,8 +794,6 @@ with the size of a commit), and the latencies of each endpoint over time.
 `docs/layered-database.md`, with their output. They are not part of the
 package; each says in its header how to build and run it.
 
-- `OverlayCost.hs` times the lookups that reading the mempool from an area
-  of its own adds to a query, in RocksDB and in memory.
 - `MigrateBench.hs` times the migration to the layered layout against
   wiping the same mempool.
 - `QueryCost.hs` writes the same synthetic history into a database of each

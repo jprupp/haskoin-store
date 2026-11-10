@@ -168,9 +168,14 @@ sameHistory ctx net number choices =
               -- with, against today's
               let asked = unGen (questions net ctx hist 60) (mkQCGen number) 30
               was <- mixed old (\queries -> mapM (answer queries) asked)
+              -- but for pages that start at a deleted transaction, which
+              -- the layered layout does not know
+              known <- mapM (startsKnown old) asked
+              let both :: [x] -> [x]
+                  both xs = [x | (x, True) <- zip xs known]
               forM_ [new, up] $ \db -> do
                 now <- layered db (\queries -> mapM (answer queries) asked)
-                take 2 (differences asked was now) `shouldBe` []
+                take 2 (differences (both asked) (both was) (both now)) `shouldBe` []
               -- the queries of a fleet do not know deleted transactions, so
               -- they are not asked for pages that start at one
               let live queries q = case startOf q of
@@ -184,9 +189,9 @@ sameHistory ctx net number choices =
               return done
             migrated <- openLayered net ctx dirOld $ \old -> upgradeDatabase (\_ -> return ()) old >> everything old
             mine <- everything new
-            -- the same, but for where the bodies of deleted transactions
-            -- are: the layered rules keep none of them in the chain
-            mine `shouldBe` migrated {inChain = []}
+            -- the same, but for the bodies of deleted transactions, which
+            -- version 20 left in the chain: the layered rules keep none
+            mine `shouldBe` migrated {inChain = [], deleted = []}
             -- the upgraded store has those that it deleted before the
             -- upgrade in the chain, as version 20 left them, even when the
             -- transaction came back later: the queries, compared after

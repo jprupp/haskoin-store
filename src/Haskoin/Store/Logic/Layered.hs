@@ -326,8 +326,6 @@ importChainTx wr br time tx = do
         throwIO Orphan
   let td = prepareTxData False br time tx us
   addChainTx wr td
-  -- it may have been deleted from the mempool before
-  getDeletedTx wr (txHash tx) >>= mapM_ (\_ -> deleteDeletedTx wr (txHash tx))
   return td
 
 -- | Give a confirmed transaction a new position in the chain: a block has a
@@ -391,8 +389,9 @@ revertBlock wr bh = do
       spenders <- getMempoolSpenders wr (txHash coinbase.tx) (length coinbase.tx.outputs)
       forM_ (nub' (map (.txid) (I.elems spenders))) $ \h ->
         getChain wr True False h >>= mapM_ (deleteSingleTx wr . txHash)
+      -- and forgotten: nothing is kept of a transaction that leaves the
+      -- store unconfirmed
       leave (txHash coinbase.tx)
-      insertDeletedTx wr (coinbase :: TxData) {deleted = True, spenders = I.empty}
   where
     inChain h =
       chainTx wr h >>= \case
@@ -570,8 +569,6 @@ addMempoolTx wr time td = do
   forM_ r.addresses (uncurry (insertMempoolAddr wr))
   adjustSummaries wr (+) r
   addToMempool wr r.txid r.time
-  -- it may have been deleted from the mempool before
-  getDeletedTx wr r.txid >>= mapM_ (\_ -> deleteDeletedTx wr r.txid)
   where
     r = mempoolRecords (writerNet wr) (writerCtx wr) time td
 
@@ -635,8 +632,16 @@ adjustSummaries wr op r = do
           bothCount = f x.bothCount y.bothCount
         }
 
--- | Delete a mempool transaction that nothing spends, and keep its body as
--- that of a deleted transaction. Throws 'TxSpent' if something spends it.
+-- | Delete a mempool transaction that nothing spends. Nothing is kept of
+-- it. Throws 'TxSpent' if something spends it.
+--
+-- Until version 22 its body was kept, marked as deleted, and the API
+-- returned it with that mark. Clients that did not read the mark took a
+-- replaced transaction for a payment, each store had its own set of them,
+-- which a fleet cannot answer from, and nothing ever removed them. What
+-- the store needs of them, not to fetch a transaction again that it just
+-- deleted, it remembers for a while in memory
+-- ("Haskoin.Store.BlockStore").
 deleteSingleTx :: Writer -> TxHash -> IO ()
 deleteSingleTx wr th =
   getMempoolTx wr th >>= \case
@@ -649,7 +654,6 @@ deleteSingleTx wr th =
         then do
           logDebug wr $ "Deleting tx: " <> txHashToHex th
           removeMempoolTx wr td
-          insertDeletedTx wr (td :: TxData) {deleted = True}
         else do
           logError wr $ "Tried to delete spent tx: " <> txHashToHex th
           throwIO TxSpent

@@ -274,8 +274,19 @@ data BlockStore = BlockStore
     -- | labels of the peers whose mempool was already requested
     syncedMempool :: !(TVar (HashSet Text)),
     -- | who reserves the syncing peer, so that no one else releases it
-    owner :: !Owner
+    owner :: !Owner,
+    -- | transactions that left the mempool unconfirmed since the store
+    -- started, as many as 'mostForgotten'. The database keeps nothing of
+    -- them, and peers go on announcing them: without this the store would
+    -- fetch each one again, only to refuse it again.
+    forgotten :: !(TVar (HashSet TxHash))
   }
+
+-- | How many deleted transactions the store remembers not to fetch again.
+-- Past that many it forgets them all and starts over, which costs a few
+-- fetches that come to nothing.
+mostForgotten :: Int
+mostForgotten = 100000
 
 -- | StatsD metrics of the block store.
 data StoreMetrics = StoreMetrics
@@ -430,7 +441,13 @@ runImportNotify self block f = do
     Left e -> return (Left e)
     Right (x, c) -> do
       let l = self.config.pub
-      forM_ (filter notInBlock c.removed) $ \h ->
+      let deleted = filter notInBlock c.removed
+      atomically . modifyTVar' self.forgotten $ \seen ->
+        let more = foldr HashSet.insert seen deleted
+         in if HashSet.size more > mostForgotten then HashSet.fromList deleted else more
+      -- one that came back is not forgotten any more
+      atomically (modifyTVar' self.forgotten (\seen -> foldr HashSet.delete seen c.added))
+      forM_ deleted $ \h ->
         publish (StoreMempoolDelete h) l
       forM_ (filter notInBlock c.added) $ \h ->
         publish (StoreMempoolNew h) l
@@ -482,6 +499,7 @@ withBlockStore cfg action = do
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
+  forgotten <- newTVarIO HashSet.empty
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -490,7 +508,8 @@ withBlockStore cfg action = do
             pending = ts,
             metrics = metrics,
             syncedMempool = sy,
-            owner = owner
+            owner = owner,
+            forgotten = forgotten
           }
   withAsync ((go r inbox)) $ \a -> do
     link a
@@ -706,6 +725,14 @@ updateOrphans self = do
         Just TxData {deleted = True} -> return False
         Just TxData {deleted = False} -> return True
 
+-- | Whether the store has a transaction, or deleted it not long ago: in
+-- both cases there is nothing to fetch.
+known :: BlockStore -> TxHash -> IO (Maybe ())
+known self h =
+  HashSet.member h <$> readTVarIO self.forgotten >>= \case
+    True -> return (Just ())
+    False -> (() <$) <$> getTxData self h
+
 -- | Queue a transaction that spends unknown outputs, recording which parents are missing.
 newOrphanTx ::
   BlockStore ->
@@ -815,7 +842,7 @@ processTxs self p hs = guardMempool self . guardSync self $ do
               <> "Already Pending"
           return Nothing
         False ->
-          getTxData self h >>= \case
+          known self h >>= \case
             Just _ -> do
               logDebug self $
                 "Tx "

@@ -193,7 +193,6 @@ import Haskoin.Store.Database.Types
     AddrTxKey (..),
     MemAddrKey (..),
     MemAddrVal (..),
-    MemDeletedKey (..),
     MemSpenderKey (..),
     MemSummary (..),
     OutVal,
@@ -324,9 +323,9 @@ getBlock (View r) = Q.getBlock r
 
 -- | Data of a transaction, with the spenders of its outputs, those in blocks
 -- and those in the mempool. A transaction in the mempool comes from the
--- mempool area, a confirmed one from the chain, and one that was deleted
--- from where it was kept: the mempool area, or the chain for those that
--- version 20 deleted.
+-- mempool area, and a confirmed one from the chain. One that left the
+-- mempool unconfirmed is not known: nothing is kept of it, and the bodies
+-- that version 20 left in the chain for such transactions are passed over.
 getTxData :: View -> TxHash -> IO (Maybe TxData)
 getTxData v h =
   getManyTxData v [h] <&> \case
@@ -344,20 +343,18 @@ getManyTxData (View r) hs = do
   return tds
 
 -- | Transactions whose hash, read as a number, matches a short identifier of
--- the Blockchain.info API, deleted ones included, in the order of their
--- hashes. There may be more than one.
+-- the Blockchain.info API, in the order of their hashes. There may be more
+-- than one.
 getNumTxData :: View -> Word64 -> IO [TxData]
 getNumTxData (View r) i = do
   unconfirmed <- matchingAsListCF r.db (mempoolCF r.db) (TxKeyS prefix)
   stored <- matchingAsListCF r.db (txCF r.db) (TxKeyS prefix)
   let rows = [(h, td) | (TxKey h, td) <- stored]
   chain <- zip (map fst rows) <$> Q.withChainSpenders r rows
-  gone <- matchingAsListCF r.db (mempoolCF r.db) (MemDeletedKeyP prefix)
   let found =
         preferred
           (Map.fromList [(h, td) | (TxKey h, td) <- unconfirmed])
           (Map.fromList chain)
-          (Map.fromList [(h, td) | (MemDeletedKey h, td) <- gone])
       matches = filter (seventh . fst) (Map.toAscList found)
   spent <- mempoolSpenders r matches
   Q.count r $ \s -> incrementCounter s.dataTxCount (length matches)
@@ -387,9 +384,7 @@ bodies :: DatabaseReader -> [TxHash] -> IO (Map TxHash TxData)
 bodies r hs = do
   unconfirmed <- look (mempoolCF r.db) TxKey hs
   chain <- look (txCF r.db) TxKey (filter (`Map.notMember` unconfirmed) hs) >>= spent
-  let live h = Map.member h unconfirmed || maybe False (not . (.deleted)) (Map.lookup h chain)
-  gone <- look (mempoolCF r.db) MemDeletedKey (filter (not . live) hs)
-  return (preferred unconfirmed chain gone)
+  return (preferred unconfirmed chain)
   where
     -- the spenders that blocks give to the outputs of confirmed
     -- transactions are under keys of their own
@@ -403,16 +398,13 @@ bodies r hs = do
         <$> Q.retrieveManyCF r.db cf (map key ks)
 
 -- | The body to answer with for each transaction, given the bodies that the
--- mempool area has for transactions in the mempool, those that the chain
--- has, and those that the mempool area has for deleted transactions.
---
--- A transaction that is in the mempool or confirmed is in one place only.
--- One that was deleted can also have a body that version 20 left in the
--- chain, marked as deleted, which counts only when nothing else is known of
--- the transaction.
-preferred :: Map TxHash TxData -> Map TxHash TxData -> Map TxHash TxData -> Map TxHash TxData
-preferred unconfirmed chain gone =
-  unconfirmed <> Map.filter (not . (.deleted)) chain <> gone <> chain
+-- mempool area has for transactions in the mempool and those that the
+-- chain has. A transaction is in one place only. A body that version 20
+-- left in the chain for a transaction that it deleted is no body at all:
+-- finding them all to delete them would mean reading every transaction of
+-- the database, so they stay where they are and are passed over.
+preferred :: Map TxHash TxData -> Map TxHash TxData -> Map TxHash TxData
+preferred unconfirmed chain = unconfirmed <> Map.filter (not . (.deleted)) chain
 
 -- | The spenders that the mempool has for the outputs of transactions,
 -- given their bodies as 'bodies' gives them.
@@ -546,8 +538,8 @@ data From
 -- | Where the page of a query starts, or 'Nothing' if it starts at a
 -- transaction that is not known, which makes the page empty.
 --
--- A page can start at a transaction that was deleted. It then starts where
--- that transaction was, as it did in version 20.
+-- A transaction that left the mempool unconfirmed is not known, so a page
+-- that starts at one is empty.
 pageStart :: DatabaseReader -> Maybe Start -> IO (Maybe From)
 pageStart _ Nothing = return (Just Top)
 pageStart _ (Just (AtBlock height)) = return (Just (InChain (BlockRef height maxBound)))

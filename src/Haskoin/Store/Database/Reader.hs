@@ -355,10 +355,9 @@ memoryReport db = do
 --
 -- Measured with 5,000 mempool transactions just deleted: a scan of an
 -- address that has nothing took 810 microseconds with filters on these
--- indices, and 13 without (@docs\/layered-database.md@). The store deletes
--- old mempool transactions by the thousand, so @--bloom@ would have made
--- every such scan slow for a while after each round. It never did, because
--- no filter was ever built before rocksdb-haskell-jprupp 2.6.2.
+-- indices, and 13 without, in the layout of version 20. No filter was ever
+-- built before rocksdb-haskell-jprupp 2.6.2, so it never happened to a
+-- store, and filters are on by default now for everything else.
 columnFamilyConfig :: Bool -> Bool -> [(String, Config)]
 columnFamilyConfig bloom cached =
   [ ("addr-tx", scanned (Just 22)),
@@ -442,9 +441,8 @@ balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
 -- | Column family for mempool transactions ('MemTxKey' and 'MemTimeKey').
--- In the layered layout it also has their bodies, under t'TxKey', their
--- spenders, under t'MemSpenderKey', and the deleted ones, under
--- t'MemDeletedKey'.
+-- In the layered layout it also has their bodies, under t'TxKey', and
+-- their spenders, under t'MemSpenderKey'.
 mempoolCF :: DB -> ColumnFamily
 mempoolCF db = columnFamilies db !! 8
 

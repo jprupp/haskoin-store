@@ -13,8 +13,8 @@
 -- answers as a member of a fleet ("Haskoin.Store.Fleet.Member") keeps in
 -- the Redis that the fleet shares, so that a request about a wallet is one
 -- or two reads of Redis instead of a read of the database for each of its
--- addresses. It is "the cache on two layers" of
--- @docs\/layered-database.md@, built on the shared pool.
+-- addresses. It is built on the shared pool, and described in "The cache
+-- of extended public keys of a fleet" in @docs\/layered-database.md@.
 --
 -- = What an entry is
 --

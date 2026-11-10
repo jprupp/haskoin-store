@@ -64,7 +64,7 @@
 -- |           |                  | address                                   |
 -- +-----------+------------------+-------------------------------------------+
 -- | 0x0e      | t'MemDeletedKey' | 'TxData' of a transaction that left the   |
--- |           |                  | mempool unconfirmed                       |
+-- |           |                  | mempool unconfirmed: not written any more |
 -- +-----------+------------------+-------------------------------------------+
 -- | 0x0f      | t'MigrationKey'  | version a migration in progress started   |
 -- |           |                  | from                                      |
@@ -590,6 +590,10 @@ instance KeyValue MemAddrKey MemAddrVal
 -- Version 20 keeps them in the column family of transactions, under
 -- t'TxKey'. There, deleting a mempool transaction writes to the data of the
 -- chain, which the layered layout does not allow.
+--
+-- Nothing writes or reads this key any more: since version 22 the store
+-- keeps nothing of a transaction that leaves the mempool unconfirmed. A
+-- database that has some has them until its mempool is wiped.
 data MemDeletedKey
   = -- | key of a deleted transaction
     MemDeletedKey !TxHash

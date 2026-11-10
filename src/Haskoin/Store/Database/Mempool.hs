@@ -82,7 +82,6 @@ module Haskoin.Store.Database.Mempool
     getAddressMempools,
     getMempoolTx,
     getMempoolSpenders,
-    getDeletedTx,
     wipeMempoolArea,
 
     -- * Applying the mempool on top of the chain
@@ -165,7 +164,6 @@ import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
   ( MemAddrKey (..),
     MemAddrVal (..),
-    MemDeletedKey (..),
     MemSpenderKey (..),
     MemSummary (..),
     MemTimeKey (..),
@@ -325,10 +323,6 @@ getMempoolSpenders :: DatabaseReader -> TxHash -> IO (IntMap Spender)
 getMempoolSpenders r h = do
   rows <- matchingAsListCF r.db (mempoolCF r.db) (MemSpenderKeyS h)
   return $ IntMap.fromList [(fromIntegral p.index, s) | (MemSpenderKey p, s) <- rows]
-
--- | Body of a transaction that left the mempool without being confirmed.
-getDeletedTx :: DatabaseReader -> TxHash -> IO (Maybe TxData)
-getDeletedTx r h = retrieveCF r.db (mempoolCF r.db) (MemDeletedKey h)
 
 -- | Delete every key of the mempool area, and say how many there were. The
 -- chain is not touched: afterwards the database is that of a store whose

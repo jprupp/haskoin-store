@@ -310,7 +310,13 @@ data Cache = Cache
     jobs :: !(TVar [Job]),
     -- | when this store last marked each xpub as used, by id, in
     -- milliseconds; see 'touchEvery'
-    touched :: !(IORef (HashMap ByteString Integer))
+    touched :: !(IORef (HashMap ByteString Integer)),
+    -- | transactions that this store deleted since it started, as far as
+    -- the cache heard of them, up to a hundred thousand. The database
+    -- keeps nothing of a deleted transaction, so without this one that
+    -- Redis has and the database does not could as well be one that this
+    -- store has not seen yet, which an entry must not lose.
+    lost :: !(IORef (HashSet TxHash))
   }
 
 -- | What a store did to the cache since it started.
@@ -359,6 +365,7 @@ withCache cfg db chain pub logger action = do
   jobs <- newTVarIO []
   counters <- newIORef (CacheCounters 0 0 0)
   touched <- newIORef HashMap.empty
+  lost <- newIORef HashSet.empty
   metrics <- mapM newCacheMetrics cfg.stats
   let cache =
         Cache
@@ -373,7 +380,8 @@ withCache cfg db chain pub logger action = do
             metrics = metrics,
             counters = counters,
             jobs = jobs,
-            touched = touched
+            touched = touched,
+            lost = lost
           }
   withSubscription pub $ \events ->
     withAsync (listener cache events) $ \a1 ->
@@ -882,7 +890,13 @@ data Attempt
 incrementalFrom :: Cache -> XPubSpec -> [XPubBal] -> [XPubBal] -> HashSet TxHash -> IO Attempt
 incrementalFrom c x old bals changed = do
   let hashes = HashSet.toList changed
-  tds <- viewed c (\v -> L.getManyTxData v hashes)
+  stored <- viewed c (\v -> L.getManyTxData v hashes)
+  -- those that the database does not have because this store deleted
+  -- them count as known, and as deleted
+  gone <- readIORef c.lost
+  dropped <- lostTxs c [h | (h, Nothing) <- zip hashes stored, HashSet.member h gone]
+  let found = HashMap.fromList [(txHash td.tx, td) | td <- dropped]
+      tds = [maybe (HashMap.lookup h found) Just td | (h, td) <- zip hashes stored]
   let newMap = HashMap.fromList [(b.balance.address, b.balance) | b <- bals]
       oldMap = HashMap.fromList [(b.balance.address, b.balance) | b <- old]
       entering = [b | (a, b) <- HashMap.toList newMap, not (HashMap.member a oldMap)]
@@ -989,9 +1003,20 @@ fullDiff c x changed m height bals _ = do
   let newTxs = [(encode t.txid, blockRefScore t.block) | t <- txs]
       newTxSet = HashSet.fromList (map fst newTxs)
       txDel = [t | t <- HashMap.keys st.txs, not (HashSet.member t newTxSet)]
-  -- a transaction that Redis has and this store has never seen
-  known <- viewed c (\v -> L.getManyTxData v [h | t <- txDel, Right h <- [decode t]])
-  if not (mayReplace m.stamp height (any isNothing known))
+  -- a transaction that Redis has and this store has never seen. The store
+  -- keeps nothing of a transaction that it deleted, so one that it does
+  -- not have is taken for deleted, and not for unseen, if the cache heard
+  -- of its deletion, or if the entry has it as unconfirmed for more than
+  -- ten minutes: a store that is in step with the others has seen a
+  -- transaction of the mempool by then, and one that is not does not get
+  -- here.
+  let asked = [(h, sc) | t <- txDel, Right h <- [decode t], Just sc <- [HashMap.lookup t st.txs]]
+  known <- viewed c (\v -> L.getManyTxData v (map fst asked))
+  gone <- readIORef c.lost
+  now <- (`div` 1000) <$> nowMs
+  let stale sc = sc < 0 && fromIntegral now - negate sc > 600
+      unseen = [h | ((h, sc), Nothing) <- zip asked known, not (HashSet.member h gone), not (stale sc)]
+  if not (mayReplace m.stamp height (not (null unseen)))
     then return Nothing
     else do
       utxos <- viewed c (\v -> L.xPubUnspents v bals def')
@@ -1286,7 +1311,12 @@ eventChanges c lastBest e = do
       writeIORef lastBest (Just h)
       ("b:" <> encode h,) <$> blockTxs c prev h
     StoreMempoolNew t -> ("t+:" <> encode t,) . maybeToList <$> viewed c (\v -> L.getTxData v t)
-    StoreMempoolDelete t -> ("t-:" <> encode t,) . maybeToList <$> viewed c (\v -> L.getTxData v t)
+    -- the store keeps nothing of a transaction that it deleted. Redis has
+    -- the body of every transaction of a cached xpub, so if it does not
+    -- have this one, no entry does either
+    StoreMempoolDelete t -> do
+      noteLost c [t]
+      ("t-:" <> encode t,) <$> lostTxs c [t]
     _ -> return ("", [])
   if null tds
     then return []
@@ -1352,13 +1382,33 @@ blockTxs c prev h =
       reverted <- case prev of
         Just p | p /= bd.header.prev && p /= h -> walk p
         _ -> return []
-      catMaybes <$> viewed c (\v -> L.getManyTxData v (bd.txs <> reverted))
+      let hashes = bd.txs <> reverted
+      found <- viewed c (\v -> L.getManyTxData v hashes)
+      -- a transaction of a reverted block that did not go back to the
+      -- mempool, as one that spends its coinbase does not, is gone from
+      -- the database. Redis has its body if a cached xpub has it.
+      let missing = [h' | (h', Nothing) <- zip hashes found]
+      noteLost c missing
+      (catMaybes found <>) <$> lostTxs c missing
   where
     -- blocks that are no longer in the main chain, from the old best block
     walk p =
       Q.getBlock c.db p >>= \case
         Just b | not b.main -> (b.txs <>) <$> walk b.header.prev
         _ -> return []
+
+-- | Note that the store deleted transactions.
+noteLost :: Cache -> [TxHash] -> IO ()
+noteLost _ [] = return ()
+noteLost c hs = atomicModifyIORef' c.lost $ \seen ->
+  let more = foldr HashSet.insert seen hs
+   in (if HashSet.size more > 100000 then HashSet.fromList hs else more, ())
+
+-- | The bodies that Redis has of transactions that the store deleted,
+-- marked as deleted. Redis has the body of every transaction of a cached
+-- xpub, so one that it does not have is in no entry.
+lostTxs :: Cache -> [TxHash] -> IO [TxData]
+lostTxs c hs = map (\td -> (td :: TxData) {deleted = True}) . catMaybes <$> cacheTxData c hs
 
 -- | Cached xpubs with an address that these transactions spend from or pay
 -- to, with the transactions that touch each.
