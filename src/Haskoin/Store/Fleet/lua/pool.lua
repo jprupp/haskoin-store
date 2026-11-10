@@ -49,6 +49,12 @@
 -- 'both' while the pool has both the entry that pays it and the entry that
 -- spends it, so it is added by the second to come and taken off by the
 -- first to go.
+--
+-- The cache of extended public keys (xpub.lua) has, for each key that it
+-- holds, the transactions of its addresses and the outputs paid to them,
+-- those of the pool among them. So what the pool puts in or takes out at an
+-- address goes in or out of the entry of every key that has the address,
+-- here, in the same step.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local osize = tsize + 4
 local key = {
@@ -68,7 +74,9 @@ local key = {
   aout = prefix .. 'pool:aout:',
   aval = prefix .. 'pool:aval:',
   aspent = prefix .. 'pool:aspent:',
-  asum = prefix .. 'pool:asum:'
+  asum = prefix .. 'pool:asum:',
+  of = prefix .. 'fx:of:',
+  entry = prefix .. 'fx:e:'
 }
 
 local function split(s, n)
@@ -131,11 +139,23 @@ local function account(t, time, entries, sign)
   for _, e in ipairs(entries) do
     local kind, a, o, v = e[1], e[2], e[3], tonumber(e[4])
     touched[a] = true
+    -- the cached keys that have the address
+    local watching = {}
+    if kind ~= 's' then
+      watching = redis.call('SMEMBERS', key.of .. a)
+    end
     if kind == 't' then
       if sign > 0 then
         redis.call('ZADD', key.atx .. a, -time, t)
       else
         redis.call('ZREM', key.atx .. a, t)
+      end
+      for _, id in ipairs(watching) do
+        if sign > 0 then
+          redis.call('ZADD', key.entry .. id .. ':txs', -time, t)
+        else
+          redis.call('ZREM', key.entry .. id .. ':txs', t)
+        end
       end
       add(a, 'txs', sign)
     elseif kind == 's' then
@@ -157,6 +177,15 @@ local function account(t, time, entries, sign)
       else
         redis.call('ZREM', key.aout .. a, o)
         redis.call('HDEL', key.aval .. a, o)
+      end
+      for _, id in ipairs(watching) do
+        if sign > 0 then
+          redis.call('ZADD', key.entry .. id .. ':outs', -time, o)
+          redis.call('HSET', key.entry .. id .. ':oval', o, e[4] .. ' ' .. #a .. ' ' .. a .. e[5])
+        else
+          redis.call('ZREM', key.entry .. id .. ':outs', o)
+          redis.call('HDEL', key.entry .. id .. ':oval', o)
+        end
       end
       add(a, 'paid', sign * v)
       add(a, 'paidCount', sign)

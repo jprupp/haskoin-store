@@ -51,7 +51,7 @@ to.
 | Cost of lookups, of whole queries and of writing | `docs/layered-database/` | measured |
 | A summary for each address, and lists read by the page | `MemSummary`, `Haskoin.Store.Database.Mempool`, `Haskoin.Store.Database.Query.Layered` | written, tested: each summary is what its entries add up to after every operation |
 | The web server on the new queries, one snapshot for each request | `Haskoin.Store.Web`, `routerScoped` | done |
-| The cache on two layers | `Haskoin.Store.Cache` | designed below, not started |
+| The cache on two layers | `Haskoin.Store.Fleet.XPub`, `xpub.lua`, `Haskoin.Store.Fleet.Member` | built for a fleet, on the shared pool; tested against the uncached answers; measured |
 
 Six findings came out of the work, in order of how soon they matter:
 
@@ -1104,9 +1104,11 @@ load at start, and no way to tell whether it matches a snapshot.
 
 ## The cache under the same rules
 
-This is the reason for the whole change. The design here is less far along
-than the database's: nothing of it is built, and it should be specified in
-`Haskoin.Store.Cache.Protocol`, with its model tests, before it is.
+This is the reason for the whole change. What follows is the design as it
+was written before the fleet existed. It is built now, for a fleet, in a
+simpler shape than this, because the shared pool had come to hold most of
+it: see [The cache as it was built](#the-cache-as-it-was-built) at the end
+of this section.
 
 ### Two layers in Redis
 
@@ -1201,6 +1203,127 @@ whatever their own mempools hold.
   mempool transactions it does not have, through its own rules. Then the
   stores' own mempools converge, and uncached queries agree too. This is an
   addition, not a requirement.
+
+### The cache as it was built
+
+`Haskoin.Store.Fleet.XPub` is the cache of extended public keys of a fleet,
+with one script, `xpub.lua`. A store alone keeps `Haskoin.Store.Cache`.
+
+**What an entry is.** For the addresses that a scan of the key reads:
+
+- the chain's layer: the balance of each address in the chain, the
+  transactions of all of them and their unspent outputs, at one block;
+- the pool's layer: the transactions of the shared pool that touch those
+  addresses, and the outputs that it pays to them.
+
+Both layers of transactions are in one sorted set, and both layers of
+outputs in another, in the order of the API, so a page is a range. A
+balance is the chain's with the summary that the pool already keeps for the
+address.
+
+**What differs from the design above, and why.**
+
+- **The pool's layer is not written by the stores.** The design had each
+  store add the entries of its mempool to the entries of the keys that they
+  touch, with rules for conflicts and for removal. The shared pool has
+  those rules already, in one script, and knows the addresses of every
+  transaction. So that script keeps the pool's layer of every entry as it
+  puts a transaction in or takes one out: a hash from each address to the
+  keys that have it is all it needs. An entry cannot have a mempool that
+  the pool does not.
+- **One block for the whole cache, not one for each entry.** The cache is
+  at a block, written next to it, and answers only while that is the fleet
+  tip. The store that moves the tip then brings the cache along: it asks
+  Redis which of the addresses that the new blocks touch are in entries,
+  usually none, and sends for those the new balances, transactions and
+  outputs, in one script that also moves the block of the cache. Until
+  then every read misses and is answered from the database, which gives
+  the same answer.
+- **No repair, because there is nothing to repair it from.** If the store
+  that moved the tip stops before it brings the cache along, the next move
+  finds the cache at a block that it does not start from, and empties it.
+  A member that sees the cache behind the same tip at two turns in a row
+  does the same. A reorganisation empties it too: undoing what the
+  abandoned blocks did would be more code than the weekly event is worth.
+  Emptying costs the builds of the keys that are asked about again.
+- **The gap is checked at every read**, not left open. The read of the
+  balances of a key runs the scan of the key over the balances of the
+  entry, pool included, and is a miss unless the scan reads exactly the
+  addresses that the entry has (`window`). A payment in the pool to an
+  unused address makes the key larger: the read misses, and the entry gets
+  the new addresses, without reading the others again. A key that got
+  smaller is deleted and built again. The other reads of a request say how
+  many addresses the request found, and miss if the entry has another
+  number by then.
+- **Entries are built in the background**, by the store that missed, for
+  keys with as many addresses or transactions as `--redis-min-addrs` and
+  `--redis-min-txs` ask, a few addresses to a write. The least recently
+  used go when there are more than `--redis-max-xpubs`.
+
+**What it costs and saves.** `FleetCost.hs` asks about the four wallets of
+the measurements three ways: of the store alone, of the store in a fleet
+without the cache, and through the cache. Every answer is checked to be the
+same. Milliseconds for a request, which reads the balances of the wallet
+and then what it was asked for:
+
+| | Alone | Fleet, no cache | Fleet, cached |
+|---|---|---|---|
+| Cold wallet, 464 addresses, 19,499 transactions: balances | 1.7 | 4.8 | 1.6 |
+| its first 100 transactions | 6.7 | 10.5 | 1.5 |
+| its first 100 unspent outputs | 10.6 | 15.8 | 2.2 |
+| the number of its transactions | 33.1 | 37.8 | 1.3 |
+| Busy wallet, 464 addresses, 42,035 transactions, 400 of them touched by the pool: balances | 2.0 | 5.4 | 3.3 |
+| its first 100 transactions | 9.6 | 64.6 | 3.1 |
+| its first 100 unspent outputs | 17.1 | 72.3 | 3.9 |
+| the number of its transactions | 78.6 | 125.7 | 3.9 |
+| Small wallet, 84 addresses, 399 transactions: balances | 0.32 | 0.82 | 0.42 |
+| its first 100 transactions | 0.75 | 1.72 | 0.67 |
+| its first 100 unspent outputs | 1.06 | 2.02 | 1.44 |
+
+- **A request about a large wallet costs what its balances cost**, a
+  millisecond or two for 464 addresses, whatever else it asks for. Without
+  the cache a fleet read the pool once for each address that it touches,
+  which is where the 65 and 72 milliseconds of the busy wallet went.
+- **The balances are most of what is left**: one read of Redis brings a
+  row for each address, and the store decodes them and runs the scan over
+  them. A wallet that the pool touches costs more, a summary read for
+  each address.
+- **A small wallet gains little**, and its unspent outputs are slower
+  through the cache than from a store alone, though faster than from a
+  fleet without it. That is what `--redis-min-addrs` and
+  `--redis-min-txs` are for.
+- **Building an entry** took 450 milliseconds for a wallet of 19,499
+  transactions and 420 for one of 42,035, of which 22,000 are in the pool
+  and are not read from the database.
+
+**What holds it to the truth.** The test of the member runs a store through
+random histories with the cache on, and after every step asks every
+question about a wallet twice, from the view at the fleet tip with the pool
+on top, and with the cache in front: balances, the count, and pages of
+transactions and of unspent outputs with limits, offsets and starts. The
+wallet is cached after two steps of three, so blocks, payments,
+replacements and reorganisations find it in the cache and out of it, and at
+one step in five the tip is moved without the cache. Twelve changes to the
+scripts and to `window`, each of which breaks one rule, were tried against
+it, and each made it fail: the pool not adding to an entry, or not taking
+out of it; a block's transactions, balances or spent outputs not applied;
+outputs that the pool spends not left out; the summaries of the pool not
+read; an entry used with other addresses than the key has, or by a caller
+with another number of them; a cache at another block than the tip
+answering, written to, or kept when it should be emptied. The integration tests run two stores as a fleet against
+a real node: each answers about a cached wallet as it does with
+`nocache=true`, and as the other does, with a payment in the pool and after
+the block that confirms it.
+
+**What is still open** of the list above:
+
+- *Mempool spenders of outputs outside the xpub* are no longer a
+  difference between stores: bodies and their spenders come from the
+  shared pool for every store.
+- *Stores that disagree* and *sharing transactions* are as the pool
+  settles them.
+- The cache has no metrics of its own yet: hits, misses and builds are not
+  counted.
 
 ## A fleet that answers as one
 
@@ -1413,9 +1536,9 @@ aside for these reasons:
   address and its list, read one after the other, can then differ by that
   transaction. A store alone reads one snapshot and has no such gap.
   Closing it in Redis would take versions of every entry of the pool.
-- **The xpub cache is not used in a fleet.** Its entries follow each
-  store's own database. The cache on two layers, of the section before,
-  would be the way to have both.
+- **The xpub cache of a store alone is not used in a fleet.** Its entries
+  follow each store's own database. A fleet has
+  [a cache of its own](#the-cache-as-it-was-built), on two layers.
 - **Deleted transactions are not known to a fleet**, since each store keeps
   its own.
 - **Conflicts between stores' mempools** are settled when a transaction is
@@ -1711,8 +1834,9 @@ Each step ends with something that can be tested against today's behaviour.
    `Haskoin.Store.Database.Query`) are not deleted: the tests run every
    random history through both and compare, which is the evidence that the
    new layout answers as the old one did. Nothing in the store calls them.
-6. **The cache on two layers**, specified and model-tested in
-   `Haskoin.Store.Cache.Protocol` first.
+6. **The cache on two layers.** Done for a fleet:
+   [The cache as it was built](#the-cache-as-it-was-built). A store alone
+   keeps the cache that it had (`Haskoin.Store.Cache`).
 
 Before step 5, the read path had to change as
 [the measurements ask](#what-has-to-change-before-the-switch): a summary for

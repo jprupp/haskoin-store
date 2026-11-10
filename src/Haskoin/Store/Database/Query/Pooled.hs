@@ -43,6 +43,7 @@ module Haskoin.Store.Database.Query.Pooled
   ( PoolReads (..),
     pooledRead,
     localPool,
+    pageStart,
   )
 where
 

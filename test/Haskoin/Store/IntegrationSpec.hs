@@ -1525,6 +1525,12 @@ redisDownTest env = do
 -- hear of from the node reaches the pool once, and both answer every
 -- question about it alike, with the one time that the pool has for it; and
 -- when a block confirms it, the fleet moves there and the pool lets it go.
+--
+-- The payment is to an extended public key, which the fleet's cache of
+-- them takes after the first request about it. Each store must then
+-- answer about the key from the cache as it does when asked to answer from
+-- its database, with the payment in the pool and after the block: the
+-- cache is brought to the block by whichever store moved the tip.
 fleetTest :: Env -> IO ()
 fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member logger $ \b urlB -> do
   one <- maybe (fail "The store is not a member of a fleet") return a.fleet
@@ -1554,6 +1560,31 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
         let h = fromMaybe (error "bad txid") (hexToTxHash txid)
         redisRun env (Redis.hexists (cachePrefix env.net <> "pool:spends") (encode h))
       listed url = length . arr . snd <$> getJSON url (address <> "/transactions")
+      about =
+        [ xpub <> q,
+          xpub <> "/balances" <> q,
+          xpub <> "/transactions" <> q,
+          xpub <> "/transactions/full" <> q,
+          xpub <> "/unspent" <> q
+        ]
+      cachedKey = cachePrefix env.net <> "fx:e:" <> xpubId x.spec <> ":meta"
+      -- the cache has the key, at the fleet tip, and each store answers
+      -- about it as it does without the cache, and as the other store does
+      throughCache what = do
+        waitFor ("the cache to have the key, " <> what) $ do
+          _ <- getJSON urlA (xpub <> "/balances" <> q)
+          has <- redisRun env (Redis.exists cachedKey)
+          tip <- memberTip one
+          cached <- redisRun env (Redis.get (cachePrefix env.net <> "fx:tip"))
+          return (has && isJust tip && cached == tip)
+        alike ("the two stores to answer alike from the cache, " <> what) about
+        waitFor ("each store to answer from the cache as from its database, " <> what) $ do
+          let direct = map (<> "&nocache=true") about
+          cachedA <- mapM (getJSON urlA) about
+          directA <- mapM (getJSON urlA) direct
+          cachedB <- mapM (getJSON urlB) about
+          directB <- mapM (getJSON urlB) direct
+          return (cachedA == directA && cachedB == directB && cachedA == cachedB)
   waitStore env a
   waitStore env b
   atTip
@@ -1562,6 +1593,7 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   waitFor "the pool of the fleet to have the payment" (inPool txid)
   waitFor "both stores to list the payment" $ (== (1, 1)) <$> ((,) <$> listed urlA <*> listed urlB)
   alike "the two stores to answer alike, with the payment in the pool" (paths txid)
+  throughCache "with the payment in the pool"
   -- the payment is unconfirmed in the answers, at the time that the pool has
   (_, unconfirmed) <- getJSON urlA ("/transaction/" <> T.unpack txid)
   (unconfirmed ! "block") `shouldSatisfy` \case
@@ -1573,6 +1605,7 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   atTip
   inPool txid `shouldReturn` False
   alike "the two stores to answer alike, with the payment confirmed" (paths txid)
+  throughCache "with the payment confirmed"
   (_, confirmed) <- getJSON urlB ("/transaction/" <> T.unpack txid)
   (confirmed ! "block") `shouldSatisfy` \case
     Object o -> KeyMap.member "height" o

@@ -54,7 +54,8 @@
 --   The state is made for each request, around one view of the database,
 --   so that everything a request reads is of one moment; a store that is a
 --   member of a fleet takes the view at the block that its fleet answers
---   from, with the mempool that the fleet shares on top
+--   from, with the mempool that the fleet shares on top, and has the
+--   fleet's cache of xpubs in front of the queries about them
 --   ("Haskoin.Store.Fleet.Member").
 --   Routes, parameters and the passing of a request to the next route are
 --   in "Haskoin.Store.Web.Router", a few dozen lines over WAI. A handler
@@ -193,9 +194,8 @@ import Haskoin.Store.Common qualified as C
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
-import Haskoin.Store.Database.Query.Pooled (pooledRead)
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Fleet.Member (Member (..), TipMoved (..), answeringAt, memberAlive, memberTip)
+import Haskoin.Store.Fleet.Member (Member (..), TipMoved (..), answeringCached, memberAlive, memberTip)
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.Web.Router qualified as Router
@@ -638,8 +638,11 @@ serveWeb config serve = do
           Just (Just tip) -> do
             handled <- newIORef False
             let marked confirm r = r {handler = \req -> r.handler req <* confirm <* writeIORef handled True} :: Route
-                inFleet r pool confirm = answer (map (marked confirm) (routesOf (stateOf (pooledRead r pool))))
-            try (answeringAt member tip inFleet) >>= \case
+                -- extended public keys through the fleet's cache of
+                -- them, unless a request asks for the database
+                inFleet plain cached confirm =
+                  answer (map (marked confirm) (routesOf WebState {query = cached, direct = plain, ..}))
+            try (answeringCached member tip inFleet) >>= \case
               Right (Just sent) -> return sent
               Right Nothing
                 -- a tip from the member's last turn of which there is no

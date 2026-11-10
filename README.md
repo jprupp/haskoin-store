@@ -251,6 +251,10 @@ can share one Redis: they keep each other's cache up to date, and a store that
 has not imported a transaction yet still serves it from the cache. Add
 `nocache=true` to a query to read the database instead.
 
+Servers behind a load balancer should also be started with `--fleet`
+([A fleet of servers](#a-fleet-of-servers)): they then answer every request
+alike, and share a cache of xpubs that is built for that.
+
 ## Configuration
 
 Every option has an environment variable that sets its default, which is handy
@@ -338,8 +342,18 @@ the same block and the same mempool:
   health check fails stops reporting.
 - **Without Redis** each server answers from its own database, and
   `/health` says 203, as it does for the cache.
-- **The xpub cache is not used with `--fleet`.** Its entries follow each
-  server's own database, which is what a fleet does not answer from.
+- **Large xpubs are cached for the whole fleet**, under the same
+  `--redis-min-addrs`, `--redis-min-txs` and `--redis-max-xpubs` as the
+  cache of a server alone, which should be the same on every server. An
+  entry holds the chain's part of a wallet at the block that the fleet
+  answers from, and the pool's part is kept by the pool itself, so a
+  cached answer is the one that the database gives, on every server. The
+  server that moves the fleet to a new block brings the cache there; in
+  the moment before it has, and for a wallet that just gained or lost an
+  address, requests are answered from the database. A reorganisation
+  empties the cache. With it a request about a wallet of 464 addresses
+  and 19,499 transactions takes 1.3 to 2.2 milliseconds, where it took 5
+  to 38.
 - **Deleted transactions** are not known to a fleet: a page that starts at
   one is empty.
 
@@ -498,6 +512,17 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   still come to differ from the database unnoticed, such as a missed spend of
   an output of a cached transaction, and what would rule them out, are in
   `docs/cache-consistency.md`.
+- A **fleet** (`Haskoin.Store.Fleet.Member`, with `--fleet`) has a cache of
+  xpubs of another kind (`Haskoin.Store.Fleet.XPub`), because its servers
+  do not answer from their own databases but from one block and one shared
+  mempool. An entry has two layers: what the chain has for the addresses of
+  the xpub at the block that the fleet answers from, and what the shared
+  pool has for them, which the script of the pool writes as it changes the
+  pool. The first follows from the chain, so any server writes the same,
+  and nothing has to be claimed or repaired: the server that moves the
+  fleet to a new block applies what the block did, and a cache that was
+  not brought along is emptied. `docs/layered-database.md` has the design,
+  the tests and the measurements.
 - The **web server** (`Haskoin.Store.Web`) answers from RocksDB, and from the
   cache for cached xpubs and for transaction bodies that Redis has.
 
@@ -732,7 +757,8 @@ package; each says in its header how to build and run it.
   databases give the same answers.
 - `FleetCost.hs` asks one store the same questions alone and as a member
   of a fleet, with its mempool in a pool in Redis, checks that the answers
-  are the same, and times both.
+  are the same, and times both. It asks about wallets a third way too,
+  through the fleet's cache of xpubs.
 
 ### Contributing
 

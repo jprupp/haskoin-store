@@ -211,7 +211,9 @@ info:
     Servers with a Redis cache keep large wallets ready: their first query reads
     the database and caches the result, and later ones are answered from memory.
     A cached answer is always the same as the database's; `nocache=true` skips
-    the cache.
+    the cache. The servers of a fleet share one such cache, and each answers
+    from it what it would answer from its database at the block that the
+    fleet answers from.
 
     ## Live updates
 
@@ -7176,7 +7178,8 @@ components:
         Answer from the database of this server, without reading the Redis cache and
         without caching the wallet. The answer is the same; this is for comparing,
         and for servers whose cache is shared with others that may be ahead of or
-        behind this one.
+        behind this one. A server of a fleet still answers from the block and the
+        mempool that the fleet shares, only without its cache of wallets.
       required: false
       schema:
         type: boolean

@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     503 with `behind-fleet`. One whose health check fails stops reporting,
     and stops counting when its lease runs out.
   - Without Redis a server answers from its own database and `/health` says
-    203. The xpub cache is not used with `--fleet`.
+    203.
   - `Haskoin.Store.Manager` runs the member (`Store.fleet`), the block
     store takes a view of the database right after each block
     (`BlockStoreConfig.onBest`), and the web server answers through
@@ -35,6 +35,37 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     from the tip that the member last read, which its first read of the
     pool checks; a transaction's body comes with what spends its outputs;
     and a first page is as large as the page asked for.
+
+- A cache of xpubs for a fleet (`Haskoin.Store.Fleet.XPub`), under the
+  options of the cache of a server alone: `--redis-min-addrs`,
+  `--redis-min-txs` and `--redis-max-xpubs`. Until now `--fleet` answered
+  every request about an xpub from the database, with a read of the shared
+  pool for each address that it touches.
+  - An entry has the chain's part of a wallet at one block, which is the
+    same for the whole cache, and the part of the shared pool, which the
+    script of the pool keeps as it changes the pool. Transactions and
+    outputs of both are in one sorted set each, in the order of the API.
+  - The cache answers only while its block is the fleet tip. The server
+    that moves the tip brings the cache along, with what the new blocks
+    did at the addresses that entries have. If it does not, or after a
+    reorganisation, the cache is emptied.
+  - Every read of balances runs the scan of the xpub over the entry and
+    misses unless it reads exactly the addresses of the entry, so a
+    payment in the pool to an unused address cannot leave the gap wrong.
+  - Entries are built in the background by the server that missed, and
+    extended when an xpub gains addresses.
+  - A request about a wallet of 464 addresses and 19,499 transactions
+    takes 1.3 to 2.2 milliseconds through it, where a fleet took 5 to 38;
+    for a wallet with 400 addresses in the pool, 3 to 4 where it took 5 to
+    126 (`docs/layered-database/fleet-cost.txt`).
+  - The test of the member compares every answer about a wallet through
+    the cache with the uncached one after each step of random histories,
+    and the two servers of the integration test do the same over HTTP.
+- `rocksdb-haskell-jprupp` 2.7 has iterators that stop at a bound. The
+  store was measured with them and has no use for them: since every
+  address of the mempool has a summary, a scan no longer walks over the
+  keys that a block deleted. It stays on 2.6.4, and
+  `docs/layered-database.md` has the numbers.
 
 ### Changed
 

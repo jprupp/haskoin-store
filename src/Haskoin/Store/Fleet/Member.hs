@@ -35,6 +35,13 @@
 --   ('answering', 'redisPool'), or says that it is behind when it has no
 --   view of the tip.
 --
+-- * __It keeps the fleet's cache of extended public keys__
+--   ("Haskoin.Store.Fleet.XPub"): it answers the queries about a key from
+--   it when the cache has the key ('answeringCached'), builds the entries
+--   that requests missed ('memberCacheLoop'), brings the cache to the new
+--   block when it moves the tip, and empties a cache that was left behind
+--   ('syncCache').
+--
 -- = Why the member does not withdraw what it deletes
 --
 -- A store deletes a transaction from its own mempool when it replaces it,
@@ -61,12 +68,20 @@ module Haskoin.Store.Fleet.Member
     answering,
     memberTip,
     answeringAt,
+    answeringCached,
     TipMoved (..),
     redisPool,
+
+    -- * The cache of extended public keys
+    memberCacheLoop,
+    wantCached,
+    syncCache,
 
     -- * The parts of a tick
     report,
     moveTip,
+    Between (..),
+    blocksBetween,
     changeBetween,
     offerMempool,
     expirePool,
@@ -90,6 +105,7 @@ import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Serialize (Serialize, decode, encode)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import Database.Redis qualified as R
 import Haskoin
@@ -104,19 +120,23 @@ import Haskoin
     nullOutPoint,
     txHash,
   )
-import Haskoin.Store.Common (Limits (..))
+import Haskoin.Store.Common (Limits (..), StoreRead (..))
 import Haskoin.Store.Data
-  ( BlockData (..),
+  ( Balance (..),
+    BlockData (..),
     BlockRef (..),
     Spender (..),
     TxData (..),
     UnixTime,
     Unspent (..),
+    XPubBal (..),
+    XPubSpec,
+    nullBalance,
   )
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
-import Haskoin.Store.Database.Query.Pooled (PoolReads (..))
+import Haskoin.Store.Database.Query.Pooled (PoolReads (..), pageStart, pooledRead)
 import Haskoin.Store.Database.Reader (DatabaseReader (..), txCF)
 import Haskoin.Store.Database.Types
   ( MemAddrKey (..),
@@ -127,15 +147,20 @@ import Haskoin.Store.Database.Types
 import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, takeView, withViewAt)
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
+import Haskoin.Store.Fleet.XPub
 import UnliftIO
   ( TVar,
     atomically,
+    handle,
     handleAny,
+    modifyIORef',
     modifyTVar',
     newIORef,
     newTVarIO,
     readIORef,
+    readTVar,
     readTVarIO,
+    retrySTM,
     stateTVar,
     timeout,
     writeIORef,
@@ -157,7 +182,15 @@ data MemberConfig = MemberConfig
     depth :: !Int,
     -- | seconds after which a transaction leaves the pool unconfirmed, or 0
     -- for never
-    expiry :: !Word64
+    expiry :: !Word64,
+    -- | how many extended public keys the fleet's cache of them may hold
+    -- ("Haskoin.Store.Fleet.XPub"), the least recently used going first, or
+    -- 0 not to use the cache
+    cacheMax :: !Int,
+    -- | cache a key that has at least this many used addresses
+    cacheMinAddrs :: !Int,
+    -- | or at least this many transactions in its addresses
+    cacheMinTxs :: !Int
   }
 
 -- | A store that is a member of a fleet.
@@ -187,7 +220,14 @@ data Member = Member
     -- | whether the store's own health checks pass. While they do not, the
     -- member does nothing, so that its lease runs out and a store that is
     -- stuck does not hold the fleet back.
-    healthy :: !(TVar Bool)
+    healthy :: !(TVar Bool),
+    -- | the extended public keys that requests asked about and the cache
+    -- did not have, by their names in Redis: 'memberCacheLoop' builds
+    -- their entries
+    wanted :: !(TVar (HashMap ByteString XPubSpec)),
+    -- | the fleet tip at which the cache was found at another block, at
+    -- the last turn
+    lagging :: !(TVar (Maybe ByteString))
   }
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
@@ -203,6 +243,8 @@ newMember config redis db = do
   offeredAt <- newTVarIO Nothing
   changed <- newTVarIO True
   healthy <- newTVarIO True
+  wanted <- newTVarIO HashMap.empty
+  lagging <- newTVarIO Nothing
   return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
@@ -257,6 +299,7 @@ memberTick m = do
   tip <- fmap decoded <$> fleetTip m.redis m.keys
   atomically (writeTVar m.tip (fromMaybe Nothing tip))
   prune m
+  syncCache m
   unless moved (expirePool m)
   offerMempool m
   where
@@ -306,12 +349,12 @@ moveTip m = do
       fleet = F.Fleet {tip = seen, reports}
   case F.agreed now fleet of
     Just target | Just target /= seen -> do
-      change <- case (traverse decode seen, decode target) of
-        (Right from, Right to) -> changeBetween m.db from to
+      between <- case (traverse decode seen, decode target) of
+        (Right from, Right to) -> blocksBetween m.db from to
         _ -> return Nothing
-      fleetAdvance m.redis m.keys 32 Nothing seen target change <&> \case
-        MovedTo _ -> True
-        _ -> False
+      fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) >>= \case
+        MovedTo _ -> advanceCache m seen target between >> return True
+        _ -> return False
     _ -> return False
   where
     redis' :: R.Redis (Either R.Reply a) -> IO a
@@ -339,7 +382,24 @@ farthest = 50
 -- is not on its main chain, or if the way is longer than 'farthest'
 -- blocks on either side.
 changeBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe PoolChange)
-changeBetween db from to = L.withView db $ \view -> do
+changeBetween db from to = fmap (.pool) <$> blocksBetween db from to
+
+-- | What the blocks between two tips did.
+data Between = Between
+  { -- | what they did to the pool
+    pool :: !PoolChange,
+    -- | the transactions of the blocks of the main chain from where it
+    -- left the way to the first tip, up to the second, in their order
+    added :: ![TxData],
+    -- | whether blocks of the way to the first tip were abandoned
+    reorganised :: !Bool
+  }
+
+-- | 'changeBetween', with the transactions that the new blocks confirm,
+-- which is what the cache of extended public keys is brought to the new
+-- tip with ('advanceCache').
+blocksBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe Between)
+blocksBetween db from to = L.withView db $ \view -> do
   let r = L.viewReader view
       -- the blocks from one that is not on the main chain back to it
       back :: Int -> BlockHash -> IO (Maybe ([BlockData], BlockData))
@@ -373,13 +433,14 @@ changeBetween db from to = L.withView db $ \view -> do
             Just added -> do
               old <- concat <$> mapM (bodies view) (reverse abandoned)
               new <- concat <$> mapM (confirmedBy r) (reverse added)
-              return . Just $
-                PoolChange
-                  { returned = [poolTx r.net r.ctx td | (_, Just td) <- old, not (coinbase td)],
-                    gone = [encode h | (h, found) <- old, maybe True coinbase found],
-                    confirmed = map (encode . txHash . (.tx)) new,
-                    spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
-                  }
+              let pool =
+                    PoolChange
+                      { returned = [poolTx r.net r.ctx td | (_, Just td) <- old, not (coinbase td)],
+                        gone = [encode h | (h, found) <- old, maybe True coinbase found],
+                        confirmed = map (encode . txHash . (.tx)) new,
+                        spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
+                      }
+              return (Just Between {pool, added = new, reorganised = not (null abandoned)})
     _ -> return Nothing
   where
     -- the transactions of an abandoned block, each with what the store has
@@ -576,7 +637,13 @@ memberTip m = fleetTip m.redis m.keys
 -- and throws the same. An answer that passed either is one that every
 -- store of the fleet gave at that moment.
 answeringAt :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO () -> IO a) -> IO (Maybe a)
-answeringAt m tip action = case decode tip of
+answeringAt m tip action = answeringWith m tip (\r pool _ confirm -> action r pool confirm)
+
+-- | 'answeringAt', for an action that reads Redis by other ways than the
+-- pool too: it is also given what to run after each such read that found
+-- the tip where it should be.
+answeringWith :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO () -> IO () -> IO a) -> IO (Maybe a)
+answeringWith m tip action = case decode tip of
   Left _ -> return Nothing
   Right block -> withViewAt m.views block $ \r -> do
     checked <- newIORef False
@@ -586,7 +653,165 @@ answeringAt m tip action = case decode tip of
             False -> do
               now <- memberTip m
               if now == Just tip then writeIORef checked True else throwIO TipMoved
-    action r (redisPool m.redis m.keys tip (writeIORef checked True)) confirm
+        found = writeIORef checked True
+    action r (redisPool m.redis m.keys tip found) found confirm
+
+-- | 'answeringAt' with the queries ready: those of
+-- "Haskoin.Store.Database.Query.Pooled" for the view and the pool, and
+-- the same with the cache of extended public keys in front
+-- ('cachedRead'), which is what requests are answered with unless they
+-- ask not to be.
+answeringCached :: Member -> ByteString -> (StoreRead -> StoreRead -> IO () -> IO a) -> IO (Maybe a)
+answeringCached m tip action = answeringWith m tip $ \r pool found confirm -> do
+  cached <- cachedRead m tip r pool found
+  action (pooledRead r pool) cached confirm
+
+-------------------------------------------------------------------------------
+-- The cache of extended public keys
+-------------------------------------------------------------------------------
+
+-- | The queries of a request with the fleet's cache of extended public
+-- keys in front of those about them: given the tip that the request
+-- answers from, the view at that block, the pool, and what to run after a
+-- read that found the tip where it should be.
+--
+-- The balances of a key come from the cache if it has the key with the
+-- addresses that it has now. The other three queries about a key are given
+-- its balances by the caller, and are answered from the cache when this
+-- same request got them there: the cache is then asked for an entry with
+-- as many addresses, so that an entry that changed in between is not
+-- used. Whatever the cache does not answer the database does, and a key
+-- that it did not have is put down to be built ('wantCached'). A read that
+-- finds the tip moved throws v'TipMoved', like those of the pool.
+cachedRead :: Member -> ByteString -> DatabaseReader -> PoolReads -> IO () -> IO StoreRead
+cachedRead m tip r pool found
+  | m.config.cacheMax <= 0 = return base
+  | otherwise = do
+      seen <- newIORef HashMap.empty
+      let hit :: Cached a -> IO (Maybe a)
+          hit = \case
+            Hit x -> Just x <$ found
+            Miss -> return Nothing
+            Moved -> throwIO TipMoved
+          entryOf x = HashMap.lookup (xpubId x) <$> readIORef seen
+          -- from the cache if this request has the entry of the key, and
+          -- from where the page starts if it has a start
+          paged :: XPubSpec -> Limits -> IO [a] -> (Entry -> L.From -> IO (Cached [a])) -> IO [a]
+          paged x limits direct cached =
+            entryOf x >>= \case
+              Nothing -> direct
+              Just e ->
+                pageStart r pool limits.start >>= \case
+                  Nothing -> return []
+                  Just from -> cached e from >>= hit >>= maybe direct return
+      return
+        base
+          { xPubBals = \x -> do
+              now <- milliseconds
+              cachedEntry m.redis m.keys tip r.initGap r.maxGap now x >>= hit >>= \case
+                Just e -> e.balances <$ modifyIORef' seen (HashMap.insert (xpubId x) e)
+                Nothing -> do
+                  bals <- base.xPubBals x
+                  wantCached m x bals
+                  return bals,
+            xPubTxs = \x bals limits ->
+              paged x limits (base.xPubTxs x bals limits) $ \e from ->
+                cachedTxs m.redis m.keys tip x e.sizes from limits,
+            xPubUnspents = \x bals limits ->
+              paged x limits (base.xPubUnspents x bals limits) $ \e from ->
+                cachedUnspents m.redis m.keys tip x e from limits,
+            xPubTxCount = \x bals ->
+              entryOf x >>= \case
+                Nothing -> base.xPubTxCount x bals
+                Just e ->
+                  cachedCount m.redis m.keys tip x e.sizes >>= hit >>= maybe (base.xPubTxCount x bals) return
+          }
+  where
+    base = pooledRead r pool
+
+-- | The time in milliseconds, by which the cache orders the keys by use.
+milliseconds :: IO Word64
+milliseconds = round . (* 1000) <$> getPOSIXTime
+
+-- | Put an extended public key down to be cached, given its balances, if
+-- it is worth it: a key with few addresses and few transactions is read
+-- from the database as fast as from Redis. The thresholds are those of the
+-- configuration, and count as "Haskoin.Store.Cache" counts them.
+wantCached :: Member -> XPubSpec -> [XPubBal] -> IO ()
+wantCached m x bals =
+  when (m.config.cacheMax > 0 && (length used >= m.config.cacheMinAddrs || txs >= m.config.cacheMinTxs)) $
+    atomically . modifyTVar' m.wanted $ \w ->
+      if HashMap.size w < 1000 then HashMap.insert (xpubId x) x w else w
+  where
+    used = filter (not . nullBalance . (.balance)) bals
+    txs = fromIntegral (sum (map (.balance.txs) used)) :: Int
+
+-- | Build the entries of the keys that requests asked about and the cache
+-- did not have, one at a time, for as long as the store runs. A build that
+-- fails is told to a function. The least recently used entries are deleted
+-- when there are more than the configuration allows.
+--
+-- This is apart from the turns of the member because an entry of a wallet
+-- with a long history takes seconds to read from the database, and a
+-- member that does not report for that long loses its lease.
+memberCacheLoop :: Member -> (String -> IO ()) -> IO a
+memberCacheLoop m complain = go
+  where
+    go = do
+      spec <- atomically $ do
+        w <- readTVar m.wanted
+        case HashMap.toList w of
+          [] -> retrySTM
+          (k, x) : _ -> x <$ writeTVar m.wanted (HashMap.delete k w)
+      handleAny (complain . show) (build spec)
+      go
+    build spec =
+      readTVarIO m.tip >>= \case
+        Nothing -> return ()
+        Just block -> do
+          now <- milliseconds
+          let tip = encode block
+          built <-
+            handle (\TipMoved -> return Nothing) $
+              answeringAt m tip (\r pool _ -> cacheBuild m.redis m.keys tip r pool now spec)
+          case built of
+            Just (Built n) | n > 0 -> void (cacheEvict m.redis m.keys m.config.cacheMax)
+            _ -> return ()
+
+-- | Bring the cache of extended public keys to the block that this member
+-- just moved the fleet tip to, with what the blocks in between did at the
+-- addresses that its entries have. The cache is emptied instead when the
+-- member cannot say what they did, when the chain was reorganised, which
+-- is rare and would need what the abandoned blocks did undone, or when
+-- the member has no view of the block.
+advanceCache :: Member -> Maybe ByteString -> ByteString -> Maybe Between -> IO ()
+advanceCache m seen target between = when (m.config.cacheMax > 0) $ do
+  changes <- case (between, decode target) of
+    (Just b, Right to) | not b.reorganised -> withViewAt m.views to $ \r -> do
+      let touched = HashMap.toList (blockChanges r.net r.ctx b.added)
+      flags <- cacheTracked m.redis m.keys (map fst touched)
+      forM [x | (x, True) <- zip touched flags] $ \(a, change) -> do
+        bal <- Q.getBalance r a
+        return (a, bal, change)
+    _ -> return Nothing
+  void (cacheAdvance m.redis m.keys seen target changes)
+
+-- | See that the cache of extended public keys does not stay at another
+-- block than the fleet tip. It is there for a moment after every move of
+-- the tip, until the store that moved it has brought the cache along, and
+-- for good if that store stopped before it did. So a member that finds
+-- the cache behind the same tip at two turns in a row empties it, and it
+-- starts again at the tip. Every turn of a member runs this.
+syncCache :: Member -> IO ()
+syncCache m = when (m.config.cacheMax > 0) $ do
+  tip <- fmap encode <$> readTVarIO m.tip
+  at <- cacheTip m.redis m.keys
+  before <- readTVarIO m.lagging
+  case tip of
+    Just t | at /= Just t -> do
+      when (before == Just t) (void (cacheAdvance m.redis m.keys Nothing t Nothing))
+      atomically (writeTVar m.lagging (Just t))
+    _ -> atomically (writeTVar m.lagging Nothing)
 
 -- | The shared pool of a fleet as it is at a tip, for the queries of
 -- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if

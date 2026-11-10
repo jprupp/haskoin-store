@@ -83,7 +83,15 @@ import Haskoin.Store.Database.Reader
     createDataMetrics,
     withLayeredReader,
   )
-import Haskoin.Store.Fleet.Member (Member, MemberConfig (..), memberForget, memberLoop, newMember, noteBest)
+import Haskoin.Store.Fleet.Member
+  ( Member,
+    MemberConfig (..),
+    memberCacheLoop,
+    memberForget,
+    memberLoop,
+    newMember,
+    noteBest,
+  )
 import NQE
   ( Inbox,
     Publisher,
@@ -161,8 +169,10 @@ data StoreConfig = StoreConfig
     -- every store of the fleet then gives the same answer to the same
     -- request, from the block that they agree on and the mempool that they
     -- share ("Haskoin.Store.Fleet.Member"). The cache of extended public
-    -- keys is not used then: its entries follow each store's own database,
-    -- which is what a fleet does not answer from.
+    -- keys of a store alone ("Haskoin.Store.Cache") is not used then: its
+    -- entries follow each store's own database, which is what a fleet does
+    -- not answer from. A fleet has one of its own
+    -- ("Haskoin.Store.Fleet.XPub"), under the same three settings.
     fleet :: !Bool,
     -- | sync mempool from peers
     syncMempool :: !Bool,
@@ -251,7 +261,10 @@ storeMember cfg db = case (cfg.fleet, cfg.redis) of
             name,
             lease = 10000,
             depth = 6,
-            expiry = fromIntegral cfg.mempoolTimeout * 24 * 3600
+            expiry = fromIntegral cfg.mempoolTimeout * 24 * 3600,
+            cacheMax = cfg.redisMaxXPubs,
+            cacheMinAddrs = cfg.redisMinAddrs,
+            cacheMinTxs = cfg.redisMinTxs
           }
         conn
         db
@@ -259,11 +272,14 @@ storeMember cfg db = case (cfg.fleet, cfg.redis) of
 
 -- | Take the store's turns as a member of its fleet while an action runs,
 -- if it is one: every two seconds, and whenever the best block changes.
+-- Beside them, in a thread of its own, the member builds the entries of
+-- the fleet's cache of extended public keys that requests asked for.
 withStoreFleet :: StoreConfig -> Publisher StoreEvent -> Maybe Member -> IO a -> IO a
 withStoreFleet _ _ Nothing action = action
 withStoreFleet cfg pub (Just member) action =
   withSubscription pub $ \sub ->
-    withAsync (memberLoop member (nextBlock sub) complain) $ \a -> link a >> action
+    withAsync (memberLoop member (nextBlock sub) complain) $ \a ->
+      withAsync (memberCacheLoop member cacheComplain) $ \b -> link a >> link b >> action
   where
     -- until the next block, telling the member what the store deletes
     nextBlock sub =
@@ -272,6 +288,7 @@ withStoreFleet cfg pub (Just member) action =
         StoreMempoolDelete h -> memberForget member [h] >> nextBlock sub
         _ -> nextBlock sub
     complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not take a turn: " <> cs why)
+    cacheComplain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not cache an xpub: " <> cs why)
 
 -- | Run the cache while an action runs, if Redis is configured.
 withStoreCache ::

@@ -19,7 +19,9 @@
 -- The store becomes the only member of a fleet under keys that start with
 -- @cost:@, which are deleted first, and offers its whole mempool to the
 -- pool, which is timed. Then each question is asked both ways, the answers
--- are checked to be the same, and the times are printed.
+-- are checked to be the same, and the times are printed. The wallets of
+-- QueryCost.hs are asked about a third way too: through the fleet's cache
+-- of extended public keys, after their entries are built, which is timed.
 module Main (main) where
 
 import Conduit (concatMapC, runConduit, sinkList, takeC, (.|))
@@ -38,7 +40,7 @@ import Database.RocksDB (withIterCF)
 import Database.RocksDB.Query (matching)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
-import Haskoin.Store.Common (Limits (..), StoreRead (..), deriveAddresses, deriveFunction)
+import Haskoin.Store.Common (Limits (..), StoreRead (..))
 import Haskoin.Store.Data (DeriveType (..), XPubSpec (..))
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
@@ -46,6 +48,7 @@ import Haskoin.Store.Database.Query.Pooled (pooledRead)
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types (BalKey (..), BalVal, MemAddrKey (..), MemAddrVal (..), MemSummary (..))
 import Haskoin.Store.Fleet.Member
+import Haskoin.Store.Fleet.XPub (cacheBuild)
 import System.Environment (getArgs)
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import Text.Printf (printf)
@@ -61,7 +64,18 @@ main = withContext $ \ctx -> do
   let mib = 1024 * 1024
       open = withLayeredReader btcRegTest ctx 20 32 dir False (Just 2000) (Just (256 * mib))
   open (Just (1024 * mib)) (Just (1024 * mib)) Nothing $ \db -> do
-    m <- newMember MemberConfig {prefix = "cost:", name = "a", lease = 600000, depth = 6, expiry = 0} conn db
+    let config =
+          MemberConfig
+            { prefix = "cost:",
+              name = "a",
+              lease = 600000,
+              depth = 6,
+              expiry = 0,
+              cacheMax = 100,
+              cacheMinAddrs = 0,
+              cacheMinTxs = 0
+            }
+    m <- newMember config conn db
     Just best <- Q.getBestBlock db
     noteBest m best
     mempool <- Q.getMempool db
@@ -124,24 +138,55 @@ main = withContext $ \ctx -> do
     ask "transaction: in the mempool" 3 [\q -> q.getTxData h | h <- newest]
     ask "100 transactions: in the mempool" 20 [\q -> q.getManyTxData (take 100 newest)]
     ask "first 100 of the mempool" 50 [\q -> q.getMempoolPage page]
-    -- the wallets of QueryCost.hs: what a request for an extended public
-    -- key costs with no cache, which a fleet does not have
+    -- the wallets of QueryCost.hs: what a request about an extended public
+    -- key costs a store alone, one of a fleet, and one of a fleet through
+    -- the cache
     let wallets =
           [ ("cold wallet", wallet ctx "the cold wallet of the measurements of haskoin-store"),
             ("quiet wallet", wallet ctx "the quiet wallet of the measurements of haskoin-store"),
             ("busy wallet", wallet ctx "the busy wallet of the measurements of haskoin-store"),
             ("small wallet", wallet ctx "the small wallet of the measurements of haskoin-store")
           ]
+        -- as 'shared', with the fleet's cache of extended public keys in
+        -- front
+        cached :: (StoreRead -> IO a) -> IO a
+        cached q = do
+          Just tip <- readTVarIO m.tip
+          answeringCached m (encode tip) (\_ through confirm -> q through <* confirm) >>= \case
+            Just x -> return x
+            Nothing -> fail "the store has no view of the fleet tip"
+        -- a request about a wallet reads its balances and then what it
+        -- was asked for, which is how the cache is used: the second read
+        -- says how many addresses the first one found
+        ask3 :: (Eq a, NFData a) => String -> Int -> (StoreRead -> IO a) -> IO ()
+        ask3 what times question = do
+          a <- own question
+          b <- shared question
+          c <- cached question
+          unless (a == b && b == c) (fail ("different answers: " <> what))
+          alone <- timed times (own question)
+          fleet <- timed times (shared question)
+          through <- timed times (cached question)
+          printf "%-44s %10.1f %10.1f %10.1f\n" what alone fleet through
+    printf "\n%-44s %10s %10s %10s\n" heading ("alone" :: String) ("fleet" :: String) ("cached" :: String)
     forM_ wallets $ \(name, spec) -> do
       bals <- own (\q -> q.xPubBals spec)
-      let derive = deriveFunction ctx spec.deriv
-          addrs m = map snd (take (length bals `div` 2 + 20) (deriveAddresses derive (pubSubKey ctx spec.key m) 0))
-      derived <- timed 5 (return (addrs 0 <> addrs 1))
-      printf "%s: %d addresses with a balance, %.0f microseconds to derive them\n" name (length bals) derived
-      ask (name <> ": balances") 5 [\q -> q.xPubBals spec]
-      ask (name <> ": first 100 transactions") 5 [\q -> q.xPubTxs spec bals page]
-      ask (name <> ": first 100 unspent outputs") 5 [\q -> q.xPubUnspents spec bals page]
-      ask (name <> ": count of transactions") 5 [\q -> q.xPubTxCount spec bals]
+      Just tip <- readTVarIO m.tip
+      t2 <- getMonotonicTimeNSec
+      built <- answeringAt m (encode tip) (\r pool _ -> cacheBuild conn m.keys (encode tip) r pool 1 spec)
+      t3 <- getMonotonicTimeNSec
+      count <- own (\q -> q.xPubTxCount spec bals)
+      printf
+        "%s: %d addresses, %d transactions, %s in %.0f milliseconds\n"
+        name
+        (length bals)
+        count
+        (show built)
+        (fromIntegral (t3 - t2) / 1000000 :: Double)
+      ask3 (name <> ": balances") 20 (\q -> q.xPubBals spec)
+      ask3 (name <> ": first 100 transactions") 20 (\q -> q.xPubBals spec >>= \b -> q.xPubTxs spec b page)
+      ask3 (name <> ": first 100 unspent outputs") 20 (\q -> q.xPubBals spec >>= \b -> q.xPubUnspents spec b page)
+      ask3 (name <> ": count of transactions") 5 (\q -> q.xPubBals spec >>= \b -> q.xPubTxCount spec b)
   where
     summary :: (MemAddrKey, MemAddrVal) -> Maybe (Address, Word64)
     summary = \case

@@ -37,6 +37,7 @@ extra-source-files:
     src/Haskoin/Store/Fleet/lua/pool.lua
     src/Haskoin/Store/Fleet/lua/read.lua
     src/Haskoin/Store/Fleet/lua/report.lua
+    src/Haskoin/Store/Fleet/lua/xpub.lua
     stress/wrk.lua
 extra-doc-files:
     README.md
@@ -68,6 +69,7 @@ library
       Haskoin.Store.Fleet.Member
       Haskoin.Store.Fleet.Pool
       Haskoin.Store.Fleet.Redis
+      Haskoin.Store.Fleet.XPub
       Haskoin.Store.Logic
       Haskoin.Store.Logic.Layered
       Haskoin.Store.Manager
@@ -271,6 +273,7 @@ test-suite spec
       Haskoin.Store.Fleet.MemberSpec
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
+      Haskoin.Store.Fleet.XPubSpec
       Haskoin.Store.FleetSpec
       Haskoin.Store.Histories
       Haskoin.Store.IntegrationSpec
