@@ -72,6 +72,8 @@ module Haskoin.Store.Fleet.Redis
     poolOffer,
     poolWithdraw,
     fleetAdvance,
+    fleetRestart,
+    fleetRestarts,
     FleetEvent (..),
     fleetEventsEnd,
     fleetEventsAfter,
@@ -85,6 +87,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import Database.Redis (Connection, Redis, Reply)
 import Database.Redis qualified as R
@@ -256,11 +259,11 @@ poolWithdraw conn keys tsize ts =
 -- live stores agree on, and what the blocks in between did.
 --
 -- A store that cannot say what they did, because it does not have the old
--- tip or because the way from it is too long, gives 'Nothing', and the pool
--- is emptied: but only if no other store is live, as when a fleet comes
--- back after all its stores were away. The stores then offer their mempools
--- to the empty pool. With another store live the answer is 'Raced', and
--- the tip waits for a store that knows the way.
+-- tip, gives 'Nothing', and the pool is emptied: but only if no other
+-- store is live, as when a fleet comes back after all its stores were
+-- away. With another store live the answer is 'Raced', and the tip waits
+-- for a store that knows the way. When the way is known and too long,
+-- see 'fleetRestart'.
 --
 -- The last argument is the blocks that the tip moves through, oldest
 -- first and the new tip last, for the events of the fleet ('FleetEvent'):
@@ -275,7 +278,45 @@ fleetAdvance ::
   Maybe PoolChange ->
   [ByteString] ->
   IO Moved
-fleetAdvance conn keys tsize clock seen target known path =
+fleetAdvance conn keys tsize clock seen target known =
+  advance conn keys tsize clock seen target (maybe "1" (const "0") known) (fromMaybe (PoolChange [] [] [] []) known)
+
+-- | Move the tip to a block and empty the pool, for a store that has both
+-- the tip and the block and finds the way between them longer than it
+-- goes through.
+--
+-- Unlike a store that does not have the old tip, it may do this with
+-- other stores live. The length of the way is the same for all of them, so
+-- none would ever say what the blocks did, and the tip would stay where it
+-- is for good: a fleet whose stores came back together after half a day
+-- away answered nothing from then on. Emptying the pool costs the stores
+-- an offer of their mempools, which they make when they see that the
+-- count of 'fleetRestarts' went up.
+fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
+fleetRestart conn keys tsize clock seen target =
+  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] []) []
+
+-- | How many times the pool was emptied to move the tip. A store that sees
+-- another number than at its last turn offers all of its mempool again:
+-- what it offered before is not in the pool any more.
+fleetRestarts :: Connection -> FleetKeys -> IO Integer
+fleetRestarts conn keys =
+  maybe 0 (maybe 0 fst . C.readInteger) <$> run conn (R.get (keys.prefix <> "fleet:restarts"))
+
+-- | The advance of the pool script, with its way of treating the pool: "0"
+-- to change it, "1" and "2" to empty it ('fleetAdvance', 'fleetRestart').
+advance ::
+  Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe Time ->
+  Maybe ByteString ->
+  ByteString ->
+  ByteString ->
+  PoolChange ->
+  [ByteString] ->
+  IO Moved
+advance conn keys tsize clock seen target how change path =
   run conn (R.eval poolScript [] args) >>= \case
     ["moved"] -> return (MovedTo target)
     ["stays"] -> return Stays
@@ -283,14 +324,11 @@ fleetAdvance conn keys tsize clock seen target known path =
     other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
   where
     args =
-      ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size]
-        <> [maybe "1" (const "0") known]
+      ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size, how]
         <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
         <> [num (length change.returned)]
         <> concatMap txArgs change.returned
         <> [B.concat path]
-
-    change = maybe (PoolChange [] [] [] []) id known
 
 -- | Read from the pool as it is at a tip: given the size of a transaction
 -- id, the tip that the caller answers from, what to read and its arguments,

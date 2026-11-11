@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.9.0
+version:        1.9.1
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes them in RocksDB, and
@@ -74,6 +74,7 @@ library
       Haskoin.Store.Logic
       Haskoin.Store.Logic.Layered
       Haskoin.Store.Manager
+      Haskoin.Store.Outage
       Haskoin.Store.Web
       Haskoin.Store.Web.Docs
       Haskoin.Store.Web.Events
@@ -107,7 +108,7 @@ library
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
@@ -172,7 +173,7 @@ library integration
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
@@ -235,7 +236,7 @@ executable haskoin-store
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17
@@ -288,6 +289,7 @@ test-suite spec
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.Logic.LayeredSpec
       Haskoin.Store.LogicSpec
+      Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.Web.EventsSpec
       Haskoin.Store.Web.RouterSpec
@@ -324,7 +326,7 @@ test-suite spec
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17
@@ -391,7 +393,7 @@ benchmark haskoin-store-bench
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17
@@ -455,7 +457,7 @@ benchmark haskoin-store-stress
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=1.6.1 && <1.7
-    , haskoin-node ==2.5.*
+    , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data ==1.11.*
     , hedis >=0.16.4 && <0.17

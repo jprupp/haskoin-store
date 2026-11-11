@@ -30,9 +30,16 @@
 -- transactions that are gone, those that are confirmed, the outputs that
 -- are spent, the number of transactions that come back, those
 -- transactions, and the blocks that the tip moves through, oldest first,
--- or ''. Returns {'moved'}, {'stays'} or {'raced'}. The pool is
--- emptied for a store that cannot say what the blocks between the two tips
--- did, and only when no other store is live: {'raced'} otherwise.
+-- or ''. Returns {'moved'}, {'stays'} or {'raced'}.
+--
+-- The pool is emptied instead of changed in two cases. With '1' the store
+-- cannot say what the blocks between the two tips did, because it does
+-- not have the old tip: only when no other store is live, and {'raced'}
+-- otherwise, since another store may know. With '2' the store has both
+-- tips and the way between them is longer than a store goes through: that
+-- is so for every store, so any of them may, or the tip would never move
+-- again. Each time the pool is emptied a counter goes up, next to the
+-- tip, which tells the stores to offer their mempools again.
 --
 -- What the pool holds for each address, kept in step with its transactions:
 -- its transactions and the outputs paid to it, both ordered newest first,
@@ -66,6 +73,7 @@ local osize = tsize + 4
 local key = {
   tip = prefix .. 'fleet:tip',
   moves = prefix .. 'fleet:moves',
+  restarts = prefix .. 'fleet:restarts',
   events = prefix .. 'fleet:events',
   lease = prefix .. 'fleet:lease',
   recent = prefix .. 'fleet:recent',
@@ -407,12 +415,13 @@ if agreed ~= target then
   return {'raced'}
 end
 
--- a store that is alone and does not know the way from the old tip starts
--- the pool again
-if ARGV[8] == '1' then
-  if #live ~= 1 then
+-- a store that does not know the way from the old tip starts the pool
+-- again: if it is alone, or if the way is too long for any store
+if ARGV[8] == '1' or ARGV[8] == '2' then
+  if ARGV[8] == '1' and #live ~= 1 then
     return {'raced'}
   end
+  redis.call('INCR', key.restarts)
   for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do
     redis.call('DEL', k)
   end

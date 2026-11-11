@@ -6,8 +6,73 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-11
+
+### Changed
+
+- **The health check runs every second**, where it ran every thirty, and
+  at once when the store has a new best block. `/health` answers from the
+  last result, so a load balancer and a fleet acted on news of up to half
+  a minute ago. Redis is asked every five seconds.
+  `--health-check-interval` still sets the interval.
+
+- **Log levels say who has the problem.** An error in the log is now
+  something wrong with the store or its database, so that an alert on
+  errors is worth having. The README has a table of the levels.
+  - A transaction from a peer that the store refuses (an orphan, a double
+    spend, one without funds, one already confirmed) is logged for
+    debugging. These were errors, several a minute on a healthy server.
+  - A request answered 4xx or 503 is logged for debugging, like a
+    successful one. Only a 500 is an error.
+  - A peer that times out or sends a block that was not asked for is a
+    warning.
+  - Redis or the price service not answering is a warning: the store
+    goes on without them, and `/health` says so.
+  - **An outage of Redis is logged once when it starts and once when it
+    is over** (`Haskoin.Store.Outage`), and for debugging in between. The
+    loops of a fleet and the worker of the cache each logged every failed
+    attempt, every second or two, and nothing said when Redis was back.
+    `memberLoop`, `memberCacheLoop` and `memberEvents` no longer take a
+    function to tell of a failure.
+  - Each transaction imported into the mempool is logged for debugging,
+    where it was information.
+  - With haskoin-node 2.5.1: a peer that hangs up or misbehaves is not an
+    error, and the comings and goings of peers are logged for debugging.
+
+### Fixed
+
+- **A fleet could stop answering for good after an outage.** A server goes
+  through 50 blocks at most to tell the shared mempool what they did, and
+  further than that it may only empty the mempool, which Redis allowed to
+  a server that was alone. Two or more servers that came back together
+  more than 50 blocks past the block that the fleet last answered from
+  each kept the other from moving on, and every request was answered 503
+  `behind-fleet` from then on.
+  - Any server may now move the fleet when the way is too long for all of
+    them (`fleetRestart`, `wayBetween`): the shared mempool is emptied, a
+    counter in Redis says so (`fleet:restarts`), and every server that
+    sees it offers its whole mempool again. A server did not notice
+    before that another one had emptied the mempool.
+  - A test builds the stuck fleet on purpose, with two members of one
+    fleet (`Haskoin.Store.Fleet.MemberSpec`).
+- **A server that had just started took a turn in its fleet before its
+  first health check**, reported the blocks that it had then, and with no
+  other server there moved the fleet to them. It now waits for the check.
+
 ### Added
 
+- **A change of health is logged**: a warning with what is wrong when
+  `/health` stops answering 200, and a line when it does again; the same
+  for Redis. Nothing said so before but the 503s of the requests.
+- **An access log**, off by default: `--access-log` (`ACCESS_LOG`) logs
+  every request with the address of the client, the status and the time
+  it took.
+- With `--debug`, a member of a fleet says why its report was not taken
+  and what became of each attempt to move the fleet's block.
+- `HASKOIN_TEST_LOG` prints the time of each line, and the lines of the
+  two stores of the fleet test under their names.
+- **A slow request is logged as a warning**, with how long it took:
+  `--slow-request` (`SLOW_REQUEST`), five seconds by default, 0 for never.
 - `stress/results/2026-11-10/`: the results of a full default stress run
   on version 1.9.0, with a comparison against the run of the day before on
   1.8.1. A cache reload takes 234 ms on average where it took 2,448, and

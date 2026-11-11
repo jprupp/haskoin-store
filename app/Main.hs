@@ -128,6 +128,7 @@ data Config = Config
     noBlockchainInfo :: !Bool,
     noXPub :: !Bool,
     healthCheckInterval :: !Int,
+    accessLog :: !Bool,
     tlsCert :: !String,
     tlsKey :: !String,
     bloom :: !Bool,
@@ -220,7 +221,9 @@ defConfig = do
   noXPub <-
     env "NO_XPUB" False parseBool
   healthCheckInterval <-
-    env "HEALTH_CHECK_INTERVAL" 30 readMaybe
+    env "HEALTH_CHECK_INTERVAL" 1 readMaybe
+  accessLog <-
+    env "ACCESS_LOG" False parseBool
   bloom <-
     env "BLOOM" True parseBool
   noWeb <-
@@ -264,6 +267,8 @@ defConfig = do
         env "BLOCK_TIMEOUT" d.blockTimeout readMaybe
       txTimeout <-
         env "TX_TIMEOUT" d.txTimeout readMaybe
+      slowRequest <-
+        env "SLOW_REQUEST" d.slowRequest readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -425,6 +430,13 @@ config c = do
           <> helpEnv "TX_TIMEOUT" "Last tx received health timeout"
           <> showDefault
           <> value c.webLimits.txTimeout
+    slowRequest <-
+      option auto $
+        metavar "SECONDS"
+          <> long "slow-request"
+          <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
+          <> showDefault
+          <> value c.webLimits.slowRequest
     return WebLimits {..}
   redis <-
     flag c.redis True $
@@ -580,9 +592,13 @@ config c = do
     option auto $
       metavar "SECONDS"
         <> long "health-check-interval"
-        <> helpEnv "HEALTH_CHECK_INTERVAL" "Background check update interval"
+        <> helpEnv "HEALTH_CHECK_INTERVAL" "Seconds between health checks; there is one at each new block too"
         <> showDefault
         <> value c.healthCheckInterval
+  accessLog <-
+    flag c.accessLog True $
+      long "access-log"
+        <> helpEnv "ACCESS_LOG" "Log every request, with the address of the client and the time it took"
   tlsCert <-
     strOption $
       metavar "FILE"
@@ -749,6 +765,7 @@ run cfg =
             noXPub = cfg.noXPub,
             noBlockchainInfo = cfg.noBlockchainInfo,
             healthCheckInterval = cfg.healthCheckInterval,
+            accessLog = cfg.accessLog,
             tls = case (cfg.tlsCert, cfg.tlsKey) of
               ("", "") -> Nothing
               ("", _) -> error "--tls-key needs --tls-cert"

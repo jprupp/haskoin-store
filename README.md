@@ -337,6 +337,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-item-count` | `MAX_ITEM_COUNT` | `200000` | Most items in a list (0 = no limit) |
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
+| `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -383,6 +384,11 @@ the same block and the same mempool:
   than something that the others would not say, and stops counting after
   ten seconds without a report, so that it holds nobody up. A server whose
   health check fails stops reporting.
+- **After a long outage** the fleet starts its shared mempool again. When
+  the servers come back more than 50 blocks past the block that the fleet
+  last answered from, the first of them moves the fleet there, empties
+  the shared mempool, and all offer their unconfirmed transactions again.
+  The log has a warning when it happens.
 - **`/events` is the same stream on every server.** What changes the
   shared mempool or moves the fleet to a block writes an event to Redis
   in the same step, and every server sends those events, in that order,
@@ -414,7 +420,7 @@ that answers as one" in `docs/layered-database.md`.
 | `--min-peers` | `MIN_PEERS` | `1` | Fewest connected peers |
 | `--block-timeout` | `BLOCK_TIMEOUT` | `14400` | Most seconds since the last block |
 | `--tx-timeout` | `TX_TIMEOUT` | `1800` | Most seconds since the last transaction |
-| `--health-check-interval` | `HEALTH_CHECK_INTERVAL` | `30` | Seconds between checks |
+| `--health-check-interval` | `HEALTH_CHECK_INTERVAL` | `1` | Seconds between checks; there is one at each new block too |
 
 ### Metrics and logging
 
@@ -425,6 +431,7 @@ that answers as one" in `docs/layered-database.md`.
 | `--statsd-prefix` | `STATSD_PREFIX` | `haskoin_store` | Prefix of every metric |
 | `--statsd-no-events` | `STATSD_NO_EVENTS` | off | Do not send individual samples |
 | `--statsd-aggregates` | `STATSD_AGGREGATES` | off | Also send aggregated statistics every second |
+| `--access-log` | `ACCESS_LOG` | off | Log every request, with the address of the client and the time it took |
 | `--debug` | `DEBUG` | off | Verbose logging |
 
 ### RocksDB
@@ -716,6 +723,10 @@ balancer at it.
 | 203 | Healthy, but its Redis does not answer |
 | 503 | A check fails; the body says which |
 
+The check runs every second, and at once when a block arrives, so what
+`/health` answers is at most a second old. Redis is asked every five
+seconds.
+
 The checks are: how far the index is behind the headers, the age of the
 last block and of the last transaction, the transactions waiting to be
 imported, and the connected peers.
@@ -795,6 +806,35 @@ The resident memory of the store is its GHC heap plus RocksDB.
 
 Logs go to standard error, one line per message, tagged with the component,
 such as `[Info#BlockStore] Best block: ...`.
+
+| Level | What it is for |
+| --- | --- |
+| Error | Something wrong with the store or its database. Alert on these |
+| Warn | Something unusual that the store dealt with: a misbehaving peer, no peers left, Redis or the price service not answering, a block reverted, the shared mempool of a fleet started again |
+| Info | Milestones: start-up, each new best block, migrations, the mempool pruned |
+| Debug | Everything else, with `--debug`: each peer, each transaction, each request |
+
+What the log says about the server itself, without `--debug`:
+
+- **Health.** One line when `/health` changes: `No longer healthy: 5 blocks
+  behind the headers` as a warning, and `Healthy again`. A store that is
+  still syncing says `Not healthy yet` once, which is not a warning.
+- **Slow requests.** A warning for a request that took `--slow-request`
+  seconds or more to answer, with the request and how long it took. The
+  stream of events is left out.
+- **Every request**, with `--access-log`, which is off by default:
+  `203.0.113.7 GET /block/best HTTP/1.1: 200 OK, 0.4 ms`. A public
+  server usually has a proxy in front that keeps this log better. The
+  address is the first of `X-Forwarded-For` when a proxy sent one.
+
+An outage of Redis is one warning when it starts, `Could not … Going on
+without`, and one line when it is over, `Can … again`. The attempts in
+between are logged for debugging.
+
+Nothing that a peer or a client does is an error. A transaction that the
+store refuses (an orphan, a double spend), a request with a bad parameter
+or for something unknown, and a peer that hangs up are all ordinary on a
+public network, and are logged for debugging.
 
 ## Using it from Haskell
 

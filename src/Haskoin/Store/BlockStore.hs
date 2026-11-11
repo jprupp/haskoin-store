@@ -594,7 +594,7 @@ processBlock self peer block =
     Requested ->
       getBlockNode self blockhash >>= \case
         Nothing -> do
-          logError self $
+          logWarn self $
             "Peer "
               <> peer.label
               <> " sent unknown block "
@@ -615,7 +615,7 @@ processBlock self peer block =
     blockhash = headerHash header
     hexhash = blockHashToHex blockhash
     refuse who = do
-      logError self $
+      logWarn self $
         who
           <> " "
           <> peer.label
@@ -768,7 +768,7 @@ importMempoolTx block_read time tx wr =
     seconds = floor (utcTimeToPOSIXSeconds time)
     new_mempool_tx = do
       t <- newMempoolTx wr tx seconds
-      logAt LevelInfo block_read.config.logger $
+      logAt LevelDebug block_read.config.logger $
         bool "Already have" "Imported" t
           <> " tx "
           <> txHashToHex (txHash tx)
@@ -881,7 +881,7 @@ checkTime self = do
   Sync.timedOut self.config.peerTimeout now <$> readTVarIO self.sync >>= \case
     Nothing -> return ()
     Just p -> do
-      logError self $ "Syncing peer timeout: " <> p.label
+      logWarn self $ "Syncing peer timeout: " <> p.label
       killPeer p
 
 -- | Revert blocks until the best block in the database is in the main chain of headers.

@@ -203,6 +203,7 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
+import Haskoin.Store.Outage (Outage, attempt, attempting, newOutage)
 import NQE (Inbox, Publisher, receive, withSubscription)
 import System.Metrics.StatsD
   ( StatCounter,
@@ -230,7 +231,6 @@ import UnliftIO
     readIORef,
     readTVar,
     timeout,
-    tryAny,
     withAsync,
     writeIORef,
     writeTVar,
@@ -316,7 +316,10 @@ data Cache = Cache
     -- keeps nothing of a deleted transaction, so without this one that
     -- Redis has and the database does not could as well be one that this
     -- store has not seen yet, which an entry must not lose.
-    lost :: !(IORef (HashSet TxHash))
+    lost :: !(IORef (HashSet TxHash)),
+    -- | whether the last thing that the worker tried failed, so that an
+    -- outage of Redis is logged once
+    outage :: !Outage
   }
 
 -- | What a store did to the cache since it started.
@@ -366,6 +369,7 @@ withCache cfg db chain pub logger action = do
   counters <- newIORef (CacheCounters 0 0 0)
   touched <- newIORef HashMap.empty
   lost <- newIORef HashSet.empty
+  outage <- newOutage
   metrics <- mapM newCacheMetrics cfg.stats
   let cache =
         Cache
@@ -381,7 +385,8 @@ withCache cfg db chain pub logger action = do
             counters = counters,
             jobs = jobs,
             touched = touched,
-            lost = lost
+            lost = lost,
+            outage = outage
           }
   withSubscription pub $ \events ->
     withAsync (listener cache events) $ \a1 ->
@@ -1257,7 +1262,7 @@ worker c = do
       return (reverse xs)
     synced <- inSync c
     if synced
-      then handleAny (\e -> log' c LevelError ("Cache: " <> cs (show e))) (work c lastBest js)
+      then void (attempt c.outage (log' c) "update the cache" (work c lastBest js))
       else releaseClaims c (concat [ks | JobHeld _ _ ks <- js])
 
 -- | Do a batch of jobs.
@@ -1288,11 +1293,7 @@ work c lastBest js = do
           _ -> return ()
   where
     reload x ts =
-      tryAny (cacheRefresh c x ts) >>= \case
-        Right r -> return r
-        Left e -> do
-          log' c LevelError ("Could not cache xpub: " <> cs (show e))
-          return Locked
+      fromMaybe Locked <$> attempting c.outage (log' c) "cache an xpub" (cacheRefresh c x ts)
 
 -- | How many xpubs a store reloads at once. Each holds the lock of its xpub,
 -- so two stores never reload the same one; reloading several at once keeps

@@ -47,7 +47,10 @@
 --
 -- * __The tip moves to the newest block that every live store reported__
 --   ('agreed', 'move'). Any store may move it. The move is a compare and
---   set, so two stores that try at once do the same thing once.
+--   set, so two stores that try at once do the same thing once. The store
+--   that moves it also says what the blocks in between did to the shared
+--   mempool; what happens when it cannot is with the mempool, in
+--   "Haskoin.Store.Fleet.Redis".
 --
 -- * __A store keeps the views of the blocks of its last report, and of the
 --   tip that it read after making it__ ('keep'). The tip can only move to a

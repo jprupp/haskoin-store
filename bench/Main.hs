@@ -144,6 +144,7 @@ webConfig store port =
       noXPub = False,
       noBlockchainInfo = False,
       healthCheckInterval = 30,
+      accessLog = False,
       tls = Nothing,
       logger = quiet
     }

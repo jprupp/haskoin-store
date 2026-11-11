@@ -57,6 +57,7 @@ import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
@@ -138,6 +139,7 @@ import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
+import System.Log.FastLogger (toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
 import UnliftIO (async, bracket, cancel, link, throwIO, try, tryAny, withAsync, withSystemTempDirectory)
@@ -273,12 +275,21 @@ withEnv kind ctx go = do
                 go env
 
 -- | A logger that prints the log of the store if @HASKOIN_TEST_LOG@ is set,
--- and discards it otherwise.
+-- and discards it otherwise. Each line starts with the time it was logged
+-- at, as seconds of the hour to the millisecond: what several stores do at
+-- once can only be put in order, and a wait told from a hang, by the time.
 withTestLogger :: (Logger -> IO a) -> IO a
 withTestLogger f =
   lookupEnv "HASKOIN_TEST_LOG" >>= \case
-    Just v | v `notElem` ["", "0"] -> withLogger LevelDebug f
+    Just v | v `notElem` ["", "0"] -> withLogger LevelDebug (f . timed)
     _ -> f Logger {level = LevelError, source = "", push = \_ -> return ()}
+  where
+    timed l = l {push = \line -> stamp >>= \at -> l.push (at <> line)} :: Logger
+    stamp = do
+      now <- getPOSIXTime
+      let (seconds, millis) = (floor (now * 1000) `mod` 3600000 :: Int) `divMod` 1000
+          padded = replicate (3 - length (show millis)) '0' <> show millis
+      return (toLogStr (show seconds <> "." <> padded <> " "))
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
 -- buffers and caches, as a member of a fleet or not.
@@ -334,6 +345,7 @@ webConfig logger store =
       noXPub = False,
       noBlockchainInfo = False,
       healthCheckInterval = 5,
+      accessLog = False,
       tls = Nothing,
       logger = logger
     }
@@ -1766,7 +1778,7 @@ eventLines url n = do
 -- its database, with the payment in the pool and after the block: the
 -- cache is brought to the block by whichever store moved the tip.
 fleetTest :: Env -> IO ()
-fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member logger $ \b urlB -> do
+fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
   one <- maybe (fail "The store is not a member of a fleet") return a.fleet
   let x = newXPub env "fleet" DeriveNormal
       q = "?derive=" <> deriveParam x
@@ -1883,10 +1895,18 @@ fleetTest env = withTestLogger $ \logger -> member logger $ \a urlA -> member lo
   (_, health) <- getJSON urlA "/health"
   ((health ! "redis") ! "ok") `shouldBe` Bool True
   where
-    member logger f = withRamDir $ \dir ->
-      withStore (env.memberIn dir) $ \s ->
+    -- Both members and their web servers log through the logger of the
+    -- tests, each with its name in front of its lines. A logger of their
+    -- own would keep its lines in a buffer of its own, and they would be
+    -- printed out of step with the rest: when the fleet test failed, that
+    -- made a health check that was prompt look seconds late.
+    member name f = withRamDir $ \dir -> do
+      let config = env.memberIn dir
+          shared = config.logger
+          named = shared {push = \line -> shared.push (name <> " " <> line)} :: Logger
+      withStore ((config :: StoreConfig) {logger = named}) $ \s ->
         listening $ \(sock, port) ->
-          withAsync (runWebSocket (webConfig logger s) sock) $ \web ->
+          withAsync (runWebSocket (webConfig named s) sock) $ \web ->
             link web >> f s ("http://127.0.0.1:" <> show port)
 
 -- | Run a second store, with its own database, syncing from the same node
