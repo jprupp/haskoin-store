@@ -300,6 +300,7 @@ import UnliftIO
     bracket_,
     catch,
     catchAny,
+    checkSTM,
     fromException,
     handleAny,
     link,
@@ -309,7 +310,9 @@ import UnliftIO
     race_,
     readIORef,
     readTQueue,
+    readTVar,
     readTVarIO,
+    registerDelay,
     stateTVar,
     throwIO,
     timeout,
@@ -397,8 +400,11 @@ data WebConfig = WebConfig
     noXPub :: !Bool,
     -- | disable the Blockchain.info compatible endpoints
     noBlockchainInfo :: !Bool,
-    -- | seconds between health checks
+    -- | seconds between health checks; there is one at each new block
+    -- too
     healthCheckInterval :: !Int,
+    -- | log every request, at the level of information ('logIt')
+    accessLog :: !Bool,
     -- | a certificate and its private key, in files in PEM format, to
     -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
     -- default
@@ -654,7 +660,14 @@ serveWeb config serve = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
   session <- Wreq.Session.newAPISession
-  health <- runHealthCheck >>= newTVarIO
+  first <- runHealthCheck
+  health <- newTVarIO first
+  -- A member of a fleet takes no turn before its store is known to be
+  -- well. A member is made ready to take turns, since a store without a
+  -- web server has nothing else to say when; with one, a store that had
+  -- just started took a turn before its first check, reported the blocks
+  -- that it had then, and with nobody else there moved the fleet to them.
+  forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first))
   cacheUp <- cacheCheck >>= newTVarIO
   eventLog <- newEventLog
   let db = config.store.db
@@ -724,11 +737,15 @@ serveWeb config serve = do
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   saidWell <- newIORef Nothing
   saidRedis <- newIORef True
+  pinged <- newIORef 0
+  -- set when the store has a new best block, for the health check to run
+  -- at once
+  newBlock <- newTVarIO False
   withAsync (priceUpdater session ticker) $ \_a1 ->
-    withAsync (healthCheckLoop health cacheUp saidWell saidRedis) $ \_a2 ->
+    withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
       withAsync (feedEvents st) $ \a3 ->
         link a3 >> do
-          serve . webSocketEvents st . logIt config.logger config.limits.slowRequest . anyOrigin . preflight . autohead . compressed $ app
+          serve . webSocketEvents st . logIt config.logger config.accessLog config.limits.slowRequest . anyOrigin . preflight . autohead . compressed $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -743,17 +760,45 @@ serveWeb config serve = do
       (Just cache, _) -> cacheAlive cache
       (_, Just member) -> memberAlive member
       _ -> return True
-    healthCheckLoop v up saidWell saidRedis = loopForever $ do
-      threadDelay (config.healthCheckInterval * 1000 * 1000)
-      h <- runHealthCheck
-      atomically (writeTVar v h)
-      tellHealth saidWell h
-      -- a store whose checks fail stops taking its turns as a member of
-      -- its fleet, so that it does not hold the others back
-      forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
-      redis <- cacheCheck
-      atomically (writeTVar up redis)
-      tellRedis saidRedis redis
+    -- The check is run every second by default, and at once when the
+    -- store has a new best block, which is when its answer changes most:
+    -- /health answers from the last result, and a load balancer or a
+    -- fleet that acts on a result of half a minute ago sends requests to
+    -- a server that fell behind. A check reads a handful of keys, so it
+    -- costs little to run often; but a store that is catching up imports
+    -- thousands of small blocks a second, and a check for each would be
+    -- work for nothing, so there is a tenth of a second between two.
+    healthCheckLoop v up saidWell saidRedis pinged newBlock =
+      bracket (subscribe config.store.pub (heard newBlock)) (unsubscribe config.store.pub) $ \_ ->
+        loopForever $ do
+          threadDelay 100000
+          due <- registerDelay (config.healthCheckInterval * 1000 * 1000)
+          atomically $ do
+            block <- readTVar newBlock
+            time <- readTVar due
+            checkSTM (block || time)
+            writeTVar newBlock False
+          h <- runHealthCheck
+          atomically (writeTVar v h)
+          tellHealth saidWell h
+          -- a store whose checks fail stops taking its turns as a member
+          -- of its fleet, so that it does not hold the others back
+          forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
+          -- Redis is asked less often, every five seconds: it is the one
+          -- part of the check that leaves the program, and waits up to
+          -- two seconds for a Redis that is away. Requests find out by
+          -- themselves that Redis is away; this is how the store finds
+          -- out that it is back.
+          now <- getPOSIXTime
+          last' <- readIORef pinged
+          when (now - last' >= 5) $ do
+            writeIORef pinged now
+            redis <- cacheCheck
+            atomically (writeTVar up redis)
+            tellRedis saidRedis redis
+    heard newBlock = \case
+      StoreBestBlock _ -> writeTVar newBlock True
+      _ -> return ()
     -- A change of health is logged, and nothing while it stays as it was:
     -- what /health answers is otherwise only known to whoever asks it. A
     -- store is not healthy while it syncs, which is no cause for alarm,
@@ -3557,17 +3602,29 @@ listToMaybe' _ = Nothing
 -- time is that of making the response, not of sending it, so a client on
 -- a slow line is not the server's slow request; and the stream of events,
 -- whose response never ends, is left out.
-logIt :: Logger -> Word32 -> Middleware
-logIt logger slow app req respond = do
+--
+-- With the access log on, every request is logged as information instead
+-- of for debugging, with the address of the client and the time it took.
+-- It is off by default: a public server has a proxy in front that keeps
+-- such a log, and knows the address of the client, where the server sees
+-- that of the proxy unless the proxy passes it on in @X-Forwarded-For@.
+-- It is for a server that is run without one.
+logIt :: Logger -> Bool -> Word32 -> Middleware
+logIt logger access slow app req respond = do
   start <- getPOSIXTime
   app req $ \res -> do
     took <- subtract start <$> getPOSIXTime
     let s = responseStatus res
         msg = fmtReq req <> ": " <> fmtStatus s
         seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
-    if statusIsServerError s && s /= status503
-      then logError logger msg
-      else logDebug logger msg
+        millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
+        client = case lookup "X-Forwarded-For" (requestHeaders req) of
+          Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
+          Nothing -> cs (show (remoteHost req))
+    if
+      | statusIsServerError s && s /= status503 -> logError logger msg
+      | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
+      | otherwise -> logDebug logger msg
     when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
       logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
     respond res

@@ -25,7 +25,10 @@
 --   ('memberTick') to the newest block that every live store reported,
 --   telling the pool what the blocks in between did ('changeBetween'):
 --   which transactions they confirmed and which outputs they spent, and
---   across a reorganisation which transactions come back.
+--   across a reorganisation which transactions come back. Across more
+--   blocks than a store goes through ('farthest'), it moves the tip and
+--   starts the pool again ('wayBetween'), and every member that sees that
+--   the pool was emptied offers its whole mempool again ('noteRestarts').
 --
 -- * __It offers its mempool to the shared pool__ ('offerMempool'), each
 --   transaction with whether its inputs are unspent in the store's view at
@@ -84,6 +87,9 @@ module Haskoin.Store.Fleet.Member
     moveTip,
     Between (..),
     blocksBetween,
+    wayBetween,
+    Way (..),
+    farthest,
     changeBetween,
     offerMempool,
     expirePool,
@@ -105,7 +111,7 @@ import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Serialize (Serialize, decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -308,6 +314,9 @@ data Member = Member
     -- | the fleet tip at which the cache was found at another block, at
     -- the last turn
     lagging :: !(TVar (Maybe ByteString)),
+    -- | how many times the pool had been emptied at this store's last
+    -- turn ('noteRestarts')
+    restarts :: !(TVar (Maybe Integer)),
     -- | the metrics of the cache, if the configuration has a StatsD client
     metrics :: !(Maybe CacheMetrics),
     -- | transactions that the store deleted from its mempool since it
@@ -335,6 +344,7 @@ newMember config redis db = do
   healthy <- newTVarIO True
   wanted <- newTVarIO HashMap.empty
   lagging <- newTVarIO Nothing
+  restarts <- newTVarIO Nothing
   metrics <- mapM newCacheMetrics config.stats
   gone <- newTVarIO HashSet.empty
   outage <- newOutage
@@ -394,12 +404,29 @@ memberTick m = do
   -- the tip is read after the report, as the rule of 'F.keep' asks
   tip <- fmap decoded <$> fleetTip m.redis m.keys
   atomically (writeTVar m.tip (fromMaybe Nothing tip))
+  noteRestarts m
   prune m
   syncCache m
   unless moved (expirePool m)
   offerMempool m
   where
     decoded = either (const Nothing) Just . decode
+
+-- | Forget what this store offered to the pool, if the pool was emptied
+-- since the store's last turn, by this store or by another
+-- ('fleetRestarts'): the next offer is then of the whole mempool. Without
+-- this a store went on taking what it had offered to be in the pool, and
+-- the pool of a fleet that started again had only what came in afterwards.
+noteRestarts :: Member -> IO ()
+noteRestarts m = do
+  now <- fleetRestarts m.redis m.keys
+  atomically $ do
+    before <- readTVar m.restarts
+    writeTVar m.restarts (Just now)
+    when (maybe False (/= now) before) $ do
+      writeTVar m.offered HashSet.empty
+      writeTVar m.waiting HashMap.empty
+      writeTVar m.changed True
 
 -- | Take a turn as a member every two seconds, and at once when an action
 -- that waits for the next best block returns, for as long as the store's
@@ -450,13 +477,16 @@ report m = do
   blocks <- filterM main (filter (`elem` held) recent)
   taken <- fleetReport m.redis m.keys Nothing m.config.lease m.config.name (map encode blocks) (map encode held)
   atomically (writeTVar m.reported (if taken then blocks else []))
+  unless taken . m.config.note LevelDebug $
+    "Report not taken: this store has no view of the fleet tip, and another store is live"
   where
     main h = maybe False (.main) <$> Q.getBlock m.db h
 
 -- | Move the fleet tip to the block that the live stores agree on, if it is
 -- another one, with what the blocks in between did to the pool. Says
 -- whether it moved. When this store cannot say what they did, the pool is
--- emptied, which Redis allows only to a store that is alone.
+-- emptied: Redis allows that to a store that is alone, and to any store
+-- when the way is too long for all of them ('Way').
 moveTip :: Member -> IO Bool
 moveTip m = do
   seen <- fleetTip m.redis m.keys
@@ -472,14 +502,44 @@ moveTip m = do
       fleet = F.Fleet {tip = seen, reports}
   case F.agreed now fleet of
     Just target | Just target /= seen -> do
-      between <- case (traverse decode seen, decode target) of
-        (Right from, Right to) -> blocksBetween m.db from to
-        _ -> return Nothing
-      let path = maybe [] (map encode . (.path)) between
-      fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) path >>= \case
+      way <- case (traverse decode seen, decode target) of
+        (Right from, Right to) -> wayBetween m.db from to
+        _ -> return NoWay
+      let between = case way of
+            Way b -> Just b
+            _ -> Nothing
+          path = maybe [] (map encode . (.path)) between
+      moved <- case way of
+        TooFar -> do
+          m.config.note LevelWarn $
+            "The fleet tip is more than "
+              <> shown farthest
+              <> " blocks from "
+              <> blockName target
+              <> ": starting the shared mempool again there"
+          fleetRestart m.redis m.keys 32 Nothing seen target
+        _ -> fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) path
+      m.config.note LevelDebug . mconcat $
+        [ "Fleet tip from ",
+          maybe "none" blockName seen,
+          " to ",
+          blockName target,
+          case moved of
+            MovedTo _ -> ": moved"
+            Stays -> ": stays"
+            Raced -> ": not moved, another store did it first or has to",
+          case way of
+            Way _ -> ""
+            NoWay -> " (this store does not know the way)"
+            TooFar -> " (the way is too long)"
+        ]
+      case moved of
         MovedTo _ -> advanceCache m seen target between >> return True
         _ -> return False
-    _ -> return False
+    agreed -> do
+      when (isNothing agreed) . m.config.note LevelDebug $
+        "The live stores have no block in common: " <> shown (Map.size reports) <> " reports"
+      return False
   where
     redis' :: R.Redis (Either R.Reply a) -> IO a
     redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
@@ -526,38 +586,60 @@ data Between = Between
 -- which is what the cache of extended public keys is brought to the new
 -- tip with ('advanceCache').
 blocksBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe Between)
-blocksBetween db from to = L.withView db $ \view -> do
+blocksBetween db from to =
+  wayBetween db from to <&> \case
+    Way between -> Just between
+    _ -> Nothing
+
+-- | What a store can say of the way between two tips.
+data Way
+  = -- | what the blocks between them did
+    Way !Between
+  | -- | nothing: it does not have one of the tips, or the second is not
+    -- on its main chain. Another store may know.
+    NoWay
+  | -- | it has both, and the way is longer than 'farthest' blocks on one
+    -- side of the fork. That is so for every store.
+    TooFar
+
+-- | 'blocksBetween', telling a way that is too long from one that the
+-- store does not know. The fleet treats them differently: a tip that no
+-- store will ever say the way from has to be left behind
+-- ('fleetRestart'), and one that another store may know has to wait.
+wayBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO Way
+wayBetween db from to = L.withView db $ \view -> do
   let r = L.viewReader view
       -- the blocks from one that is not on the main chain back to it
-      back :: Int -> BlockHash -> IO (Maybe ([BlockData], BlockData))
+      back :: Int -> BlockHash -> IO (Either Way ([BlockData], BlockData))
       back n h
-        | n > farthest = return Nothing
+        | n > farthest = return (Left TooFar)
         | otherwise =
             Q.getBlock r h >>= \case
-              Nothing -> return Nothing
+              Nothing -> return (Left NoWay)
               Just bd
-                | bd.main -> return (Just ([], bd))
+                | bd.main -> return (Right ([], bd))
                 | otherwise -> fmap (\(bs, fork) -> (bd : bs, fork)) <$> back (n + 1) bd.header.prev
       -- the blocks of the main chain from a block down to above a height
-      down :: Int -> BlockData -> BlockData -> IO (Maybe [BlockData])
+      down :: Int -> BlockData -> BlockData -> IO (Either Way [BlockData])
       down n fork bd
-        | n > farthest = return Nothing
-        | bd.height <= fork.height = return (if bd.header == fork.header then Just [] else Nothing)
+        | n > farthest = return (Left TooFar)
+        | bd.height <= fork.height = return (if bd.header == fork.header then Right [] else Left NoWay)
         | otherwise =
             Q.getBlock r bd.header.prev >>= \case
-              Nothing -> return Nothing
+              Nothing -> return (Left NoWay)
               Just parent -> fmap (bd :) <$> down (n + 1) fork parent
   target <- Q.getBlock r to
   left <- case from of
     Just h -> back 0 h
     -- without a tip there was no pool, and nothing for the blocks to do
-    Nothing -> return (fmap ([],) target)
+    Nothing -> return (maybe (Left NoWay) (Right . ([],)) target)
   case (target, left) of
-    (Just bd, Just (abandoned, fork))
+    (_, Left none) -> return none
+    (Just bd, Right (abandoned, fork))
       | bd.main ->
           down 0 fork bd >>= \case
-            Nothing -> return Nothing
-            Just added -> do
+            Left none -> return none
+            Right added -> do
               old <- concat <$> mapM (bodies view) (reverse abandoned)
               new <- concat <$> mapM (confirmedBy r) (reverse added)
               let pool =
@@ -568,8 +650,8 @@ blocksBetween db from to = L.withView db $ \view -> do
                         spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
                       }
               let path = map (headerHash . (.header)) (reverse added)
-              return (Just Between {pool, added = new, reorganised = not (null abandoned), path})
-    _ -> return Nothing
+              return (Way Between {pool, added = new, reorganised = not (null abandoned), path})
+    _ -> return NoWay
   where
     -- the transactions of an abandoned block, each with what the store has
     -- of it now, if it still has it and did not delete it

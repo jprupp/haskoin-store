@@ -235,8 +235,16 @@ on the moment at which each commits a block.
   which each transaction was first offered, so every store lists it alike.
 - **Moving the tip changes the pool in the same step.** The store that
   moves it says what the blocks in between confirmed and spent, and across
-  a reorganisation what comes back. A store that cannot say empties the
-  pool, which the script allows only when no other store is live.
+  a reorganisation what comes back.
+- **When no store can say, the pool starts again.** A store goes through
+  50 blocks at most to say what they did. Past that it moves the tip and
+  empties the pool, and a counter next to the tip tells every store to
+  offer its mempool again.
+  - Any store may do this. The way is as long for all of them, and a tip
+    that nobody may leave stays for good: two stores that came back
+    together after half a day away answered nothing from then on.
+  - A store that does not have the old tip at all may do it only when it
+    is alone. Another store might know the way.
 - **Every request** is answered from the view at the fleet tip with the pool
   on top. Each read of the pool checks that the tip has not moved. If it
   has, the request is answered again, unless its response is on its way.
@@ -451,9 +459,11 @@ and reorganisations are compared with them after every operation.
   of the pool, which are pure functions. A member runs random histories
   against a real Redis, with the cache on and off, each answer held to the
   store's own. Integration tests run two stores against a real node.
+  One test builds a tip that is too far for both of two live stores,
+  which used to stay where it was for good.
 - **Mutations were tried**, one at a time, in the migration, the rules, the
-  queries (thirteen), the records (four) and the cache (twelve). Each made
-  the tests fail.
+  queries (thirteen), the records (four), the cache (twelve) and the way
+  out of a tip that is too far (two). Each made the tests fail.
 
 Not shown: load, and a database of real size.
 

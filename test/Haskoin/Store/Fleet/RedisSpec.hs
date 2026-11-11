@@ -128,6 +128,34 @@ spec = do
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
+      it "empties the pool for any store when the way is too long, and counts it" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
+        before <- fleetRestarts conn keys
+        -- two stores that both have a view of the tip, so both are live,
+        -- at a block that neither will say the way to
+        fleetReport conn keys (Just 0) 10 "a" [block 2] [block 2, block 1] `shouldReturn` True
+        fleetReport conn keys (Just 0) 10 "b" [block 2] [block 2, block 1] `shouldReturn` True
+        -- a store that does not know the way waits for one that does
+        fleetAdvance conn keys 4 (Just 0) (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
+        fleetRestarts conn keys `shouldReturn` before
+        fleetTip conn keys `shouldReturn` Just (block 1)
+        -- one that knows it and finds it too long does not, or the tip
+        -- would never move again
+        fleetRestart conn keys 4 (Just 0) (Just (block 1)) (block 2) `shouldReturn` MovedTo (block 2)
+        fleetTip conn keys `shouldReturn` Just (block 2)
+        poolSpends conn keys `shouldReturn` []
+        (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
+          `shouldReturn` []
+        -- which the stores hear of, to offer their mempools again
+        fleetRestarts conn keys `shouldReturn` before + 1
+        -- still only to the block that the live stores agree on, and only
+        -- from the tip that the store saw
+        fleetRestart conn keys 4 (Just 0) (Just (block 2)) (block 3) `shouldReturn` Raced
+        fleetRestart conn keys 4 (Just 0) (Just (block 1)) (block 2) `shouldReturn` Raced
+        fleetRestarts conn keys `shouldReturn` before + 1
       it "reads the pool by the page, as it is at the tip that is asked for" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True

@@ -1,9 +1,10 @@
 module Haskoin.Store.Fleet.MemberSpec (spec) where
 
-import Control.Monad (foldM_, void, when)
+import Control.Monad (foldM, foldM_, forM_, void, when)
 import Data.Default (def)
 import Data.Either (isRight)
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
 import Data.Serialize (encode)
 import Data.Text qualified as T
 import Data.Word (Word16)
@@ -15,7 +16,7 @@ import Haskoin.Store.Database.Query.Layered (From (..))
 import Haskoin.Store.Database.Query.Pooled (pooledRead)
 import Haskoin.Store.Database.Views (closeViews)
 import Haskoin.Store.Fleet.Member
-import Haskoin.Store.Fleet.Redis (FleetKeys (..), poolWithdraw)
+import Haskoin.Store.Fleet.Redis (FleetKeys (..), fleetRestarts, poolWithdraw)
 import Haskoin.Store.Fleet.RedisSpec (withRedis)
 import Haskoin.Store.Fleet.XPub
 import Haskoin.Store.Histories
@@ -240,6 +241,94 @@ spec = prepareContext $ \ctx -> do
                     [() | (level, _) <- logged, level /= LevelInfo, level /= LevelDebug] `shouldBe` []
                     emptied `shouldSatisfy` all ("Emptied the xpub cache at block " `T.isPrefixOf`)
                     readIORef hits >>= (`shouldSatisfy` (> 10))
+      it "leaves behind a tip that is too far for every store, and fills the pool again" $ \(conn, fresh) ->
+        -- Two stores of one fleet, both live and both with a view of the
+        -- tip, take no turn while their chain grows by more blocks than a
+        -- store goes through to say what they did to the pool: as stores do
+        -- that are behind, whose health checks fail until they have caught
+        -- up. When they take their turns again, the tip is where it was.
+        --
+        -- No store will ever say the way from there, and neither is alone,
+        -- which is what Redis asked of a store that empties the pool: the
+        -- tip stayed there for good, and every request was answered that
+        -- the store was behind its fleet. The integration tests met this
+        -- when the health check began to run at every block, which made
+        -- stores stop taking turns sooner than they used to.
+        --
+        -- Now the first to take a turn moves the tip to their best block
+        -- and empties the pool, and both offer their mempools again: what
+        -- they answer afterwards is what the store answers by itself.
+        withSystemTempDirectory "haskoin-store-member-" $ \dir ->
+          openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
+            keys <- fresh
+            said <- newIORef []
+            let config name =
+                  MemberConfig
+                    { prefix = keys.prefix,
+                      name,
+                      lease = 60000,
+                      depth = 6,
+                      expiry = 0,
+                      cacheMax = 0,
+                      cacheMinAddrs = 0,
+                      cacheMinTxs = 0,
+                      stats = Nothing,
+                      note = \level line -> modifyIORef' said ((level, line) :)
+                    }
+                best = Q.getBestBlock db >>= maybe (fail "no best block") return
+            a <- newMember (config "a") conn db
+            b <- newMember (config "b") conn db
+            let both f = f a >> f b
+                done hist op = do
+                  void (apply mixedRules shadow op)
+                  out <- apply layeredRules db op
+                  both (`memberForget` out.removed)
+                  return (record db hist op out)
+                pay hist seed =
+                  plan shadow hist seed >>= \case
+                    (hist', Nothing) -> return hist'
+                    (hist', Just op) -> done hist' op
+                mine hist = do
+                  hist' <- blockOn db [] >>= done hist
+                  -- as the block store does after each block
+                  best >>= \h -> both (`noteBest` h)
+                  return hist'
+                same hist = do
+                  own <- layered db (ask hist)
+                  forM_ [a, b] $ \m ->
+                    answering m (\r pool -> ask hist (pooledRead r pool)) >>= \case
+                      Answered shared -> shared `shouldBe` own
+                      Alone -> expectationFailure "the fleet has no tip"
+                      Behind -> expectationFailure "a store has no view of the fleet tip"
+            hist0 <- start layeredRules db
+            best >>= \h -> both (`noteBest` h)
+            both memberTick
+            -- payments that both stores have, and that the pool takes
+            hist1 <- foldM pay hist0 (onlyPayments [100, 2000, 30000, 4000, 500, 60000])
+            both memberTick
+            old <- memberTip a
+            old `shouldSatisfy` isJust
+            same hist1
+            Q.getMempool db >>= (`shouldSatisfy` (not . null))
+            -- more blocks than a store goes through, and no turn taken
+            hist2 <- foldM (\hist _ -> mine hist) hist1 [1 .. farthest + 5]
+            restarts <- fleetRestarts conn keys
+            memberTip a `shouldReturn` old
+            both memberTick
+            new <- encode <$> best
+            memberTip a `shouldReturn` Just new
+            fleetRestarts conn keys `shouldReturn` restarts + 1
+            -- the pool was emptied, and has again what the stores have
+            both memberTick
+            same hist2
+            Q.getMempool db >>= (`shouldSatisfy` (not . null))
+            closeViews a.views
+            closeViews b.views
+            -- said once, by the store that did it, as a warning
+            logged <- readIORef said
+            [line | (LevelWarn, line) <- logged] `shouldSatisfy` \case
+              [line] -> "starting the shared mempool again" `T.isInfixOf` line
+              _ -> False
 
 -- | A history that a run of the tests found: a block is mined, reverted and
 -- mined again while the cache is not brought along, so that the fleet tip

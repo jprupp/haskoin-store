@@ -48,8 +48,8 @@ segwitTxHex =
 
 -- | What the log has after a request that is answered with a status, after
 -- a number of milliseconds, by a server that warns of requests of a second.
-logged :: [T.Text] -> Int -> Int -> IO [T.Text]
-logged path status wait = do
+logged :: Bool -> [T.Text] -> Int -> Int -> IO [T.Text]
+logged access path status wait = do
   said <- newIORef []
   let logger = Logger {level = LevelDebug, source = "", push = \line -> modifyIORef' said (decodeUtf8 (fromLogStr line) :)}
       answer = case status of
@@ -58,7 +58,7 @@ logged path status wait = do
         503 -> status503
         _ -> status500
       app _ respond = threadDelay (wait * 1000) >> respond (responseLBS answer [] "")
-  _ <- logIt logger 1 app defaultRequest {pathInfo = path} (\_ -> return ResponseReceived)
+  _ <- logIt logger access 1 app defaultRequest {pathInfo = path} (\_ -> return ResponseReceived)
   reverse <$> readIORef said
 
 -- | The level of each line of a log, as the line names it at its start.
@@ -84,15 +84,23 @@ spec :: Spec
 spec = do
   describe "log of requests" $ do
     it "has an error only for an error of the server" $ do
-      levels <$> logged ["block", "best"] 200 0 `shouldReturn` ["Debug"]
-      levels <$> logged ["address", "x"] 404 0 `shouldReturn` ["Debug"]
-      levels <$> logged ["health"] 503 0 `shouldReturn` ["Debug"]
-      levels <$> logged ["block", "best"] 500 0 `shouldReturn` ["Error"]
+      levels <$> logged False ["block", "best"] 200 0 `shouldReturn` ["Debug"]
+      levels <$> logged False ["address", "x"] 404 0 `shouldReturn` ["Debug"]
+      levels <$> logged False ["health"] 503 0 `shouldReturn` ["Debug"]
+      levels <$> logged False ["block", "best"] 500 0 `shouldReturn` ["Error"]
     it "warns of a request that took long, and not of the stream of events" $ do
-      slow <- logged ["xpub", "x"] 200 1100
+      slow <- logged False ["xpub", "x"] 200 1100
       levels slow `shouldBe` ["Debug", "Warn"]
       last slow `shouldSatisfy` T.isInfixOf "Slow request, 1.1 seconds: "
-      levels <$> logged ["events"] 200 1100 `shouldReturn` ["Debug"]
+      levels <$> logged False ["events"] 200 1100 `shouldReturn` ["Debug"]
+    it "has every request as information when the access log is on" $ do
+      lines' <- logged True ["block", "best"] 200 0
+      levels lines' `shouldBe` ["Info"]
+      -- the address of the client, the request, the status and the time
+      last lines' `shouldSatisfy` T.isInfixOf "0.0.0.0:0 GET"
+      last lines' `shouldSatisfy` T.isInfixOf ": 200 OK, "
+      last lines' `shouldSatisfy` T.isSuffixOf " ms\n"
+      levels <$> logged True ["block", "best"] 500 0 `shouldReturn` ["Error"]
   describe "ailments" $ do
     it "names what fails of a health check" $ do
       ailments well `shouldBe` ""
