@@ -122,6 +122,11 @@ import UnliftIO (throwIO)
 -------------------------------------------------------------------------------
 
 -- | Log a message with the logger of the writer.
+-- What a peer sends and the store refuses (an orphan, a double spend, a
+-- transaction without funds) is logged for debugging: it is the ordinary
+-- traffic of a network, and nothing is wrong with the store. An error is
+-- kept for what should not happen whatever peers do: a block that does not
+-- fit the database.
 logDebug, logError :: Writer -> Text -> IO ()
 logDebug wr = logAt LevelDebug (writerLogger wr)
 logError wr = logAt LevelError (writerLogger wr)
@@ -545,7 +550,7 @@ newMempoolTx wr tx w =
         spendable wr p >>= \case
           Just u -> return u
           Nothing -> do
-            logError wr $ "Attempted to import a tx missing UTXO: " <> txHashToHex (txHash tx)
+            logDebug wr $ "Attempted to import a tx missing UTXO: " <> txHashToHex (txHash tx)
             throwIO Orphan
       addMempoolTx wr w (prepareTxData rbf (MemRef w) w tx us)
       return True
@@ -646,7 +651,7 @@ deleteSingleTx :: Writer -> TxHash -> IO ()
 deleteSingleTx wr th =
   getMempoolTx wr th >>= \case
     Nothing -> do
-      logError wr $ "Already deleted: " <> txHashToHex th
+      logDebug wr $ "Already deleted: " <> txHashToHex th
       throwIO TxNotFound
     Just td -> do
       spenders <- getMempoolSpenders wr th (length td.tx.outputs)
@@ -663,17 +668,17 @@ deleteSingleTx wr th =
 checkNewTx :: Writer -> [TxHash] -> Tx -> IO ()
 checkNewTx wr replaced tx = do
   when (unique_inputs < length tx.inputs) $ do
-    logError wr $ "Transaction spends same output twice: " <> txHashToHex (txHash tx)
+    logDebug wr $ "Transaction spends same output twice: " <> txHashToHex (txHash tx)
     throwIO DuplicatePrevOutput
   prevs <- mapM prev_output (prevOuts tx)
   when (any isNothing prevs) $ do
-    logError wr $ "Orphan: " <> txHashToHex (txHash tx)
+    logDebug wr $ "Orphan: " <> txHashToHex (txHash tx)
     throwIO Orphan
   when (isCoinbaseTx tx) $ do
-    logError wr $ "Coinbase cannot be imported into mempool: " <> txHashToHex (txHash tx)
+    logDebug wr $ "Coinbase cannot be imported into mempool: " <> txHashToHex (txHash tx)
     throwIO UnexpectedCoinbase
   when (outputs > sum (map (.value) (catMaybes prevs))) $ do
-    logError wr $ "Insufficient funds for tx: " <> txHashToHex (txHash tx)
+    logDebug wr $ "Insufficient funds for tx: " <> txHashToHex (txHash tx)
     throwIO InsufficientFunds
   where
     prev_output op
@@ -711,13 +716,13 @@ getChain wr memonly rbfcheck th' =
           return Nothing
         Just td
           | memonly && confirmed td.block -> do
-              logError wr $ "Transaction already confirmed: " <> txHashToHex th
+              logDebug wr $ "Transaction already confirmed: " <> txHashToHex th
               throwIO TxConfirmed
           | rbfcheck ->
               if (writerNet wr).replaceByFee
                 then return $ Just td
                 else do
-                  logError wr $ "Double-spending transaction: " <> txHashToHex th
+                  logDebug wr $ "Double-spending transaction: " <> txHashToHex th
                   throwIO DoubleSpend
           | otherwise -> return $ Just td
     go txm pdg = do

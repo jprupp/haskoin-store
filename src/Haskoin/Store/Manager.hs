@@ -291,10 +291,10 @@ storeMember cfg db = case (cfg.fleet, cfg.redis) of
 -- the fleet's cache of extended public keys that requests asked for.
 withStoreFleet :: StoreConfig -> Publisher StoreEvent -> Maybe Member -> IO a -> IO a
 withStoreFleet _ _ Nothing action = action
-withStoreFleet cfg pub (Just member) action =
+withStoreFleet _ pub (Just member) action =
   withSubscription pub $ \sub ->
-    withAsync (memberLoop member (nextBlock sub) complain) $ \a ->
-      withAsync (memberCacheLoop member cacheComplain) $ \b -> link a >> link b >> action
+    withAsync (memberLoop member (nextBlock sub)) $ \a ->
+      withAsync (memberCacheLoop member) $ \b -> link a >> link b >> action
   where
     -- until the next block, telling the member what the store deletes
     nextBlock sub =
@@ -302,8 +302,6 @@ withStoreFleet cfg pub (Just member) action =
         StoreBestBlock _ -> return ()
         StoreMempoolDelete h -> memberForget member [h] >> nextBlock sub
         _ -> nextBlock sub
-    complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not take a turn: " <> cs why)
-    cacheComplain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not cache an xpub: " <> cs why)
 
 -- | Run an action with the events that the store tells its clients. A
 -- store alone tells its own. A member of a fleet tells those of the
@@ -315,9 +313,9 @@ withFleetEvents ::
   (Publisher StoreEvent -> IO a) ->
   IO a
 withFleetEvents _ pub Nothing action = action pub
-withFleetEvents cfg _ (Just member) action =
+withFleetEvents _ _ (Just member) action =
   withPublisher $ \shared ->
-    withAsync (memberEvents member False (tell shared) complain) $ \a -> link a >> action shared
+    withAsync (memberEvents member False (tell shared)) $ \a -> link a >> action shared
   where
     tell shared event = forM_ (told event) (`publish` shared)
     told = \case
@@ -326,7 +324,6 @@ withFleetEvents cfg _ (Just member) action =
       FleetLeft h -> StoreMempoolDelete <$> hash h
     hash :: (Serialize x) => ByteString -> Maybe x
     hash = either (const Nothing) Just . decode
-    complain why = logAt LevelError (withSource "Fleet" cfg.logger) ("Could not read the events: " <> cs why)
 
 -- | Run the cache while an action runs, if Redis is configured.
 withStoreCache ::

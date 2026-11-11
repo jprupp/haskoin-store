@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **Log levels say who has the problem.** An error in the log is now
+  something wrong with the store or its database, so that an alert on
+  errors is worth having. The README has a table of the levels.
+  - A transaction from a peer that the store refuses (an orphan, a double
+    spend, one without funds, one already confirmed) is logged for
+    debugging. These were errors, several a minute on a healthy server.
+  - A request answered 4xx or 503 is logged for debugging, like a
+    successful one. Only a 500 is an error.
+  - A peer that times out or sends a block that was not asked for is a
+    warning.
+  - Redis or the price service not answering is a warning: the store
+    goes on without them, and `/health` says so.
+  - **An outage of Redis is logged once when it starts and once when it
+    is over** (`Haskoin.Store.Outage`), and for debugging in between. The
+    loops of a fleet and the worker of the cache each logged every failed
+    attempt, every second or two, and nothing said when Redis was back.
+    `memberLoop`, `memberCacheLoop` and `memberEvents` no longer take a
+    function to tell of a failure.
+  - Each transaction imported into the mempool is logged for debugging,
+    where it was information.
+  - With haskoin-node 2.5.1: a peer that hangs up or misbehaves is not an
+    error, and the comings and goings of peers are logged for debugging.
+
 ### Added
 
 - `stress/results/2026-11-10/`: the results of a full default stress run

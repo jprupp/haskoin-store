@@ -156,6 +156,7 @@ import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, take
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
+import Haskoin.Store.Outage (Outage, attempt, newOutage)
 import System.Metrics.StatsD
   ( StatCounter,
     StatGauge,
@@ -313,7 +314,10 @@ data Member = Member
     -- started, up to a hundred thousand. The database keeps nothing of
     -- them, and the rule for conflicts in the pool asks about them
     -- ('offerMempool').
-    gone :: !(TVar (HashSet TxHash))
+    gone :: !(TVar (HashSet TxHash)),
+    -- | whether the last thing that the member tried with Redis failed,
+    -- so that an outage is logged once, by whichever loop meets it
+    outage :: !Outage
   }
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
@@ -333,6 +337,7 @@ newMember config redis db = do
   lagging <- newTVarIO Nothing
   metrics <- mapM newCacheMetrics config.stats
   gone <- newTVarIO HashSet.empty
+  outage <- newOutage
   return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
@@ -398,15 +403,15 @@ memberTick m = do
 
 -- | Take a turn as a member every two seconds, and at once when an action
 -- that waits for the next best block returns, for as long as the store's
--- health checks pass. A turn that fails, as when Redis is away, is told to
--- a function and tried again at the next.
-memberLoop :: Member -> IO () -> (String -> IO ()) -> IO a
-memberLoop m nextBlock complain = go
+-- health checks pass. A turn that fails, as when Redis is away, is tried
+-- again at the next, and logged as an outage is ('attempt').
+memberLoop :: Member -> IO () -> IO a
+memberLoop m nextBlock = go
   where
     go = do
       void (timeout 2000000 nextBlock)
       well <- readTVarIO m.healthy
-      when well (handleAny (complain . show) (memberTick m))
+      when well (void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m)))
       go
 
 -- | Hear what happens to the fleet, for as long as the store runs: each
@@ -418,25 +423,23 @@ memberLoop m nextBlock complain = go
 -- The telling starts from now, or from the oldest event that Redis keeps:
 -- the second is for a listener that wants to hold the same history as the
 -- other stores whenever it started, as the log of events of the web server
--- does. When Redis cannot be read a function is told why, and listening
--- goes on from the last event heard, so nothing is left out unless Redis
--- dropped it meanwhile.
-memberEvents :: Member -> Bool -> (FleetEvent -> IO ()) -> (String -> IO ()) -> IO a
-memberEvents m whole tell complain = newIORef (if whole then Just "0-0" else Nothing) >>= start
+-- does. When Redis cannot be read, that is logged as an outage is
+-- ('attempt'), and listening goes on a second later from the last event
+-- heard, so nothing is left out unless Redis dropped it meanwhile.
+memberEvents :: Member -> Bool -> (FleetEvent -> IO ()) -> IO a
+memberEvents m whole tell = newIORef (if whole then Just "0-0" else Nothing) >>= go
   where
-    start at = do
-      handleAny (complain . show) $ do
-        from <- readIORef at >>= maybe (fleetEventsEnd m.redis m.keys) return
-        writeIORef at (Just from)
-        listen at from
-      void (timeout 1000000 (atomically retrySTM) :: IO (Maybe ()))
-      start at
-    listen at from = do
+    go at = do
+      heard <- attempt m.outage m.config.note "read the events of the fleet" (listen at)
+      unless heard (void (timeout 1000000 (atomically retrySTM) :: IO (Maybe ())))
+      go at
+    -- what there is after the place, waiting a second for it
+    listen at = do
+      from <- readIORef at >>= maybe (fleetEventsEnd m.redis m.keys) return
+      writeIORef at (Just from)
       events <- fleetEventsAfter m.redis m.keys from 1000
       mapM_ (tell . snd) events
-      let next = foldl (\_ (place, _) -> place) from events
-      writeIORef at (Just next)
-      listen at next
+      writeIORef at (Just (foldl (\_ (place, _) -> place) from events))
 
 -- | Report the blocks of the main chain that the store has views of, newest
 -- first.
@@ -888,8 +891,8 @@ wantCached m x bals =
 -- This is apart from the turns of the member because an entry of a wallet
 -- with a long history takes seconds to read from the database, and a
 -- member that does not report for that long loses its lease.
-memberCacheLoop :: Member -> (String -> IO ()) -> IO a
-memberCacheLoop m complain = go
+memberCacheLoop :: Member -> IO a
+memberCacheLoop m = go
   where
     go = do
       spec <- atomically $ do
@@ -897,7 +900,7 @@ memberCacheLoop m complain = go
         case HashMap.toList w of
           [] -> retrySTM
           (k, x) : _ -> x <$ writeTVar m.wanted (HashMap.delete k w)
-      handleAny (complain . show) (build spec)
+      void (attempt m.outage m.config.note "cache an xpub for the fleet" (build spec))
       go
     build spec =
       readTVarIO m.tip >>= \case

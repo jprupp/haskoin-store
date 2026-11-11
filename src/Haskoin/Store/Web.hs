@@ -178,6 +178,7 @@ import Haskoin.Node
     getPeers,
     logDebug,
     logError,
+    logWarn,
     sendMessage,
     withSource,
   )
@@ -239,7 +240,6 @@ import Network.HTTP.Types
     status503,
     statusIsClientError,
     statusIsServerError,
-    statusIsSuccessful,
   )
 import Network.Socket (Socket)
 import Network.Wai
@@ -839,7 +839,7 @@ getRates logger net session url currency times = do
     return $ r ^. Wreq.responseBody
   where
     err _ = do
-      logError logger "Could not get historic prices"
+      logWarn logger "Could not get historic prices"
       return []
     body = toJSON times
     base =
@@ -857,7 +857,7 @@ price ::
   TVar (HashMap Text BinfoTicker) ->
   IO ()
 price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
-  let err e = logError logger $ cs (show e)
+  let err e = logWarn logger $ "Could not get prices: " <> cs (show e)
   handleAny err $ do
     r <- Wreq.asJSON =<< Wreq.Session.get session u
     atomically . writeTVar v $ r ^. Wreq.responseBody
@@ -1722,7 +1722,7 @@ eventsStart st = \case
 -- client can take up on any of them.
 feedEvents :: WebState -> IO ()
 feedEvents st = case own.fleet of
-  Just member -> memberEvents member True (mapM_ happened . fleet) complain
+  Just member -> memberEvents member True (mapM_ happened . fleet)
   Nothing -> do
     queue <- newTQueueIO
     let listen = mapM_ (writeTQueue queue) . local
@@ -1748,7 +1748,6 @@ feedEvents st = case own.fleet of
         -- a transaction that cannot be read is told to every client
         known <- st.direct.getTxData t `catchAny` \_ -> return Nothing
         atomically (appendEvent st.eventLog (TxEntered t (seenOf own.net own.ctx <$> known)))
-    complain why = logError (withSource "Events" st.config.logger) ("Could not read the events: " <> cs why)
 
 -- GET Address Transactions --
 
@@ -3503,15 +3502,23 @@ listToMaybe' :: [Maybe a] -> Maybe a
 listToMaybe' [x] = x
 listToMaybe' _ = Nothing
 
--- | Middleware that logs every request with its response status: errors at error level, others at debug level.
+-- | Middleware that logs every request with its response status. Only an
+-- error of the server is logged as one: a request that the server could
+-- not answer although nothing was wrong with it (500).
+--
+-- A request that the client got wrong (400, 404) is the client's error,
+-- and a public server gets them all day. A 503 is the server saying that
+-- it is not ready, which its health check and its fleet already report.
+-- Both are logged for debugging, as successes are; logged as errors they
+-- hid the ones that are.
 logIt :: Logger -> Middleware
 logIt logger app req respond =
   app req $ \res -> do
     let s = responseStatus res
         msg = fmtReq req <> ": " <> fmtStatus s
-    if statusIsSuccessful s
-      then logDebug logger msg
-      else logError logger msg
+    if statusIsServerError s && s /= status503
+      then logError logger msg
+      else logDebug logger msg
     respond res
 
 -- | Describe a request for logs.

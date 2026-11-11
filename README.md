@@ -796,6 +796,22 @@ The resident memory of the store is its GHC heap plus RocksDB.
 Logs go to standard error, one line per message, tagged with the component,
 such as `[Info#BlockStore] Best block: ...`.
 
+| Level | What it is for |
+| --- | --- |
+| Error | Something wrong with the store or its database. Alert on these |
+| Warn | Something unusual that the store dealt with: a misbehaving peer, no peers left, Redis or the price service not answering, a block reverted |
+| Info | Milestones: start-up, each new best block, migrations, the mempool pruned |
+| Debug | Everything else, with `--debug`: each peer, each transaction, each request |
+
+An outage of Redis is one warning when it starts, `Could not … Going on
+without`, and one line when it is over, `Can … again`. The attempts in
+between are logged for debugging.
+
+Nothing that a peer or a client does is an error. A transaction that the
+store refuses (an orphan, a double spend), a request with a bad parameter
+or for something unknown, and a peer that hangs up are all ordinary on a
+public network, and are logged for debugging.
+
 ## Using it from Haskell
 
 Query a running server with `haskoin-store-data`:
