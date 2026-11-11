@@ -271,6 +271,9 @@ on the moment at which each commits a block.
 - **Why not a lock and a commit in step:** a store that stalls would block
   the others, and stores would still commit milliseconds apart.
 
+How the shared mempool works step by step, and its weak points, are in
+`docs/fleet-mempool.md`.
+
 **What a fleet cannot say, and what it costs.**
 
 - **A request sees one block, but not one moment of the pool.** A

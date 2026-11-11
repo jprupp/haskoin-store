@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `docs/fleet-mempool.md`: how the shared mempool of a fleet works, why
+  it holds, and its weak points. A report in the repository, not in the
+  package.
+
 ## [1.9.1] - 2026-11-11
 
 ### Changed
