@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **A change of health is logged**: a warning with what is wrong when
+  `/health` stops answering 200, and a line when it does again; the same
+  for Redis. Nothing said so before but the 503s of the requests.
+- **A slow request is logged as a warning**, with how long it took:
+  `--slow-request` (`SLOW_REQUEST`), five seconds by default, 0 for never.
 - `stress/results/2026-11-10/`: the results of a full default stress run
   on version 1.9.0, with a comparison against the run of the day before on
   1.8.1. A cache reload takes 234 ms on average where it took 2,448, and

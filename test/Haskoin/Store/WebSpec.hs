@@ -1,11 +1,26 @@
 module Haskoin.Store.WebSpec (spec) where
 
+import Control.Concurrent (threadDelay)
 import Data.ByteString (ByteString)
 import Data.Either (isLeft)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (fromJust)
+import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
 import Haskoin (Tx (..), bch, btc, decodeHex, txHash, txHashToHex)
-import Haskoin.Store.Web (acceptsBinary, decodeTxBody)
+import Haskoin.Node (LogLevel (..), Logger (..))
+import Haskoin.Store.Data
+  ( BlockHealth (..),
+    CountHealth (..),
+    HealthCheck (..),
+    MaxHealth (..),
+    TimeHealth (..),
+  )
+import Haskoin.Store.Web (acceptsBinary, ailments, decodeTxBody, logIt)
+import Network.HTTP.Types (status200, status404, status500, status503)
+import Network.Wai (Request (..), defaultRequest, responseLBS)
+import Network.Wai.Internal (ResponseReceived (..))
+import System.Log.FastLogger (fromLogStr)
 import Test.Hspec
 
 -- | A transaction written by hand, in the format without witness. It has
@@ -31,8 +46,60 @@ segwitTxHex =
   \010101\
   \00000000"
 
+-- | What the log has after a request that is answered with a status, after
+-- a number of milliseconds, by a server that warns of requests of a second.
+logged :: [T.Text] -> Int -> Int -> IO [T.Text]
+logged path status wait = do
+  said <- newIORef []
+  let logger = Logger {level = LevelDebug, source = "", push = \line -> modifyIORef' said (decodeUtf8 (fromLogStr line) :)}
+      answer = case status of
+        200 -> status200
+        404 -> status404
+        503 -> status503
+        _ -> status500
+      app _ respond = threadDelay (wait * 1000) >> respond (responseLBS answer [] "")
+  _ <- logIt logger 1 app defaultRequest {pathInfo = path} (\_ -> return ResponseReceived)
+  reverse <$> readIORef said
+
+-- | The level of each line of a log, as the line names it at its start.
+levels :: [T.Text] -> [T.Text]
+levels = map (T.takeWhile (`notElem` ['#', ']']) . T.drop 1)
+
+-- | A health check that passes.
+well :: HealthCheck
+well =
+  HealthCheck
+    { blocks = BlockHealth {headers = 100, blocks = 100, max = 3},
+      lastBlock = TimeHealth {age = 60, max = 14400},
+      lastTx = TimeHealth {age = 5, max = 1800},
+      pendingTxs = MaxHealth {count = 0, max = 10000},
+      peers = CountHealth {count = 8, min = 1},
+      network = "btc",
+      version = "0",
+      time = 0,
+      redis = Nothing
+    }
+
 spec :: Spec
 spec = do
+  describe "log of requests" $ do
+    it "has an error only for an error of the server" $ do
+      levels <$> logged ["block", "best"] 200 0 `shouldReturn` ["Debug"]
+      levels <$> logged ["address", "x"] 404 0 `shouldReturn` ["Debug"]
+      levels <$> logged ["health"] 503 0 `shouldReturn` ["Debug"]
+      levels <$> logged ["block", "best"] 500 0 `shouldReturn` ["Error"]
+    it "warns of a request that took long, and not of the stream of events" $ do
+      slow <- logged ["xpub", "x"] 200 1100
+      levels slow `shouldBe` ["Debug", "Warn"]
+      last slow `shouldSatisfy` T.isInfixOf "Slow request, 1.1 seconds: "
+      levels <$> logged ["events"] 200 1100 `shouldReturn` ["Debug"]
+  describe "ailments" $ do
+    it "names what fails of a health check" $ do
+      ailments well `shouldBe` ""
+      let behind = well {blocks = BlockHealth {headers = 105, blocks = 100, max = 3}} :: HealthCheck
+          alone = behind {peers = CountHealth {count = 0, min = 1}} :: HealthCheck
+      ailments behind `shouldBe` "5 blocks behind the headers"
+      ailments alone `shouldBe` "5 blocks behind the headers, 0 peers"
   describe "acceptsBinary" $ do
     it "takes the binary type by itself" $
       acceptsBinary "application/octet-stream" `shouldBe` True

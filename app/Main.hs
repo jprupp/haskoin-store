@@ -264,6 +264,8 @@ defConfig = do
         env "BLOCK_TIMEOUT" d.blockTimeout readMaybe
       txTimeout <-
         env "TX_TIMEOUT" d.txTimeout readMaybe
+      slowRequest <-
+        env "SLOW_REQUEST" d.slowRequest readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -425,6 +427,13 @@ config c = do
           <> helpEnv "TX_TIMEOUT" "Last tx received health timeout"
           <> showDefault
           <> value c.webLimits.txTimeout
+    slowRequest <-
+      option auto $
+        metavar "SECONDS"
+          <> long "slow-request"
+          <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
+          <> showDefault
+          <> value c.webLimits.slowRequest
     return WebLimits {..}
   redis <-
     flag c.redis True $

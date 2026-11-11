@@ -337,6 +337,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-item-count` | `MAX_ITEM_COUNT` | `200000` | Most items in a list (0 = no limit) |
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
+| `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -802,6 +803,15 @@ such as `[Info#BlockStore] Best block: ...`.
 | Warn | Something unusual that the store dealt with: a misbehaving peer, no peers left, Redis or the price service not answering, a block reverted |
 | Info | Milestones: start-up, each new best block, migrations, the mempool pruned |
 | Debug | Everything else, with `--debug`: each peer, each transaction, each request |
+
+What the log says about the server itself, without `--debug`:
+
+- **Health.** One line when `/health` changes: `No longer healthy: 5 blocks
+  behind the headers` as a warning, and `Healthy again`. A store that is
+  still syncing says `Not healthy yet` once, which is not a warning.
+- **Slow requests.** A warning for a request that took `--slow-request`
+  seconds or more to answer, with the request and how long it took. The
+  stream of events is left out.
 
 An outage of Redis is one warning when it starts, `Could not … Going on
 without`, and one line when it is over, `Can … again`. The attempts in

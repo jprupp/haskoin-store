@@ -20,7 +20,7 @@ spec = describe "outage" $ do
     heard <- reverse <$> readIORef said
     map fst heard `shouldBe` [LevelWarn, LevelDebug, LevelDebug, LevelInfo]
     -- what failed and why, and what works again
-    snd (head heard) `shouldSatisfy` T.isPrefixOf "Could not reach the service: no route"
+    snd (heard !! 0) `shouldSatisfy` T.isPrefixOf "Could not reach the service: no route"
     snd (last heard) `shouldBe` "Can reach the service again"
   it "warns again at the next outage" $ do
     said <- newIORef []

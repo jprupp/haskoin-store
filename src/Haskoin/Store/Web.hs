@@ -74,6 +74,10 @@ module Haskoin.Store.Web
     -- * Request parsing
     decodeTxBody,
     acceptsBinary,
+
+    -- * Logging
+    logIt,
+    ailments,
   )
 where
 
@@ -178,6 +182,7 @@ import Haskoin.Node
     getPeers,
     logDebug,
     logError,
+    logInfo,
     logWarn,
     sendMessage,
     withSource,
@@ -283,6 +288,7 @@ import Network.WebSockets.Connection.PingPong
 import Network.Wreq qualified as Wreq
 import Network.Wreq.Session as Wreq (Session)
 import Network.Wreq.Session qualified as Wreq.Session
+import Numeric (showFFloat)
 import Numeric.Natural (Natural)
 import System.Metrics.StatsD
 import Text.Read (readMaybe)
@@ -333,13 +339,16 @@ data WebLimits = WebLimits
     -- unhealthy
     txTimeout :: !Word64,
     -- | seconds without a new block before the store is reported unhealthy
-    blockTimeout :: !Word64
+    blockTimeout :: !Word64,
+    -- | seconds that a request may take before the log has a warning
+    -- about it ('logIt')
+    slowRequest :: !Word32
   }
   deriving (Eq, Show)
 
 -- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
--- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes and
--- block timeout of four hours.
+-- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes,
+-- block timeout of four hours, and a warning for requests of five seconds.
 instance Default WebLimits where
   def =
     WebLimits
@@ -350,7 +359,8 @@ instance Default WebLimits where
         xpubGap = 32,
         xpubGapInit = 20,
         txTimeout = 3600 `div` 2,
-        blockTimeout = 4 * 3600
+        blockTimeout = 4 * 3600,
+        slowRequest = 5
       }
 
 -- | Configuration of the web server.
@@ -712,11 +722,13 @@ serveWeb config serve = do
       notFound req (Unknown ks) =
         errorResponse st req . UserError $
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
+  saidWell <- newIORef Nothing
+  saidRedis <- newIORef True
   withAsync (priceUpdater session ticker) $ \_a1 ->
-    withAsync (healthCheckLoop health cacheUp) $ \_a2 ->
+    withAsync (healthCheckLoop health cacheUp saidWell saidRedis) $ \_a2 ->
       withAsync (feedEvents st) $ \a3 ->
         link a3 >> do
-          serve . webSocketEvents st . logIt config.logger . anyOrigin . preflight . autohead . compressed $ app
+          serve . webSocketEvents st . logIt config.logger config.limits.slowRequest . anyOrigin . preflight . autohead . compressed $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -731,14 +743,40 @@ serveWeb config serve = do
       (Just cache, _) -> cacheAlive cache
       (_, Just member) -> memberAlive member
       _ -> return True
-    healthCheckLoop v up = loopForever $ do
+    healthCheckLoop v up saidWell saidRedis = loopForever $ do
       threadDelay (config.healthCheckInterval * 1000 * 1000)
       h <- runHealthCheck
       atomically (writeTVar v h)
+      tellHealth saidWell h
       -- a store whose checks fail stops taking its turns as a member of
       -- its fleet, so that it does not hold the others back
       forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
-      cacheCheck >>= atomically . writeTVar up
+      redis <- cacheCheck
+      atomically (writeTVar up redis)
+      tellRedis saidRedis redis
+    -- A change of health is logged, and nothing while it stays as it was:
+    -- what /health answers is otherwise only known to whoever asks it. A
+    -- store is not healthy while it syncs, which is no cause for alarm,
+    -- so only a store that was healthy gets a warning.
+    health' = withSource "Health" config.logger
+    tellHealth said h = do
+      before <- readIORef said
+      writeIORef said (Just (isOK h))
+      case (before, isOK h) of
+        (Just True, False) -> logWarn health' ("No longer healthy: " <> ailments h)
+        (Nothing, False) -> logInfo health' ("Not healthy yet: " <> ailments h)
+        (Just False, True) -> logInfo health' "Healthy again"
+        (Nothing, True) -> logInfo health' "Healthy"
+        _ -> return ()
+    -- the same for the Redis that a store with a cache answers through;
+    -- /health says 203 without it
+    tellRedis said redis = do
+      before <- readIORef said
+      writeIORef said redis
+      case (before, redis) of
+        (True, False) -> logWarn health' "Redis does not answer: answering from the database"
+        (False, True) -> logInfo health' "Redis answers again"
+        _ -> return ()
     -- what a browser asks before a request from another site that is not
     -- of the plainest kind: which methods and headers it may use. Without
     -- an answer it does not send the request.
@@ -3511,15 +3549,42 @@ listToMaybe' _ = Nothing
 -- it is not ready, which its health check and its fleet already report.
 -- Both are logged for debugging, as successes are; logged as errors they
 -- hid the ones that are.
-logIt :: Logger -> Middleware
-logIt logger app req respond =
+--
+-- A request that took a number of seconds or more to answer gets a
+-- warning, with how long it took (0 for never). That is the one thing
+-- about a single request that says something of the server: a query that
+-- reads far more than it should, or a database that has become slow. The
+-- time is that of making the response, not of sending it, so a client on
+-- a slow line is not the server's slow request; and the stream of events,
+-- whose response never ends, is left out.
+logIt :: Logger -> Word32 -> Middleware
+logIt logger slow app req respond = do
+  start <- getPOSIXTime
   app req $ \res -> do
+    took <- subtract start <$> getPOSIXTime
     let s = responseStatus res
         msg = fmtReq req <> ": " <> fmtStatus s
+        seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
     if statusIsServerError s && s /= status503
       then logError logger msg
       else logDebug logger msg
+    when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
+      logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
     respond res
+
+-- | What is wrong with a store whose health check fails, for its log.
+ailments :: HealthCheck -> Text
+ailments h =
+  T.intercalate ", " . concat $
+    [ [shown (h.blocks.headers - h.blocks.blocks) <> " blocks behind the headers" | not (isOK h.blocks)],
+      [shown h.lastBlock.age <> " seconds since the last block" | not (isOK h.lastBlock)],
+      [shown h.lastTx.age <> " seconds since the last transaction" | not (isOK h.lastTx)],
+      [shown h.pendingTxs.count <> " transactions waiting to be imported" | not (isOK h.pendingTxs)],
+      [shown h.peers.count <> " peers" | not (isOK h.peers)]
+    ]
+  where
+    shown :: (Show a) => a -> Text
+    shown = cs . show
 
 -- | Describe a request for logs.
 fmtReq :: Request -> Text
