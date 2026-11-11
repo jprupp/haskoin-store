@@ -486,7 +486,7 @@ report m = do
 -- another one, with what the blocks in between did to the pool. Says
 -- whether it moved. When this store cannot say what they did, the pool is
 -- emptied: Redis allows that to a store that is alone, and to any store
--- when the way is too long for all of them ('Way').
+-- when the way is too long for all of them (v'TooFar').
 moveTip :: Member -> IO Bool
 moveTip m = do
   seen <- fleetTip m.redis m.keys

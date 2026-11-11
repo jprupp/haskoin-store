@@ -745,7 +745,8 @@ serveWeb config serve = do
     withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
       withAsync (feedEvents st) $ \a3 ->
         link a3 >> do
-          serve . webSocketEvents st . logIt config.logger config.accessLog config.limits.slowRequest . anyOrigin . preflight . autohead . compressed $ app
+          let logged = logIt config.logger config.accessLog config.limits.slowRequest
+          serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo

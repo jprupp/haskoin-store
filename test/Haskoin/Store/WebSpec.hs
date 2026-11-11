@@ -51,7 +51,8 @@ segwitTxHex =
 logged :: Bool -> [T.Text] -> Int -> Int -> IO [T.Text]
 logged access path status wait = do
   said <- newIORef []
-  let logger = Logger {level = LevelDebug, source = "", push = \line -> modifyIORef' said (decodeUtf8 (fromLogStr line) :)}
+  let keep line = modifyIORef' said (decodeUtf8 (fromLogStr line) :)
+      logger = Logger {level = LevelDebug, source = "", push = keep}
       answer = case status of
         200 -> status200
         404 -> status404
