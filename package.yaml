@@ -1,5 +1,5 @@
 name: haskoin-store
-version: 1.10.1
+version: 1.11.0
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: |
   An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
@@ -49,10 +49,10 @@ dependencies:
   - file-embed ^>= 0.0.16.0
   - hashable ^>= 1.5.1.0
   - hashtables ^>= 1.4.2
-  - haskoin-store-data ^>= 2.0
+  - haskoin-store-data ^>= 2.0.1
   - monad-control ^>= 1.0.3.1
   - mtl ^>= 2.3.2
-  - haskoin-core ^>= 1.6.1
+  - haskoin-core ^>= 1.6.2
   - haskoin-node ^>= 2.5.1
   - nqe ^>= 0.6.9
   - random ^>= 1.3.1

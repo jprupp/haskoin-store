@@ -6,6 +6,80 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-12
+
+`POST /transactions` is done another way, and now says what came of the
+transaction. `docs/publishing.md` has the design and the measurements.
+
+### Changed
+- **A 200 means that a full node accepted the transaction and that the
+  server has it.** It used to mean that the transaction was sent, and came
+  at once whatever happened. The request now waits for a node to announce
+  the transaction back, for `--publish-timeout` (`PUBLISH_TIMEOUT`)
+  seconds at most, 30 by default. With a node that whitelists the store
+  that takes milliseconds.
+- The transaction is handed to one node, on a connection made for it. It
+  used to go to half the peers, on the connections the store syncs from.
+- The transaction comes into the mempool when a node announces it on a
+  connection that never sent it. The store used to ask the peers it had
+  sent it to, once, five seconds later.
+- The same transaction posted again is sent once, and one that the store
+  has is not sent at all.
+
+### Added
+- The store refuses, with 400 and the reason, a transaction that it can
+  tell no node will take:
+  - one that spends an output it does not know, one that a confirmed
+    transaction has spent, or a coinbase less than a hundred blocks old;
+  - one whose outputs are worth more than its inputs, or that is a
+    coinbase;
+  - one whose lock time has not passed;
+  - one larger than nodes relay, or with an output that is dust;
+  - **one with a forged signature**, for coins locked to one key: key
+    hash, key, witness key hash plain or nested, and Taproot by its key;
+    on Bitcoin Cash with ECDSA and Schnorr signatures, and for coins that
+    hold tokens. This is `judgeInputs` of haskoin-core 1.6.2, which also
+    verifies multisig: with ECDSA signatures on both networks, with
+    Schnorr signatures on Bitcoin Cash, and the multisig of Taproot.
+- `--node-rpc` (`NODE_RPC`): the JSON-RPC URL of a full node. The store
+  publishes through it (`sendrawtransaction`): the node checks
+  everything, says why it refuses, which Bitcoin Core does not tell a
+  peer, and does not close the store's connections over what it refuses.
+  When the node does not answer, the transaction goes to a peer.
+- **A peer is sent only what the store verified.** A transaction with an
+  input that the store cannot verify, a script that is not a key or a
+  multisig, is refused with 400 unless the store can send it over RPC. A
+  peer that finds a transaction invalid may close every connection of
+  the store, so sending on what it could not judge let anyone cut the
+  store off from its peers.
+- The reason of a node that refuses a transaction and says why, as Bitcoin
+  Cash Node does, is the message of the 400.
+- 500 when no node could be reached, when a node closed the connection on
+  receiving the transaction, and when no node announced it in time. The
+  reference always listed these errors; the code gave none of them.
+- A transaction that a node refused, closed the connection on, or did not
+  announce is remembered for ten minutes and not sent again. Other
+  transactions are published as before.
+- The body of `POST /transactions` is read up to the length of the longest
+  transaction of the network in hexadecimal, and a longer one is answered
+  413. The server used to read a body of any size into memory.
+- `Store` has `connect`, the function that opens a connection to a node.
+- The integration tests run a store against a Bitcoin Core and a Bitcoin
+  Cash Node that do not whitelist it.
+
+### Fixed
+- **A published transaction was often not seen until a block confirmed
+  it.** Bitcoin Core does not give a transaction back on the connection
+  that sent it until its timer for announcements has run, five seconds on
+  average: the one request the store made at five seconds got `notfound`
+  three times in four against Bitcoin Core 32.1. A store whose only node
+  did not whitelist it then never took the transaction in.
+- **One request could cut a store off from half its peers.** A node that
+  finds a transaction invalid may close every connection from the address
+  that sent it, and Bitcoin Cash Node 29.2 does. A forged transaction went
+  to half the peers on the connections the store syncs from.
+- With no peer connected the answer was 200 and nothing was sent.
+
 ## [1.10.1] - 2026-11-12
 
 ### Changed

@@ -11,7 +11,7 @@ servers:
   - url: './'
 
 info:
-  version: &version 1.10.1
+  version: &version 1.11.0
   title: Haskoin
   contact:
     name: JP Rupp
@@ -1967,16 +1967,23 @@ paths:
         must be in the format that nodes of the network read: on BCH,
         which has no SegWit, the format without witness data.
 
-        **A 200 means the transaction was sent, not that the network accepted it.**
-        The server does not validate transactions; it gives the transaction to half
-        of its peers, which check it as they would any other. If they accept it, they
-        relay it back, and it appears in the mempool and in balances within seconds.
-        To know whether it was accepted, look for it with `/transaction/{txid}` or
-        watch `/events`.
+        **A 200 means that a full node accepted the transaction and that this
+        server has it**: the next request for the transaction, or for a balance
+        it changes, shows it.
 
-        Five seconds later the server asks those peers for the transaction back. A
-        peer that accepted it sends it, and the server imports it like any other
-        transaction it hears about; a peer that refused it has nothing to send.
+        The server does not broadcast. It checks what it can by itself: that
+        the inputs exist and are not spent, the amounts, the lock time, the
+        size and dust rules of relay, and the signature of every input that
+        spends a coin locked to one key. It does not run other scripts: a
+        transaction with an input it cannot verify is published only by a
+        server that reaches a full node over RPC, and refused by others.
+        Then it hands the transaction to one full node, and answers
+        when a node has announced it back, which is how it enters the mempool of
+        this server. That takes milliseconds when the node whitelists the server,
+        and seconds otherwise.
+
+        A transaction that this server has already is answered 200 and not sent.
+        Posting the same transaction again is always safe: it is sent once.
       operationId: postTransaction
       parameters:
         - $ref: '#/components/parameters/prettyParam'
@@ -2001,7 +2008,7 @@ paths:
                        1486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000"
       responses:
         '200':
-          description: Transaction accepted by network peer.
+          description: A full node accepted the transaction, and this server has it.
           content:
             application/json:
               schema:
@@ -2009,18 +2016,47 @@ paths:
               example:
                 txid: 0b7cb07d848959fbd02ad6e2ed21fac888b8e8011c6b8c5362d05c703066ae67
         '400':
-          description: Transaction rejected.
+          description: |
+            The transaction was refused, and `message` says why:
+
+            * The body is not one transaction in hexadecimal.
+            * It spends an output that this server does not know, or that a
+              confirmed transaction has spent, or a coinbase that is not a
+              hundred blocks old.
+            * Its outputs are worth more than its inputs, its lock time has
+              not passed, it is larger than nodes relay, or one of its
+              outputs is dust.
+            * The signature of an input that spends a coin locked to one key
+              does not verify.
+            * This server cannot verify the signature of an input, such as
+              one of a script that is not a key or a multisig, and has no full node to
+              give the transaction to over RPC.
+            * A node refused it and said why.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: |
+            The body is longer than a transaction of the network can be in
+            hexadecimal: 8,000,000 characters on networks with SegWit and
+            2,000,000 on Bitcoin Cash, and some white space.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
           description: |
-            Publishing transaction failed for one of these reasons:
+            The server could not find out whether the network took the
+            transaction. Post the same transaction again to ask again.
 
-            * No network peers available.
-            * Timeout while publishing, most likely silent rejection.
-            * Network peer disconnected while publishing transaction.
+            * `server-timeout`: a node took the transaction and none announced
+              it within the time this server waits (30 seconds by default).
+              Most likely it was refused: Bitcoin Core does not say when it
+              refuses a transaction.
+            * `server-error`: no node could be reached; or a node closed the
+              connection on receiving the transaction, which a node does with
+              one it finds invalid.
           content:
             application/json:
               schema:
