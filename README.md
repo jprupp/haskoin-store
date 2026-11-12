@@ -82,7 +82,7 @@ Bitcoin Cash APIs such as api.haskoin.com.
 | Xpubs           | Balances, transactions and UTXO of extended public keys, for legacy, nested SegWit and native SegWit addresses, with an optional Redis cache for large wallets |
 | Blocks and txs  | Lookup by hash, height or time; raw serialized forms; transactions of a block               |
 | Mempool         | Persistent, indexed by arrival time, with replace-by-fee on BTC and pruning of old entries   |
-| Formats         | JSON, pretty JSON, or a compact binary encoding                                              |
+| Formats         | JSON, or pretty JSON                                                                         |
 | Live events     | New blocks and transactions as a JSON stream or over a WebSocket                            |
 | Compatibility   | Endpoints in the style of Blockchain.info under `/blockchain/`                               |
 | Operations      | Health check, StatsD metrics, RocksDB memory limits, Docker image                           |
@@ -279,7 +279,7 @@ curl -N "localhost:3000/events?xpub=xpub6C…&derive=legacy,segwit"
 `quiet=true` sends blocks alone until the client watches something; a
 WebSocket client with a long list connects with it and sends the list in
 messages. The [API reference](swagger.yaml) has every message and
-parameter, and the binary form of each message.
+parameter.
 
 ### 7. Make big wallets fast
 
@@ -482,9 +482,7 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 
 - The root of the server, `/`, is the reference of its API as a page that
   can try requests, and `/swagger.yaml` the file behind it.
-- Add `?pretty=true` for indented JSON.
-- Send `Accept: application/octet-stream` for the binary format: see
-  [Binary format](#binary-format) below.
+- Answers are JSON. Add `?pretty=true` for indented JSON.
 - Lists are paged with `limit` and `offset`, newest first. `height` begins
   a page at a transaction hash, a block hash, a block height or a Unix time
   instead.
@@ -492,8 +490,7 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   a value it cannot read, gives 400 with a message that names it, instead of
   being ignored. The Blockchain.info endpoints accept `format=json`, which
   clients written for them often send.
-- Errors come back with an HTTP status, in the format that was asked for:
-  400 for bad input, 404 for unknown things, 409 when a short transaction
+- Errors come back as JSON with an HTTP status: 400 for bad input, 404 for unknown things, 409 when a short transaction
   number is ambiguous, 413 for requests that ask for too much.
 
 ### HTTP and HTTPS
@@ -513,35 +510,6 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   public service usually has a proxy in front that holds the certificate;
   this is for a server by itself. The files are read at start, so a
   renewed certificate takes a restart.
-
-### Binary format
-
-Every endpoint but those under `/blockchain/` and `/dbstats` also answers
-in a compact binary format, which is smaller and faster to decode than
-JSON. The Haskell client in `haskoin-store-data` speaks it, and
-`swagger.yaml` has a section, "Binary format", that is enough to write a
-client in another language: the primitives, the layout of every type, and
-what each endpoint returns.
-
-- **Ask for it** with `Accept: application/octet-stream`. In a list of
-  types it wins when its `q` weight is above 0 and no less than that of
-  `application/json`; a wildcard or no header gives JSON. The answer has
-  `Content-Type: application/octet-stream`, and every answer has
-  `Vary: Accept`.
-- **Errors come in binary too**: one byte that says which error, and a
-  message or a list of transactions for those that have one. Up to
-  version 1.8.1 they were JSON whatever was asked, so a client that also
-  talks to older servers reads the `Content-Type` of an error.
-- **Lists start with their length**, the raw lists of blocks and
-  transactions included, which up to version 1.8.1 had none.
-- **`/events` is the exception**: a stream of events of 33 bytes each,
-  with no count, for as long as the connection is open.
-- **Over the WebSocket** binary is binary frames, for the events and for
-  the commands that choose transactions. The server answers in the kind
-  of frame that it was last sent.
-- Everything is big-endian, except what is copied from the peer-to-peer
-  protocol, such as a whole transaction or block.
-
 
 ### Endpoints at a glance
 
@@ -878,7 +846,7 @@ Haskoin Store is two Haskell packages, each in its own repository:
 - **`haskoin-store`**, this repository: the indexer, the web server and the
   executable.
 - **[`haskoin-store-data`](https://github.com/jprupp/haskoin-store-data)**:
-  the data types, their JSON and binary encodings, and a client for the API
+  the data types, their JSON, and a client for the API
   (`Haskoin.Store.WebClient`). Use this one to talk to a Haskoin Store server
   from Haskell. It is small to depend on, as it has no database or node.
 

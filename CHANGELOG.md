@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-12
+
+The API speaks JSON only. Its binary format is gone, from the server and
+from the documentation.
+
+### Removed
+
+- **The binary format.** `Accept: application/octet-stream` no longer
+  gives binary: every answer is JSON, errors and `/events` included. The
+  "Binary format" sections of `README.md` and `swagger.yaml` are gone.
+  Clients built with haskoin-store-data before 2.0.0 ask for binary and
+  do not work with this server; version 2.0.0 of its client speaks JSON.
+- **Binary frames over the WebSocket** of `/events`. Events are sent in
+  text frames, and a binary frame from the client closes the connection
+  as a command that cannot be read.
+- **Raw bytes in `POST /transactions`.** The body is the transaction in
+  hex.
+
+### Changed
+
+- Answers have `Vary: Accept-Encoding`, without `Accept`, which no longer
+  changes what is answered.
+- Depends on haskoin-store-data 2.0.0.
+
 ### Added
 
 - `docs/fleet-mempool.md`: how the shared mempool of a fleet works, why
