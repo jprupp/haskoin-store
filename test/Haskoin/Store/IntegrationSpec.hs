@@ -64,7 +64,7 @@ import Haskoin
   ( Address (..),
     BloomFlags (..),
     Ctx,
-    Network,
+    Network (..),
     OutPoint (..),
     TxHash (..),
     XPrvKey,
@@ -75,15 +75,16 @@ import Haskoin
     bloomInsert,
     deriveXPubKey,
     encodeHex,
+    headerHash,
     hexToBlockHash,
     hexToTxHash,
     makeXPrvKey,
-    marshal,
     marshalJSON,
     prepareContext,
     prvSubKey,
     pubSubKey,
     sha256,
+    txHash,
     txHashToHex,
     xPrvWif,
     xPubAddr,
@@ -117,11 +118,17 @@ import Haskoin.Store.Cache
 import Haskoin.Store.Common (StoreEvent (..))
 import Haskoin.Store.Data
   ( Balance (..),
+    BlockData (..),
     BlockRef (..),
     Event (..),
     EventCommand (..),
     Except (..),
+    HealthCheck (..),
+    BlockHealth (..),
+    RawResult (..),
+    SerialList (..),
     Spender (..),
+    Transaction (..),
     TxData (..),
     XPubBal (..),
   )
@@ -132,6 +139,8 @@ import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
 import Haskoin.Store.Integration.Valkey
+import Haskoin.Store.WebClient qualified as Client
+import Haskoin.Store.WebCommon (ApiResource, NoCache (..), NoTx (..))
 import NQE (receive, withSubscription)
 import Network.Socket qualified as Socket
 import Network.WebSockets qualified as WS
@@ -176,7 +185,8 @@ chainSpec kind = do
   it "catches up with changes that the database has before their events" catchUpTest
   it "keeps the spenders of cached transactions up to date" spenderTest
   it "evicts the least recently used xpubs" evictTest
-  it "answers an error in the format that was asked for" errorFormatTest
+  it "answers an error in JSON, whatever was asked for" errorFormatTest
+  it "answers the Haskell client of haskoin-store-data" clientTest
   it "speaks HTTP as browsers, proxies and long requests need it" httpTest
   it "serves HTTPS, and nothing else, when given a certificate" tlsTest
   it "tells each client of the transactions it chose, and takes up where it left" eventsTest
@@ -1559,9 +1569,9 @@ redisDownTest env = do
     (== 200) . fst <$> getJSON env.cached "/health"
   checkXPub env x ref
 
--- | An error is answered in binary to a request that asks for binary, and
--- in JSON otherwise, and every answer says that it depends on what was
--- asked for.
+-- | An error is answered in JSON, whatever the request asks for, and
+-- every answer says that it depends on whether the client reads gzip, and
+-- on nothing else.
 errorFormatTest :: Env -> IO ()
 errorFormatTest env = do
   let unknown = "/transaction/" <> replicate 64 'a'
@@ -1577,16 +1587,52 @@ errorFormatTest env = do
             r ^. Wreq.responseHeader "Vary",
             r ^. Wreq.responseBody
           )
-  (code, kind, vary, bytes) <- ask (Just "application/octet-stream")
-  (code, kind, vary) `shouldBe` (404, "application/octet-stream", "Accept, Accept-Encoding")
-  -- the error, as haskoin-store-data encodes it
-  decode (BL.toStrict bytes) `shouldBe` Right ThingNotFound
-  -- in a list with a weight, which used to give JSON
-  (_, listed, _, _) <- ask (Just "text/plain;q=0.1, application/octet-stream;q=0.9")
-  listed `shouldBe` "application/octet-stream"
-  (code', kind', vary', json) <- ask Nothing
-  (code', kind', vary') `shouldBe` (404, "application/json", "Accept, Accept-Encoding")
-  (body json ! "error") `shouldBe` String "not-found-or-invalid-arg"
+  forM_ [Just "application/octet-stream", Nothing] $ \accept -> do
+    (code, kind, vary, json) <- ask accept
+    (code, kind, vary) `shouldBe` (404, "application/json", "Accept-Encoding")
+    (body json ! "error") `shouldBe` String "not-found-or-invalid-arg"
+
+-- | The client of haskoin-store-data reads what the server answers: values
+-- in the JSON of the network, plain JSON, raw transactions, errors, and the
+-- lines of the events.
+clientTest :: Env -> IO ()
+clientTest env = do
+  let x = newXPub env "client" DeriveNormal
+      -- the client puts the name of the network in the path, as
+      -- api.haskoin.com has it, and the server of the tests has none
+      conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain}
+      call :: (ApiResource a b) => a -> IO b
+      call r = Client.apiCall env.ctx conf r >>= either (fail . show) return
+  heard <- newIORef []
+  listener <- async . Client.apiEvents conf $ \e -> modifyIORef' heard (e :) >> return True
+  -- the client is listening once it hears of a block
+  void (mine env 1)
+  waitFor "the client to listen" (not . null <$> readIORef heard)
+  ref <- newLedger
+  paid <- pay env x ref [([0, 0], 100000)]
+  txid <- maybe (fail "Not a hash") return (hexToTxHash paid)
+  -- the node relays the payment in its own time: a block before it would
+  -- confirm it without it ever entering the mempool of the store
+  waitFor "the client to hear of the payment" ((EventTx txid `elem`) <$> readIORef heard)
+  [mined] <- mine env 1
+  block <- call (Client.GetBlockBest (NoTx True))
+  blockHashToHex (headerHash block.header) `shouldBe` mined
+  tx <- call (Client.GetTx txid)
+  tx.txid `shouldBe` txid
+  raw <- call (Client.GetTxRaw txid)
+  txHash raw.get `shouldBe` txid
+  balances <- call (Client.GetAddrsBalance [addrOf env x [0, 0]])
+  map (.confirmed) balances.get `shouldBe` [100000]
+  keys <- call (Client.GetXPubBalances x.spec.key DeriveNormal (NoCache False))
+  sum (map (.balance.confirmed) keys.get) `shouldBe` 100000
+  health <- call Client.GetHealth
+  health.blocks.blocks `shouldSatisfy` (> 0)
+  -- an error comes back as the error that it is
+  unknown <- Client.apiCall env.ctx conf (Client.GetTx (TxHash (sha256 ("nothing" :: C8.ByteString))))
+  either Just (const Nothing) unknown `shouldBe` Just ThingNotFound
+  hash <- maybe (fail "Not a hash") return (hexToBlockHash mined)
+  waitFor "the client to hear of the block" ((EventBlock hash `elem`) <$> readIORef heard)
+  cancel listener
 
 -- | A web server on the store of the tests, given a certificate that is
 -- made for the occasion: it answers over HTTPS, and does not answer a
@@ -1651,11 +1697,12 @@ httpTest env = do
 
 -- | The events of the server over a WebSocket. A client that says nothing
 -- hears of every transaction; one that names an extended public key, an
--- address or a Bloom filter hears of the transactions that touch them, in
--- JSON or in binary as it spoke, and all hear of the block. The key is
+-- address or a Bloom filter hears of the transactions that touch them, and
+-- all hear of the block. The key is
 -- followed past the gap it had when it was named. A client that comes
 -- back with the hash of an event hears what came after it, and one that
--- sends what the server cannot read is disconnected.
+-- sends what the server cannot read, a binary frame among it, is
+-- disconnected.
 eventsTest :: Env -> IO ()
 eventsTest env = do
   let x = newXPub env "events" DeriveNormal
@@ -1663,14 +1710,13 @@ eventsTest env = do
       port = read (reverse (takeWhile (/= ':') (reverse env.plain))) :: Int
       client path = WS.runClient "127.0.0.1" port path
       json = BL.toStrict . marshalJSON (env.net, env.ctx)
-      binary = marshal (env.net, env.ctx)
       -- every event that a client hears after saying something, in order
       hearing path say heard = client path $ \c -> do
-        mapM_ (either (WS.sendTextData c) (WS.sendBinaryData c)) (say :: [Either C8.ByteString C8.ByteString])
+        mapM_ (WS.sendTextData c) (say :: [C8.ByteString])
         forever $
           WS.receiveDataMessage c >>= \case
             WS.Text bytes _ -> modifyIORef' heard (either error id (eitherDecode bytes) :)
-            WS.Binary bytes -> modifyIORef' heard (either error id (decode (BL.toStrict bytes)) :)
+            WS.Binary _ -> error "A binary frame from the server"
       eventId = \case
         EventTx h -> txHashToHex h
         EventBlock h -> blockHashToHex h
@@ -1683,9 +1729,9 @@ eventsTest env = do
     mapM
       async
       [ hearing "/events" [] all',
-        hearing "/events" [Left (json (EventWatchXPub x.spec))] key,
-        hearing "/events" [Right (binary (EventWatch [addrOf env y [0, 0]]))] address,
-        hearing "/events" [Right (binary (EventFilterLoad bloom))] filtered,
+        hearing "/events" [json (EventWatchXPub x.spec)] key,
+        hearing "/events" [json (EventWatch [addrOf env y [0, 0]])] address,
+        hearing "/events" [json (EventFilterLoad bloom)] filtered,
         -- chosen in the URL, before the first event: blocks alone, a key
         -- under a type of address, an address
         hearing "/events?quiet=true" [] quiet,
@@ -1745,13 +1791,17 @@ eventsTest env = do
   fst <$> getJSON env.plain "/events?after=nonsense" `shouldReturn` 400
   refused <- tryAny (client ("/events?after=" <> replicate 64 '0') (\_ -> return ()))
   either (const True) (const False) refused `shouldBe` True
-  -- a command that cannot be read ends the connection, with the reason
-  closed <- try . client "/events" $ \c -> do
-    WS.sendTextData c ("{\"type\":\"nonsense\"}" :: C8.ByteString)
-    void (WS.receiveDataMessage c)
-  case closed of
-    Left (WS.CloseRequest code why) -> (code, why) `shouldBe` (1008, "Could not read the command")
-    wrong -> expectationFailure ("Not closed: " <> show wrong)
+  -- a command that cannot be read ends the connection, with the reason,
+  -- and so does a binary frame
+  let sent message = do
+        closed <- try . client "/events" $ \c -> do
+          WS.sendDataMessage c message
+          void (WS.receiveDataMessage c)
+        case closed of
+          Left (WS.CloseRequest code why) -> (code, why) `shouldBe` (1008, "Could not read the command")
+          wrong -> expectationFailure ("Not closed: " <> show wrong)
+  sent (WS.Text "{\"type\":\"nonsense\"}" Nothing)
+  sent (WS.Binary "\x06")
 
 -- | The first lines of a stream of events, which has no end: the request
 -- is given up once they are there.

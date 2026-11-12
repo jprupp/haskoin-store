@@ -15,18 +15,17 @@
 --
 -- 'runWeb' serves the endpoints described in "Haskoin.Store.WebCommon" and a
 -- set of endpoints compatible with the Blockchain.info API under
--- @\/blockchain\/@. Responses are JSON by default, pretty-printed with
--- @?pretty=true@, or binary if the request has the header
--- @Accept: application\/octet-stream@. New blocks and mempool transactions are
--- streamed at @\/events@, as lines of JSON or over a WebSocket.
+-- @\/blockchain\/@. Responses are JSON, pretty-printed with @?pretty=true@.
+-- New blocks and mempool transactions are streamed at @\/events@, as lines
+-- of JSON or over a WebSocket.
 --
 -- Limits on the size of responses are set with 'WebLimits'. Errors are
 -- returned as JSON with an HTTP status that depends on the 'Except'.
 -- = Design of the API
 --
--- * __Two encodings of the same data.__ JSON is easy to use from anywhere. The
---   binary encoding is several times smaller and faster to produce and parse, and
---   is what the Haskell client uses.
+-- * __One encoding.__ The API speaks JSON, which any language reads, and
+--   which compression makes small. A second format would have to be kept
+--   in step with the first for every change.
 --
 -- * __Limits protect the server.__ A single request for every transaction of a
 --   busy address could take minutes and gigabytes. 'WebLimits' caps list sizes
@@ -73,7 +72,6 @@ module Haskoin.Store.Web
 
     -- * Request parsing
     decodeTxBody,
-    acceptsBinary,
 
     -- * Logging
     logIt,
@@ -149,7 +147,6 @@ import Data.Maybe
     fromJust,
     fromMaybe,
     isJust,
-    listToMaybe,
     mapMaybe,
     maybeToList,
   )
@@ -219,7 +216,6 @@ import Haskoin.Store.Manager
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
 import Haskoin.Store.Web.Router hiding (header)
-import Haskoin.Store.Web.Router qualified as Router
 import Haskoin.Store.WebCommon
 import Haskoin.Transaction
 import Haskoin.Util
@@ -276,7 +272,6 @@ import Network.WebSockets
     pendingRequest,
     rejectRequestWith,
     requestPath,
-    sendBinaryData,
     sendTextData,
   )
 import Network.WebSockets qualified as WebSockets
@@ -610,9 +605,7 @@ withMetrics st df go =
 
 -- | Encoding of a response.
 data SerialAs
-  = -- | binary, for @Accept: application\/octet-stream@
-    SerialAsBinary
-  | -- | compact JSON
+  = -- | compact JSON
     SerialAsJSON
   | -- | indented JSON, for @?pretty=true@
     SerialAsPrettyJSON
@@ -731,9 +724,9 @@ serveWeb config serve = do
         | pathInfo request == ["events"] = routerScoped routes ($ routes) notFound request
         | otherwise = routerScoped routes scoped notFound request
       routes = routesOf st
-      notFound req NoRoute = errorResponse st req ThingNotFound
-      notFound req (Unknown ks) =
-        errorResponse st req . UserError $
+      notFound _ NoRoute = errorResponse st ThingNotFound
+      notFound _ (Unknown ks) =
+        errorResponse st . UserError $
           "Unknown parameter: " <> T.unpack (T.intercalate ", " ks)
   saidWell <- newIORef Nothing
   saidRedis <- newIORef True
@@ -840,24 +833,18 @@ serveWeb config serve = do
       | otherwise = inner req respond
     allowed = "GET, HEAD, POST, DELETE, OPTIONS"
     -- answers are compressed for a client that says it reads gzip: JSON
-    -- shrinks several times over, and the binary format, which is mostly
-    -- hashes, by less. The events are a stream that has to leave as it is
-    -- written, and are left alone.
+    -- shrinks several times over. The events are a stream that has to
+    -- leave as it is written, and are left alone.
     compressed inner req
       | pathInfo req == ["events"] = inner req
-      | otherwise = gzip gzipSettings inner req
-    gzipSettings =
-      Gzip.defaultGzipSettings
-        { Gzip.gzipCheckMime = \m -> Gzip.defaultCheckMime m || "application/octet-stream" `C.isPrefixOf` m
-        }
-    -- any origin may ask, and what is answered depends on the format that
-    -- was asked for, which a cache between the client and the server has
-    -- to know: it must not give the JSON of one client to another that
-    -- asked for binary. The same goes for whether it is compressed, and
-    -- the two are said in one header.
+      | otherwise = gzip Gzip.defaultGzipSettings inner req
+    -- any origin may ask, and whether the answer is compressed depends on
+    -- what the client said it reads, which a cache between the client and
+    -- the server has to know: it must not give gzip to a client that
+    -- cannot read it.
     anyOrigin = modifyResponse (mapResponseHeaders varied)
     varied headers =
-      [("Access-Control-Allow-Origin", "*"), ("Vary", "Accept, Accept-Encoding")]
+      [("Access-Control-Allow-Origin", "*"), ("Vary", "Accept-Encoding")]
         <> filter ((/= "Vary") . fst) headers
 
 -- | Answer the errors of the handler of a route: an 'Except' with its
@@ -869,37 +856,28 @@ guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
     answer req e
       | Just Next <- fromException e = throwIO Next
       | Just TipMoved <- fromException e = throwIO TipMoved
-      | Just x <- fromException e = errorResponse st req x
+      | Just x <- fromException e = errorResponse st x
       | otherwise = do
           logError st.config.logger $ fmtReq req.wai <> ": " <> cs (show e)
-          errorResponse st req ServerError
+          errorResponse st ServerError
 
 -- | What a store that is a member of a fleet answers when it has no view of
 -- the block that the fleet answers from: 503, so that a load balancer sends
 -- the request to another store. Any answer of its own could differ from
 -- those of the other stores, which is what a fleet is there to prevent.
 behindResponse :: WebState -> Req -> IO Response
-behindResponse st req = errorResponse st req BehindFleet
+behindResponse st _ = errorResponse st BehindFleet
 
--- | The response to an error, counted in the metrics, in the format that
--- the request asked for.
---
--- Errors were JSON whatever was asked, because 'Except' had no binary
--- encoding. A client that speaks binary had to carry a JSON decoder for
--- the one answer that it least expects. From haskoin-store-data 1.10 an
--- error has a binary encoding like everything else.
-errorResponse :: WebState -> Req -> Except -> IO Response
-errorResponse st req e = do
+-- | The response to an error, in JSON, counted in the metrics.
+errorResponse :: WebState -> Except -> IO Response
+errorResponse st e = do
   forM_ st.metrics $ \m ->
     mapM_ (`incrementCounter` 1) $
       if
         | statusIsClientError (errStatus e) -> Just m.clientErrors
         | statusIsServerError (errStatus e) -> Just m.serverErrors
         | otherwise -> Nothing
-  return $
-    if wantsBinary req
-      then responseLBS (errStatus e) ((hContentType, "application/octet-stream") : again) (runPutL (serialize e))
-      else responseLBS (errStatus e) ((hContentType, "application/json") : again) (A.encode e)
+  return $ responseLBS (errStatus e) ((hContentType, "application/json") : again) (A.encode e)
   where
     -- a server behind its fleet catches up within a block or is taken out
     -- of rotation: a client or a load balancer that reads this header
@@ -1165,8 +1143,8 @@ pathCompact st ps parser action encJson encValue =
   pathCommon st ps parser action (const status200) encJson encValue False
 
 -- | The route of an API resource: parse the request, run the handler, and
--- encode the response as JSON or binary, as the client asked. It accepts the
--- parameters given, and @pretty@.
+-- encode the response as JSON. It accepts the parameters given, and
+-- @pretty@.
 pathCommon ::
   (ApiResource a b) =>
   WebState ->
@@ -1183,7 +1161,7 @@ pathCommon _ ps parser action status encJson encValue pretty =
     proto <- serialAs req pretty
     res <- action =<< parser req
     return $
-      responseLBS (status res) [(hContentType, serialType proto)] (protoSerial proto encJson encValue res)
+      responseLBS (status res) [(hContentType, "application/json")] (protoSerial proto encJson encValue res)
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
@@ -1201,64 +1179,23 @@ textResponse t =
   return $
     responseLBS status200 [(hContentType, "text/plain; charset=utf-8")] (TL.encodeUtf8 t)
 
--- | Encode a response in binary, JSON or pretty JSON.
+-- | Encode a response in JSON or pretty JSON.
 protoSerial ::
-  (Serial a) =>
   SerialAs ->
   (a -> Encoding) ->
   (a -> Value) ->
   a ->
   L.ByteString
-protoSerial SerialAsBinary _ _ = runPutL . serialize
 protoSerial SerialAsJSON f _ = encodingToLazyByteString . f
 protoSerial SerialAsPrettyJSON _ g =
   encodePretty' defConfig {confTrailingNewline = True} . g
 
--- | The content type of an encoding.
-serialType :: SerialAs -> C.ByteString
-serialType SerialAsBinary = "application/octet-stream"
-serialType _ = "application/json"
-
--- | Whether a request asks for the binary encoding: its @Accept@ header
--- names @application\/octet-stream@, and gives it no less weight than it
--- gives JSON.
---
--- The header is a list of media types, each with a weight from 0 to 1,
--- written @;q=@, that is 1 when left out. Binary is what is sent when
--- @application\/octet-stream@ is in the list with a weight above 0 that is
--- at least that of @application\/json@, if that is there too. A wildcard
--- such as @*\/*@ asks for nothing in particular and gets JSON, the
--- default, as does a request without the header. The header used to be
--- compared with the one string, so that a client that sent a list, or a
--- weight, got JSON without being told.
-wantsBinary :: Req -> Bool
-wantsBinary req = maybe False acceptsBinary (Router.header req "accept")
-
--- | 'wantsBinary', given the value of the @Accept@ header.
-acceptsBinary :: Text -> Bool
-acceptsBinary accept =
-  case weight "application/octet-stream" of
-    Just q | q > 0 -> maybe True (q >=) (weight "application/json")
-    _ -> False
-  where
-    ranges = map range (T.splitOn "," accept)
-    weight name = lookup name ranges
-    range :: Text -> (Text, Double)
-    range part = case map T.strip (T.splitOn ";" part) of
-      [] -> ("", 0)
-      name : params -> (T.toLower name, fromMaybe 1 (listToMaybe (mapMaybe quality params)))
-    quality setting = case T.splitOn "=" setting of
-      [k, v] | T.toLower (T.strip k) == "q" -> readMaybe (T.unpack (T.strip v)) <|> Just 0
-      _ -> Nothing
-
--- | The encoding that a request asks for: binary if it 'wantsBinary', else
--- JSON, pretty if the @pretty@ parameter or the default says so.
+-- | The encoding that a request asks for: JSON, pretty if the @pretty@
+-- parameter or the default says so.
 serialAs :: Req -> Bool -> IO SerialAs
-serialAs req pretty
-  | wantsBinary req = return SerialAsBinary
-  | otherwise = do
-      p <- paramOr req readBool "pretty" pretty
-      return $ if p then SerialAsPrettyJSON else SerialAsJSON
+serialAs req pretty = do
+  p <- paramOr req readBool "pretty" pretty
+  return $ if p then SerialAsPrettyJSON else SerialAsJSON
 
 -- GET Block / GET Blocks --
 
@@ -1605,10 +1542,8 @@ handleMempool st (GetMempool limitM (OffsetParam o)) =
 -- log of events ("Haskoin.Store.Web.Events").
 --
 -- The client may send the commands of t'EventCommand' to choose the
--- transactions that it hears about. Each side speaks JSON in text frames
--- or binary in binary frames, and the server speaks as it was last spoken
--- to; before the client has said anything, as the @Accept@ header of the
--- handshake asks, like any request. A command that the server cannot read
+-- transactions that it hears about. Each side speaks JSON in text frames;
+-- a binary frame is a command that cannot be read. A command that the server cannot read
 -- or cannot do closes the connection with the reason, as a node does with
 -- an SPV client: there are no answers to wait for.
 --
@@ -1631,8 +1566,6 @@ webSocketEvents s =
       let request = pendingRequest pending
           (path, query) = C.break (== '?') (requestPath request)
           asked = parseQuery query
-          accept = lookup "Accept" (WebSockets.requestHeaders request)
-          binary = maybe False (acceptsBinary . T.decodeUtf8Lenient) accept
       if path /= "/events"
         then turnAway pending ThingNotFound
         else
@@ -1640,42 +1573,37 @@ webSocketEvents s =
             Left e -> turnAway pending e
             Right (start, watch) -> do
               conn <- acceptRequest pending
-              format <- newTVarIO binary
               -- websockets only sees pongs while reading, which the
               -- thread that hears the commands does
               withPingPong pingPong conn $ \c ->
-                race_ (hear c watch format) (tell c watch format start) `catch` gone
+                race_ (hear c watch) (tell c watch start) `catch` gone
     -- a client that leaves is not an error to report
     gone :: WebSockets.ConnectionException -> IO ()
     gone _ = return ()
     -- the commands of the client, until one cannot be done
-    hear c watch format = do
+    hear c watch = do
       message <- WebSockets.receiveDataMessage c
-      let (binary, read') = case message of
-            WebSockets.Text bytes _ -> (False, A.decode bytes >>= parseMaybe (unmarshalValue (net, ctx)))
-            WebSockets.Binary bytes -> (True, either (const Nothing) Just (unmarshal (net, ctx) (L.toStrict bytes)))
-      atomically (writeTVar format binary)
+      let read' = case message of
+            WebSockets.Text bytes _ -> A.decode bytes >>= parseMaybe (unmarshalValue (net, ctx))
+            WebSockets.Binary _ -> Nothing
       case read' of
         Nothing -> refuse c "Could not read the command"
         Just cmd ->
           try (command ctx gap s.query.xPubBals watch cmd) >>= \case
-            Right (Right ()) -> hear c watch format
+            Right (Right ()) -> hear c watch
             Right (Left why) -> refuse c why
             Left (_ :: Except) -> refuse c "Could not do the command"
     -- 1008: the message is against what the server allows
     refuse c why = WebSockets.sendCloseCode c 1008 (T.pack why)
     -- the events from a place in the log on, those that the client chose
-    tell c watch format from =
+    tell c watch from =
       atomically (readEvents s.eventLog from) >>= \case
         Nothing -> WebSockets.sendClose c ("Event queue full" :: Text)
         Just entries -> do
           forM_ entries $ \e -> do
             wanted <- atomically (stateTVar watch (relevant ctx gap e.seen))
-            when wanted $
-              readTVarIO format >>= \case
-                True -> sendBinaryData c (runPutL (serialize e.event))
-                False -> sendTextData c (A.encode e.event)
-          tell c watch format (from + fromIntegral (length entries))
+            when wanted $ sendTextData c (A.encode e.event)
+          tell c watch (from + fromIntegral (length entries))
     turnAway pending e =
       rejectRequestWith
         pending
@@ -1687,15 +1615,15 @@ webSocketEvents s =
           }
 
 -- | Handler for @GET \/events@: stream of new blocks and of transactions
--- that enter or leave the mempool, one per line in JSON or one after the
--- other in binary, until the client falls off the start of the log.
+-- that enter or leave the mempool, one per line in JSON, until the client
+-- falls off the start of the log.
 -- @after@ takes up from an event ('eventsStart').
 handleEvents :: WebState -> Req -> IO Response
 handleEvents st req = do
   proto <- serialAs req False
   let asked name = lookup name req.params
   (start, watch) <- eventsOpen st asked >>= either (raise st) return
-  return . responseStream status200 [(hContentType, serialType proto)] $ \write flush' ->
+  return . responseStream status200 [(hContentType, "application/json")] $ \write flush' ->
     let send from = do
           flush'
           -- ends the response when the client falls too far behind
@@ -1711,7 +1639,6 @@ handleEvents st req = do
     serial proto e =
       lazyByteString $
         protoSerial proto toEncoding toJSON e <> newLine proto
-    newLine SerialAsBinary = mempty
     newLine SerialAsJSON = "\n"
     newLine SerialAsPrettyJSON = mempty
     own = st.config.store
@@ -3273,7 +3200,7 @@ pathHealth st =
           | h.redis == Just False = (status203, [("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
-      responseLBS status ((hContentType, serialType proto) : extra) (protoSerial proto toEncoding toJSON h)
+      responseLBS status ((hContentType, "application/json") : extra) (protoSerial proto toEncoding toJSON h)
   where
     proxy = Proxy :: Proxy GetHealth
 
@@ -3434,7 +3361,7 @@ parseTxBody st req = do
     Right tx -> return tx
 
 -- | Read a transaction from a request body. The body is the transaction in
--- hex or as raw bytes. White space in the hex is ignored.
+-- hex. White space around and inside it is ignored.
 --
 -- The body must hold one transaction and nothing else. Bytes after the
 -- transaction are refused, as Bitcoin Core does for a raw transaction.
@@ -3444,17 +3371,16 @@ parseTxBody st req = do
 -- witness only. Its nodes would not read the SegWit format, so the store
 -- does not take it either.
 decodeTxBody :: Network -> C.ByteString -> Either String Tx
-decodeTxBody net body = fromHex <> fromBytes body
+decodeTxBody net body =
+  case parseBase16 (C.filter (not . isSpace) body) of
+    Right b16 -> fromBytes (decodeBase16 b16)
+    Left e -> Left (cs e)
   where
     fromBytes = runGetS $ do
       tx <- getNetworkTx net
       done <- isEmpty
       unless done $ fail "Trailing bytes after transaction"
       return tx
-    fromHex =
-      case parseBase16 (C.filter (not . isSpace) body) of
-        Right b16 -> fromBytes (decodeBase16 b16)
-        Left e -> Left (cs e)
 
 -- | Offset in the @offset@ parameter. Responds with an error if above the maximum.
 parseOffset :: WebState -> Req -> IO OffsetParam

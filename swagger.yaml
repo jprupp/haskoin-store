@@ -91,17 +91,11 @@ info:
 
     ## Formats
 
-    - **JSON** by default, without spaces, to keep responses small.
+    - **JSON**, without spaces, to keep responses small.
     - **Pretty JSON** with `pretty=true`, indented for people to read.
-    - **Binary** with the header `Accept: application/octet-stream`: the compact
-      serialization that the Haskell client in
-      [haskoin-store-data](https://github.com/jprupp/haskoin-store-data)
-      decodes. It is smaller and faster to decode than JSON. "Binary format"
-      below gives every byte of it.
 
     Endpoints that end in `/raw` return data serialized as in the peer-to-peer
-    protocol, in hexadecimal inside JSON (`{"result": "0100…"}`), or as bytes
-    with the binary format.
+    protocol, in hexadecimal inside JSON (`{"result": "0100…"}`).
 
     ## Parameters are checked
 
@@ -140,9 +134,6 @@ info:
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
-
-    A request that asks for the binary format gets its errors in binary too:
-    see "Binary format".
 
     `/health` also answers 203 for a server that works but cannot reach its
     Redis; see there.
@@ -267,286 +258,13 @@ info:
       `application/x-www-form-urlencoded`. A URL has room for some hundred
       addresses; a body has no such limit. `/transactions` is the exception:
       `POST` there publishes a transaction.
-    - **`Vary: Accept, Accept-Encoding`** is on every answer, so that a cache
-      keeps the formats apart.
+    - **`Vary: Accept-Encoding`** is on every answer, so that a cache keeps
+      compressed and plain answers apart.
     - **`Retry-After`** is on a 503: one second from a server that is behind
       its fleet, five from a health check that fails.
     - **The reference itself** is at the root of every server: `/` is this
       page, for the version that the server runs, and `/swagger.yaml` the file
       behind it.
-
-    ## Binary format
-
-    This section is enough to write a client in any language.
-
-    ### Asking for it
-
-    - Send the header `Accept: application/octet-stream`. In a list of types,
-      binary is sent when that type has a `q` weight above 0 that is no less
-      than the weight of `application/json`, if that is listed too. A
-      wildcard such as `*/*`, or no header, gives JSON. There is no query
-      parameter for it, and `pretty` has no effect on it.
-    - Every answer has `Vary: Accept`, so that a cache keeps the two formats
-      apart.
-    - A binary answer has `Content-Type: application/octet-stream`. The body is
-      one value, with nothing before or after it.
-    - **An error comes in the format asked for**, like any other answer. In
-      binary it is an `Except`, described below. Servers up to version 1.8.1
-      sent every error as JSON: read the `Content-Type` of an error to tell.
-    - `/health` answers 503 and 203 with a normal body, in the format asked for.
-    - The only endpoint that reads a body is `POST /transactions`: one
-      transaction as in the peer-to-peer protocol, as raw bytes or as hex. The
-      server tells them apart by content, not by `Content-Type`.
-    - The Blockchain.info endpoints and `/dbstats` have no binary form.
-    - Over the WebSocket at `/events`, binary is binary frames: the server
-      sends them when the handshake asked for binary, and from the first binary
-      frame that the client sends.
-
-    ### Primitives
-
-    Everything is big-endian, except inside the peer-to-peer structures (`Tx`,
-    `BlockHeader`, `OutPoint`, `Block`), which are byte for byte what nodes send.
-
-    | Name | Encoding |
-    | --- | --- |
-    | `u8`, `u32`, `u64` | Unsigned integer of 1, 4 or 8 bytes, big-endian. |
-    | `i32`, `i64` | Two's complement, big-endian. |
-    | `u32le`, `u64le` | Little-endian; only in peer-to-peer structures. |
-    | `bool` | One byte: `00` false, `01` true. |
-    | `bytes` | `u64` length, then that many bytes. |
-    | `text` | `bytes` that hold UTF-8. |
-    | `list T` | `u64` count, then that many `T`. |
-    | `opt T` | `00` for none; `01` then `T`. |
-    | `map T` | `list` of pairs `u64` key, `T`; keys ascending, each once. |
-    | `hash256` | 32 bytes, in the reverse order of the hex in JSON. |
-    | `hash160` | 20 bytes, in the order of the hex. |
-    | `varint` | Bitcoin's CompactSize, shortest form; only in peer-to-peer structures. |
-    | `integer` | See below. |
-
-    There are no variable-length integers outside the peer-to-peer structures:
-    every length and count is a `u64`. A type with several forms starts with a
-    tag byte, given in its table.
-
-    `integer` holds a number of any size. `00` then `i32` when it fits 32 bits.
-    Otherwise `01`, a sign byte (`01`, or `ff` for negative), a `u64` length,
-    and the absolute value in that many bytes, least significant first, with no
-    zero byte at the end.
-
-    ### Peer-to-peer structures
-
-    | Type | Layout |
-    | --- | --- |
-    | `OutPoint` | `hash256` transaction id, `u32le` output index. 36 bytes. |
-    | `BlockHeader` | `u32le` version, `hash256` previous, `hash256` Merkle root, `u32le` time, bits, nonce. |
-    | `Tx` | `u32le` version, `varint` count, inputs, `varint` count, outputs, `u32le` lock time. |
-    | `Tx` input | `OutPoint`, `varint` length, script, `u32le` sequence. |
-    | `Tx` output | `u64le` value, `varint` length, script. |
-    | `Block` | `BlockHeader`, `varint` count, that many `Tx`. |
-
-    A `Tx` with a witness has the SegWit form: `00 01` after the version, and
-    before the lock time one stack per input, each a `varint` count of items,
-    each a `varint` length and bytes. A `Tx` in which no input has a witness is
-    written in the form without it, on every network.
-
-    ### Address
-
-    An address is a tag and a hash. It does not carry its network, so it decodes
-    without knowing it. Writing it as text needs the network.
-
-    | Tag | Then | Kind |
-    | --- | --- | --- |
-    | `00` | `hash160` | Pay to public key hash. |
-    | `01` | `hash160` | Pay to script hash. |
-    | `02` | `hash160` | Pay to witness public key hash. |
-    | `03` | `hash256` | Pay to witness script hash. |
-    | `04` | `u8` version, `bytes` program (40 at most) | Other SegWit address, such as Taproot. |
-    | `05` | `hash256` | Pay to script hash of 32 bytes (BCH). |
-    | `06` | `u8` type, `bytes` hash (64 at most) | Other CashAddr address. |
-
-    The `hash256` of tags `03` and `05` is in the order of the script, not
-    reversed.
-
-    ### BlockRef and TxRef
-
-    `BlockRef` says where a transaction is. Its numbers are **inverted**: each
-    is written as the largest value of its width minus the number, so that the
-    bytes sort newest first. Subtract again to read them.
-
-    | Tag | Then | Meaning |
-    | --- | --- | --- |
-    | `00` | `u64`: 2^64 - 1 - time | In the mempool; time first seen. |
-    | `01` | `u32`: 2^32 - 1 - height, `u32`: 2^32 - 1 - position | In a block, at that position in it. |
-
-    `TxRef` is a `BlockRef`, then the `hash256` transaction id.
-
-    ### Transaction
-
-    | Field | Encoding | Note |
-    | --- | --- | --- |
-    | block | `BlockRef` | |
-    | version | `u32` | |
-    | locktime | `u32` | |
-    | inputs | `list Input` | |
-    | outputs | `list Output` | |
-    | deleted | `bool` | |
-    | rbf | `bool` | |
-    | time | `u64` | Not inverted. |
-    | txid | `hash256` | |
-    | size | `u32` | With the witness. |
-    | weight | `u32` | Present on every network. |
-    | fee | `u64` | 0 for a coinbase. |
-
-    `Input`, by tag:
-
-    | Field | Encoding | `00` coinbase | `01` other |
-    | --- | --- | --- | --- |
-    | outpoint | `OutPoint` | yes | yes |
-    | sequence | `u32` | yes | yes |
-    | sigscript | `bytes` | yes | yes |
-    | pkscript | `bytes` | | yes |
-    | value | `u64` | | yes |
-    | witness | `list bytes` | yes | yes |
-    | address | `opt Address` | | yes |
-
-    The witness list is present on every network, and empty where there is none.
-
-    `Output`: `u64` value, `bytes` script, `opt Spender`, `opt Address`.
-
-    `Spender`: `hash256` id of the spending transaction, `u32` input index.
-
-    `TxData` is the record of a transaction in the database. No endpoint
-    returns it; it is here for programs that read the database.
-
-    | Field | Encoding | Note |
-    | --- | --- | --- |
-    | block | `BlockRef` | |
-    | tx | `Tx` | |
-    | prevs | `map Prev` | By input index. `Prev`: `bytes` script, `u64` value. |
-    | deleted | `bool` | |
-    | rbf | `bool` | |
-    | time | `u64` | |
-    | spenders | `map Spender` | By output index. |
-
-    ### Blocks, balances and unspent outputs
-
-    `BlockData`. The hash is not sent: it is the double SHA-256 of the header.
-
-    | Field | Encoding | Note |
-    | --- | --- | --- |
-    | height | `u32` | |
-    | mainchain | `bool` | |
-    | work | `integer` | |
-    | header | `BlockHeader` | |
-    | size | `u32` | |
-    | weight | `u32` | Present on every network. |
-    | tx | `list hash256` | |
-    | outputs | `u64` | |
-    | fee | `u64` | |
-    | subsidy | `u64` | |
-
-    | Type | Layout |
-    | --- | --- |
-    | `Balance` | `Address`, then `u64` confirmed, unconfirmed, utxo, txs, received. |
-    | `Unspent` | `BlockRef`, `OutPoint`, `u64` value, `bytes` script, `opt Address`. |
-    | `XPubBal` | `list u32` path, `Balance`. |
-    | `XPubUnspent` | `list u32` path, `Unspent`. |
-    | `XPubSummary` | `u64` confirmed, unconfirmed, received, utxo; `u32` external, change. |
-    | `TxId` | `hash256`. |
-    | `Event` | Tag `00` new best block or `01` mempool transaction, then `hash256`. 33 bytes. |
-    | `PeerInfo` | `bytes` user agent, `text` address, `i32` version, `u64` services, `bool` relay. |
-
-    ### Commands of the event WebSocket
-
-    What a client sends in a binary frame over the WebSocket at `/events`, one
-    command to a frame: a tag, then what it carries.
-
-    | Tag | Then | Command |
-    | --- | --- | --- |
-    | `00` | `list Address` | Watch these addresses too. |
-    | `01` | `list Address` | Stop watching these addresses. |
-    | `02` | `XPub`, `u8` derivation | Watch this extended public key too. |
-    | `03` | `XPub`, `u8` derivation | Stop watching this key. |
-    | `04` | `Filter` | Set the Bloom filter, in place of the one before. |
-    | `05` | `bytes`, 520 at most | Add an element to the Bloom filter. |
-    | `06` | | Remove the Bloom filter. |
-    | `07` | | Forget all of it, and hear of every transaction. |
-    | `08` | | Forget all of it, and hear of blocks alone. |
-
-    `XPub` is the 78 bytes of the key as BIP 32 serializes it, which is what
-    the Base58Check of its text decodes to: `u32` version of the network, `u8`
-    depth, 4 bytes fingerprint of the parent, `u32` index, 32 bytes chain code,
-    33 bytes compressed public key. The derivation is `00` legacy, `01` compat,
-    `02` segwit.
-
-    `Filter` is the `filterload` message of the peer-to-peer protocol (BIP 37):
-    `varint` length and that many bytes of filter, 36,000 at most, `u32le`
-    number of hash functions, 50 at most, `u32le` tweak, `u8` flags.
-
-    ### Health
-
-    Each part starts with its own `ok`, which repeats what its numbers say.
-
-    | Field | Encoding | Note |
-    | --- | --- | --- |
-    | ok | `bool` | The whole check. |
-    | blocks | `bool` ok, `u32` headers, `u32` blocks, `i32` max | |
-    | last-block | `bool` ok, `i64` age, `i64` max | |
-    | last-tx | `bool` ok, `i64` age, `i64` max | |
-    | pending-txs | `bool` ok, `i64` count, `i64` max | |
-    | peers | `bool` ok, `i64` count, `i64` min | |
-    | net | `text` | |
-    | version | `text` | |
-    | time | `u64` | A number, not the text of the JSON. |
-    | redis | `u8` | `00` no cache, `01` not answering, `02` answering. |
-
-    Older servers end the body before `redis`; read that as no cache.
-
-    ### What each endpoint returns
-
-    Lists are `list T`. The events are the one exception: they have no count,
-    because they have no end.
-
-    An error, with any status that is not a success, is an `Except`: one byte
-    that says which, and for some a body.
-
-    | Byte | Error | Body |
-    | --- | --- | --- |
-    | `00` | `not-found-or-invalid-arg` | |
-    | `01` | `server-error` | |
-    | `02` | `bad-request` | |
-    | `03` | `user-error` | The message: `bytes`, UTF-8. |
-    | `04` | `string-error` | The message: `bytes`, UTF-8. |
-    | `05` | `multiple-tx-index` | `list hash256`: the transactions that match. |
-    | `06` | `server-timeout` | |
-    | `07` | `request-too-large` | |
-    | `08` | `behind-fleet` | |
-
-    | Endpoints | Body |
-    | --- | --- |
-    | `/block/{block}`, `/block/best`, `/block/time/…`, `/block/mtp/…` | `BlockData` |
-    | `/blocks`, `/block/latest`, `/block/height/…`, `/block/heights` | `list BlockData` |
-    | `/transaction/{txid}` | `Transaction` |
-    | `/transactions`, `/transactions/block/…`, `…/transactions/full` | `list Transaction` |
-    | `/address/…/transactions`, `/xpub/…/transactions` | `list TxRef` |
-    | `/address/{address}/balance` | `Balance` |
-    | `/address/balances` | `list Balance` |
-    | `/address/…/unspent` | `list Unspent` |
-    | `/xpub/{xpub}` | `XPubSummary` |
-    | `/xpub/{xpub}/balances` | `list XPubBal` |
-    | `/xpub/{xpub}/unspent` | `list XPubUnspent` |
-    | `DELETE /xpub/{xpub}` | `bool` |
-    | `/transaction/{txid}/after/{height}` | `opt bool` |
-    | `POST /transactions` | `TxId` |
-    | `/mempool` | `list hash256` |
-    | `/peers` | `list PeerInfo` |
-    | `/health` | Health, as above. |
-    | `…/raw` of one block or transaction | `Block` or `Tx`, bare. |
-    | `…/raw` of several | `list Block` or `list Tx`. Servers up to 1.8.1 sent them with no count. |
-    | `/events` | An endless stream of `Event`, **no count** and nothing between them. |
-
-    The wrappers add no bytes: the `result` object of the JSON
-    (`GenericResult`, `RawResult`, `RawResultList` in the Haskell client) is
-    its content alone, and `SerialList` is `list T`.
 
 tags:
   - name: Address
@@ -648,10 +366,6 @@ paths:
                   count: 20
                   min: 1
                 time: '2021-06-14 10:21:43 UTC'
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '503':
           description: unavailable
           content:
@@ -727,10 +441,6 @@ paths:
                   block:
                     height: 688707
                     position: 786
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -842,10 +552,6 @@ paths:
                   time: 1621533785
                   rbf: false
                   weight: 900
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -897,10 +603,6 @@ paths:
                   block:
                     height: 688707
                     position: 786
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -1085,10 +787,6 @@ paths:
                   time: 1621533785
                   rbf: false
                   weight: 900
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -1125,10 +823,6 @@ paths:
                 utxo: 0
                 txs: 2
                 received: 2275183814
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -1170,10 +864,6 @@ paths:
                   utxo: 0
                   txs: 2
                   received: 2259981628
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid Address.
           content:
@@ -1242,10 +932,6 @@ paths:
                   index: 0
                   pkscript: 76a9143fd3cf57704a93e9782a97a4fb5a3bf7fb1a604788ac
                   value: 24597765
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -1318,10 +1004,6 @@ paths:
                   index: 0
                   pkscript: 76a91468150eecfe9abfbe5660c4953bdc8a4c127f91b488ac
                   value: 52128096
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid address.
           content:
@@ -1408,10 +1090,6 @@ paths:
                 fees: 87081
                 outputs: 115319020328
                 work: 440514608165117083892886234
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/block/best/raw':
     get:
@@ -1445,10 +1123,6 @@ paths:
                              0120ffffffff0100f2052a0100000043410408ab2f56361f83064e4ce51acc29\
                              1fb57c2cbcdb1d6562f6278c43a1406b548fd6cefc11bcc29eb620d5861cb9ed\
                              69dc39f2422f54b06a8af4f78c8276cfdc6bac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/block/latest':
     get:
@@ -1521,10 +1195,6 @@ paths:
                   fees: 9075725
                   outputs: 58906363954005
                   work: 440511085324684718115244800
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/block/{block}':
     get:
@@ -1568,10 +1238,6 @@ paths:
                 fees: 0
                 outputs: 5301000000
                 work: 451709610344319134
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1635,10 +1301,6 @@ paths:
                              185c81e2aa2c41ab175407c09484ce9694b44953fcb751206564a9c24dd094d4\
                              2fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f000000000019\
                              76a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1702,10 +1364,6 @@ paths:
                   fees: 0
                   outputs: 0
                   work: 363124009197915
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/block/height/{height}':
     get:
@@ -1747,10 +1405,6 @@ paths:
                   fees: 0
                   outputs: 0
                   work: 863301599433
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1787,10 +1441,6 @@ paths:
                            0138ffffffff0100f2052a010000004341045e071dedd1ed03721c6e9bba28fc\
                            276795421a378637fb41090192bb9f208630dcbac5862a3baeb9df3ca6e4e256\
                            b7fd2404824c20198ca1b004ee2197866433ac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1840,10 +1490,6 @@ paths:
                 fees: 0
                 outputs: 0
                 work: 863301599433
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1885,10 +1531,6 @@ paths:
                              6f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe554827\
                              1967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4\
                              f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1938,10 +1580,6 @@ paths:
                 fees: 0
                 outputs: 0
                 work: 889071796431
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -1981,10 +1619,6 @@ paths:
                              010effffffff0100f2052a01000000434104bc184a82d824a8ff59576e8b6843\
                              767407e4f35edb5ad725460764a30ddf91479fd0eb1b0c2b4371a06b3fdae345\
                              3262fcf3358afafe3dbebccf2fdefcd0853cac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -2062,10 +1696,6 @@ paths:
                   fees: 0
                   outputs: 0
                   work: 1292804882733
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -2135,10 +1765,6 @@ paths:
                 time: 1621593351
                 rbf: false
                 weight: 876
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Transaction not found.
           content:
@@ -2174,10 +1800,6 @@ paths:
                          4a8d8182b6de761f6af3b8c6ba8f0000000002ce040000000000001976a914e7\
                          f58a9d4dfa6fdf481f03ff9e696c1c1eadd36688acb4168900000000001976a9\
                          14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Transaction not found.
           content:
@@ -2222,10 +1844,6 @@ paths:
                     type: boolean
                     nullable: true
                     example: true
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid argument.
           content:
@@ -2332,10 +1950,6 @@ paths:
                   time: 1621593351
                   rbf: false
                   weight: 876
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid argument.
           content:
@@ -2350,8 +1964,8 @@ paths:
       description: |
         Send a signed transaction to the network, and get its id back.
 
-        The body is the transaction in hexadecimal (white space is ignored) or as
-        raw bytes. It must be in the format that nodes of the network read: on BCH,
+        The body is the transaction in hexadecimal (white space is ignored). It
+        must be in the format that nodes of the network read: on BCH,
         which has no SegWit, the format without witness data.
 
         **A 200 means the transaction was sent, not that the network accepted it.**
@@ -2386,11 +2000,6 @@ paths:
                        c8926b65f64e312dd821b243a37c000000000211180000000000001976a91434\
                        04e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a9\
                        1486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000"
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-              description: Bitcoin protocol transaction.
       responses:
         '200':
           description: Transaction accepted by network peer.
@@ -2400,10 +2009,6 @@ paths:
                 $ref: '#/components/schemas/TxId'
               example:
                 txid: 0b7cb07d848959fbd02ad6e2ed21fac888b8e8011c6b8c5362d05c703066ae67
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: Transaction rejected.
           content:
@@ -2592,10 +2197,6 @@ paths:
                   time: 1293623863
                   rbf: false
                   weight: 900
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -2659,10 +2260,6 @@ paths:
                   4dd094d42fdbfdd5aad3e063ce6af4cfaaea4ea14fbbffffffff0140420f0000\
                   0000001976a91439aa3d569e06a1d7926dc4be1193c99bf2eb9ee088ac000000\
                   00"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Block not found.
           content:
@@ -2708,10 +2305,6 @@ paths:
                   4a8d8182b6de761f6af3b8c6ba8f0000000002cf0400000000000017a914d1b0\
                   b139593754efcaab5ad20d13dd3be82e5bfe875e1c8900000000001976a914dd\
                   1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid argument.
           content:
@@ -2748,10 +2341,6 @@ paths:
                 - a60e3b0775e08877d0a8edac874090034f2fa55a15fb339b98b18abb5c8cbdf3
                 - c9c50b1f75b4a69319c51ffae3a47df7de99b02089e696b711244fd4591eb51e
                 - 11acbc09285f99d2cc11b707b61952258d554dcffe9a91ab0f6a22d1b06ac618
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/events':
     get:
@@ -2861,10 +2450,8 @@ paths:
         message each, and `after` works the same. The server pings every 30
         seconds and drops clients that do not answer within 60.
 
-        Messages are JSON in text frames or binary in binary frames ("Binary
-        format" above). The server answers in the kind of frame that the
-        client last sent; before the client has sent any, in binary if the
-        `Accept` header of the handshake asked for it, else in JSON.
+        Messages are JSON in text frames. A binary frame from the client is a
+        message that the server cannot read, and closes the connection.
 
         ## Choosing transactions
 
@@ -2934,10 +2521,6 @@ paths:
               example:
                 type: tx
                 id: 3e225aa5d41b0f7560ee641f86b00728adc626102b348f9d319e0fdfd848a0db
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: A parameter could not be read, or names too much to watch.
           content:
@@ -2988,10 +2571,6 @@ paths:
                   version: 70015
                   services: "0000000000000425"
                   relay: true
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
 
   '/xpub/{xpub}':
     get:
@@ -3028,10 +2607,6 @@ paths:
                 indices:
                   change: 27
                   external: 73
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: |
             The wallet has no transactions with this `derive`, but has some with
@@ -3083,10 +2658,6 @@ paths:
                     type: boolean
                     nullable: false
                     example: true
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '404':
           description: Invalid argument.
           content:
@@ -3329,10 +2900,6 @@ paths:
                   rbf: false
                   weight: 1624
 
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: |
             The wallet has no transactions with this `derive`, but has some with
@@ -3394,10 +2961,6 @@ paths:
                   block:
                     height: 678151
                     position: 657
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: |
             The wallet has no transactions with this `derive`, but has some with
@@ -3475,10 +3038,6 @@ paths:
                     utxo: 0
                     txs: 2
                     received: 23000
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: |
             The wallet has no transactions with this `derive`, but has some with
@@ -3563,10 +3122,6 @@ paths:
                   path:
                     - 1
                     - 26
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         '400':
           description: |
             The wallet has no transactions with this `derive`, but has some with
