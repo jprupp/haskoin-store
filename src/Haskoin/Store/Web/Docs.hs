@@ -17,16 +17,22 @@
 -- describes whatever version that site was last given, and someone who
 -- runs a server wants the reference of the server in front of them. So the
 -- file is compiled into the program ('swaggerYaml'), and the root of the
--- server answers with a page that shows it ('swaggerPage'), with the
--- server itself first in its list of servers, so that requests tried from
--- the page go to it.
+-- server answers with a page that shows it ('swaggerPage').
+--
+-- The file names one server, @.\/@, a relative address that a reader
+-- resolves against the address it read the file from. Requests tried from
+-- the page go to the server that served it, whether it answers at the root
+-- of a host or behind a proxy under a path such as @\/btc\/@. The file
+-- names no public servers: those would describe someone else's servers,
+-- at whatever version they run. The page has no list of servers to choose
+-- from and no box to load another description, for the same reason.
 --
 -- = What the page needs
 --
--- The page is Swagger UI, loaded from a public CDN at a fixed version, as
--- the page of api.haskoin.com does. A browser without access to the
--- Internet shows an empty page; @\/swagger.yaml@ is served either way. The
--- program is not made a megabyte and a half larger to carry a copy of it.
+-- The page is Swagger UI, loaded from a public CDN at a fixed version. A
+-- browser without access to the Internet shows an empty page;
+-- @\/swagger.yaml@ is served either way. The program is not made a
+-- megabyte and a half larger to carry a copy of it.
 module Haskoin.Store.Web.Docs
   ( swaggerYaml,
     swaggerPage,
@@ -37,20 +43,14 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.FileEmbed (embedFile, makeRelativeToProject)
 
--- | @swagger.yaml@ as it was when the program was built, with this server
--- at the head of its list of servers: a relative address, which a reader of
--- the description resolves against where it found the description.
+-- | @swagger.yaml@ as it was when the program was built.
 swaggerYaml :: ByteString
-swaggerYaml = case B.breakSubstring marker file of
-  (before, rest)
-    | B.null rest -> file
-    | otherwise -> before <> marker <> "  - url: './'\n    description: This server\n" <> B.drop (B.length marker) rest
-  where
-    marker = "servers:\n"
-    file = $(makeRelativeToProject "swagger.yaml" >>= embedFile)
+swaggerYaml = $(makeRelativeToProject "swagger.yaml" >>= embedFile)
 
 -- | The page at the root of the server: Swagger UI, showing 'swaggerYaml',
--- which it asks this server for, next to wherever the page itself is.
+-- which it asks this server for, next to wherever the page itself is. It
+-- leaves out the bar of Swagger UI that loads another description, and the
+-- list of servers, which holds only this one.
 swaggerPage :: ByteString
 swaggerPage =
   B.intercalate
@@ -62,11 +62,14 @@ swaggerPage =
       "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
       "  <title>Haskoin Store API</title>",
       "  <link rel=\"stylesheet\" href=\"" <> cdn <> "/swagger-ui.css\">",
+      "  <style>",
+      "    /* the list of servers, which holds only this one */",
+      "    .swagger-ui .scheme-container { display: none; }",
+      "  </style>",
       "</head>",
       "<body>",
       "  <div id=\"swagger-ui\"></div>",
       "  <noscript>The reference of this API is at <a href=\"swagger.yaml\">swagger.yaml</a>.</noscript>",
-      "  <script src=\"" <> cdn <> "/swagger-ui-standalone-preset.js\"></script>",
       "  <script src=\"" <> cdn <> "/swagger-ui-bundle.js\" charset=\"UTF-8\"></script>",
       "  <script>",
       "    window.onload = function () {",
@@ -75,8 +78,8 @@ swaggerPage =
       "      window.ui = SwaggerUIBundle({",
       "        url: new URL('swagger.yaml', here).href,",
       "        dom_id: '#swagger-ui',",
-      "        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],",
-      "        layout: 'StandaloneLayout'",
+      "        presets: [SwaggerUIBundle.presets.apis],",
+      "        layout: 'BaseLayout'",
       "      });",
       "    };",
       "  </script>",

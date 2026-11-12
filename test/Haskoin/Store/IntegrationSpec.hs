@@ -1693,7 +1693,10 @@ httpTest env = do
   BL.toStrict (page ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "swagger-ui"
   reference <- Wreq.getWith quiet (env.plain <> "/swagger.yaml")
   statusOf reference `shouldBe` 200
-  BL.toStrict (reference ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "description: This server"
+  -- one server, the one that served it, wherever it is mounted
+  let described = BL.toStrict (reference ^. Wreq.responseBody)
+  described `shouldSatisfy` C8.isInfixOf "servers:\n  - url: './'\n"
+  described `shouldNotSatisfy` C8.isInfixOf "api.haskoin.com"
 
 -- | The events of the server over a WebSocket. A client that says nothing
 -- hears of every transaction; one that names an extended public key, an

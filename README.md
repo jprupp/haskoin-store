@@ -3,7 +3,7 @@
 [![CI](https://github.com/jprupp/haskoin-store/actions/workflows/ci.yml/badge.svg)](https://github.com/jprupp/haskoin-store/actions/workflows/ci.yml)
 [![Hackage haskoin-store](https://img.shields.io/hackage/v/haskoin-store.svg?label=haskoin-store)](https://hackage.haskell.org/package/haskoin-store)
 [![Hackage haskoin-store-data](https://img.shields.io/hackage/v/haskoin-store-data.svg?label=haskoin-store-data)](https://hackage.haskell.org/package/haskoin-store-data)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/haskoin-store/blob/master/LICENSE)
 
 A Bitcoin (BTC) and Bitcoin Cash (BCH) block chain indexer with a REST API,
 written in Haskell. It connects to the peer-to-peer network directly, so it
@@ -468,8 +468,8 @@ output or a balance would otherwise read.
 
 ## API
 
-Full reference: [`swagger.yaml`](swagger.yaml), also served at
-[api.haskoin.com](https://api.haskoin.com/). It explains the conventions of
+Full reference: [`swagger.yaml`](swagger.yaml), also served by every
+server about itself (below). It explains the conventions of
 the API (amounts, ordering, paging, formats, errors, unconfirmed transactions
 and reorganisations) and the reasons for them, as well as every endpoint.
 
@@ -481,7 +481,10 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 ```
 
 - The root of the server, `/`, is the reference of its API as a page that
-  can try requests, and `/swagger.yaml` the file behind it.
+  can try requests, and `/swagger.yaml` the file behind it. The file names
+  one server, `./`, so requests tried from the page go to the server that
+  served it, also behind a proxy that mounts it under a path such as
+  `/btc/`. The reference always matches the version that is running.
 - Answers are JSON. Add `?pretty=true` for indented JSON.
 - Lists are paged with `limit` and `offset`, newest first. `height` begins
   a page at a transaction hash, a block hash, a block height or a Unix time
