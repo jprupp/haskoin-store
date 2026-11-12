@@ -23,6 +23,7 @@ module Haskoin.Store.Integration.Node
   ( NodeKind (..),
     Node (..),
     nodeContainer,
+    strangerContainer,
     nodeNetwork,
     RpcError (..),
     rpc,
@@ -123,6 +124,16 @@ nodeContainer kind image =
             BitcoinCore -> [],
       ports = [18443, 18444]
     }
+
+-- | The same node without the whitelist: it treats the store as it treats
+-- any peer that connected to it. It announces transactions on its timer
+-- and not at once, does not answer a request for its mempool, and may
+-- close the connections of a peer that sends it an invalid transaction.
+strangerContainer :: NodeKind -> String -> ContainerSpec
+strangerContainer kind image =
+  spec {name = spec.name <> "-stranger", command = filter (/= "-whitelist=0.0.0.0/0") spec.command}
+  where
+    spec = nodeContainer kind image
 
 -- | Error returned by a node.
 data RpcError = RpcError !Text !Value

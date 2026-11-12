@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.10.1
+version:        1.11.0
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes them in RocksDB, and
@@ -78,6 +78,7 @@ library
       Haskoin.Store.Web
       Haskoin.Store.Web.Docs
       Haskoin.Store.Web.Events
+      Haskoin.Store.Web.Publish
       Haskoin.Store.Web.Router
   other-modules:
       Paths_haskoin_store
@@ -107,9 +108,9 @@ library
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -172,9 +173,9 @@ library integration
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -235,10 +236,10 @@ executable haskoin-store
     , filepath >=1.5.5.0 && <1.6
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -292,6 +293,7 @@ test-suite spec
       Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.Web.EventsSpec
+      Haskoin.Store.Web.PublishSpec
       Haskoin.Store.Web.RouterSpec
       Haskoin.Store.WebSpec
       Haskoin.StoreSpec
@@ -325,10 +327,10 @@ test-suite spec
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , hspec >=2.11.18 && <2.12
     , http-types >=0.12.6 && <0.13
@@ -392,10 +394,10 @@ benchmark haskoin-store-bench
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
@@ -456,10 +458,10 @@ benchmark haskoin-store-stress
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.1 && <1.7
+    , haskoin-core >=1.6.2 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
-    , haskoin-store-data ==2.0.*
+    , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
     , http-types >=0.12.6 && <0.13
     , integration

@@ -227,9 +227,14 @@ it.
 curl -X POST --data-binary @tx.hex localhost:3000/transactions
 ```
 
-The body is the signed transaction in hex. The store sends it to its peers and
-returns the transaction id. It appears in the mempool, and in the wallet's
-history, as soon as a peer relays it back.
+The body is the signed transaction in hex. The store hands it to one full
+node and answers with the transaction id once a node has announced it back
+and the store has it: the wallet's history shows it on the next request.
+
+A transaction that cannot be valid, or that a node refuses with a reason, is
+answered 400 with the reason. A 500 means that the store could not find out:
+post the same transaction again, which sends nothing twice.
+[Publishing](#publishing) has the rest.
 
 ### 6. Stay up to date without polling
 
@@ -338,6 +343,8 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
+| `--publish-timeout` | `PUBLISH_TIMEOUT` | `30` | Seconds that `POST /transactions` waits for a node to announce the transaction back |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to a peer |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -507,6 +514,10 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   as a form (`application/x-www-form-urlencoded`), so that it does not
   have to fit in a URL. `/transactions` does not: `POST` there publishes
   a transaction.
+- **A transaction to publish has a largest size**: the body of
+  `POST /transactions` may be as long as the longest transaction of the
+  network in hexadecimal, 8 MB with SegWit and 2 MB on Bitcoin Cash. More
+  is answered 413 without being read whole.
 - **A 503 says when to try again**, in `Retry-After`.
 - **HTTPS is optional and off by default.** With `--tls-cert` and
   `--tls-key` the server speaks HTTPS on its port, and nothing else. A
@@ -546,6 +557,46 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   is back on the main chain of headers.
 - The **web server** answers from RocksDB, and from Redis for what is
   cached there.
+
+### Publishing
+
+The store does not check scripts, so a transaction that a client posts
+never goes into its mempool directly: anyone could show a payment that will
+never confirm. It is handed to one full node, and comes in when a node
+announces it back.
+
+- **A connection of its own.** The transaction goes to a node on a
+  connection made for it, not on those the store syncs from. A node does
+  not announce a transaction to the connection that gave it. On the others
+  the store hears of it as of any transaction, and imports it the same way.
+- **The answer waits for that**, up to `--publish-timeout` seconds. A 200
+  means that a full node accepted the transaction and the store has it.
+- **The store checks what it can first**: that the inputs exist and are
+  not spent, that a coinbase is old enough, the amounts, the lock time,
+  the size and the dust rule of relay, and the signature of every coin
+  that is locked to one key, on both networks. A transaction that fails
+  is refused with the reason, and nothing is sent. A script of any other
+  kind is left to the node.
+- **Over the RPC of a node, when the store has it.** With `--node-rpc`
+  the store gives the transaction to a full node over its RPC. The node
+  checks everything and says why it refuses. If the node does not
+  answer, the transaction goes to a peer instead.
+- **To a peer, only what the store verified.** A peer that is sent a
+  transaction it finds invalid may close every connection of the store.
+  So a transaction with an input that the store cannot verify, a script
+  that is not a key or a multisig, is refused unless there is an RPC to
+  send it over. Give the store the RPC of a node to publish those.
+- **The same transaction is sent once**, however often it is posted.
+- **Whitelist the store on your nodes** (`-whitelist` in Bitcoin Core and
+  Bitcoin Cash Node). A node announces to a whitelisted peer without
+  delay, so the answer takes milliseconds; otherwise Bitcoin Core takes
+  five seconds on average. And a node that finds a transaction invalid may
+  close every connection of the peer that sent it, which it never does to
+  a whitelisted one. The store then connects again, does not send that
+  transaction a second time, and goes on publishing the others.
+
+`docs/publishing.md` has the design, what was measured on Bitcoin Core and
+Bitcoin Cash Node, and how it differs from versions before 1.11.0.
 
 ### The database
 
@@ -675,6 +726,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Cache` | The Redis cache of a server alone |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
+| `Haskoin.Store.Web.Publish` | Publishing a transaction through a full node |
 
 The rules and queries of version 20 (`Haskoin.Store.Logic`,
 `Haskoin.Store.Database.Query`) stay in the library as a reference. The

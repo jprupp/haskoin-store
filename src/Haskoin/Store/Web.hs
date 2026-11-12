@@ -97,7 +97,7 @@ import Conduit
     (.|),
   )
 import Control.Applicative ((<|>))
-import Control.Lens ((.~), (^.))
+import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad
   ( filterM,
     forM_,
@@ -114,7 +114,9 @@ import Data.Aeson
   ( Encoding,
     ToJSON (..),
     Value,
+    (.=),
   )
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson qualified as A
 import Data.Aeson.Encode.Pretty
   ( Config (..),
@@ -140,7 +142,10 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
+import Data.Foldable qualified
 import Data.Int (Int64)
+import Data.List qualified
+import Data.Maybe qualified
 import Data.List (nub)
 import Data.Maybe
   ( catMaybes,
@@ -177,11 +182,11 @@ import Haskoin.Node
     chainGetAncestor,
     chainGetBest,
     getPeers,
+    logAt,
     logDebug,
     logError,
     logInfo,
     logWarn,
-    sendMessage,
     withSource,
   )
 import Haskoin.Script
@@ -215,6 +220,7 @@ import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
+import Haskoin.Store.Web.Publish qualified as Publish
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.WebCommon
 import Haskoin.Transaction
@@ -247,12 +253,15 @@ import Network.Wai
   ( Application,
     Middleware,
     Request (..),
+    RequestBodyLength (..),
     Response,
+    getRequestBodyChunk,
     mapResponseHeaders,
     modifyResponse,
     responseLBS,
     responseStatus,
     responseStream,
+    setRequestBodyChunks,
   )
 import Network.Wai.Handler.Warp
   ( defaultSettings,
@@ -289,7 +298,6 @@ import System.Metrics.StatsD
 import Text.Read (readMaybe)
 import UnliftIO
   ( TVar,
-    async,
     atomically,
     bracket,
     bracket_,
@@ -299,6 +307,7 @@ import UnliftIO
     fromException,
     handleAny,
     link,
+    atomicModifyIORef',
     newIORef,
     newTQueueIO,
     newTVarIO,
@@ -312,6 +321,7 @@ import UnliftIO
     throwIO,
     timeout,
     try,
+    tryAny,
     withAsync,
     writeIORef,
     writeTQueue,
@@ -340,13 +350,17 @@ data WebLimits = WebLimits
     blockTimeout :: !Word64,
     -- | seconds that a request may take before the log has a warning
     -- about it ('logIt')
-    slowRequest :: !Word32
+    slowRequest :: !Word32,
+    -- | seconds that @POST \/transactions@ waits for a node to announce
+    -- the transaction back ("Haskoin.Store.Web.Publish")
+    publishTimeout :: !Word32
   }
   deriving (Eq, Show)
 
 -- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
 -- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes,
--- block timeout of four hours, and a warning for requests of five seconds.
+-- block timeout of four hours, a warning for requests of five seconds, and
+-- thirty seconds for a published transaction to come back.
 instance Default WebLimits where
   def =
     WebLimits
@@ -358,7 +372,8 @@ instance Default WebLimits where
         xpubGapInit = 20,
         txTimeout = 3600 `div` 2,
         blockTimeout = 4 * 3600,
-        slowRequest = 5
+        slowRequest = 5,
+        publishTimeout = 30
       }
 
 -- | Configuration of the web server.
@@ -400,6 +415,10 @@ data WebConfig = WebConfig
     healthCheckInterval :: !Int,
     -- | log every request, at the level of information ('logIt')
     accessLog :: !Bool,
+    -- | URL of the JSON-RPC interface of a full node, with its user and
+    -- password, to publish transactions through ('sendNode'); 'Nothing'
+    -- to publish through peers only
+    nodeRpc :: !(Maybe String),
     -- | a certificate and its private key, in files in PEM format, to
     -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
     -- default
@@ -429,7 +448,10 @@ data WebState = WebState
     -- for a store without a cache
     cacheUp :: !(TVar Bool),
     -- | the events that the clients of @\/events@ read ('feedEvents')
-    eventLog :: !EventLog
+    eventLog :: !EventLog,
+    -- | the transactions being published, and those that failed not long
+    -- ago ("Haskoin.Store.Web.Publish")
+    outbox :: !(TVar Publish.Outbox)
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
@@ -663,6 +685,7 @@ serveWeb config serve = do
   forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first))
   cacheUp <- cacheCheck >>= newTVarIO
   eventLog <- newEventLog
+  outbox <- newTVarIO Publish.emptyOutbox
   let db = config.store.db
       stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
       routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
@@ -739,7 +762,7 @@ serveWeb config serve = do
       withAsync (feedEvents st) $ \a3 ->
         link a3 >> do
           let logged = logIt config.logger config.accessLog config.limits.slowRequest
-          serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed $ app
+          serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -933,6 +956,40 @@ price logger net session url pget v = forM_ purl $ \u -> loopForever $ do
           | net == btc = Just "btc"
           | net == bch = Just "bch"
           | otherwise = Nothing
+
+-- | Read no more of the body of a transaction to publish than a
+-- transaction can be long: twice 'Publish.maxTxSize' in hexadecimal, and
+-- some room for white space. More is answered 413, by its length when the
+-- client gave it, and else as soon as that much was read.
+--
+-- The router reads the body whole before it knows what to do with it.
+-- Without this, anyone could have the server hold a body of any size.
+-- Other requests with a body are forms of parameters, and are not capped
+-- here.
+cappedBody :: WebState -> Middleware
+cappedBody st app request respond
+  | requestMethod request == methodPost,
+    filter (not . T.null) (pathInfo request) == ["transactions"] =
+      case requestBodyLength request of
+        KnownLength n | n > fromIntegral most -> refuse
+        _ -> do
+          left <- newIORef most
+          let chunk = do
+                bytes <- getRequestBodyChunk request
+                now <- atomicModifyIORef' left (\l -> let l' = l - C.length bytes in (l', l'))
+                when (now < 0) (throwIO RequestTooLarge)
+                return bytes
+          app (setRequestBodyChunks chunk request) respond `catch` \case
+            RequestTooLarge -> refuse
+            e -> throwIO e
+  | otherwise = app request respond
+  where
+    most = maxPublishBody st.config.store.net
+    refuse = errorResponse st RequestTooLarge >>= respond
+
+-- | The most bytes of the body of @POST \/transactions@.
+maxPublishBody :: Network -> Int
+maxPublishBody net = 2 * Publish.maxTxSize net + 4096
 
 -- | Stop handling the request, and answer with an error ('guarded').
 raise :: WebState -> Except -> IO a
@@ -1499,29 +1556,136 @@ cbAfterHeight q height txid =
 
 -- POST Transaction --
 
--- | Handler for @POST \/transactions@: broadcast a transaction to half of the peers and return its hash.
+-- | Handler for @POST \/transactions@: hand the transaction to a full node,
+-- and answer with its hash once a node has announced it back
+-- ("Haskoin.Store.Web.Publish"). What the store or a node refuses is 400
+-- with the reason; no node, no answer and no announcement are 500.
 handlePostTx :: WebState -> PostTx -> IO TxId
 handlePostTx st (PostTx tx) =
-  withMetrics st (.txPost) $ do
-    let cfg = st.config
-    (publishTx cfg tx)
-    return (TxId (txHash tx))
+  withMetrics st (.txPost) $
+    Publish.publish (publishing st) tx >>= \case
+      Publish.Verdict Publish.Accepted -> return (TxId (txHash tx))
+      Publish.Invalid why -> raise st (UserError (show why))
+      Publish.Verdict (Publish.Refused why) ->
+        raise st (UserError ("A node refused the transaction: " <> T.unpack why))
+      Publish.Verdict (Publish.Unverified i) ->
+        raise st . UserError $
+          "This server cannot verify the signature of input "
+            <> show i
+            <> ", and sends to its peers only what it has verified"
+      Publish.Verdict Publish.Silent -> raise st ServerTimeout
+      _ -> raise st ServerError
 
--- | Send transaction to all connected peers.
-publishTx ::
-  WebConfig ->
-  Tx ->
-  IO ()
-publishTx cfg tx = do
-  ps <- getPeers cfg.store.peerMgr
-  let c = max 1 (length ps `div` 2)
-  forM_ (take c ps) $ \p -> do
-    sendMessage (MTx tx) p.mailbox
-    void . async $ do
-      threadDelay (5 * 1000 * 1000)
-      let v = if cfg.store.net.segWit then InvWitnessTx else InvTx
-          g = MGetData (GetData [InvVector v (txHash tx).get])
-      sendMessage g p.mailbox
+-- | The chain as the store has it, for the checks of a transaction to
+-- publish: the height of the best block, and the median of the times of
+-- the last eleven blocks.
+chainRules :: WebState -> IO Publish.Rules
+chainRules st = do
+  best <- st.query.getBestBlock >>= maybe (return Nothing) st.query.getBlock
+  times <- maybe (return []) (back (11 :: Int)) best
+  return
+    Publish.Rules
+      { net = own.net,
+        inputs = \tx -> judgeInputs own.net own.ctx tx . map Just,
+        height = maybe 0 (.height) best,
+        medianTime = case Data.List.sort times of
+          [] -> 0
+          sorted -> fromIntegral (sorted !! (length sorted `div` 2))
+      }
+  where
+    own = st.config.store
+    back n b
+      | n <= 1 = return [b.header.timestamp]
+      | otherwise =
+          (b.header.timestamp :) <$> (st.query.getBlock b.header.prev >>= maybe (return []) (back (n - 1)))
+
+-- | Give a transaction to a full node over its JSON-RPC interface
+-- (@sendrawtransaction@).
+--
+-- The node runs every script and holds the transaction to its own rules
+-- and its own mempool, says why it refuses, and does not close the
+-- connections of the store over what it refuses, as it may over a
+-- transaction that a peer sends it. A transaction that the node takes
+-- comes back to the store as any other: the node announces it on the
+-- connection that the store syncs from.
+--
+-- It is an option because the store needs nothing of a node but to be
+-- its peer, and this needs an account on one. A node that does not
+-- answer, or answers what cannot be read, is 'Publish.Unavailable': the
+-- transaction then goes to a peer, if the store verified it. A
+-- transaction that the node has already was sent.
+sendNode :: WebState -> String -> Tx -> IO Publish.Direct
+sendNode st url tx =
+  tryAny (Wreq.Session.postWith opts st.session url body) >>= \case
+    Left e -> unheard (cs (show e))
+    Right r -> case A.decode (r ^. Wreq.responseBody) >>= answer of
+      Nothing -> unheard ("HTTP " <> cs (show (r ^. Wreq.responseStatus . Wreq.statusCode)))
+      Just Nothing -> return Publish.Sent
+      Just (Just why)
+        | "already" `T.isInfixOf` why -> return Publish.Sent
+        | otherwise -> return (Publish.Declined why)
+  where
+    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
+    body =
+      A.object
+        [ "jsonrpc" .= ("1.0" :: Text),
+          "id" .= ("haskoin-store" :: Text),
+          "method" .= ("sendrawtransaction" :: Text),
+          "params" .= [encodeHex (runPutS (serialize tx))]
+        ]
+    -- the error of the answer if it has one, nothing if it has a result
+    answer v = do
+      A.Object top <- Just v
+      case KeyMap.lookup "error" top of
+        Just (A.Object e) | Just (A.String why) <- KeyMap.lookup "message" e -> Just (Just why)
+        Just A.Null | KeyMap.member "result" top -> Just Nothing
+        Nothing | KeyMap.member "result" top -> Just Nothing
+        _ -> Nothing
+    unheard why = do
+      logWarn
+        (withSource "Publish" st.config.logger)
+        ("The node did not take a transaction over RPC, which goes to a peer if it is verified: " <> why)
+      return Publish.Unavailable
+
+-- | What "Haskoin.Store.Web.Publish" needs, for a request.
+--
+-- The nodes are the peers of the store that relay transactions, in the
+-- order of the peer manager.
+publishing :: WebState -> Publish.Publishing
+publishing st =
+  Publish.Publishing
+    { limits =
+        Publish.Limits
+          { wait = fromIntegral st.config.limits.publishTimeout,
+            handover = 10,
+            tries = 2,
+            capacity = 1000,
+            memory = 600
+          },
+      outbox = st.outbox,
+      rules = chainRules st,
+      direct = maybe (\_ -> return Publish.Unavailable) (sendNode st) st.config.nodeRpc,
+      has = fmap (maybe False (not . (.deleted))) . st.query.getTxData,
+      coin = Publish.coinOf st.query,
+      present = \h -> L.withView own.db $ \v ->
+        maybe False (not . (.deleted)) <$> (L.layeredRead v).getTxData h,
+      events = own.events,
+      mempool = not st.config.noMempool,
+      nodes =
+        map (.address) . filter (maybe False (.relay) . (.version))
+          <$> getPeers own.peerMgr,
+      courier =
+        Publish.deliver
+          Publish.Courier
+            { net = own.net,
+              connect = own.connect,
+              patience = 10,
+              logger = withSource "Courier" st.config.logger
+            },
+      note = \level -> logAt level (withSource "Publish" st.config.logger)
+    }
+  where
+    own = st.config.store
 
 -- GET Mempool / Events --
 

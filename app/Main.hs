@@ -129,6 +129,7 @@ data Config = Config
     noXPub :: !Bool,
     healthCheckInterval :: !Int,
     accessLog :: !Bool,
+    nodeRpc :: !String,
     tlsCert :: !String,
     tlsKey :: !String,
     bloom :: !Bool,
@@ -224,6 +225,8 @@ defConfig = do
     env "HEALTH_CHECK_INTERVAL" 1 readMaybe
   accessLog <-
     env "ACCESS_LOG" False parseBool
+  nodeRpc <-
+    env "NODE_RPC" "" pure
   bloom <-
     env "BLOOM" True parseBool
   noWeb <-
@@ -269,6 +272,8 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
+      publishTimeout <-
+        env "PUBLISH_TIMEOUT" d.publishTimeout readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -437,6 +442,13 @@ config c = do
           <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
           <> showDefault
           <> value c.webLimits.slowRequest
+    publishTimeout <-
+      option auto $
+        metavar "SECONDS"
+          <> long "publish-timeout"
+          <> helpEnv "PUBLISH_TIMEOUT" "Wait this long for a published transaction to come back from a node"
+          <> showDefault
+          <> value c.webLimits.publishTimeout
     return WebLimits {..}
   redis <-
     flag c.redis True $
@@ -599,6 +611,12 @@ config c = do
     flag c.accessLog True $
       long "access-log"
         <> helpEnv "ACCESS_LOG" "Log every request, with the address of the client and the time it took"
+  nodeRpc <-
+    strOption $
+      metavar "URL"
+        <> long "node-rpc"
+        <> helpEnv "NODE_RPC" "Publish transactions over the JSON-RPC of this full node, and through a peer when it fails"
+        <> value c.nodeRpc
   tlsCert <-
     strOption $
       metavar "FILE"
@@ -766,6 +784,7 @@ run cfg =
             noBlockchainInfo = cfg.noBlockchainInfo,
             healthCheckInterval = cfg.healthCheckInterval,
             accessLog = cfg.accessLog,
+            nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
             tls = case (cfg.tlsCert, cfg.tlsKey) of
               ("", "") -> Nothing
               ("", _) -> error "--tls-key needs --tls-cert"

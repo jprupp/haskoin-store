@@ -34,7 +34,7 @@
 module Haskoin.Store.IntegrationSpec (spec) where
 
 import Control.Lens ((&), (.~), (?~), (^.))
-import Control.Monad (forM_, forever, unless, void, when)
+import Control.Monad (forM_, forever, replicateM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -66,13 +66,17 @@ import Haskoin
     Ctx,
     Network (..),
     OutPoint (..),
+    Tx (..),
     TxHash (..),
+    TxIn (..),
+    TxOut (..),
     XPrvKey,
     addrToText,
     addressToScriptBS,
     blockHashToHex,
     bloomCreate,
     bloomInsert,
+    decodeHex,
     deriveXPubKey,
     encodeHex,
     headerHash,
@@ -92,13 +96,16 @@ import Haskoin
     xPubExport,
     xPubWitnessAddr,
   )
-import Haskoin.Node (LogLevel (..), Logger (..), withConnection, withLogger)
+import Haskoin qualified as H
+import Haskoin.Node (LogLevel (..), Logger (..), getPeers, withConnection, withLogger)
 import Haskoin.Store
   ( DeriveType (..),
     Store (..),
     StoreConfig (..),
     WebConfig (..),
+    WebLimits (..),
     XPubSpec (..),
+    decodeTxBody,
     runWebSocket,
     withStore,
   )
@@ -162,10 +169,19 @@ spec = do
       it "check the store against Bitcoin Core and Bitcoin Cash Node" $
         pendingWith why
     Right () -> prepareContext $ \ctx -> do
+      forM_ [BitcoinCore, BitcoinCashNode] $ \kind ->
+        aroundAll (withEnvOf False kind ctx) $
+          describe (name kind <> " that does not whitelist the store") $
+            it "publishes what it verified, and keeps its node when sent what it cannot verify" strangerTest
       aroundAll (withEnv BitcoinCore ctx) $
         describe "Bitcoin Core" (chainSpec BitcoinCore)
       aroundAll (withEnv BitcoinCashNode ctx) $
         describe "Bitcoin Cash Node" (chainSpec BitcoinCashNode)
+
+-- | The name of a node, as people write it.
+name :: NodeKind -> String
+name BitcoinCore = "Bitcoin Core"
+name BitcoinCashNode = "Bitcoin Cash Node"
 
 chainSpec :: NodeKind -> SpecWith Env
 chainSpec kind = do
@@ -187,6 +203,11 @@ chainSpec kind = do
   it "evicts the least recently used xpubs" evictTest
   it "answers an error in JSON, whatever was asked for" errorFormatTest
   it "answers the Haskell client of haskoin-store-data" clientTest
+  it "publishes through a full node, and shows only what the node announced back" publishTest
+  it "publishes over the RPC of its node when given it, and through a peer when that fails" askTest
+  when (kind == BitcoinCashNode) $
+    it "publishes transactions that make and spend tokens" tokenTest
+  it "publishes spends of a multisig, signed the old way and with Schnorr signatures" multisigTest
   it "speaks HTTP as browsers, proxies and long requests need it" httpTest
   it "serves HTTPS, and nothing else, when given a certificate" tlsTest
   it "tells each client of the transactions it chose, and takes up where it left" eventsTest
@@ -232,14 +253,21 @@ initGap = 20
 gap = 32
 
 withEnv :: NodeKind -> Ctx -> (Env -> IO ()) -> IO ()
-withEnv kind ctx go = do
+withEnv = withEnvOf True
+
+-- | The same with a node that whitelists the store, as an operator's own
+-- node should, or with one that does not. The second announces
+-- transactions seconds later, so the web servers wait longer for one they
+-- published, and it does not give its mempool when asked.
+withEnvOf :: Bool -> NodeKind -> Ctx -> (Env -> IO ()) -> IO ()
+withEnvOf whitelisted kind ctx go = do
   image <- testImage
   withContainer (redisContainer image) $ \redis -> do
     redisPort <- hostPort redis 6379
     let redisURL = "redis://127.0.0.1:" <> show redisPort
     waitRedis redisURL
     writeOldKeys redisURL
-    withContainer (nodeContainer kind image) $ \c -> do
+    withContainer ((if whitelisted then nodeContainer else strangerContainer) kind image) $ \c -> do
       rpcPort <- hostPort c 18443
       p2pPort <- hostPort c 18444
       let node =
@@ -256,10 +284,11 @@ withEnv kind ctx go = do
       void $ generateTo node 150 miner
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
-            cfg = storeConfig net ctx logger dir redisURL p2pPort False
+            cfg = (storeConfig net ctx logger dir redisURL p2pPort False) {syncMempool = whitelisted}
         withStore cfg $ \store -> do
           listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
-            let web s = runWebSocket (webConfig logger s)
+            let patient c = c {limits = c.limits {publishTimeout = 45}} :: WebConfig
+                web s = runWebSocket ((if whitelisted then id else patient) (webConfig logger s))
             conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
             cache <- maybe (fail "The store has no cache") return store.cache
             withAsync (web store cachedSock) $ \a1 ->
@@ -345,7 +374,8 @@ webConfig logger store =
       maxLaggingBlocks = 100,
       maxPendingTxs = 10000,
       minPeers = 0,
-      limits = def,
+      -- a short wait, for the transactions that a node takes and says nothing of
+      limits = def {publishTimeout = 3},
       version = "test",
       noMempool = False,
       stats = Nothing,
@@ -356,6 +386,7 @@ webConfig logger store =
       noBlockchainInfo = False,
       healthCheckInterval = 5,
       accessLog = False,
+      nodeRpc = Nothing,
       tls = Nothing,
       logger = logger
     }
@@ -1697,6 +1728,372 @@ httpTest env = do
   let described = BL.toStrict (reference ^. Wreq.responseBody)
   described `shouldSatisfy` C8.isInfixOf "servers:\n  - url: './'\n"
   described `shouldNotSatisfy` C8.isInfixOf "api.haskoin.com"
+
+-- | Transactions posted to the store. A good one is handed to the node,
+-- which announces it back: the answer comes once the store has it, and
+-- posting it again sends nothing. What the store can tell is wrong is
+-- refused with the reason: an output it does not know or that is spent,
+-- and a signature of a key that does not verify. One that only a node can
+-- refuse, here for paying no fee, is not answered as published and never
+-- shows; after it the store still has its node, and publishes the next.
+publishTest :: Env -> IO ()
+publishTest env = do
+  first <- unsent env
+  let firstId = cs (txHashToHex (txHash first))
+  publishTx env first >>= \(code, v) -> (code, textField "txid" v) `shouldBe` (200, Just (cs firstId))
+  -- it is there for the request that follows
+  (seen, _) <- getJSON env.plain ("/transaction/" <> firstId)
+  seen `shouldBe` 200
+  inNode <- rpc env.node "getrawmempool" []
+  arr inNode `shouldSatisfy` elem (String (cs firstId))
+  publishTx env first >>= \(code, _) -> code `shouldBe` 200
+  -- an output that the store does not know
+  let nowhere = OutPoint (TxHash (sha256 ("nowhere" :: C8.ByteString))) 0
+      orphan = first {inputs = [i {outpoint = nowhere} | i <- take 1 first.inputs], witness = []} :: Tx
+  publishTx env orphan >>= \(code, v) -> do
+    code `shouldBe` 400
+    fmap (T.isInfixOf "does not know") (textField "message" v) `shouldBe` Just True
+  -- a forged one: the outputs are not those that were signed. The wallets
+  -- of both nodes pay to one key, so the store can tell by itself
+  second <- unsent env
+  let forged = cheaper second
+  publishTx env forged >>= \(code, v) -> do
+    code `shouldBe` 400
+    fmap (T.isInfixOf "does not verify") (textField "message" v) `shouldBe` Just True
+  (unseen, _) <- getJSON env.plain ("/transaction/" <> cs (txHashToHex (txHash forged)))
+  unseen `shouldBe` 404
+  -- one that pays no fee, which only a node refuses
+  free <- unsentFree env
+  (code, v) <- publishTx env free
+  case env.node.kind of
+    -- Bitcoin Cash Node says why
+    BitcoinCashNode -> do
+      code `shouldBe` 400
+      fmap (T.isInfixOf "A node refused") (textField "message" v) `shouldBe` Just True
+    -- Bitcoin Core says nothing
+    BitcoinCore -> code `shouldBe` 500
+  (unpaid, _) <- getJSON env.plain ("/transaction/" <> cs (txHashToHex (txHash free)))
+  unpaid `shouldBe` 404
+  publishTx env second >>= \(c, _) -> c `shouldBe` 200
+  -- more than a transaction can be long: refused before it is read whole
+  let most = 2 * (if env.net.segWit then 4000000 else 1000000) + 4096
+  publishBody env (C8.replicate (most + 1) '0') >>= \(c, _) -> c `shouldBe` 413
+  -- an output that a block has spent
+  void $ mine env 1
+  publishTx env (cheaper first) >>= \(c, e) -> do
+    c `shouldBe` 400
+    fmap (T.isInfixOf "confirmed transaction has spent") (textField "message" e) `shouldBe` Just True
+
+-- | A transaction of the node's wallet, signed and not sent.
+unsent :: Env -> IO Tx
+unsent env = do
+  to <- getNewAddress env.node
+  raw <-
+    rpc env.node "createrawtransaction" [toJSON ([] :: [Value]), object [Key.fromText to .= btc 300000]]
+  funded <- rpc env.node "fundrawtransaction" [raw]
+  signed <- rpc env.node "signrawtransactionwithwallet" [funded ! "hex"]
+  case signed ! "hex" of
+    String h -> either fail return (decodeTxBody env.net (cs h))
+    other -> fail ("No transaction: " <> show other)
+
+-- | Sign a raw transaction with the wallet of the node, with a hash type
+-- if one is given.
+signed :: Env -> Maybe Text -> Value -> IO Tx
+signed env hashType raw = do
+  let how = maybe [] (\t -> [toJSON ([] :: [Value]), String t]) hashType
+  answer <- rpc env.node "signrawtransactionwithwallet" ([raw] <> how)
+  case answer ! "hex" of
+    String h -> either fail return (decodeTxBody env.net (cs h))
+    other -> fail ("No transaction: " <> show other)
+
+-- | A transaction of the node's wallet that pays no fee: one coin, sent
+-- whole to one address.
+unsentFree :: Env -> IO Tx
+unsentFree env = do
+  coins <- arr <$> rpc env.node "listunspent" []
+  to <- getNewAddress env.node
+  case coins of
+    c : _ -> do
+      let spent = object ["txid" .= (c ! "txid"), "vout" .= (c ! "vout")]
+      rpc env.node "createrawtransaction" [toJSON [spent], object [Key.fromText to .= (c ! "amount")]]
+        >>= signed env Nothing
+    [] -> fail "The wallet has no coin"
+
+-- | The same transaction paying one satoshi less: another transaction,
+-- with signatures that are not of it.
+cheaper :: Tx -> Tx
+cheaper tx = tx {outputs = [o {value = o.value - 1} | o <- tx.outputs]}
+
+-- | Post a transaction to publish.
+publishTx :: Env -> Tx -> IO (Int, Value)
+publishTx env tx = publishBody env (cs (encodeHex (encode tx)))
+
+publishBody :: Env -> C8.ByteString -> IO (Int, Value)
+publishBody env bytes = do
+  r <- Wreq.postWith opts (env.plain <> "/transactions") bytes
+  return (r ^. Wreq.responseStatus . Wreq.statusCode, body (r ^. Wreq.responseBody))
+  where
+    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
+
+-- | A good transaction whose input the store cannot judge, because it
+-- would have to run a script: it spends a coin locked by a script of its
+-- own, here one that anyone can spend, which the wallet of the node pays
+-- first. The script is in a witness script hash on Bitcoin, and in a
+-- script hash on Bitcoin Cash.
+unjudged :: Env -> IO Tx
+unjudged env = do
+  let script = "\x51" :: C8.ByteString
+      locked
+        | env.net.segWit = H.PayWitnessScriptHash (sha256 script)
+        | otherwise = H.PayScriptHash (H.addressHash script)
+  (coin, _) <- payScript env locked
+  tx <- spendingTo env coin
+  return $
+    if env.net.segWit
+      then tx {witness = [[script]]}
+      else tx {inputs = [i {script = encode (H.Script [H.opPushData script])} | i <- tx.inputs]}
+
+-- | A node that does not whitelist the store, which is what a node makes
+-- of any peer it did not choose. It announces a transaction on a timer,
+-- so the answer takes seconds, and is still that the store has it.
+--
+-- Such a node may close every connection of a peer that sends it a
+-- transaction it finds invalid, those the store syncs from too, and
+-- Bitcoin Cash Node does. So the store sends a peer only what it has
+-- verified: a transaction whose signature it cannot judge is refused, and
+-- one made to fail at the node, which used to cost the store its
+-- connections, never reaches the node. The store keeps its node, and
+-- publishes the next good transaction.
+strangerTest :: Env -> IO ()
+strangerTest env = do
+  unsent env >>= published
+  -- a spend of a coin that a script locks: the store cannot tell a good
+  -- one from one that the node would close its connections over
+  forged <- unjudged env
+  publishTx env forged >>= \(code, v) -> do
+    code `shouldBe` 400
+    fmap (T.isInfixOf "cannot verify") (textField "message" v) `shouldBe` Just True
+  threadDelay 1000000
+  (length <$> getPeers env.store.peerMgr) >>= (`shouldSatisfy` (> 0))
+  unsent env >>= published
+  -- the store follows the chain
+  void $ mine env 1
+  where
+    published tx = do
+      publishTx env tx >>= \(code, _) -> code `shouldBe` 200
+      (seen, _) <- getJSON env.plain ("/transaction/" <> cs (txHashToHex (txHash tx)))
+      seen `shouldBe` 200
+
+-- | A store that was given the RPC of its node publishes through it. A
+-- transaction that the node does not take is refused with the node's
+-- reason, on Bitcoin Core too, which says nothing to a peer. A good
+-- transaction whose signature the store cannot judge is published, where
+-- a store without the RPC refuses it. And when the RPC does not answer,
+-- what the store verified goes to a peer.
+askTest :: Env -> IO ()
+askTest env = withTestLogger $ \logger -> listening $ \(sock, port) -> listening $ \(deaf, deafPort) -> do
+  let rpcURL = "http://test:test@" <> drop (length ("http://" :: String)) env.node.url
+      config url = (webConfig logger env.store) {nodeRpc = Just url} :: WebConfig
+      asking = env {plain = "http://127.0.0.1:" <> show port} :: Env
+      unanswered = env {plain = "http://127.0.0.1:" <> show deafPort} :: Env
+      up e = (== 200) . fst <$> getJSON e.plain "/block/best?notx=true"
+      refused why (code, v) = (code, fmap (T.isInfixOf why) (textField "message" v)) `shouldBe` (400, Just True)
+  -- nothing listens on port 1
+  let withBoth go =
+        withAsync (runWebSocket (config rpcURL) sock) $ \a ->
+          withAsync (runWebSocket (config "http://127.0.0.1:1/") deaf) $ \b ->
+            link a >> link b >> go
+  withBoth $ do
+    waitFor "the server that has the RPC of the node" (up asking)
+    waitFor "the server whose node does not answer" (up unanswered)
+    unsentFree env >>= publishTx asking >>= refused "min relay fee not met"
+    unsent env >>= publishTx asking >>= \(code, _) -> code `shouldBe` 200
+    -- not judged by the store: over RPC only
+    first <- unjudged env
+    publishTx env first >>= refused "cannot verify"
+    publishTx unanswered first >>= refused "cannot verify"
+    publishTx asking first >>= \(code, _) -> code `shouldBe` 200
+    -- verified by the store: to a peer when the RPC does not answer
+    unsent env >>= publishTx unanswered >>= \(code, _) -> code `shouldBe` 200
+
+-- | Pay a script from the wallet of the node, and give the coin: where it
+-- is, and the output that holds it.
+payScript :: Env -> H.ScriptOutput -> IO (OutPoint, TxOut)
+payScript env so = do
+  address <- maybe (fail "No address for the script") return (H.outputAddress env.net env.ctx so)
+  txid <- sendMany env.node [(addrText env address, 300000)]
+  waitSynced env
+  funding <- getRawTx env.node txid
+  vout <- case [ numV n
+               | o <- arr (funding ! "vout"),
+                 Just n <- [field "n" o],
+                 (textField "hex" =<< field "scriptPubKey" o) == Just (scriptHex env address)
+               ] of
+    v : _ -> return v
+    [] -> fail "No output to the script"
+  spent <- maybe (fail "Not a transaction id") return (hexToTxHash txid)
+  return (OutPoint spent (fromIntegral vout), TxOut 300000 (H.marshal env.ctx so))
+
+-- | A transaction that spends a coin of 300,000 to the wallet of the
+-- node, with nothing in its input yet.
+spendingTo :: Env -> OutPoint -> IO Tx
+spendingTo env coin = do
+  to <- getNewAddress env.node
+  info <- rpc env.node "getaddressinfo" [String to]
+  back <- maybe (fail "No script for the address of the wallet") return (textField "scriptPubKey" info >>= decodeHex)
+  return
+    Tx
+      { version = 2,
+        inputs = [TxIn {outpoint = coin, script = "", sequence = maxBound}],
+        outputs = [TxOut {value = 299000, script = back}],
+        witness = [],
+        locktime = 0
+      }
+
+-- | A Schnorr signature of Bitcoin Cash, made the plain way: this is a
+-- test, and the nonce is no secret worth keeping. haskoin-core verifies
+-- these and does not make them.
+cashSchnorr :: Ctx -> H.SecKey -> H.Hash256 -> C8.ByteString
+cashSchnorr ctx k h = case [sig | Just sig <- map attempt [1 ..]] of
+  sig : _ -> sig
+  [] -> error "No nonce"
+  where
+    n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141 :: Integer
+    p = 2 ^ (256 :: Int) - 2 ^ (32 :: Int) - 977 :: Integer
+    word256 i = let b = H.integerToBS i in C8.replicate (32 - C8.length b) '\0' <> b
+    public = H.exportPubKey ctx True (H.derivePubKey ctx k)
+    attempt nonce = do
+      r <- H.derivePubKey ctx <$> H.secKey (word256 nonce)
+      let (x, y) = C8.splitAt 32 (C8.drop 1 (H.exportPubKey ctx False r))
+          square = powMod (H.bsToInteger y) ((p - 1) `div` 2) == 1
+          e = H.bsToInteger (encode (H.sha256 (x <> public <> encode h))) `mod` n
+      if square then Just (x <> word256 ((nonce + e * H.bsToInteger k.get) `mod` n)) else Nothing
+    powMod _ 0 = 1 :: Integer
+    powMod b i
+      | even i = let half = powMod b (i `div` 2) in half * half `mod` p
+      | otherwise = b * powMod b (i - 1) `mod` p
+
+-- | Spends of a coin that two of three keys open, published through a
+-- peer: the store has no RPC here, and sends a peer only what it
+-- verified. Each is made with keys of the test, not by the wallet of the
+-- node, and the node takes it.
+--
+-- On both networks, the multisig of old, with ECDSA signatures. On
+-- Bitcoin, the multisig of Taproot, a script with a Schnorr signature for
+-- each key that signs. On Bitcoin Cash, the same multisig as of old
+-- signed with Schnorr signatures, where a field of bits says which keys
+-- signed. The same spend paying one satoshi less, which its signatures
+-- are not of, is refused.
+multisigTest :: Env -> IO ()
+multisigTest env = do
+  let ctx = env.ctx
+      secret n = fromMaybe (error "Not a secret key") (H.secKey (C8.replicate 31 '\0' <> C8.singleton n))
+      secrets = map secret "\x0b\x0c\x0d"
+      points = map (H.derivePubKey ctx) secrets
+      twoOfThree = H.PayMulSig (map (H.wrapPubKey True) points) 2
+      right = either (fail . ("Could not make the transaction: " <>)) return
+      published tx = do
+        publishTx env (cheaper tx) >>= \(code, v) ->
+          (code, fmap (T.isInfixOf "cannot verify") (textField "message" v)) `shouldBe` (400, Just True)
+        publishTx env tx >>= \(code, v) -> (code, v) `shouldSatisfy` ((== 200) . fst)
+        (seen, _) <- getJSON env.plain ("/transaction/" <> cs (txHashToHex (txHash tx)))
+        seen `shouldBe` 200
+      -- signed by the first two keys, the old way
+      old locked hashType = do
+        (coin, out) <- payScript env locked
+        unsigned <- spendingTo env coin
+        let input =
+              H.SigInput
+                { script = locked,
+                  value = out.value,
+                  outpoint = coin,
+                  sighash = hashType,
+                  redeem = Just twoOfThree
+                }
+        right (H.signTx env.net ctx unsigned [input] (take 2 secrets)) >>= published
+  case env.kind of
+    BitcoinCore -> do
+      inWitness <- right (H.payToWitnessScriptAddress ctx twoOfThree)
+      old (fromMaybe (error "No script") (H.addressToOutput inWitness)) H.sigHashAll
+      -- Taproot: signed by the first and the third key
+      let xOnly = C8.drop 1 . H.exportPubKey ctx True
+          leaf =
+            H.Script $
+              [H.opPushData (xOnly (head points)), H.OP_CHECKSIG]
+                <> concat [[H.opPushData (xOnly k), H.OP_CHECKSIGADD] | k <- drop 1 points]
+                <> [H.OP_2, H.OP_NUMEQUAL]
+          internal = H.derivePubKey ctx (secret '\x0e')
+          tree = H.TaprootOutput {internalKey = internal, mast = Just (H.MASTLeaf H.tapscriptLeafVersion leaf)}
+      (coin, out) <- payScript env (H.taprootScriptOutput ctx tree)
+      unsigned <- spendingTo env coin
+      let leafOf = Just (H.leafHash H.tapscriptLeafVersion leaf, 0xffffffff)
+      digest <- right (H.taprootSigHash unsigned [out] 0 H.sigHashDefault Nothing leafOf)
+      let sign k = (H.signSchnorr ctx k (H.hashToMsg digest)).get
+          spend =
+            H.ScriptPathSpend
+              H.ScriptPathData
+                { annex = Nothing,
+                  -- an item for each key, that of the last key first
+                  stack = [sign (secrets !! 2), "", sign (head secrets)],
+                  script = leaf,
+                  extIsOdd = odd (H.keyParity ctx (H.taprootOutputKey ctx tree)),
+                  leafVersion = H.tapscriptLeafVersion,
+                  internalKey = internal,
+                  control = [],
+                  opaqueScript = Nothing
+                }
+      witness <- right (H.encodeTaprootWitness ctx spend)
+      published (unsigned {witness = [witness]} :: Tx)
+    BitcoinCashNode -> do
+      inScript <- right (H.payToScriptAddress ctx twoOfThree)
+      let locked = fromMaybe (error "No script") (H.addressToOutput inScript)
+      old locked (H.setForkIdFlag H.sigHashAll)
+      -- Schnorr signatures of the first and the third key: bits 0 and 2
+      (coin, out) <- payScript env locked
+      unsigned <- spendingTo env coin
+      code <- right (H.encodeOutput ctx twoOfThree)
+      digest <- right (H.txSigHashForkId env.net unsigned code out.value 0 (H.setForkIdFlag H.sigHashAll))
+      let sign k = cashSchnorr ctx k digest <> "\x41"
+          pushed = [sign (head secrets), sign (secrets !! 2), H.marshal ctx twoOfThree]
+          items = [H.OP_5] <> map H.opPushData pushed
+      published (unsigned {inputs = [i {script = encode (H.Script items)} | i <- unsigned.inputs]} :: Tx)
+
+-- | Tokens of Bitcoin Cash. A transaction of the node's wallet that makes
+-- tokens, and one that spends the output that holds them, are published:
+-- the store verifies their signatures, which cover the tokens, and does
+-- not take them for forged. A forged spend of the tokens is refused.
+tokenTest :: Env -> IO ()
+tokenTest env = do
+  coins <- arr <$> rpc env.node "listunspent" []
+  to <- getNewAddress env.node
+  -- the category of new tokens is the transaction of a first output spent
+  coin <- case [c | c <- coins, numV (c ! "vout") == 0] of
+    c : _ -> return c
+    [] -> fail "The wallet has no first output"
+  let amount less = case coin ! "amount" of
+        Number n -> Number (n - less)
+        other -> other
+      holding less =
+        object
+          [ Key.fromText to
+              .= object
+                [ "amount" .= amount less,
+                  "tokenData" .= object ["category" .= (coin ! "txid"), "amount" .= ("1000" :: Text)]
+                ]
+          ]
+      spending txid = toJSON [object ["txid" .= txid, "vout" .= (0 :: Int)]]
+      published tx = publishTx env tx >>= \(code, v) -> (code, v) `shouldSatisfy` ((== 200) . fst)
+  genesis <-
+    rpc env.node "createrawtransaction" [spending (coin ! "txid"), toJSON [holding 0.001]]
+      >>= signed env Nothing
+  published genesis
+  spend <-
+    rpc env.node "createrawtransaction" [spending (txHashToHex (txHash genesis)), toJSON [holding 0.002]]
+      >>= signed env Nothing
+  publishTx env (cheaper spend) >>= \(code, v) -> do
+    code `shouldBe` 400
+    fmap (T.isInfixOf "does not verify") (textField "message" v) `shouldBe` Just True
+  published spend
 
 -- | The events of the server over a WebSocket. A client that says nothing
 -- hears of every transaction; one that names an extended public key, an

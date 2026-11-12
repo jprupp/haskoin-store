@@ -142,7 +142,11 @@ data Store = Store
     -- | network constants
     net :: !Network,
     -- | secp256k1 context
-    ctx :: !Ctx
+    ctx :: !Ctx,
+    -- | how the store opens a connection to a node, for those it makes
+    -- besides the ones of the peer manager
+    -- ("Haskoin.Store.Web.Publish")
+    connect :: !(SockAddr -> WithConnection)
   }
 
 -- | Configuration for a 'Store'.
@@ -251,7 +255,8 @@ withStore cfg action =
                           events = events,
                           pub = pub,
                           net = cfg.net,
-                          ctx = cfg.ctx
+                          ctx = cfg.ctx,
+                          connect = cfg.connect
                         }
 
 -- | The store as a member of a fleet, if the configuration says that it is
