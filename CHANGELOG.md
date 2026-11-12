@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-11-12
+
+### Changed
+- `swagger.yaml` names one server, `./`: the server that served it,
+  wherever it is mounted. It no longer lists the servers of api.haskoin.com,
+  which describe whatever version those run, not the server in front of
+  you. The server serves the file as it is, instead of adding itself to
+  that list.
+- The reference page at `/` has no list of servers to choose from and no
+  bar to load another description: it shows the reference of the server
+  that serves it, and nothing else.
+
+### Fixed
+- The licence links of `swagger.yaml` and `README.md` pointed to a file
+  that does not exist, and the version in `swagger.yaml` said 1.9.1.
+
 ## [1.10.0] - 2026-11-12
 
 The API speaks JSON only. Its binary format is gone, from the server and

@@ -5,14 +5,13 @@
 # same way, as an explicit key ("? ").
 openapi: 3.0.0
 
+# One server, relative: the server that served this file, wherever it is
+# mounted. A reader resolves it against the address it read the file from.
 servers:
-  - url: 'https://api.haskoin.com/bch/'
-  - url: 'https://api.haskoin.com/btc/'
-  - url: 'https://api.haskoin.com/bchtest4/'
-  - url: 'https://api.haskoin.com/btctest4/'
+  - url: './'
 
 info:
-  version: &version 1.9.1
+  version: &version 1.10.1
   title: Haskoin
   contact:
     name: JP Rupp
@@ -20,7 +19,7 @@ info:
     email: jprupp@protonmail.ch
   license:
     name: MIT
-    url: https://github.com/jprupp/haskoin-store/blob/master/haskoin-store/LICENSE
+    url: https://github.com/jprupp/haskoin-store/blob/master/LICENSE
   description: |
     Haskoin Store indexes the Bitcoin (BTC) and Bitcoin Cash (BCH) block chains
     and answers the questions that a node cannot answer on its own: what is the
@@ -29,9 +28,9 @@ info:
     its indices up to date with every block and every unconfirmed transaction,
     and serves them here.
 
-    The servers of this reference are the public instance at api.haskoin.com, one per
-    network: `btc`, `bch`, and their test networks `btctest4` and `bchtest4`. The
-    same API is served by any Haskoin Store you run yourself.
+    Every Haskoin Store serves this reference about itself, at its root, and
+    the requests it describes go to the server that served it: the reference
+    always matches the version of the server in front of you.
 
     ## The basics
 
