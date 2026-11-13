@@ -109,7 +109,7 @@ import Haskoin
     txHashToHex,
   )
 import Haskoin.Node (LogLevel (..), logAt)
-import Haskoin.Store.Common (nub', sortTxs)
+import Haskoin.Store.Common (Replaced (..), nub', replacedKept, sortTxs)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Mempool (MemRecords (..), mempoolRecords)
 import Haskoin.Store.Database.Types (MemAddrKey (..), MemAddrVal (..), MemSummary (..))
@@ -252,6 +252,9 @@ importBlock wr b n = do
   setBlocksAtHeight wr (nub (headerHash n.header : bs)) n.height
   setBest wr (headerHash n.header)
   tds <- importTxs wr n b.txs
+  -- forget what a block replaced 'replacedKept' blocks ago
+  when (n.height >= replacedKept) $
+    getReplacedAt wr (n.height - replacedKept) >>= mapM_ (deleteReplaced wr)
   let bd =
         BlockData
           { height = n.height,
@@ -279,7 +282,9 @@ importBlock wr b n = do
        in fromIntegral $ s * 3 + x
 
 -- | Import the transactions of a block, in dependency order, after deleting
--- the mempool transactions that conflict with them.
+-- the mempool transactions that conflict with them. What is kept of each
+-- one deleted ('Replaced') names the transaction of the block that it
+-- conflicts with, or that its unconfirmed ancestor conflicts with.
 importTxs :: Writer -> BlockNode -> [Tx] -> IO [TxData]
 importTxs wr bn txns = do
   mapM_ (freeOutputs . snd) (reverse txs)
@@ -288,7 +293,10 @@ importTxs wr bn txns = do
     txs = sortTxs txns
     br i = BlockRef {height = bn.height, position = i}
     blockTime = fromIntegral bn.header.timestamp
-    freeOutputs tx = getConflicts wr True False tx >>= mapM_ (deleteSingleTx wr . txHash)
+    freeOutputs tx =
+      getConflicts wr True False tx >>= mapM_ (\gone -> do
+        deleteSingleTx wr (txHash gone)
+        insertReplaced wr (txHash gone) Replaced {by = txHash tx, height = bn.height})
     action i tx =
       getMempoolTx wr (txHash tx) >>= \case
         Just td -> do
@@ -380,6 +388,8 @@ revertBlock wr now bh = do
   tds <- mapM inChain bd.txs
   setBest wr bd.header.prev
   insertBlock wr bd {main = False}
+  -- what the block replaced is not replaced any more
+  getReplacedAt wr bd.height >>= mapM_ (deleteReplaced wr)
   case tds of
     [] -> return ()
     coinbase : rest -> do

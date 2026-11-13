@@ -35,6 +35,8 @@ module Haskoin.Store.Database.Query
     getBestBlock,
     getBlocksAtHeight,
     getBlock,
+    getReplaced,
+    getReplacedAt,
 
     -- * Transactions
     getTxData,
@@ -140,6 +142,7 @@ import Haskoin
   )
 import Haskoin.Store.Common
   ( Limits (..),
+    Replaced,
     Start (..),
     StoreRead (..),
     applyLimitsC,
@@ -196,7 +199,8 @@ databaseRead r =
       xPubUnspents = \_ -> xPubUnspents r,
       xPubTxs = \_ -> xPubTxs r,
       xPubTxCount = \_ -> xPubTxCount r,
-      getAddressesTxCount = getAddressesTxCount r
+      getAddressesTxCount = getAddressesTxCount r,
+      getReplaced = getReplaced r
     }
 
 -- | Count something in the metrics, if they are enabled.
@@ -221,6 +225,16 @@ getBlocksAtHeight r h =
     Just ls -> do
       count r $ \s -> incrementCounter s.dataBlockCount (length ls)
       return ls
+
+-- | What is kept of a transaction that a block replaced ('Replaced').
+getReplaced :: DatabaseReader -> TxHash -> IO (Maybe Replaced)
+getReplaced r h = retrieveCF r.db (blockCF r.db) (ReplacedKey h)
+
+-- | The transactions that the block at a height replaced.
+getReplacedAt :: DatabaseReader -> BlockHeight -> IO [TxHash]
+getReplacedAt r h = do
+  rows <- matchingAsListCF r.db (heightCF r.db) (ReplacedAtKeyH h)
+  return [t | (ReplacedAtKey _ t, ()) <- rows]
 
 -- | Data of a block.
 getBlock :: DatabaseReader -> BlockHash -> IO (Maybe BlockData)

@@ -130,6 +130,7 @@ info:
     | 400 | `user-error`, `bad-request` | A parameter or the body is wrong; the message says which. |
     | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
     | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
+    | 410 | `replaced` | A transaction asked for by its id was replaced by one that a block confirmed; `replaced-by` and `height` say which and where. |
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
@@ -160,8 +161,22 @@ info:
     confirms another transaction that spends the same coins, or, on BTC, when a
     replacement that pays a higher fee arrives (replace-by-fee). It is then
     removed from every balance and history, together with any transaction that
-    spends its outputs. From then on the server answers as if it had never
-    seen it: fetching it by its id gives 404. Earlier versions answered with
+    spends its outputs. It is no longer in any answer that lists
+    transactions.
+
+    Fetched by its id, a transaction that a block replaced gives 410, Gone,
+    for 2016 blocks, with the transaction of the block that replaced it, or
+    that replaced the unconfirmed transaction whose outputs it spent:
+
+    ```json
+    {"error": "replaced", "message": "Transaction … was replaced by … in the block at height 977130",
+     "replaced-by": "<txid>", "height": 977130}
+    ```
+
+    After that, and for one replaced in the mempool by a higher fee, the
+    answer is 404, as for a transaction the server never saw. If the block is
+    undone by a reorganisation, so is the 410. The servers of a fleet
+    answer alike, from what the fleet keeps. Earlier versions answered with
     the transaction and `"deleted": true`, which clients that did not look at
     that field took for a pending payment.
 
@@ -1763,6 +1778,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '410':
+          description: A block replaced the transaction; see Unconfirmed transactions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   '/transaction/{txid}/raw':
     get:
@@ -1793,6 +1814,12 @@ paths:
                          14dd1eee80cebba451dc26f6423881b8836fe86a8388ac00000000"
         '404':
           description: Transaction not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '410':
+          description: A block replaced the transaction; see Unconfirmed transactions.
           content:
             application/json:
               schema:

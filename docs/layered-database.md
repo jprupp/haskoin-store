@@ -54,6 +54,10 @@ The column families and encodings of version 20, with other contents:
   confirmed transaction spends.
 - **`addr-tx`:** confirmed transactions by address.
 - **`balance`:** balances of the chain alone. The unconfirmed part is zero.
+- **`block`, `height`:** the blocks, and since 1.13.0 what is kept of a
+  mempool transaction that a block replaced: the transaction of the block
+  that won, and its height (`ReplacedKey`), and an index by height
+  (`ReplacedAtKey`). See [replaced transactions](#replaced-transactions).
 
 ### The mempool area
 
@@ -176,9 +180,11 @@ Each event is one atomic RocksDB batch across both areas.
   summaries of its addresses. It is replaced, dropped or too old
   (`--mempool-timeout`): its keys are deleted.
 - **A block arrives:** it is imported into the chain area. The keys of the
-  mempool transactions that it confirms or conflicts with are deleted.
+  mempool transactions that it confirms or conflicts with are deleted, and
+  each one that conflicts is kept as replaced. What the block of 2016
+  blocks before replaced is forgotten.
 - **A block is reverted:** its transactions leave the chain area and their
-  keys go to the mempool area.
+  keys go to the mempool area. What it replaced is forgotten.
 - **The mempool is wiped (`--wipe-mempool`):** every key of the mempool
   area is deleted. That is safe at any time.
 
@@ -192,6 +198,37 @@ whether or not the store had seen its transactions.
 - **The replace-by-fee flag** of a mempool transaction is inherited from
   unconfirmed ancestors, and corrected, in the mempool area only, when an
   ancestor is confirmed or comes back.
+
+## Replaced transactions
+
+The store keeps nothing of a transaction that leaves the mempool
+unconfirmed, and a wallet that asked for it got a 404, as for one that
+never was. It could not tell a payment that lost to another from one it
+mistyped, and a payment that a reorganisation replaced simply vanished.
+
+So a block keeps, for each mempool transaction that it replaces, the
+transaction of the block that won and the height of the block: the one
+that spends what it spent, or what its unconfirmed ancestor spent. The API
+answers 410 for it, with both.
+
+- **It is kept with the chain.** It is written by the import of the block
+  and deleted by its revert. But it depends on the mempool that the block
+  found as well, and each store has its own: a store that had the payment
+  keeps it, one that never saw it does not.
+- **A fleet keeps its own, in the pool**, and its stores answer from that
+  alone, so that they answer alike: see
+  [a fleet that answers as one](#a-fleet-that-answers-as-one).
+- **It is kept for 2016 blocks**, two weeks, as long as a mempool keeps a
+  transaction. Each block forgets what the block 2016 before it replaced,
+  so the cost is one scan of a height per block.
+- **A transaction that is seen again** is answered as itself: the store
+  looks for the transaction first, and only then for a record.
+- **Not kept:** a transaction replaced in the mempool, by a higher fee or
+  by one that a node took first. That would be kept with the mempool: in
+  the store's own, or in the pool of a fleet.
+- **Not compared with version 20**, which kept the transaction itself with
+  `deleted` set, in another place. The tests of the layout leave these keys
+  out of their comparison, and check them on their own.
 
 ## Records of confirmed transactions are written once
 
@@ -267,6 +304,22 @@ on the moment at which each commits a block.
   with a block when the tip moves, and age is counted on the pool's times.
 - **A store ahead of the tip holds back** a transaction until each of its
   inputs spends an output of the pool or one unspent in its view at the tip.
+- **What the blocks replaced is kept with the pool**, so that every store
+  answers 410 alike for a transaction that lost to one of a block. When the
+  tip moves, a transaction of the pool that leaves because it, or an
+  ancestor, spent what the new blocks spend is kept with the transaction
+  of the block that spent it and its height.
+  - A payment of an abandoned block that a new one replaced is not in the
+    pool: the store that moves the tip has imported the new blocks and
+    deleted it. Every store had it confirmed and keeps the same of it, so
+    the store names it, and the pool keeps it once the tip reaches the
+    block that replaced it. The tip may stop at the fork on the way, when
+    the stores reach the new blocks at different times.
+  - It is forgotten when the transaction that won comes back from an
+    abandoned block, and 2016 blocks later, and with the pool when the pool
+    starts again.
+  - `Haskoin.Store.Fleet.Pool.advanceReplacing` is the specification, and
+    the tests hold the script to it after every step of random sequences.
 - **The replace-by-fee flag is kept apart from the body.** It changes when
   a parent is confirmed or comes back, and a body given to the pool once
   went stale (`replaceable`).

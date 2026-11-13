@@ -84,6 +84,7 @@ import Haskoin
   )
 import Haskoin.Store.Common
   ( Limits (..),
+    Replaced,
     Start (..),
     StoreRead (..),
     applyLimitsC,
@@ -160,7 +161,10 @@ data PoolReads = PoolReads
     page :: Word32 -> Word32 -> IO [(UnixTime, TxHash)],
     -- | the transactions of the pool whose hash starts with six bytes, as
     -- 'decodeTxKey' gives them
-    startingWith :: (Word32, Word16) -> IO [TxHash]
+    startingWith :: (Word32, Word16) -> IO [TxHash],
+    -- | what the pool keeps of a transaction that a block replaced as the
+    -- tip moved past it ('Haskoin.Store.Fleet.Pool.advanceReplacing')
+    replaced :: TxHash -> IO (Maybe Replaced)
   }
 
 -- | The queries of a store that answers from the chain as a reader has it,
@@ -194,7 +198,11 @@ pooledRead r pool =
       xPubUnspents = \_ -> xPubUnspents r pool,
       xPubTxs = \_ xbals -> getAddressesTxs r pool (Q.usedAddresses xbals),
       xPubTxCount = \_ xbals -> getAddressesTxCount r pool (Q.usedAddresses xbals),
-      getAddressesTxCount = getAddressesTxCount r pool
+      getAddressesTxCount = getAddressesTxCount r pool,
+      -- from the pool, which keeps what the blocks replaced as the tip
+      -- moves past them, the same for every store: not from the store's
+      -- own database, which has what its own mempool lost
+      getReplaced = pool.replaced
     }
   where
     only = \case
@@ -511,7 +519,9 @@ localPool r =
       page = \offset limit -> Q.getMempoolPage r Limits {limit = limit, offset = offset, start = Nothing},
       startingWith = \prefix -> do
         rows <- matchingAsListCF r.db (mempoolCF r.db) (TxKeyS prefix)
-        return [h | (TxKey h, _ :: TxData) <- rows]
+        return [h | (TxKey h, _ :: TxData) <- rows],
+      -- what the blocks replaced, as the store's own database keeps it
+      replaced = Q.getReplaced r
     }
   where
     entries :: Address -> IO [(MemAddrKey, MemAddrVal)]

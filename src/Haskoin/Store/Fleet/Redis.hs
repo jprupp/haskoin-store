@@ -88,7 +88,7 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
 import Data.Maybe (fromMaybe)
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Database.Redis (Connection, Redis, Reply)
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
@@ -218,8 +218,18 @@ data PoolChange = PoolChange
     gone :: ![ByteString],
     -- | transactions that the new blocks confirm
     confirmed :: ![ByteString],
-    -- | outputs that the new blocks spend
-    spent :: ![ByteString]
+    -- | outputs that the new blocks spend, each followed by the transaction
+    -- of the block that spends it and the height of that block in four
+    -- bytes, big-endian: what replaces a transaction of the pool that
+    -- spends it ('Haskoin.Store.Fleet.Pool.advanceReplacing')
+    spent :: ![ByteString],
+    -- | the height of the block that the tip moves to, by which what was
+    -- replaced 2016 blocks before is forgotten, if it is known
+    height :: !(Maybe Word32),
+    -- | transactions of the abandoned blocks that the store has as
+    -- replaced, each followed like an output of 'spent' by what replaced
+    -- it: kept as replaced once the tip reaches it
+    lost :: ![ByteString]
   }
   deriving (Eq, Show)
 
@@ -279,7 +289,9 @@ fleetAdvance ::
   [ByteString] ->
   IO Moved
 fleetAdvance conn keys tsize clock seen target known =
-  advance conn keys tsize clock seen target (maybe "1" (const "0") known) (fromMaybe (PoolChange [] [] [] []) known)
+  advance conn keys tsize clock seen target (maybe "1" (const "0") known) (fromMaybe unchanged known)
+  where
+    unchanged = PoolChange [] [] [] [] Nothing []
 
 -- | Move the tip to a block and empty the pool, for a store that has both
 -- the tip and the block and finds the way between them longer than it
@@ -294,7 +306,7 @@ fleetAdvance conn keys tsize clock seen target known =
 -- count of 'fleetRestarts' went up.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
-  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] []) []
+  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) []
 
 -- | How many times the pool was emptied to move the tip. A store that sees
 -- another number than at its last turn offers all of its mempool again:
@@ -325,7 +337,8 @@ advance conn keys tsize clock seen target how change path =
   where
     args =
       ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size, how]
-        <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent]
+        <> [maybe "" num change.height]
+        <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent, B.concat change.lost]
         <> [num (length change.returned)]
         <> concatMap txArgs change.returned
         <> [B.concat path]

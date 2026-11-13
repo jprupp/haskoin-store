@@ -1291,7 +1291,7 @@ deriveTest env = do
 
 -- | A transaction confirmed in a block that a reorganisation removes, and
 -- double-spent in the new chain, must disappear from the store and from the
--- cache.
+-- cache, and is answered 410 with the transaction that replaced it.
 --
 -- Bitcoin Cash Node cannot mine a chosen transaction (@generateblock@), so
 -- the double spend is set up with coinbase maturity: transaction A spends a
@@ -1325,6 +1325,13 @@ reorgTest env = do
   e <- expect <$> readIORef ref
   e.txids `shouldBe` [txB]
   checkXPub env x ref
+  -- asked for by its id, the payment that lost says what replaced it, from
+  -- the database and from the cache alike, where one that never was is 404
+  forM_ [env.plain, env.cached] $ \url -> do
+    (code, v) <- getJSON url ("/transaction/" <> cs txA)
+    (code, textField "error" v, textField "replaced-by" v) `shouldBe` (410, Just "replaced", Just txB)
+    fst <$> getJSON url ("/transaction/" <> cs txA <> "/raw") `shouldReturn` 410
+  fst <$> getJSON env.plain ("/transaction/" <> replicate 64 '1') `shouldReturn` 404
 
 -- | A coinbase that may be spent in the next block and not before, and a
 -- way to spend it to an address. A spend in that block is dropped by the
@@ -2563,6 +2570,39 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
   waitFor "the health check of a member to pass" ((== 200) . fst <$> getJSON urlA "/health")
   (_, health) <- getJSON urlA "/health"
   ((health ! "redis") ! "ok") `shouldBe` Bool True
+  -- a payment that a reorganisation replaced, as in 'reorgTest': both
+  -- stores answer 410 alike, from what the pool kept as the tip moved
+  let y = newXPub env "fleet-replaced" DeriveNormal
+  (coinbaseSpend, cbValue) <- youngCoinbase env (newXPub env "fleet-coinbase" DeriveNormal)
+  txA <- coinbaseSpend (at env y [0, 0]) (cbValue - 100000)
+  [blockX] <- mine env 1
+  waitStore env a
+  waitStore env b
+  atTip
+  header <- rpc env.node "getblockheader" [String blockX]
+  parent <- maybe (fail "No parent") return (textField "previousblockhash" header)
+  void $ rpc env.node "invalidateblock" [String parent]
+  other <- getNewAddress env.node
+  void $ generateTo env.node 1 other
+  txB <- coinbaseSpend (at env y [0, 1]) (cbValue - 200000)
+  void $ mine env 2
+  waitStore env a
+  waitStore env b
+  atTip
+  let path = "/transaction/" <> T.unpack txA
+      answers = (,) <$> getJSON urlA path <*> getJSON urlB path
+  agreed <- tryAny . waitFor "both stores to answer that the payment was replaced" $ do
+    (fromA, fromB) <- answers
+    return (fromA == fromB && fst fromA == 410)
+  case agreed of
+    Right () -> return ()
+    Left _ -> do
+      got <- answers
+      kept <- redisRun env (Redis.hgetall (cachePrefix env.net <> "pool:rep"))
+      local <- mapM (\st -> Q.getReplaced st.db (fromMaybe (error "txid") (hexToTxHash txA))) [a, b]
+      expectationFailure ("Not replaced alike: " <> show got <> "; pool: " <> show kept <> "; stores: " <> show local)
+  (_, gone) <- getJSON urlA ("/transaction/" <> T.unpack txA)
+  textField "replaced-by" gone `shouldBe` Just txB
   where
     -- Both members and their web servers log through the logger of the
     -- tests, each with its name in front of its lines. A logger of their

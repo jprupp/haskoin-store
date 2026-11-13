@@ -1,14 +1,15 @@
 module Haskoin.Store.Logic.LayeredSpec (spec) where
 
-import Control.Monad (foldM, forM_, void)
+import Control.Monad (foldM, forM_, replicateM_, void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
-import Data.Either (isLeft)
-import Data.List (sortOn)
+import Data.Either (isLeft, isRight)
+import Data.List (sort, sortOn)
 import Data.Maybe (isJust)
 import Data.Serialize (decode)
 import Haskoin
   ( Block (..),
+    BlockHeight,
     BlockHash,
     Ctx,
     Network,
@@ -23,8 +24,8 @@ import Haskoin
     prepareContext,
     txHash,
   )
-import Haskoin.Store.Common (Start (..), StoreRead (..))
-import Haskoin.Store.Data (TxData (..), Unspent (..))
+import Haskoin.Store.Common (Replaced (..), Start (..), StoreRead (..), replacedKept)
+import Haskoin.Store.Data (BlockData (..), TxData (..), Unspent (..))
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Migrate (upgradeDatabase)
 import Haskoin.Store.Database.Query qualified as Q
@@ -93,6 +94,26 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
         block <- blockOn db [child]
         (.result) <$> apply layeredRules db block `shouldReturn` Left Orphan
         everything db `shouldReturn` untouched
+
+  it "keep what a block replaced, and forget it when the block is reverted" $
+    withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
+      openLayered btcRegTest ctx dir $ \db -> do
+        (gone, height) <- replacedByBlock db
+        best <- Q.getBestBlock db >>= maybe (fail "no best block") return
+        isRight . (.result) <$> apply layeredRules db (Revert best 2000) `shouldReturn` True
+        mapM (Q.getReplaced db) gone `shouldReturn` [Nothing, Nothing]
+        Q.getReplacedAt db height `shouldReturn` []
+
+  it "forget what a block replaced 2016 blocks later" $
+    withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
+      openLayered btcRegTest ctx dir $ \db -> do
+        (gone, height) <- replacedByBlock db
+        let mineEmpty = blockOn db [] >>= apply layeredRules db
+        replicateM_ (fromIntegral replacedKept - 1) mineEmpty
+        all isJust <$> mapM (Q.getReplaced db) gone `shouldReturn` True
+        void mineEmpty
+        mapM (Q.getReplaced db) gone `shouldReturn` [Nothing, Nothing]
+        Q.getReplacedAt db height `shouldReturn` []
 
   it "leave the keys of a mempool transaction alone when a block confirms what it spends" $
     withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
@@ -238,8 +259,10 @@ data Everything = Everything
 everything :: DatabaseReader -> IO Everything
 everything db = do
   best <- Q.getBestBlock db
-  blocks <- dump db (blockCF db.db)
-  heights <- dump db (heightCF db.db)
+  -- what is kept of replaced transactions is the layered layout's own,
+  -- and tested on its own
+  blocks <- filter (not . ("\x11" `B.isPrefixOf`) . fst) <$> dump db (blockCF db.db)
+  heights <- filter (not . ("\x12" `B.isPrefixOf`) . fst) <$> dump db (heightCF db.db)
   chain <- chainOf db
   area <- dump db (mempoolCF db.db)
   mempoolByAddress <- dump db (mempoolAddrCF db.db)
@@ -262,3 +285,26 @@ everything db = do
     decoded :: ByteString -> IO TxData
     decoded = either fail return . decode
     span' p xs = (filter p xs, filter (not . p) xs)
+
+-- | A payment and its child in the mempool, and a block whose transaction
+-- spends what the payment spent: both are replaced. Gives their hashes and
+-- the height of the block, after checking what is kept of them.
+replacedByBlock :: DatabaseReader -> IO ([TxHash], BlockHeight)
+replacedByBlock db = do
+  hist <- start layeredRules db
+  let paid = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4000 (p2pkh 1)] [] 0
+      child = Tx 2 [TxIn (OutPoint (txHash paid) 0) "" maxBound] [TxOut 3000 (p2pkh 2)] [] 0
+      rival = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4500 (p2pkh 3)] [] 0
+      gone = map txHash [paid, child]
+  forM_ [paid, child] $ \tx ->
+    (.result) <$> apply layeredRules db (Pay tx 1000) `shouldReturn` Right "True"
+  block <- blockOn db [rival]
+  replaced <- apply layeredRules db block
+  sort replaced.removed `shouldBe` sort gone
+  best <- Q.getBestBlock db >>= maybe (fail "no best block") return
+  height <- maybe (fail "no block") (return . (.height)) =<< Q.getBlock db best
+  -- the payment, and its child, which spent what it paid
+  let what = Replaced {by = txHash rival, height = height}
+  mapM (Q.getReplaced db) gone `shouldReturn` [Just what, Just what]
+  Q.getReplacedAt db height `shouldReturn` sort gone
+  return (gone, height)

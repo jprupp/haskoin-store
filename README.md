@@ -621,7 +621,8 @@ The chain and the mempool are kept apart.
   changes the chain's data.
 - **A transaction that leaves the mempool unconfirmed is forgotten**: it was
   replaced, double-spent by a block, or too old. The API answers 404 for
-  it.
+  it, or 410, with the transaction that won, for one that a block replaced
+  in the last 2016 blocks.
 - **Each request reads one snapshot** of the database, so everything in an
   answer is of the same moment.
 

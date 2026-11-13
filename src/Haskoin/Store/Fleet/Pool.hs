@@ -73,6 +73,7 @@ module Haskoin.Store.Fleet.Pool
     -- * Following the tip
     Change (..),
     advance,
+    advanceReplacing,
 
     -- * What the pool holds for each address
     Entry (..),
@@ -213,7 +214,40 @@ data Change t o = Change
 -- of the chain; and what spends an output that they spend leaves with
 -- everything that spends it.
 advance :: (Ord t, Ord o) => (o -> t) -> Change t o -> Pool t o -> Pool t o
-advance maker change pool0 = clashed
+advance maker change pool = let (p, _, _) = advanceReplacing maker change (const Nothing) [] Map.empty pool in p
+
+-- | 'advance', and what the new blocks replaced. Given a label for each
+-- output that they spend, transactions of the abandoned blocks that the
+-- store has as replaced, each with the transaction that replaced it and a
+-- label, and those of earlier moves that still wait for theirs. Gives the
+-- pool, what was replaced, each with its label, and what still waits.
+--
+-- * A transaction of the pool that leaves because it, or an unconfirmed
+--   ancestor of it, spent an output that the new blocks spend, was
+--   replaced, with the label of the output. The outputs are taken in
+--   order, and one that left for two of them has the label of the first.
+--
+-- * A transaction of an abandoned block that the store has as replaced is
+--   not in the pool and does not come back to it: the store has imported
+--   the new blocks by then, and deleted it. Every store had it confirmed,
+--   so every store says the same of it. It was replaced once the tip
+--   reaches the block that confirms the transaction that replaced it, which
+--   may be in this move or in a later one: the tip may stop at the fork
+--   before it goes on.
+--
+-- The store labels with the transaction that won and the height of its
+-- block, and the pool keeps them for a while, so that a wallet that asks
+-- for a transaction that lost is told what won.
+advanceReplacing ::
+  (Ord t, Ord o) =>
+  (o -> t) ->
+  Change t o ->
+  (o -> Maybe w) ->
+  [(t, t, w)] ->
+  Map t (t, w) ->
+  Pool t o ->
+  (Pool t o, [(t, w)], Map t (t, w))
+advanceReplacing maker change label lost waiting pool0 = (final, now <> clashed, still)
   where
     back = foldl' comeBack pool0 change.returned
     -- a transaction that was confirmed has the better claim to what it
@@ -225,7 +259,19 @@ advance maker change pool0 = clashed
     orphaned = concatMap (\t -> maybe [] Set.toList (Map.lookup t back.children)) change.gone
     alive = withdraw orphaned back
     settled = foldl' (flip remove) alive change.confirmed
-    clashed = withdraw (mapMaybe (`Map.lookup` settled.spender) change.spent) settled
+    -- what waits for a transaction that the new blocks confirm was replaced
+    confirmed = Set.fromList change.confirmed
+    waitingNow = foldl' (\m (t, by, w) -> Map.insert t (by, w) m) waiting lost
+    (reached, still) = Map.partition (\(by, _) -> Set.member by confirmed) waitingNow
+    now = [(t, w) | (t, (_, w)) <- Map.toList reached]
+    -- what spends an output that the blocks spend leaves, with all that
+    -- spends it
+    (final, clashed) = foldl' clash (settled, []) change.spent
+    clash (p, replaced) o = case Map.lookup o p.spender of
+      Nothing -> (p, replaced)
+      Just s ->
+        let leaving = Set.toList (descendants [s] p)
+         in (withdraw [s] p, replaced <> maybe [] (\w -> [(t, w) | t <- leaving]) (label o))
 
 -- | What a transaction does at an address, for addresses of type @a@: the
 -- entries by address of "Haskoin.Store.Database.Mempool", which a store

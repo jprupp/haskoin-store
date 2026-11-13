@@ -116,6 +116,31 @@ the new block is still the one the live servers agree on. Then it changes
 the pool, moves the tip, counts the move, and tells the blocks as events.
 Two servers that try at once do it once: the second finds the tip changed.
 
+### What the blocks replaced
+
+The pool also keeps what the blocks replaced, so that every server answers
+410 alike for a transaction that lost to a transaction of a block. A
+server's own record of it depends on its own mempool, and is not used in a
+fleet.
+
+- **A transaction of the pool** that leaves because it, or an ancestor,
+  spent an output that the new blocks spend is kept with the transaction of
+  the block that spent it, and the height of its block. The server gives
+  both with each output (`pool:rep`, with `pool:repby:` by winner and
+  `pool:repat` by height).
+- **A payment of an abandoned block** that a new block replaced is not in
+  the pool, and the server no longer has it: it has imported the new blocks
+  and deleted it. Every server had it confirmed and keeps the same record
+  of it, so the server that moves the tip names it, and it waits
+  (`pool:lost`) until a move confirms the transaction that replaced it.
+  The tip may stop at the fork before it goes on, when the servers reach
+  the new blocks at different times; the test of the fleet ran into that.
+- **It is forgotten** when the winner comes back from an abandoned block,
+  2,016 blocks after its height, and when the pool starts again.
+
+Not kept: a transaction of the pool replaced by fee, or withdrawn for its
+age. Those answer 404.
+
 ## When nobody can say what the blocks did
 
 A server goes through 50 blocks at most. Two cases are past that:

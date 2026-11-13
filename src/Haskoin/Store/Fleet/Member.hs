@@ -112,7 +112,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
-import Data.Serialize (Serialize, decode, encode)
+import Data.Serialize (Serialize, decode, encode, get, getWord32be, putWord32be, runGet, runPut)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
@@ -134,7 +134,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..))
-import Haskoin.Store.Common (Limits (..), StoreRead (..))
+import Haskoin.Store.Common (Limits (..), Replaced (..), StoreRead (..))
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -642,12 +642,27 @@ wayBetween db from to = L.withView db $ \view -> do
             Right added -> do
               old <- concat <$> mapM (bodies view) (reverse abandoned)
               new <- concat <$> mapM (confirmedBy r) (reverse added)
+              -- those of the abandoned blocks that this store has as
+              -- replaced: every store had them confirmed, and says the same
+              let named h rep = encode h <> encode rep.by <> runPut (putWord32be rep.height)
+              lostOnes <- fmap catMaybes . forM [h | (h, Nothing) <- old] $ \h ->
+                fmap (named h) <$> Q.getReplaced r h
               let pool =
                     PoolChange
                       { returned = [poolTx r.net r.ctx td | (_, Just td) <- old, not (coinbase td)],
                         gone = [encode h | (h, found) <- old, maybe True coinbase found],
                         confirmed = map (encode . txHash . (.tx)) new,
-                        spent = [encode i.outpoint | td <- new, i <- td.tx.inputs, i.outpoint /= nullOutPoint]
+                        -- with what spends each output and where, for what
+                        -- the blocks replaced
+                        spent =
+                          [ encode i.outpoint <> encode (txHash td.tx) <> runPut (putWord32be h)
+                          | td <- new,
+                            BlockRef {height = h} <- [td.block],
+                            i <- td.tx.inputs,
+                            i.outpoint /= nullOutPoint
+                          ],
+                        height = Just bd.height,
+                        lost = lostOnes
                       }
               let path = map (headerHash . (.header)) (reverse added)
               return (Way Between {pool, added = new, reorganised = not (null abandoned), path})
@@ -1121,7 +1136,11 @@ redisPool conn keys tip checked =
       page = \offset limit -> do
         rows <- ask "page" [num offset, num limit]
         return [(number time, h) | [member, time] <- groups 2 rows, Right h <- [decode member]],
-      startingWith = \start -> rights . map decode <$> ask "ids" [B.drop 1 (encode (TxKeyS start))]
+      startingWith = \start -> rights . map decode <$> ask "ids" [B.drop 1 (encode (TxKeyS start))],
+      replaced = \h ->
+        ask "replaced" [encode h] >>= \case
+          [value] | Right (by, height) <- runGet ((,) <$> get <*> getWord32be) value -> return (Just Replaced {..})
+          _ -> return Nothing
     }
   where
     ask what args = poolRead conn keys 32 (Just tip) what args >>= maybe (throwIO TipMoved) (<$ checked)
