@@ -36,7 +36,6 @@ default-extensions:
   - OverloadedStrings
 dependencies:
   - aeson ^>= 2.2.5.1
-  - aeson-pretty ^>= 0.8.11
   - base ^>= 4.21.2.0
   - base16 ^>= 2.0
   - bytes ^>= 0.17.5

@@ -209,6 +209,7 @@ chainSpec kind = do
     it "publishes transactions that make and spend tokens" tokenTest
   it "publishes spends of a multisig, signed the old way and with Schnorr signatures" multisigTest
   it "speaks HTTP as browsers, proxies and long requests need it" httpTest
+  it "answers in pieces what the database names, with what it would answer at once" piecesTest
   it "serves HTTPS, and nothing else, when given a certificate" tlsTest
   it "tells each client of the transactions it chose, and takes up where it left" eventsTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
@@ -1064,6 +1065,63 @@ multiaddrTest env = do
   got <- getJSON env.plain (m <> "&n=10&offset=0")
   posted `shouldBe` got
 
+-- | The endpoints that answer while they read ("Haskoin.Store.Web.Pieces"),
+-- on a block and an address with more transactions than a piece has, so
+-- that each answer is made of several: the bytes of a block are those that
+-- the node gives, and the transactions are those that the endpoints of one
+-- transaction give, all of them and in order.
+piecesTest :: Env -> IO ()
+piecesTest env = do
+  let x = newXPub env "pieces" DeriveNormal
+      a = at env x [0, 0]
+      count = 130 :: Int
+  replicateM_ count (rpc env.node "sendtoaddress" [String a, Number 0.0001])
+  void $ mine env 1
+  best <- bestBlockHash env.node
+  height <- numV <$> rpc env.node "getblockcount" []
+  hex <- rpc env.node "getblock" [String best, Number 0]
+  ids <- maybe [] arr . field "tx" <$> plainJSON env ("/block/" <> cs best)
+  -- what earlier tests left in the mempool is in the block too
+  length ids `shouldSatisfy` (> count)
+  -- raw blocks
+  let block = "/block/" <> cs best
+  forM_ [block <> "/raw", "/block/best/raw"] $ \p ->
+    (field "result" <$> plainJSON env p) `shouldReturn` Just hex
+  plainJSON env ("/block/height/" <> show height <> "/raw") `shouldReturn` toJSON [hex]
+  text <- Wreq.get (env.plain <> "/blockchain/rawblock/" <> cs best <> "?format=hex")
+  String (cs (text ^. Wreq.responseBody)) `shouldBe` hex
+  lookup "Content-Length" (text ^. Wreq.responseHeaders) `shouldBe` Nothing
+  -- the transactions of a block
+  let one i = "/transaction/" <> cs (str i)
+      str = \case
+        String t -> t
+        v -> error ("Not a string: " <> show v)
+  singles <- mapM (plainJSON env . one) ids
+  (arr <$> plainJSON env ("/transactions/block/" <> cs best)) `shouldReturn` singles
+  raws <- map str . arr <$> plainJSON env ("/transactions/block/" <> cs best <> "/raw")
+  length raws `shouldBe` length ids
+  (T.concat raws `T.isSuffixOf` str hex) `shouldBe` True
+  -- the block as Blockchain.info
+  rb <- plainJSON env ("/blockchain/rawblock/" <> cs best)
+  num "n_tx" rb `shouldBe` fromIntegral (length ids)
+  map (field "hash") (maybe [] arr (field "tx" rb)) `shouldBe` map Just ids
+  heights <- plainJSON env ("/blockchain/block-height/" <> show height)
+  fmap arr (field "blocks" heights) `shouldBe` Just [rb]
+  -- the transactions of addresses and of an xpub
+  refs <- arr <$> plainJSON env ("/address/" <> cs a <> "/transactions?limit=200")
+  length refs `shouldBe` count
+  wanted <- mapM (plainJSON env . one) (mapMaybe (field "txid") refs)
+  forM_
+    [ "/address/" <> cs a <> "/transactions/full?limit=200",
+      "/address/transactions/full?limit=200&addresses=" <> cs a,
+      "/xpub/" <> x.text <> "/transactions/full?limit=200",
+      "/xpub/" <> x.text <> "/transactions/full?limit=200&nocache=true"
+    ]
+    $ \p -> (arr <$> plainJSON env p) `shouldReturn` wanted
+  -- a block that is not there is an error, not a response cut short
+  (code, _) <- getJSON env.plain ("/transactions/block/" <> replicate 64 'a')
+  code `shouldBe` 404
+
 -- | Endpoints that do not involve xpubs, checked against the node.
 endpointsTest :: Env -> IO ()
 endpointsTest env = do
@@ -1164,13 +1222,14 @@ strictTest env = do
   let refused =
         [ ("/block/best?limt=5", "Unknown parameter: limt"),
           ("/block/best?notx=yes", "Invalid value for parameter notx: yes"),
-          ("/block/best?pretty=maybe", "Invalid value for parameter pretty"),
+          ("/block/best?pretty=true", "Unknown parameter: pretty"),
+          ("/health?pretty=true", "Unknown parameter: pretty"),
+          ("/events?pretty=true", "Unknown parameter: pretty"),
           ("/mempool?limit=-1", "Invalid value for parameter limit"),
           ("/address/" <> cs a <> "/transactions?offset=x", "Invalid value for parameter offset"),
           ("/xpub/" <> x.text <> "?derive=Legacy", "Invalid value for parameter derive"),
           ("/blockchain/latestblock?txidindex=1", "Invalid value for parameter txidindex"),
           ("/blockchain/latestblock?format=hex", "Invalid value for parameter format"),
-          ("/blockchain/latestblock?pretty=true", "Unknown parameter: pretty"),
           ("/blockchain/rawtx/" <> cs coinbase <> "?format=xml", "Invalid value for parameter format"),
           ("/blockchain/multiaddr?active=" <> x.text <> "&filter=4", "Invalid value for parameter filter"),
           ("/blockchain/unspent?active=" <> cs a <> "&confirmations=-2", "Invalid value for parameter confirmations"),
@@ -1184,7 +1243,7 @@ strictTest env = do
   (code, v) <- postForm env.plain "/transactions" [("hex", "00")]
   (code, textField "message" v) `shouldBe` (400, Just "Unknown parameter: hex")
   forM_
-    [ "/block/best?notx=true&pretty=true",
+    [ "/block/best?notx=true",
       "/blockchain/latestblock?format=json&txidindex=true",
       "/xpub/" <> x.text <> "?derive=normal&nocache=false"
     ]
