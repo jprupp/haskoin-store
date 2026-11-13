@@ -75,7 +75,7 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
         mine txs db h = (h,) . Just <$> blockOn db txs
         pay tx _ h = return (h, Just (Pay tx h.clock))
         revert _ h = return $ case h.chain of
-          (b, _) : _ -> (h, Just (Revert (headerHash b.header)))
+          (b, _) : _ -> (h, Just (Revert (headerHash b.header) h.clock))
           [] -> (h, Nothing)
     -- the third store is upgraded with the spend in its mempool
     (outcomes, _) <- sameHistory ctx btcRegTest 2 [mine [twice], pay spend, mine [spend], revert, revert]

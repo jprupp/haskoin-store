@@ -357,10 +357,19 @@ moveChainTx wr t new time = do
 
 -- | Revert the best block: make its parent the best block, mark it as not in
 -- the main chain, take its transactions out of the chain and give them to
--- the mempool, and delete its coinbase with whatever spends it. Throws
--- 'BlockNotBest' if the block is not the best block.
-revertBlock :: Writer -> BlockHash -> IO ()
-revertBlock wr bh = do
+-- the mempool at a time, the time of the revert, and delete its coinbase
+-- with whatever spends it. Throws 'BlockNotBest' if the block is not the
+-- best block.
+--
+-- The transactions go back with the time that they are put back, not that
+-- of their block. The mempool deletes what is older than its timeout
+-- (@--mempool-timeout@), by that time: with the time of the block, a
+-- transaction of a block older than the timeout was deleted as soon as it
+-- came back, while the nodes kept it. Stores of a fleet give it the same
+-- time all the same, as the shared mempool keeps the time of the first
+-- store that offers it.
+revertBlock :: Writer -> UnixTime -> BlockHash -> IO ()
+revertBlock wr now bh = do
   bd <-
     bestBlockData wr >>= \b ->
       if headerHash b.header == bh
@@ -380,14 +389,12 @@ revertBlock wr bh = do
           ordered = filter ((`M.member` returned) . txHash) (map snd (sortTxs (map (.tx) tds)))
       -- out of the chain, each after the transactions that spend it
       forM_ (reverse ordered) (leave . txHash)
-      -- into the mempool, at the time that each had in the chain, which is
-      -- that of the block: the time at which a store first saw it is not
-      -- kept past its confirmation, and every store gives it the same
-      -- time this way. The coinbase is still in the chain: a transaction that spends it has all its
-      -- parents while its flag is worked out, as in the layout of version 20
+      -- into the mempool, at the time of the revert. The coinbase is still
+      -- in the chain: a transaction that spends it has all its parents
+      -- while its flag is worked out, as in the layout of version 20
       forM_ (mapMaybe ((`M.lookup` returned) . txHash) ordered) $ \td -> do
         rbf <- isRBF wr td.tx
-        addMempoolTx wr td.timestamp (td :: TxData) {rbf = rbf}
+        addMempoolTx wr now (td :: TxData) {rbf = rbf, timestamp = now}
         updateSpendersRBF wr td.tx
       -- a coinbase cannot be in the mempool: it is deleted, and so is
       -- everything that spends it

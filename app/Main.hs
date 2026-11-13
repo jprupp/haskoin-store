@@ -272,8 +272,6 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
-      publishTimeout <-
-        env "PUBLISH_TIMEOUT" d.publishTimeout readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -442,13 +440,6 @@ config c = do
           <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
           <> showDefault
           <> value c.webLimits.slowRequest
-    publishTimeout <-
-      option auto $
-        metavar "SECONDS"
-          <> long "publish-timeout"
-          <> helpEnv "PUBLISH_TIMEOUT" "Wait this long for a published transaction to come back from a node"
-          <> showDefault
-          <> value c.webLimits.publishTimeout
     return WebLimits {..}
   redis <-
     flag c.redis True $
@@ -615,7 +606,9 @@ config c = do
     strOption $
       metavar "URL"
         <> long "node-rpc"
-        <> helpEnv "NODE_RPC" "Publish transactions over the JSON-RPC of this full node, and through a peer when it fails"
+        <> helpEnv
+          "NODE_RPC"
+          "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails"
         <> value c.nodeRpc
   tlsCert <-
     strOption $

@@ -59,6 +59,7 @@ module Haskoin.Store.Logic
   ( ImportException (..),
     initBest,
     revertBlock,
+    revertBlockAt,
     importBlock,
     newMempoolTx,
     deleteUnconfirmedTx,
@@ -236,7 +237,18 @@ bestBlockData wr = do
 -- main chain, move its transactions back to the mempool, and delete its
 -- coinbase. Throws 'BlockNotBest' if the block is not the best block.
 revertBlock :: Writer -> BlockHash -> IO ()
-revertBlock wr bh = do
+revertBlock wr = revertWith wr id
+
+-- | 'revertBlock', with the transactions put back at a time, the time of
+-- the revert, as the layered layout puts them back
+-- ("Haskoin.Store.Logic.Layered"): the tests compare the two.
+revertBlockAt :: Writer -> UnixTime -> BlockHash -> IO ()
+revertBlockAt wr now = revertWith wr (\td -> (td :: TxData) {timestamp = now})
+
+-- | Revert the best block, changing each transaction that goes back to the
+-- mempool first.
+revertWith :: Writer -> (TxData -> TxData) -> BlockHash -> IO ()
+revertWith wr restamp bh = do
   bd <-
     bestBlockData wr >>= \b ->
       if headerHash b.header == bh
@@ -257,7 +269,7 @@ revertBlock wr bh = do
   insertBlock wr bd {main = False}
   logDebug wr $
     "Updated as not in main chain: " <> blockHashToHex bh
-  forM_ (drop 1 tds) (unConfirmTx wr)
+  forM_ (drop 1 tds) (unConfirmTx wr . restamp)
   logDebug wr $
     "Unconfirmed " <> cs (show (length tds)) <> " transactions"
   deleteConfirmedTx wr (txHash (tds !! 0).tx)

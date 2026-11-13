@@ -180,7 +180,7 @@ withShadow net ctx action =
 data Rules = Rules
   { initBest :: Writer -> IO (),
     importBlock :: Writer -> Block -> BlockNode -> IO (BlockData, [TxData]),
-    revertBlock :: Writer -> BlockHash -> IO (),
+    revertBlock :: Writer -> UnixTime -> BlockHash -> IO (),
     newMempoolTx :: Writer -> Tx -> UnixTime -> IO Bool,
     deleteUnconfirmedTx :: Writer -> Bool -> TxHash -> IO ()
   }
@@ -191,7 +191,7 @@ mixedRules =
   Rules
     { initBest = Mixed.initBest,
       importBlock = Mixed.importBlock,
-      revertBlock = Mixed.revertBlock,
+      revertBlock = Mixed.revertBlockAt,
       newMempoolTx = Mixed.newMempoolTx,
       deleteUnconfirmedTx = Mixed.deleteUnconfirmedTx
     }
@@ -239,8 +239,8 @@ data Op
     Mine !Block !BlockNode
   | -- | a mempool transaction is deleted, with its descendants
     Delete !TxHash
-  | -- | the best block is reverted
-    Revert !BlockHash
+  | -- | the best block is reverted, at a time
+    Revert !BlockHash !UnixTime
   deriving (Show)
 
 -- | What an operation did: what the rules returned or why they refused, and
@@ -260,7 +260,7 @@ apply rules db = \case
   -- that each layout keeps in a body
   Mine block node -> outcome . fmap (first fst) <$> run db (\w -> rules.importBlock w block node)
   Delete h -> outcome <$> run db (\w -> rules.deleteUnconfirmedTx w False h)
-  Revert h -> outcome <$> run db (\w -> rules.revertBlock w h)
+  Revert h time -> outcome <$> run db (\w -> rules.revertBlock w time h)
   where
     outcome :: (Show a) => Either ImportException (a, MempoolChanges) -> Outcome
     outcome (Left e) = Outcome {result = Left e, added = [], removed = []}
@@ -275,7 +275,7 @@ record db hist op out = case op of
     | isLeft out.result -> noted block.txs
     | otherwise -> (noted block.txs) {chain = (block, node) : hist.chain}
   Delete _ -> hist
-  Revert _
+  Revert _ _
     | isLeft out.result -> hist
     | otherwise -> hist {chain = drop 1 hist.chain}
   where
@@ -492,7 +492,7 @@ plan db hist0 seed = (hist,) <$> chosen
             h : _ | even s -> h
             _ -> TxHash (sha256 (encode seed))
     revert = return $ case hist.chain of
-      (b, _) : _ : _ -> Just (Revert (headerHash b.header))
+      (b, _) : _ : _ -> Just (Revert (headerHash b.header) hist.clock)
       _ -> Nothing
     -- an earlier transaction, which may be confirmed, in the mempool,
     -- deleted, or missing what it spends

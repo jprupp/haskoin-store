@@ -241,10 +241,11 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           map (\td -> (td.block, td.timestamp)) <$> stored `shouldReturn` [(BlockRef 2 1, time)]
           wrongTimes db `shouldReturn` []
           -- and when the block is reverted it goes back to the mempool
-          -- with that time, which every store has for it
-          reverted <- apply layeredRules db (Revert (headerHash (maybe (error "no block") (.header) best)))
+          -- with the time of the revert, which the timeout of the mempool
+          -- counts from
+          reverted <- apply layeredRules db (Revert (headerHash (maybe (error "no block") (.header) best)) 7000)
           isRight reverted.result `shouldBe` True
-          fmap (.timestamp) <$> M.getMempoolTx db (txHash tx) `shouldReturn` Just time
+          fmap (.timestamp) <$> M.getMempoolTx db (txHash tx) `shouldReturn` Just 7000
     modifyMaxSuccess (const 20) $
       it "is the time of its block, after any history" $
         -- whatever a store saw in its mempool before, and through blocks
@@ -345,7 +346,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           -- a block that is reverted takes its spenders along, and a group
           -- with none left has no key
           best <- Q.getBestBlock db >>= maybe (fail "no best block") return
-          reverted <- apply layeredRules db (Revert best)
+          reverted <- apply layeredRules db (Revert best 0)
           isRight reverted.result `shouldBe` True
           keysNow `shouldReturn` []
           Q.getChainSpenders db (txHash wide) `shouldReturn` IntMap.empty

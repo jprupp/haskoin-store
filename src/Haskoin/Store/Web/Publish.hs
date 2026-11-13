@@ -1,4 +1,5 @@
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# OPTIONS_GHC -Wno-ambiguous-fields #-}
 
@@ -12,158 +13,125 @@
 --
 -- Publishing a transaction that a client posted: @POST \/transactions@.
 --
--- = The problem
---
--- The store does not run scripts. It can check the signature of a coin
--- locked to one key, and cannot tell whether a script of another kind is
--- satisfied, so it cannot tell every valid transaction from a forged one.
--- Two things follow. It must not put a
--- transaction from a client into its mempool, or anyone could show a
--- payment that will never confirm. And it must not send one over the
--- connections it syncs from: a node that finds a transaction invalid may
--- drop every connection from the address that sent it, and Bitcoin Cash
--- Node does.
---
 -- = What it does
---
--- The store does not broadcast. It hands the transaction to one full node
--- and listens for it to come back:
 --
 -- 1. __Check__ what the store can decide from its own index ('judge'): the
 --    coins, the amounts, the lock time, the rules of relay that do not
---    change, and the signature of every coin locked to one key. A
---    transaction that the store has in a block is answered at once.
+--    change, the form of the input scripts, the tokens of Bitcoin Cash, and
+--    the signature of every coin locked to one key. A transaction that the
+--    store has in a block is answered at once, and nothing is sent.
 --
 -- 2. __Send over RPC__, where the store was given the RPC of a full node
---    ('Publishing'.@direct@). The node checks everything, says why it
---    refuses, and what it refuses costs the store nothing. The next step
---    is for when there is no such node, or it does not answer.
+--    ('Publishing'.@direct@). The node checks everything, and says at once
+--    whether it took the transaction and why not. It is the only way to
+--    publish a spend of a coin that the store cannot verify.
 --
--- 3. __Hand over__ ('deliver'), only a transaction whose every signature
---    the store verified: on a connection of its own, the courier, to
---    a node that the store syncs from. The transaction, then a @ping@. A
---    node handles the messages of a connection in order, so the @pong@
---    says that it is done with the transaction.
+-- 3. __Hand it to every peer__ otherwise, if the store verified every
+--    input: to all at once, each on a connection of its own ('deliver'),
+--    and answer that it was handed over as soon as they took it. What the
+--    network does with it is the network's to decide. Bitcoin Core refuses
+--    without saying so; Bitcoin Cash Node says why, and if every peer that
+--    answered refused it, the answer is that reason.
 --
--- 4. __Listen__: the connections that the store syncs from never mentioned
---    the transaction, so a node that accepted it announces it there as it
---    does any other, and the store imports it as it does any other. That
---    announcement, the echo, is the only way into the mempool.
+-- 4. __It comes back__ as any transaction does: a peer that takes it
+--    announces it on the connections that the store syncs from, which did
+--    not send it, and the store imports it. That takes a moment with a node
+--    that whitelists the store, and seconds with one that does not. The
+--    store also asks for it a few times ('Asking'), in case none does.
 --
--- 5. __Answer__ when the transaction is in the mempool, or when the node
---    said that it refused it, or after 'Limits'.@wait@ seconds.
---
--- 6. __Remember__ ('Outbox'): a transaction on its way, and one that was
---    refused, are kept for a while by the hash of their bytes. The same
---    bytes posted again join the first request, or get its answer, and are
---    not sent again.
---
--- A transaction that the store has in its mempool, unconfirmed, is
--- checked and sent again in the same way, and answered from what the node
--- did with it: there is no echo to wait for, as the store has it already.
--- The store does not hold its mempool to its node's, so it may list a
--- transaction that the nodes forgot: after a reorganisation, or when a
--- node lost its mempool. Posting it again is how a wallet gets it back to
--- them. Answering at once, as for a confirmed one, left the wallet with no
--- way out but a fee bump, which Bitcoin Cash does not have, until the
--- store dropped the transaction weeks later. It costs a node a
--- transaction it may have already, which it ignores.
+-- A transaction that the store has unconfirmed is checked and sent again in
+-- the same way. The store does not hold its mempool to its node's, so it
+-- may list a transaction that the nodes forgot: after a reorganisation, or
+-- when a node lost its mempool. Posting it again is how a wallet gets it
+-- back to them.
 --
 -- = Why it is this way
 --
+-- * __No waiting for the echo.__ Until 1.12.1 the request waited, up to
+--   @--publish-timeout@, for a node to announce the transaction back, and
+--   said what came of it. The wait was arbitrary, Bitcoin Core does not say
+--   when it refuses, and the store cannot see the network: a transaction
+--   that one node refuses may be taken by others. The client is told what
+--   the store knows, that it was handed over, and finds out the rest the
+--   way it finds out about any transaction.
+--
 -- * __A connection of its own.__ A node never announces a transaction to
---   the connection that gave it, and answers @notfound@ when asked for it
---   there until its timer for announcements has run. So on the connection
---   that sent it there is no telling what the node made of it. On any
---   other connection the store is a peer that does not have the
---   transaction, and hears of it by the ordinary relay, which every node
---   does. Bitcoin Core does the same for its own transactions when told
---   to broadcast them privately.
+--   the connection that gave it, and gives it back there only once it
+--   relayed it to another peer, or announced something else there. Sent on
+--   the connections that the store syncs from, a transaction did not come
+--   back to a store whose node had no other peer until a block confirmed
+--   it. On a connection of its own it comes back as any other.
 --
--- * __The transaction, not an announcement of it.__ A node waits two
---   seconds before asking a peer it did not choose for what it announced,
---   and does not ask at all for what it knows or has refused.
+-- * __Every peer.__ A peer that is sent a transaction it finds invalid may
+--   close its connections to the sender, and Bitcoin Cash Node closes them
+--   all. So the store sends a peer only what it verified, and checks the
+--   rules whose breach was measured to cost it its connections: the form of
+--   the input scripts and the tokens ("docs/publishing.md" has what was
+--   measured). A transaction that only breaks a rule of relay, such as one
+--   that pays too little, is refused by the nodes without harm.
 --
--- * __One node.__ What is sent to one node reaches the others if it is
---   good. Sending it to many spreads what is bad.
---
--- * __No breaker.__ A node that closes the courier on a transaction has
---   found it invalid, and may have closed the other connections from this
---   address too. That transaction is not sent again. The store does not
---   stop publishing the others: someone who posts forged transactions
---   would then keep everyone else from publishing, which is worse than
---   what it guards against. The store connects to its node again, and a
---   node that whitelists the store closes nothing.
---
--- The alternatives: sending through a node's RPC would make the store
--- need an account on a node, where it needs only to be a peer; the RPC is
--- an option, to ask before sending. Running scripts here would need an
--- interpreter of every script of both chains, held to the nodes rule for
--- rule; the store checks a signature where there is no script to run.
--- Giving the transaction to
--- half the peers and listening on the others needs two peers, and puts the
--- connections that the store syncs from at risk.
+-- * __The RPC first.__ A node that the store can ask says no with a reason,
+--   from Bitcoin Core too, and runs every script.
 --
 -- = What it cannot do
 --
--- Only a full node runs a script. A peer that is sent a transaction it
--- finds invalid may drop every connection of the sender, so the store
--- sends a peer only what it verified, and refuses a spend of a coin
--- that a script locks unless it has the RPC of a node to send it over. A node that
--- whitelists the store never does, and announces without delay, so a
--- store should be whitelisted by the nodes it is run next to. Bitcoin
--- Core does not say to a peer when it refuses a transaction: the client
--- learns it when the wait is over, unless the store asks over RPC.
+-- Only a full node runs a script. The store refuses a spend of a coin that
+-- a script locks unless it has the RPC of a node to send it over. It does
+-- not know whether the network took a transaction until it sees it: a
+-- client that wants to know watches for it, or posts it again.
 module Haskoin.Store.Web.Publish
   ( -- * Publishing
     Publishing (..),
-    Limits (..),
     Answer (..),
-    Verdict (..),
     Direct (..),
     Held (..),
     publish,
+
+    -- * The courier
+    Delivery (..),
+    Courier (..),
+    deliver,
+
+    -- * Asking for what was handed over
+    Asking,
+    newAsking,
+    askFor,
+    askLoop,
+    askAgain,
+    due,
 
     -- * What the store can check
     Coin (..),
     Refusal (..),
     Rules (..),
     judge,
+    tokenRules,
     isDust,
     maxStandardSize,
     coinOf,
     maxTxSize,
-
-    -- * What is on its way
-    Outbox,
-    Slot (..),
-    Ticket (..),
-    emptyOutbox,
-    enter,
-    settle,
-
-    -- * The courier
-    Delivery (..),
-    Courier (..),
-    deliver,
   )
 where
 
-import Control.Monad (unless, when)
+import Control.Monad (forM_, forever, unless, when)
+import Data.Bits (shiftL, (.&.), (.|.))
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
-import Data.Maybe (listToMaybe)
-import Data.Serialize (encode)
+import Data.List (partition)
+import Data.Maybe (isJust, listToMaybe)
+import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
-import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-import Data.Word (Word32, Word64)
+import Data.Word (Word32, Word64, Word8)
 import Haskoin
-  ( Hash256,
+  ( BlockHeight,
+    InputVerdict (..),
     Message (..),
     MessageCommand (..),
     Network (..),
@@ -172,16 +140,17 @@ import Haskoin
     Ping (..),
     Pong (..),
     Reject (..),
+    Script (..),
     Tx (..),
     TxHash,
-    BlockHeight,
-    InputVerdict (..),
     TxIn (..),
     TxOut (..),
     VarString (..),
-    doubleSHA256,
+    isMinimalPush,
+    isPushOp,
     nullOutPoint,
     sockToHostAddress,
+    splitTokenPrefix,
     txHash,
     txHashToHex,
   )
@@ -198,21 +167,19 @@ import Haskoin.Node
     wrapPeer,
   )
 import Haskoin.Node.Peer.Lock (Lock (..))
-import Haskoin.Store.Common (StoreEvent (..), StoreRead (..))
+import Haskoin.Store.Common (StoreRead (..))
 import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), isCoinbaseTx)
-import NQE (Publisher, newMailbox, receive, withPublisher, withSubscription)
+import NQE (newMailbox, receive, withPublisher, withSubscription)
 import Network.Socket (SockAddr (..))
 import System.Random (randomIO)
 import UnliftIO
-  ( STM,
-    TVar,
+  ( TVar,
     atomically,
+    mapConcurrently,
+    modifyTVar',
     newTVarIO,
-    onException,
     race,
-    readTVar,
     readTVarIO,
-    retrySTM,
     stateTVar,
     timeout,
     waitCatch,
@@ -220,38 +187,6 @@ import UnliftIO
     writeTVar,
   )
 import UnliftIO.Concurrent (threadDelay)
-
--- | How long to wait, and how much to remember.
-data Limits = Limits
-  { -- | seconds that a request waits for the transaction to come back
-    wait :: !NominalDiffTime,
-    -- | seconds that the courier may take to connect and hand over
-    handover :: !NominalDiffTime,
-    -- | nodes to try when one cannot be reached
-    tries :: !Int,
-    -- | transactions that the outbox holds; more are turned away
-    capacity :: !Int,
-    -- | seconds that an answer other than success is remembered
-    memory :: !NominalDiffTime
-  }
-  deriving (Eq, Show)
-
--- | What a full node, or the lack of one, made of a transaction.
-data Verdict
-  = -- | a node announced it back, or the store has it
-    Accepted
-  | -- | a node refused it and said why
-    Refused !Text
-  | -- | a node closed the connection on receiving it
-    Dropped
-  | -- | no node could be reached
-    Unreachable
-  | -- | a node took it and nothing came back in time
-    Silent
-  | -- | not sent: the store could not verify the signature of this input,
-    -- and had no node to give the transaction to over RPC
-    Unverified !Int
-  deriving (Eq, Show)
 
 -- | Whether the store has a transaction, and where.
 data Held
@@ -276,12 +211,22 @@ data Direct
 
 -- | The answer to a request to publish.
 data Answer
-  = -- | what came of handing it to a node
-    Verdict !Verdict
+  = -- | the store has it in a block: nothing was sent
+    InBlock
+  | -- | a full node took it over its RPC
+    ToNode
+  | -- | handed to this many peers
+    ToPeers !Int
+  | -- | a full node refused it over its RPC and said why, or every peer
+    -- that answered refused it
+    Refused !Text
   | -- | refused by the store, before anything was sent
     Invalid !Refusal
-  | -- | the outbox is full
-    Busy
+  | -- | not sent: the store could not verify the signature of this input,
+    -- and had no node to give the transaction to over RPC
+    Unverified !Int
+  | -- | not handed over: the store has no peer, or reached none
+    NoPeers
   deriving (Eq, Show)
 
 -- | An output that a transaction spends, as the store knows it.
@@ -317,6 +262,11 @@ data Refusal
   | TooHeavy !Int
   | Dust !Int
   | Forged !Int
+  | BadVersion !Word32
+  | NotPushOnly !Int
+  | NotMinimal !Int
+  | BadTokens !Int
+  | TokensUnbacked !String
   deriving (Eq)
 
 instance Show Refusal where
@@ -337,6 +287,11 @@ instance Show Refusal where
   show (TooHeavy n) = "The transaction is larger than nodes relay: " <> show n
   show (Dust i) = "Output " <> show i <> " is worth less than it costs to spend, and nodes do not relay it"
   show (Forged i) = "The signature of input " <> show i <> " does not verify"
+  show (BadVersion v) = "Nodes do not take a transaction of version " <> show v
+  show (NotPushOnly i) = "The script of input " <> show i <> " does more than push data"
+  show (NotMinimal i) = "The script of input " <> show i <> " pushes data in a longer form than it needs"
+  show (BadTokens i) = "The tokens of output " <> show i <> " are not written as tokens are"
+  show (TokensUnbacked c) = "The transaction gives tokens of category " <> c <> " that its inputs do not hold"
 
 showOutPoint :: OutPoint -> String
 showOutPoint o = cs (txHashToHex o.hash) <> ":" <> show o.index
@@ -386,6 +341,14 @@ data Rules = Rules
 --   output so small that spending it costs more than it holds ('isDust').
 --   These are rules of relay and not of the chain; they are the ones that
 --   have not changed in years.
+-- * __Input scripts__ only push data, each push in its shortest form. On
+--   Bitcoin Cash that is a rule of the chain, and a node drops every
+--   connection of a peer that sends a transaction that breaks it.
+-- * __The version__: 1 or 2 on Bitcoin Cash, a rule of the chain there; 1
+--   to 3 on Bitcoin, which nodes relay.
+-- * __Tokens__ of Bitcoin Cash ('tokenRules'): written as tokens are, and
+--   given only as the inputs hold them. A node drops every connection of a
+--   peer that sends a transaction that breaks them.
 -- * __Signatures__, where there is no script to run: an input that spends
 --   a coin locked to one key with a signature that does not verify
 --   ('judgeInputs' of haskoin-core). An input that is a script, or that
@@ -407,7 +370,10 @@ judge rules tx coins = do
   when (null tx.outputs) $ Left NoOutputs
   when (any ((== nullOutPoint) . (.outpoint)) tx.inputs) $ Left IsCoinbase
   mapM_ (Left . DuplicateInput) (firstDuplicate (map (.outpoint) tx.inputs))
+  unless (tx.version `elem` versions) $ Left (BadVersion tx.version)
+  mapM_ pushes (zip [0 ..] tx.inputs)
   spent <- mapM known (zip (map (.outpoint) tx.inputs) coins)
+  when cash $ tokenRules tx spent
   -- sums of 64-bit values: compared as integers, which do not wrap
   unless (sum (map (toInteger . (.value)) spent) >= sum (map (toInteger . (.value)) tx.outputs)) $ Left Overspent
   mapM_ mature (zip (map (.outpoint) tx.inputs) coins)
@@ -418,6 +384,20 @@ judge rules tx coins = do
   mapM_ (Left . Forged) (take 1 [i | (i, InputForged) <- verdicts])
   return (listToMaybe [i | (i, InputUndecided) <- verdicts])
   where
+    cash = isJust rules.net.sigHashForkId
+    -- Bitcoin Cash takes versions 1 and 2 only, by its rules since May
+    -- 2023; Bitcoin Core relays those and version 3
+    versions
+      | cash = [1, 2]
+      | otherwise = [1, 2, 3]
+    -- an input script that only pushes data, each push in its shortest
+    -- form: rules of Bitcoin Cash, relay rules of Bitcoin Core
+    pushes (i, input) = case decode input.script of
+      Right (Script ops)
+        | not (all isPushOp ops) -> Left (NotPushOnly i)
+        | not (all isMinimalPush ops) -> Left (NotMinimal i)
+        | otherwise -> Right ()
+      Left _ -> Left (NotPushOnly i)
     size = B.length (encode tx)
     -- what the limit of relay counts: weight with SegWit, bytes without
     heavy
@@ -501,81 +481,10 @@ coinOf q o =
     confirmed BlockRef {height} = Just height
     confirmed MemRef {} = Nothing
 
--- | A transaction of the outbox.
-data Slot
-  = -- | a request is publishing it
-    Flying
-  | -- | what came of it
-    Done !Verdict
-  deriving (Eq, Show)
-
--- | The transactions on their way and those that failed not long ago, by
--- the hash of their bytes.
---
--- The hash is of the bytes as posted, witness included. By the
--- transaction id, someone could post a transaction of another with its
--- witness spoiled, and have the good one answered as refused.
-data Outbox = Outbox
-  { slots :: !(HashMap Hash256 (UTCTime, Slot))
-  }
-  deriving (Eq, Show)
-
--- | An outbox with nothing on its way.
-emptyOutbox :: Outbox
-emptyOutbox = Outbox HashMap.empty
-
--- | What a request is told when it comes with a transaction.
-data Ticket
-  = -- | publish it: it has a slot now
-    Fresh
-  | -- | another request is publishing it: wait for that one
-    Joined
-  | -- | it failed not long ago, this way
-    Known !Verdict
-  | -- | no room
-    Full
-  deriving (Eq, Show)
-
--- | Come with a transaction. What is too old is forgotten first.
-enter :: Limits -> UTCTime -> Hash256 -> Outbox -> (Ticket, Outbox)
-enter limits now key old =
-  case HashMap.lookup key box.slots of
-    Just (_, Flying) -> (Joined, box)
-    Just (_, Done v) -> (Known v, box)
-    Nothing
-      | HashMap.size box.slots >= limits.capacity -> (Full, box)
-      | otherwise -> (Fresh, box {slots = HashMap.insert key (now, Flying) box.slots})
-  where
-    box = Outbox {slots = HashMap.filter kept old.slots}
-    -- a request that died without settling does not hold its slot for ever
-    kept (t, Flying) = diffUTCTime now t < limits.wait + 2 * limits.handover * fromIntegral limits.tries + 60
-    kept (t, Done _) = diffUTCTime now t < limits.memory
-
--- | Say what came of a transaction. Success and a node that could not be
--- reached are not remembered: the first is in the database, and the
--- second is worth trying again at once. They stay only long enough for
--- the requests that joined to read them ('enter' forgets them).
-settle :: UTCTime -> Hash256 -> Verdict -> Outbox -> Outbox
-settle now key v box =
-  box
-    { slots = HashMap.insert key (stamp, Done v) box.slots
-    }
-  where
-    stamp = case v of
-      Accepted -> long
-      Unreachable -> long
-      -- the node may answer over RPC the next time
-      Unverified _ -> long
-      _ -> now
-    -- older than any memory
-    long = addUTCTime (-1000000000) now
-
--- | What publishing needs. The courier and the nodes are functions, so
+-- | What publishing needs. The peers and the courier are functions, so
 -- that the rules can be tested without a network.
 data Publishing = Publishing
-  { limits :: !Limits,
-    outbox :: !(TVar Outbox),
-    -- | the chain as the store has it now
+  { -- | the chain as the store has it now
     rules :: !(IO Rules),
     -- | give the transaction to a full node over its RPC, where the store
     -- was given the RPC of one
@@ -585,17 +494,14 @@ data Publishing = Publishing
     holds :: !(TxHash -> IO Held),
     -- | the coin of an output, from the queries of the request ('coinOf')
     coin :: !(OutPoint -> IO Coin),
-    -- | whether the store has the transaction now, read anew: the queries
-    -- of a request see the database as it was when the request came
-    present :: !(TxHash -> IO Bool),
-    -- | what the store tells its clients
-    events :: !(Publisher StoreEvent),
-    -- | whether the store has a mempool to see the transaction come into
-    mempool :: !Bool,
-    -- | the nodes to hand a transaction to, the first first
-    nodes :: !(IO [SockAddr]),
-    -- | hand a transaction to a node
+    -- | the addresses of the peers that the store has now, that take
+    -- transactions
+    peers :: !(IO [SockAddr]),
+    -- | hand a transaction to a peer on a connection of its own ('deliver')
     courier :: !(SockAddr -> Tx -> IO Delivery),
+    -- | ask for a transaction that was handed over, after the answer: see
+    -- 'Asking'. It must not wait.
+    fetch :: !(TxHash -> IO ()),
     note :: !(LogLevel -> Text -> IO ())
   }
 
@@ -603,104 +509,204 @@ data Publishing = Publishing
 publish :: Publishing -> Tx -> IO Answer
 publish p tx =
   p.holds txid >>= \case
-    Confirmed -> return (Verdict Accepted)
-    held ->
+    Confirmed -> return InBlock
+    _ ->
       (judge <$> p.rules <*> pure tx <*> mapM (p.coin . (.outpoint)) tx.inputs) >>= \case
         Left r -> return (Invalid r)
-        Right unverified -> do
-          now <- getCurrentTime
-          atomically (stateTVar p.outbox (enter p.limits now key)) >>= \case
-            Full -> p.note LevelWarn "Outbox full: transaction turned away" >> return Busy
-            Joined -> Verdict <$> joined
-            -- sent already, and the node may only have been slow to announce
-            Known Silent -> Verdict <$> listening (return Silent)
-            Known v -> return (Verdict v)
-            Fresh -> do
-              let go
-                    | held == Pending = again unverified
-                    | otherwise = listening (send unverified)
-              v <- go `onException` done Unreachable
-              done v
-              say v
-              return (Verdict v)
+        Right unverified ->
+          p.direct tx >>= \case
+            Sent -> do
+              p.note LevelDebug ("A node took " <> name <> " over its RPC")
+              p.fetch txid
+              return ToNode
+            Declined why -> do
+              p.note LevelInfo ("A node refused " <> name <> ": " <> why)
+              return (Refused why)
+            Unavailable -> case unverified of
+              Just i -> do
+                p.note LevelInfo ("Not sent to a peer, input " <> T.pack (show i) <> " not verified: " <> name)
+                return (Unverified i)
+              Nothing -> do
+                addresses <- p.peers
+                delivered <- mapConcurrently (\a -> p.courier a tx) addresses
+                let handed = length [() | d <- delivered, d `elem` [Took, NoAnswer]]
+                    reasons = [why | Rejected why <- delivered]
+                if
+                  | handed > 0 -> do
+                      p.note LevelDebug ("Handed " <> name <> " to " <> T.pack (show handed) <> " peers")
+                      p.fetch txid
+                      return (ToPeers handed)
+                  | why : _ <- reasons -> do
+                      p.note LevelInfo ("Every peer refused " <> name <> ", the first: " <> why)
+                      return (Refused why)
+                  | Closed `elem` delivered -> do
+                      p.note LevelWarn ("A peer closed the connection on receiving " <> name)
+                      return (Refused "a peer closed the connection on receiving it")
+                  | otherwise -> do
+                      p.note LevelWarn ("No peer to hand " <> name <> " to")
+                      return NoPeers
   where
     txid = txHash tx
-    key = doubleSHA256 (encode tx)
     name = txHashToHex txid
-    done v = do
-      now <- getCurrentTime
-      atomically (stateTVar p.outbox (\b -> ((), settle now key v b)))
-    joined =
-      timeout (seconds (p.limits.wait + 2 * p.limits.handover)) (atomically (slotDone p.outbox key)) >>= \case
-        Just (Just v) -> return v
-        -- forgotten already: it was accepted, or no node was reached
-        Just Nothing -> (\has -> if has then Accepted else Unreachable) <$> p.present txid
-        Nothing -> return Silent
-    -- Listen before sending, so that the echo cannot come unheard, and
-    -- look again for the transaction once listening: it may have come
-    -- since the request read the database.
-    listening send =
-      withSubscription p.events $ \sub ->
-        p.present txid >>= \case
-          True -> return Accepted
-          False ->
-            send >>= \case
-              Silent
-                | not p.mempool -> return Accepted
-                | otherwise ->
-                    timeout (seconds p.limits.wait) (echo sub) >>= \case
-                      Just () -> return Accepted
-                      -- an event may have been missed, never a transaction
-                      Nothing -> (\has -> if has then Accepted else Silent) <$> p.present txid
-              v -> return v
-    -- The store has it in its mempool, so no echo will come: what the node
-    -- took is accepted.
-    again unverified =
-      send unverified >>= \case
-        Silent -> return Accepted
-        v -> return v
-    echo sub =
-      receive sub >>= \case
-        StoreMempoolNew h | h == txid -> return ()
-        _ -> echo sub
-    -- Over the RPC of a node if the store has one that answers: the node
-    -- checks everything, says why it refuses, and nothing it refuses
-    -- costs the store its connections. Else to a peer, and then only what
-    -- the store verified itself.
-    send unverified =
-      p.direct tx >>= \case
-        Sent -> return Silent
-        Declined why -> return (Refused why)
-        Unavailable -> maybe handOver (return . Unverified) unverified
-    -- 'Silent' here: the node has it, and has not said that it refused it
-    handOver = p.nodes >>= go . take p.limits.tries
-      where
-        go [] = return Unreachable
-        go (sa : more) =
-          p.courier sa tx >>= \case
-            Took -> return Silent
-            NoAnswer -> return Silent
-            Rejected why -> return (Refused why)
-            Closed -> return Dropped
-            NoConnection -> go more
-    say Accepted = p.note LevelDebug ("Published " <> name)
-    say (Refused why) = p.note LevelInfo ("A node refused " <> name <> ": " <> why)
-    say Dropped = p.note LevelWarn ("A node closed the connection on receiving " <> name)
-    say Unreachable = p.note LevelWarn ("No node to publish " <> name <> " to")
-    say (Unverified i) =
-      p.note LevelInfo ("Not sent to a peer, input " <> T.pack (show i) <> " not verified: " <> name)
-    say Silent = p.note LevelInfo ("No node announced " <> name <> " after taking it")
 
--- | Wait for a transaction that another request is publishing.
-slotDone :: TVar Outbox -> Hash256 -> STM (Maybe Verdict)
-slotDone var key =
-  HashMap.lookup key . (.slots) <$> readTVar var >>= \case
-    Just (_, Flying) -> retrySTM
-    Just (_, Done v) -> return (Just v)
-    Nothing -> return Nothing
+-- | The transactions that were handed over and that the store asks for
+-- until it has them, each with when to ask next and the delays after that
+-- ('askAgain').
+--
+-- The store asks its peers as if they had announced the transaction, so
+-- that it is requested and imported as any other. A peer gives it back
+-- once it would announce it: Bitcoin Cash Node in a second or two, Bitcoin
+-- Core once it has announced something to the store since it took the
+-- transaction, which on a busy network is a matter of seconds.
+--
+-- One thread of the web server asks ('askLoop'), and stops with it: a
+-- thread for each transaction could outlive the database that it reads.
+newtype Asking = Asking (TVar (HashMap TxHash (UTCTime, [NominalDiffTime])))
 
-seconds :: NominalDiffTime -> Int
-seconds t = max 0 (round (t * 1000000))
+-- | Nothing to ask for.
+newAsking :: IO Asking
+newAsking = Asking <$> newTVarIO HashMap.empty
+
+-- | The most transactions asked for at once. Past it a transaction is not
+-- asked for, and comes to the store when a peer announces it or a block
+-- confirms it.
+askingLimit :: Int
+askingLimit = 10000
+
+-- | Ask for a transaction from now on, on the schedule of 'askAgain'.
+askFor :: Asking -> TxHash -> IO ()
+askFor (Asking var) h = do
+  now <- getCurrentTime
+  atomically . modifyTVar' var $ \m -> case askAgain of
+    first : rest | HashMap.size m < askingLimit -> HashMap.insert h (addUTCTime first now, rest) m
+    _ -> m
+
+-- | The transactions whose time to be asked for has come, and what is left
+-- to ask for after them: each at its next delay, or no more after its last.
+due ::
+  UTCTime ->
+  HashMap TxHash (UTCTime, [NominalDiffTime]) ->
+  ([TxHash], HashMap TxHash (UTCTime, [NominalDiffTime]))
+due now m = ([h | (h, (t, _)) <- HashMap.toList m, t <= now], HashMap.mapMaybe next m)
+  where
+    next (t, ds)
+      | t > now = Just (t, ds)
+      | otherwise = case ds of
+          d : rest -> Just (addUTCTime d now, rest)
+          [] -> Nothing
+
+-- | Every second, ask for each transaction whose time has come, unless the
+-- store has it now. Runs until it is cancelled.
+askLoop :: Asking -> (TxHash -> IO Bool) -> (TxHash -> IO ()) -> IO ()
+askLoop (Asking var) present ask = forever $ do
+  threadDelay 1000000
+  now <- getCurrentTime
+  ready <- atomically (stateTVar var (due now))
+  forM_ ready $ \h ->
+    present h >>= \case
+      True -> atomically (modifyTVar' var (HashMap.delete h))
+      False -> ask h
+
+-- | When to ask for a transaction that was handed over: soon, for Bitcoin
+-- Cash Node, and then every 25 seconds for two minutes and a half. The
+-- delays are longer than the 20 seconds that the block store waits for a
+-- transaction that it requested before it asks again.
+askAgain :: [NominalDiffTime]
+askAgain = [2, 25, 25, 25, 25, 25, 25]
+
+-- | The tokens that an output holds: their category, a non-fungible token
+-- with its capability and commitment, and an amount of fungible ones.
+data Tokens = Tokens
+  { category :: !ByteString,
+    nft :: !(Maybe (Word8, ByteString)),
+    amount :: !Word64
+  }
+
+-- | The tokens at the front of the script of an output, if it has any, or
+-- 'Left' if they are not written as tokens are ('splitTokenPrefix').
+readTokens :: ByteString -> Either () (Maybe Tokens)
+readTokens script = case splitTokenPrefix script of
+  Nothing -> Left ()
+  Just (prefix, _)
+    | B.null prefix -> Right Nothing
+    | otherwise -> Right (Just (parse prefix))
+  where
+    -- the prefix is well formed: 'splitTokenPrefix' said so
+    parse prefix =
+      let flags = B.index prefix 33
+          rest0 = B.drop 34 prefix
+          (commitment, rest1)
+            | flags .&. 0x40 /= 0 = let (n, r) = compact rest0 in B.splitAt (fromIntegral n) r
+            | otherwise = (B.empty, rest0)
+          held
+            | flags .&. 0x10 /= 0 = fst (compact rest1)
+            | otherwise = 0
+       in Tokens
+            { category = B.take 32 (B.drop 1 prefix),
+              nft = if flags .&. 0x20 /= 0 then Just (flags .&. 0x0f, commitment) else Nothing,
+              amount = held
+            }
+    compact :: ByteString -> (Word64, ByteString)
+    compact b = case B.uncons b of
+      Just (w, r)
+        | w < 0xfd -> (fromIntegral w, r)
+        | w == 0xfd -> sized 2 r
+        | w == 0xfe -> sized 4 r
+        | otherwise -> sized 8 r
+      Nothing -> (0, B.empty)
+    sized :: Int -> ByteString -> (Word64, ByteString)
+    sized k r = (B.foldr (\w acc -> acc `shiftL` 8 .|. fromIntegral w) 0 (B.take k r), B.drop k r)
+
+-- | The rules of the tokens of Bitcoin Cash (CashTokens, since May 2023),
+-- given the outputs that the inputs spend, in order. A node drops every
+-- connection of a peer that sends it a transaction that breaks them, so
+-- the store checks them before it sends anything.
+--
+-- * The tokens of every output are written as tokens are.
+-- * A category is new when it is the id of a transaction whose first
+--   output an input spends: its tokens may be made at will.
+-- * Of any other category, the outputs hold no more fungible tokens than
+--   the inputs, and no more than the largest amount, in all.
+-- * And its non-fungible tokens come from the inputs: any, when an input
+--   holds one that can mint; else each output's equals one of an input
+--   that cannot be changed, or takes the place of one that can be changed,
+--   and none can mint.
+tokenRules :: Tx -> [TxOut] -> Either Refusal ()
+tokenRules tx spent = do
+  outs <- mapM readOut (zip [0 ..] tx.outputs)
+  let ins = [t | Right (Just t) <- map (readTokens . (.script)) spent]
+      made = [t | Just t <- outs]
+      new = [encode i.outpoint.hash | i <- tx.inputs, i.outpoint.index == 0]
+      categories = HashMap.keys (HashMap.fromList [(t.category, ()) | t <- made])
+  forM_ categories $ \c -> do
+    let given = [t | t <- made, t.category == c]
+        held = [t | t <- ins, t.category == c]
+        total = sum (map (toInteger . (.amount)) given)
+    when (total > 0x7fffffffffffffff) $ Left (TokensUnbacked (named c))
+    unless (c `elem` new) $ do
+      when (total > sum (map (toInteger . (.amount)) held)) $ Left (TokensUnbacked (named c))
+      unless (nftsBacked [n | Just n <- map (.nft) given] [n | Just n <- map (.nft) held]) $
+        Left (TokensUnbacked (named c))
+  where
+    readOut (i, o) = either (const (Left (BadTokens i))) Right (readTokens o.script)
+    -- the id of a category as people write it: the bytes reversed
+    named = concatMap hex . B.unpack . B.reverse
+    hex w = [digits !! fromIntegral (w `div` 16), digits !! fromIntegral (w `mod` 16)]
+    digits = "0123456789abcdef"
+    -- capabilities: 0 none, 1 mutable, 2 minting
+    nftsBacked given held
+      | any ((== 2) . fst) held = True
+      | any ((== 2) . fst) given = False
+      | otherwise =
+          let (fixed, changing) = partition ((== 0) . fst) given
+              left = foldl matched ([n | n <- held, fst n == 0], []) fixed
+              mutable = length (filter ((== 1) . fst) held)
+           in length (snd left) + length changing <= mutable
+    -- an immutable token given takes an equal one held, or waits for a
+    -- mutable one
+    matched (pool, unmatched) n = case break (== n) pool of
+      (before, _ : after) -> (before <> after, unmatched)
+      _ -> (pool, n : unmatched)
 
 -- | What a node did with a transaction handed to it.
 data Delivery
@@ -794,3 +800,6 @@ deliver c sa tx =
         (Nothing, Just (Right ())) -> Took
         (Nothing, Just (Left ())) -> if was then Closed else NoConnection
         (Nothing, Nothing) -> if was then NoAnswer else NoConnection
+
+seconds :: NominalDiffTime -> Int
+seconds t = max 0 (round (t * 1000000))
