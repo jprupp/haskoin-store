@@ -70,7 +70,7 @@ spec = do
         it "keeps the shared mempool as the rules say, step by step" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do
             keys <- fresh
-            foldM_ (pooled conn keys) (P.empty, Nothing, 0) (steps :: [PoolStep])
+            foldM_ (pooled conn keys) (P.empty, Nothing, 0, (Map.empty, Map.empty)) (steps :: [PoolStep])
       it "turns away an offer that was checked against another tip" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
@@ -82,7 +82,7 @@ spec = do
         -- the tip does not move to a block that the stores do not agree on
         fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just nothing) [] `shouldReturn` Raced
         fleetReport conn keys Nothing 60000 "a" [block 2, block 1] [block 1] `shouldReturn` True
-        let confirms = nothing {confirmed = [block 7], spent = [out 0 0]}
+        let confirms = nothing {confirmed = [block 7], spent = [out 0 0 <> block 7 <> encode (2 :: Word32)]}
         fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) [] `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
@@ -102,7 +102,7 @@ spec = do
         -- a block confirms the third, which is not an event of the mempool,
         -- and the tip moves through two blocks
         fleetReport conn keys Nothing 60000 "a" [block 3, block 2, block 1] [block 1] `shouldReturn` True
-        let confirms = nothing {confirmed = [block 9], spent = [out 0 1]}
+        let confirms = nothing {confirmed = [block 9], spent = [out 0 1 <> block 9 <> encode (3 :: Word32)]}
         fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 3) (Just confirms) [block 2, block 3]
           `shouldReturn` MovedTo (block 3)
         heard <- map snd <$> fleetEventsAfter conn keys start 10
@@ -239,9 +239,9 @@ spec = do
         fleetMove conn keys (Just now) seen `shouldReturn` expected
         same conn keys now model'
         return (model', now)
-    nothing = PoolChange {returned = [], gone = [], confirmed = [], spent = []}
+    nothing = PoolChange {returned = [], gone = [], confirmed = [], spent = [], height = Nothing, lost = []}
     -- carry a step of the pool out in Redis and in the model, and compare
-    pooled conn keys (model, tip, n) = \case
+    pooled conn keys (model, tip, n, kept) = \case
       Give t inputs replaced -> do
         -- a transaction spends from those of lower numbers only, as none
         -- can spend from one that spends from it
@@ -255,30 +255,73 @@ spec = do
         got <- poolOffer conn keys 4 tip (txOf t (map fst outs)) (map snd outs) (map block replaced)
         sorted got `shouldBe` sorted expected
         samePool conn keys model'
-        return (model', tip, n)
+        return (model', tip, n, kept)
       Take ts -> do
         let model' = P.withdraw (map block ts) model
         left <- poolWithdraw conn keys 4 (map block ts)
         Set.fromList left `shouldBe` Map.keysSet model.spends `Set.difference` Map.keysSet model'.spends
         samePool conn keys model'
-        return (model', tip, n)
+        return (model', tip, n, kept)
       Go back dead done used -> do
-        -- one store, which reports a block that no step has had
+        -- one store, which reports a block that no step has had, 700
+        -- blocks above the last, so that what was replaced is forgotten
+        -- three steps later
         let target = block (1000 + n)
+            height = 700 * (n + 1)
             returned' = [(block t, [out a i | (a, i) <- nubOrd ins, a < t]) | (t, ins) <- back]
-            change = P.Change returned' (map block dead) (map block done) [out a i | (a, i) <- used]
+            -- what spends each output in the blocks, one of the
+            -- transactions of the tests, so that it may come back later
+            labelled = [(out a i, block ((a * 7 + i * 3 + n) `mod` 12) <> encode height) | (a, i) <- used]
+            change = P.Change returned' (map block dead) (map block done) (map fst labelled)
+            -- the store names those of the abandoned blocks that it has as
+            -- replaced: here one of those that are gone, by a transaction
+            -- that the blocks may confirm now, later or never
+            lost = [(block t, block w, block w <> encode height) | t <- take 1 dead, let w = (t * 5 + n) `mod` 12]
             sent =
               PoolChange
                 [txOf (number t) os | (t, os) <- returned']
                 change.gone
                 change.confirmed
-                change.spent
+                [o <> w | (o, w) <- labelled]
+                (Just height)
+                [t <> w | (t, _, w) <- lost]
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
         fleetAdvance conn keys 4 (Just 0) tip target (Just sent) [] `shouldReturn` MovedTo target
-        let model' = P.advance maker change model
+        let (records, waiting) = kept
+            (model', replaced, waiting') = P.advanceReplacing maker change (`lookup` labelled) lost waiting model
+            -- what a transaction that comes back had replaced is forgotten
+            -- first, then the new, then what is 2016 blocks old
+            back' = Set.fromList (map fst returned')
+            unwon = Map.filter (\w -> not (Set.member (B.take 4 w) back')) records
+            records' = Map.filter fresh (foldl' (\m (t, w) -> Map.insert t w m) unwon replaced)
+            waiting'' = Map.filter (fresh . snd) waiting'
+            fresh w = height < 2016 || either (const False) (> height - 2016) (decode (B.drop 4 w))
         samePool conn keys model'
-        return (model', Just target, n + 1)
+        sameReplaced conn keys records' waiting''
+        return (model', Just target, n + 1, (records', waiting''))
     maker = B.take 4
+    -- what is kept of replaced transactions, with its two indices
+    sameReplaced conn keys expected waiting = do
+      let key k = keys.prefix <> k
+          list :: Redis.Redis (Either Redis.Reply a) -> IO a
+          list = fmap (either (error . show) id) . Redis.runRedis conn
+      waits <- list (Redis.hgetall (key "pool:lost"))
+      Map.fromList waits `shouldBe` Map.map snd waiting
+      forM_ (Map.toList waiting) $ \(t, (by, _)) ->
+        list (Redis.sismember (key ("pool:lostby:" <> by)) t) `shouldReturn` True
+      byWinner <- list (Redis.keys (key "pool:lostby:*"))
+      Set.fromList byWinner `shouldBe` Set.fromList [key ("pool:lostby:" <> by) | (by, _) <- Map.elems waiting]
+      lostAt <- list (Redis.zcard (key "pool:lostat"))
+      lostAt `shouldBe` fromIntegral (Map.size waiting)
+      kept <- list (Redis.hgetall (key "pool:rep"))
+      Map.fromList kept `shouldBe` expected
+      at <- list (Redis.zrangeWithscores (key "pool:repat") 0 (-1))
+      let heightOf w = either (const (-1)) fromIntegral (decode (B.drop 4 w) :: Either String Word32)
+      Map.fromList at `shouldBe` Map.map heightOf expected
+      forM_ (Map.toList expected) $ \(t, w) ->
+        list (Redis.sismember (key ("pool:repby:" <> B.take 4 w)) t) `shouldReturn` True
+      bys <- list (Redis.keys (key "pool:repby:*"))
+      Set.fromList bys `shouldBe` Set.fromList [key ("pool:repby:" <> B.take 4 w) | w <- Map.elems expected]
     sorted = \case
       Conflict rivals -> Conflict (sort rivals)
       other -> other

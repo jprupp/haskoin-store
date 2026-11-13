@@ -91,6 +91,11 @@ module Haskoin.Store.Database.Writer
     insertMempoolAddr,
     deleteMempoolAddr,
     getMempoolAddr,
+
+    -- * Transactions that blocks replaced
+    insertReplaced,
+    deleteReplaced,
+    getReplacedAt,
   )
 where
 
@@ -125,6 +130,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (Logger)
+import Haskoin.Store.Common (Replaced (..))
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
@@ -197,6 +203,10 @@ type MemSpenderTable = H.BasicHashTable OutPoint (Maybe Spender)
 -- | Changed entries of the mempool by address: 'Nothing' for a deletion.
 type MemAddrTable = H.BasicHashTable MemAddrKey (Maybe MemAddrVal)
 
+-- | Changed records of transactions that blocks replaced: 'Nothing' for a
+-- deletion.
+type ReplacedTable = H.BasicHashTable TxHash (Maybe Replaced)
+
 -- | Changes made in a batch, not yet written to the database.
 data Memory = Memory
   { -- | network constants
@@ -230,7 +240,9 @@ data Memory = Memory
     -- | inputs of blocks that spend outputs, by group of outputs
     -- as t'SpenderKey' says, each group as the batch leaves it: empty for one
     -- that has no spent output left
-    spenderTable :: !SpenderTable
+    spenderTable :: !SpenderTable,
+    -- | what is kept of transactions that blocks replaced
+    replacedTable :: !ReplacedTable
   }
 
 -- | Set the best block.
@@ -388,7 +400,8 @@ hashMapOps db Memory {..} =
         memTxOps db memTxTable,
         memSpenderOps db memSpenderTable,
         memAddrOps db memAddrTable,
-        spenderOps db spenderTable
+        spenderOps db spenderTable,
+        replacedOps db replacedTable
       ]
 
 -- | Operation for the change of the best block, if any.
@@ -405,6 +418,23 @@ blockHashOps db t = map (uncurry f) <$> (H.toList t)
   where
     f k (Just d) = insertOpCF (blockCF db) (BlockKey k) d
     f k Nothing = deleteOpCF (blockCF db) (BlockKey k)
+
+-- | Operations for changed records of replaced transactions: the record,
+-- and its entry at the height of its block. A record that is deleted, or
+-- kept again at another height, takes its old entry with it.
+replacedOps :: DB -> ReplacedTable -> IO [BatchOp]
+replacedOps db t = concat <$> (H.toList t >>= mapM f)
+  where
+    f (h, new) = do
+      old <- retrieveCF db (blockCF db) (ReplacedKey h) :: IO (Maybe Replaced)
+      let forget =
+            [ deleteOpCF (heightCF db) (ReplacedAtKey o.height h)
+            | Just o <- [old],
+              fmap (.height) new /= Just o.height
+            ]
+      return . (forget <>) $ case new of
+        Just r -> [insertOpCF (blockCF db) (ReplacedKey h) r, insertOpCF (heightCF db) (ReplacedAtKey r.height h) ()]
+        Nothing -> [deleteOpCF (blockCF db) (ReplacedKey h)]
 
 -- | Operations for changed block heights.
 blockHeightOps :: DB -> HeightTable -> IO [BatchOp]
@@ -627,6 +657,25 @@ getChainSpenders w h outputs = do
       kept = IntMap.filterWithKey (\i _ -> (fromIntegral i `div` spenderGroup) `notElem` replaced) stored
   return (IntMap.unions (kept : map snd changed))
 
+-- | Keep what a block replaced.
+insertReplaced :: Writer -> TxHash -> Replaced -> IO ()
+insertReplaced w h r = H.insert w.memory.replacedTable h (Just r)
+
+-- | Forget what was kept of a replaced transaction.
+deleteReplaced :: Writer -> TxHash -> IO ()
+deleteReplaced w h = H.insert w.memory.replacedTable h Nothing
+
+-- | The transactions that the block at a height replaced, with the changes
+-- of the batch applied.
+getReplacedAt :: Writer -> BlockHeight -> IO [TxHash]
+getReplacedAt w height = do
+  stored <- Q.getReplacedAt w.reader height
+  changes <- H.toList w.memory.replacedTable
+  let changed = HashMap.fromList changes
+      kept = filter (not . (`HashMap.member` changed)) stored
+      added = [h | (h, Just r) <- changes, r.height == height]
+  return (kept <> added)
+
 -- | The mempool in the database with the changes of this batch applied,
 -- newest first.
 getMempool :: Writer -> IO [(UnixTime, TxHash)]
@@ -657,6 +706,7 @@ newMemory net ctx = do
   memSpenderTable <- liftIO H.new
   memAddrTable <- liftIO H.new
   spenderTable <- liftIO H.new
+  replacedTable <- liftIO H.new
   return Memory {..}
 
 -- | Read the best block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.

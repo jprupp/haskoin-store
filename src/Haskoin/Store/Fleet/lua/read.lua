@@ -34,6 +34,9 @@
 -- the newest, an id and a time for each.
 --
 -- 'ids': some bytes. The transactions whose id starts with them.
+--
+-- 'replaced': transactions. For each, the transaction of a block that
+-- replaced it and the height of the block in four bytes, or ''.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local osize = tsize + 4
 if (redis.call('GET', prefix .. 'fleet:tip') or '') ~= ARGV[4] then
@@ -167,6 +170,10 @@ elseif what == 'ids' then
     '[' .. ARGV[5], '(' .. ARGV[5] .. string.rep(string.char(255), tsize))
   for _, t in ipairs(found) do
     answer[#answer + 1] = t
+  end
+elseif what == 'replaced' then
+  for i = 5, #ARGV do
+    answer[#answer + 1] = redis.call('HGET', prefix .. 'pool:rep', ARGV[i]) or ''
   end
 end
 return answer

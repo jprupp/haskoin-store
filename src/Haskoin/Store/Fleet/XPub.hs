@@ -212,7 +212,8 @@ nothingPool =
       bodies = return . map (const (Nothing, IntMap.empty)),
       spenders = return . map (const Nothing),
       page = \_ _ -> return [],
-      startingWith = \_ -> return []
+      startingWith = \_ -> return [],
+      replaced = \_ -> return Nothing
     }
 
 -------------------------------------------------------------------------------

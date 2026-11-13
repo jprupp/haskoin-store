@@ -26,11 +26,25 @@
 --
 -- 'advance': the tip that the store saw or '', the block to move to, the
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
--- bytes, '1' to empty the pool instead of changing it or '0', the
--- transactions that are gone, those that are confirmed, the outputs that
--- are spent, the number of transactions that come back, those
--- transactions, and the blocks that the tip moves through, oldest first,
--- or ''. Returns {'moved'}, {'stays'} or {'raced'}.
+-- bytes, '1' to empty the pool instead of changing it or '0', the height of
+-- the block to move to or '', the transactions that are gone, those that
+-- are confirmed, the outputs that are spent, each followed by the
+-- transaction of the block that spends it and the height of that block in
+-- four bytes, big-endian, the transactions of the abandoned blocks that the
+-- store has as replaced, each followed in the same way, the number of
+-- transactions that come back, those transactions, and the blocks that the
+-- tip moves through, oldest first, or ''. Returns {'moved'}, {'stays'} or
+-- {'raced'}.
+--
+-- What the new blocks replaced is kept: each transaction of the pool that
+-- leaves because it, or an ancestor, spent an output that a transaction of
+-- the blocks spends, with that transaction and the height of its block.
+-- A transaction of the abandoned blocks that the store names as replaced
+-- waits until a move confirms the transaction that replaced it, and is
+-- kept then. What is kept is forgotten when the transaction that replaced
+-- it comes back from an abandoned block; it, and what waits, are forgotten
+-- 2016 blocks after their height, by the height of the block that the tip
+-- moves to. Haskoin.Store.Fleet.Pool.advanceReplacing says the same.
 --
 -- The pool is emptied instead of changed in two cases. With '1' the store
 -- cannot say what the blocks between the two tips did, because it does
@@ -91,6 +105,12 @@ local key = {
   aval = prefix .. 'pool:aval:',
   aspent = prefix .. 'pool:aspent:',
   asum = prefix .. 'pool:asum:',
+  rep = prefix .. 'pool:rep',
+  repby = prefix .. 'pool:repby:',
+  repat = prefix .. 'pool:repat',
+  lostval = prefix .. 'pool:lost',
+  lostby = prefix .. 'pool:lostby:',
+  lostat = prefix .. 'pool:lostat',
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:'
 }
@@ -319,6 +339,30 @@ if what == 'withdraw' then
   return withdraw(split(ARGV[4], tsize))
 end
 
+-- forget that these transactions were replaced
+local function unreplaced(ts)
+  for _, t in ipairs(ts) do
+    local value = redis.call('HGET', key.rep, t)
+    if value then
+      redis.call('SREM', key.repby .. string.sub(value, 1, tsize), t)
+      redis.call('HDEL', key.rep, t)
+      redis.call('ZREM', key.repat, t)
+    end
+  end
+end
+
+-- keep that a transaction was replaced: by a transaction, which comes
+-- first in the value, at a height, which follows in four bytes. What was
+-- kept of it before goes, with its place among what its winner replaced.
+local function replaced(t, value)
+  local by, h = string.sub(value, 1, tsize), string.sub(value, tsize + 1, tsize + 4)
+  local b1, b2, b3, b4 = string.byte(h, 1, 4)
+  unreplaced({t})
+  redis.call('HSET', key.rep, t, value)
+  redis.call('SADD', key.repby .. by, t)
+  redis.call('ZADD', key.repat, ((b1 * 256 + b2) * 256 + b3) * 256 + b4, t)
+end
+
 local tip = redis.call('GET', key.tip) or ''
 if tip ~= ARGV[4] then
   return {'raced'}
@@ -432,11 +476,13 @@ if ARGV[8] == '1' or ARGV[8] == '2' then
 end
 
 -- the abandoned blocks: what can come back does, and what spends the rest
--- leaves
-local at = 13
-for _ = 1, tonumber(ARGV[12]) do
+-- leaves. What a transaction that comes back replaced is not replaced any
+-- more.
+local at = 15
+for _ = 1, tonumber(ARGV[14]) do
   local tx
   tx, at = read(at)
+  unreplaced(redis.call('SMEMBERS', key.repby .. tx.id))
   if not member(tx.id) then
     -- it was confirmed: what spends the same in the pool gives way
     local rivals = {}
@@ -450,8 +496,21 @@ for _ = 1, tonumber(ARGV[12]) do
     insert(tx)
   end
 end
+-- what the store has as replaced of the abandoned blocks waits for the
+-- transaction that replaced it
+for _, item in ipairs(split(ARGV[13], 2 * tsize + 4)) do
+  local t, value = string.sub(item, 1, tsize), string.sub(item, tsize + 1)
+  local old = redis.call('HGET', key.lostval, t)
+  if old then
+    redis.call('SREM', key.lostby .. string.sub(old, 1, tsize), t)
+  end
+  local b1, b2, b3, b4 = string.byte(string.sub(value, tsize + 1, tsize + 4), 1, 4)
+  redis.call('HSET', key.lostval, t, value)
+  redis.call('SADD', key.lostby .. string.sub(value, 1, tsize), t)
+  redis.call('ZADD', key.lostat, ((b1 * 256 + b2) * 256 + b3) * 256 + b4, t)
+end
 local orphaned = {}
-for _, t in ipairs(split(ARGV[9], tsize)) do
+for _, t in ipairs(split(ARGV[10], tsize)) do
   for _, kid in ipairs(redis.call('SMEMBERS', key.kids .. t)) do
     orphaned[#orphaned + 1] = kid
   end
@@ -459,18 +518,38 @@ end
 withdraw(orphaned)
 
 -- the new blocks: what they confirm leaves alone, and what spends what they
--- spend leaves with all that spends it
-for _, t in ipairs(split(ARGV[10], tsize)) do
+-- spend leaves with all that spends it, and is kept as replaced
+for _, t in ipairs(split(ARGV[11], tsize)) do
   remove(t, true)
 end
-local clashing = {}
-for _, o in ipairs(split(ARGV[11], osize)) do
-  local s = redis.call('HGET', key.spender, o)
+-- what waited for a transaction that they confirm was replaced
+for _, t in ipairs(split(ARGV[11], tsize)) do
+  for _, waiting in ipairs(redis.call('SMEMBERS', key.lostby .. t)) do
+    replaced(waiting, redis.call('HGET', key.lostval, waiting))
+    redis.call('HDEL', key.lostval, waiting)
+    redis.call('ZREM', key.lostat, waiting)
+  end
+  redis.call('DEL', key.lostby .. t)
+end
+for _, item in ipairs(split(ARGV[12], osize + tsize + 4)) do
+  local s = redis.call('HGET', key.spender, string.sub(item, 1, osize))
   if s then
-    clashing[#clashing + 1] = s
+    for _, t in ipairs(withdraw({s})) do
+      replaced(t, string.sub(item, osize + 1))
+    end
   end
 end
-withdraw(clashing)
+-- forget what was replaced, or waits, 2016 blocks before the block of the
+-- tip
+if ARGV[9] ~= '' and tonumber(ARGV[9]) >= 2016 then
+  local limit = tonumber(ARGV[9]) - 2016
+  unreplaced(redis.call('ZRANGEBYSCORE', key.repat, '-inf', limit))
+  for _, t in ipairs(redis.call('ZRANGEBYSCORE', key.lostat, '-inf', limit)) do
+    redis.call('SREM', key.lostby .. string.sub(redis.call('HGET', key.lostval, t), 1, tsize), t)
+    redis.call('HDEL', key.lostval, t)
+    redis.call('ZREM', key.lostat, t)
+  end
+end
 
 redis.call('SET', key.tip, target)
 redis.call('INCR', key.moves)

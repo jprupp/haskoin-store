@@ -88,6 +88,8 @@ module Haskoin.Store.Database.Types
     MemSummary (..),
     MemDeletedKey (..),
     MigrationKey (..),
+    ReplacedKey (..),
+    ReplacedAtKey (..),
     SpenderKey (..),
     SpenderVal (..),
     spenderGroup,
@@ -127,6 +129,7 @@ import Data.Serialize
     getWord32be,
     getWord64be,
     getWord8,
+    putWord32be,
     putWord64be,
     putWord8,
     runGet,
@@ -146,6 +149,7 @@ import Haskoin
     scriptToAddressBS,
   )
 import Haskoin.Crypto
+import Haskoin.Store.Common (Replaced)
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData,
@@ -641,6 +645,49 @@ instance Serialize MigrationKey where
 instance Key MigrationKey
 
 instance KeyValue MigrationKey Word32
+
+-- | Key of what is kept of a mempool transaction that a block replaced
+-- ('Replaced'), in the @block@ column family, since haskoin-store 1.13.0.
+-- It is part of the chain: written and deleted only by the import and the
+-- revert of blocks.
+data ReplacedKey = ReplacedKey !TxHash
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize ReplacedKey where
+  -- 0x11 · TxHash
+  put (ReplacedKey h) = putWord8 0x11 >> put h
+  get = do
+    guard . (== 0x11) =<< getWord8
+    ReplacedKey <$> get
+
+instance Key ReplacedKey
+
+instance KeyValue ReplacedKey Replaced
+
+-- | The transactions replaced by the block at a height, in the @height@
+-- column family, which the revert of the block forgets, and which are
+-- forgotten 'Haskoin.Store.Common.replacedKept' blocks later. The height comes first, written
+-- big-endian, so that a scan of one height finds them all. The column
+-- family has no prefix extractor, which a scan by five bytes needs.
+data ReplacedAtKey
+  = -- | a transaction replaced at a height
+    ReplacedAtKey !BlockHeight !TxHash
+  | -- | short key that matches the transactions replaced at a height
+    ReplacedAtKeyH !BlockHeight
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize ReplacedAtKey where
+  -- 0x12 · height · TxHash
+  put (ReplacedAtKey h t) = put (ReplacedAtKeyH h) >> put t
+  -- 0x12 · height
+  put (ReplacedAtKeyH h) = putWord8 0x12 >> putWord32be h
+  get = do
+    guard . (== 0x12) =<< getWord8
+    ReplacedAtKey <$> getWord32be <*> get
+
+instance Key ReplacedAtKey
+
+instance KeyValue ReplacedAtKey ()
 
 -- | Key of the inputs of blocks that spend some outputs of a transaction,
 -- in the @spender@ column family, since database version 22: the

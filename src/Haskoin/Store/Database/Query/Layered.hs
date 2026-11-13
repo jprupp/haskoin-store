@@ -260,7 +260,8 @@ layeredRead v@(View r) =
       xPubUnspents = \_ -> xPubUnspents v,
       xPubTxs = \_ -> xPubTxs v,
       xPubTxCount = \_ -> xPubTxCount v,
-      getAddressesTxCount = getAddressesTxCount v
+      getAddressesTxCount = getAddressesTxCount v,
+      getReplaced = Q.getReplaced r
     }
 
 -- | The queries of a database as a t'StoreRead', each on a view of its
@@ -295,7 +296,8 @@ standaloneRead r =
       xPubUnspents = \x bs l -> one (\q -> q.xPubUnspents x bs l),
       xPubTxs = \x bs l -> one (\q -> q.xPubTxs x bs l),
       xPubTxCount = \x bs -> one (\q -> q.xPubTxCount x bs),
-      getAddressesTxCount = \as -> one (\q -> q.getAddressesTxCount as)
+      getAddressesTxCount = \as -> one (\q -> q.getAddressesTxCount as),
+      getReplaced = \h -> one (\q -> q.getReplaced h)
     }
   where
     one :: (StoreRead -> IO a) -> IO a

@@ -31,6 +31,8 @@ module Haskoin.Store.Common
     Start (..),
     StoreRead (..),
     StoreEvent (..),
+    Replaced (..),
+    replacedKept,
     getActiveBlock,
     getActiveTxData,
     notDeleted,
@@ -84,7 +86,8 @@ import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
-import Data.Serialize (encode)
+import Data.Serialize (Serialize (..), encode)
+import GHC.Generics (Generic)
 import Data.Time.Clock.System
   ( getSystemTime,
     systemNanoseconds,
@@ -228,8 +231,47 @@ data StoreRead = StoreRead
     xPubTxCount :: XPubSpec -> [XPubBal] -> IO Word32,
     -- | number of distinct transactions of a set of addresses, counted
     -- without reading them
-    getAddressesTxCount :: [Address] -> IO Word32
+    getAddressesTxCount :: [Address] -> IO Word32,
+    -- | what is kept of a transaction that a block of the main chain
+    -- replaced, if it did in the last 'replacedKept' blocks
+    getReplaced :: TxHash -> IO (Maybe Replaced)
   }
+
+-- | What the store keeps of a mempool transaction that a block replaced:
+-- the block confirmed a transaction that spends an output that it spent,
+-- or that one of its unconfirmed ancestors spent.
+--
+-- The store keeps nothing else of a transaction that leaves the mempool
+-- unconfirmed, and a wallet that asked for it got a 404, as for a
+-- transaction that never was: it could not tell a payment that lost to
+-- another from one that it mistyped. With this it is told which
+-- transaction won, and in which block.
+--
+-- A store keeps it with the chain: written when the block is imported and
+-- deleted when it is reverted, for 'replacedKept' blocks. That depends on
+-- the mempool that the block found as well, which is each store's own, so
+-- the stores of a fleet answer from what the shared pool keeps instead
+-- ("Haskoin.Store.Fleet.Pool".'Haskoin.Store.Fleet.Pool.advanceReplacing'),
+-- which is the same for all of them.
+data Replaced = Replaced
+  { -- | the transaction of the block that spends what it, or an ancestor,
+    -- spent
+    by :: !TxHash,
+    -- | the height of the block
+    height :: !BlockHeight
+  }
+  deriving (Eq, Show, Generic)
+
+instance Serialize Replaced where
+  put r = put r.by >> put r.height
+  get = Replaced <$> get <*> get
+
+-- | Blocks for which a 'Replaced' is kept: 2016, two weeks of blocks of ten
+-- minutes, as long as a mempool keeps a transaction by default
+-- (@--mempool-timeout@). A wallet that has not looked for two weeks finds
+-- the transaction unknown.
+replacedKept :: BlockHeight
+replacedKept = 2016
 
 -- | Data of a block, or 'Nothing' if it is unknown or not in the main chain.
 getActiveBlock :: StoreRead -> BlockHash -> IO (Maybe BlockData)

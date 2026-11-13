@@ -4,7 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
-## [Unreleased]
+## [1.13.0] - 2026-11-13
+
+Transactions are handed over at once, a payment that a block replaced is
+answered 410, and what a reorganisation puts back stays in the mempool.
+
+### Added
+- **A transaction that a block replaced is answered 410, Gone**, at
+  `/transaction/:txid` and its raw form, with the transaction of the block
+  that won (`replaced-by`) and its height, for 2016 blocks. It was 404, as
+  for a transaction that never was, and a payment that a reorganisation
+  replaced simply vanished. A store keeps it with the block and deletes it
+  with its revert. The stores of a fleet keep it in the shared pool, as
+  the fleet tip moves past the block, and answer from that alike: a
+  store's own record depends on its own mempool. A transaction replaced in
+  the mempool is still 404. The client of haskoin-store-data reports the
+  410 as an error it does not know, until that package learns it.
 
 ### Changed
 - **`POST /transactions` answers 202, "handed over", at once.** The store

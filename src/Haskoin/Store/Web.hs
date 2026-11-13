@@ -239,6 +239,7 @@ import Network.HTTP.Types
     status400,
     status404,
     status409,
+    status410,
     status413,
     status500,
     status503,
@@ -301,6 +302,7 @@ import UnliftIO
     catch,
     catchAny,
     checkSTM,
+    Exception,
     fromException,
     handleAny,
     link,
@@ -866,9 +868,46 @@ guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
       | Just Next <- fromException e = throwIO Next
       | Just TipMoved <- fromException e = throwIO TipMoved
       | Just x <- fromException e = errorResponse st x
+      | Just g <- fromException e = goneResponse st g
       | otherwise = do
           logError st.config.logger $ fmtReq req.wai <> ": " <> cs (show e)
           errorResponse st ServerError
+
+-- | A transaction that a block replaced ('Replaced'), asked for by its id:
+-- answered 410, Gone, with the transaction that replaced it and the height
+-- of its block, where one that never was is 404.
+--
+-- The errors of the API are those of haskoin-store-data, whose client
+-- reads them. This one is not among them yet, so it is answered here, in
+-- the same form: the client takes it for an error it does not know.
+data Gone = Gone !TxHash !Replaced
+  deriving (Show)
+
+instance Exception Gone
+
+-- | The answer to 'Gone', counted with the errors of clients.
+goneResponse :: WebState -> Gone -> IO Response
+goneResponse st (Gone txid r) = do
+  forM_ st.metrics $ \m -> incrementCounter m.clientErrors 1
+  return . responseLBS status410 [(hContentType, "application/json")] . A.encode $
+    A.object
+      [ "error" .= ("replaced" :: Text),
+        "message"
+          .= T.unwords
+            [ "Transaction",
+              txHashToHex txid,
+              "was replaced by",
+              txHashToHex r.by,
+              "in the block at height",
+              T.pack (show r.height)
+            ],
+        "replaced-by" .= r.by,
+        "height" .= r.height
+      ]
+
+-- | Not found: 'Gone' if a block replaced the transaction, else 404.
+notFoundTx :: WebState -> TxHash -> IO a
+notFoundTx st txid = st.query.getReplaced txid >>= maybe (raise st ThingNotFound) (throwIO . Gone txid)
 
 -- | What a store that is a member of a fleet answers when it has no view of
 -- the block that the fleet answers from: 503, so that a load balancer sends
@@ -1437,7 +1476,7 @@ handleBlockMTPRaw st (GetBlockMTPRaw (TimeParam t)) =
 handleTx :: WebState -> GetTx -> IO Transaction
 handleTx st (GetTx txid) =
   withMetrics st (.tx) $
-    C.getTransaction st.query txid >>= maybe (raise st ThingNotFound) return
+    C.getTransaction st.query txid >>= maybe (notFoundTx st txid) return
 
 -- | Handler for @GET \/transactions?txids=…@: several transactions.
 handleTxs ::
@@ -1457,7 +1496,7 @@ handleTxRaw st (GetTxRaw txid) =
   withMetrics st (.txRaw) $
     C.getTransaction st.query txid
       >>= \case
-        Nothing -> raise st ThingNotFound
+        Nothing -> notFoundTx st txid
         Just tx -> return $ RawResult (transactionData tx)
 
 -- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized.
