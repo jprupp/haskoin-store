@@ -15,7 +15,7 @@
 --
 -- 'runWeb' serves the endpoints described in "Haskoin.Store.WebCommon" and a
 -- set of endpoints compatible with the Blockchain.info API under
--- @\/blockchain\/@. Responses are JSON, pretty-printed with @?pretty=true@.
+-- @\/blockchain\/@. Responses are JSON.
 -- New blocks and mempool transactions are streamed at @\/events@, as lines
 -- of JSON or over a WebSocket.
 --
@@ -113,23 +113,19 @@ import Control.Monad.Trans (lift)
 import Data.Aeson
   ( Encoding,
     ToJSON (..),
-    Value,
     (.=),
   )
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson qualified as A
-import Data.Aeson.Encode.Pretty
-  ( Config (..),
-    defConfig,
-    encodePretty',
-  )
 import Data.Aeson.Encoding
   ( encodingToLazyByteString,
+    fromEncoding,
     list,
+    unsafeToEncoding,
   )
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
-import Data.ByteString.Builder (lazyByteString)
+import Data.ByteString.Builder (Builder, lazyByteString)
 import Data.ByteString.Char8 qualified as C
 import Data.ByteString.Lazy qualified as L
 import Data.Bytes.Get
@@ -137,21 +133,19 @@ import Data.Bytes.Put
 import Data.Bytes.Serial
 import Data.Char (isSpace)
 import Data.Default (Default (..))
-import Data.Function ((&))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
-import Data.Foldable qualified
 import Data.Int (Int64)
 import Data.List qualified
-import Data.Maybe qualified
 import Data.List (nub)
 import Data.Maybe
   ( catMaybes,
     fromJust,
     fromMaybe,
     isJust,
+    listToMaybe,
     mapMaybe,
     maybeToList,
   )
@@ -220,6 +214,7 @@ import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
+import Haskoin.Store.Web.Pieces (around, hexOf, listPieces, pieced, piecesResponse)
 import Haskoin.Store.Web.Publish qualified as Publish
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.WebCommon
@@ -230,7 +225,8 @@ import NQE
     unsubscribe,
   )
 import Network.HTTP.Types
-  ( Status (..),
+  ( ResponseHeaders,
+    Status (..),
     hContentType,
     methodGet,
     methodPost,
@@ -311,6 +307,7 @@ import UnliftIO
     newIORef,
     newTQueueIO,
     newTVarIO,
+    onException,
     race_,
     readIORef,
     readTQueue,
@@ -624,14 +621,6 @@ withMetrics st df go =
     stop m t1 = do
       t2 <- time
       addTiming (df m) (t2 - t1)
-
--- | Encoding of a response.
-data SerialAs
-  = -- | compact JSON
-    SerialAsJSON
-  | -- | indented JSON, for @?pretty=true@
-    SerialAsPrettyJSON
-  deriving (Eq, Show)
 
 -------------------
 -- Path Handlers --
@@ -1047,24 +1036,28 @@ handlePaths st cfg =
     pathHealth st,
     plainList ["limit", "offset"] (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
     marshalledList ["blocks", "notx"] (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
-    plain [] (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
-    plain [] (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st),
+    pieces (.blockRaw) [] (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
+    pieces (.blockRaw) [] (\_ -> return GetBlockBestRaw) (handleBlockBestRaw st),
     marshalledList ["notx"] (\r -> GetBlockLatest <$> dflt r) (handleBlockLatest st),
     marshalledList ["heights", "notx"] (\r -> GetBlockHeights <$> need r <*> dflt r) (handleBlockHeights st),
-    plain [] (\r -> GetBlockHeightRaw <$> cap r) (handleBlockHeightRaw st),
-    plain [] (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
-    plain [] (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
+    pieces (.blockRaw) [] (\r -> GetBlockHeightRaw <$> cap r) (handleBlockHeightRaw st),
+    pieces (.blockRaw) [] (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
+    pieces (.blockRaw) [] (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
     marshalledList ["txids"] (\r -> GetTxs <$> need r) (handleTxs st),
     plain ["txids"] (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
-    marshalledList [] (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
-    plain [] (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
+    marshalledPieces (.txBlock) [] (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
+    pieces (.txBlockRaw) [] (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
     plain [] (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
     plainList ("addresses" : limits) (\r -> GetAddrsTxs <$> need r <*> lim r) (handleAddrsTxs st),
-    marshalledList limits (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
-    marshalledList ("addresses" : limits) (\r -> GetAddrsTxsFull <$> need r <*> lim r) (handleAddrsTxsFull st),
+    marshalledPieces (.addressTxFull) limits (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
+    marshalledPieces
+      (.addressTxFull)
+      ("addresses" : limits)
+      (\r -> GetAddrsTxsFull <$> need r <*> lim r)
+      (handleAddrsTxsFull st),
     marshalledList ["addresses"] (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
     marshalledList ("addresses" : limits) (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
-    get "/events" ("pretty" : "after" : eventParams) (handleEvents st),
+    get "/events" ("after" : eventParams) (handleEvents st),
     get "/dbstats" [] (handleDbStats st),
     -- the reference of the API, as a page and as the file that it shows
     get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage),
@@ -1100,19 +1093,31 @@ handlePaths st cfg =
     -- network, as a list of those, or in plain JSON
     marshalled ::
       (ApiResource a b, MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
-    marshalled ps p h = pathCompact st ps p h (marshalEncoding net) (marshalValue net)
+    marshalled ps p h = pathCompact ps p h (marshalEncoding net)
     marshalledList ::
       (ApiResource a (SerialList b), MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
     marshalledList ps p h =
-      pathCompact
-        st
-        ps
-        p
-        (fmap SerialList . h)
-        (list (marshalEncoding net) . (.get))
-        (toJSONList . map (marshalValue net) . (.get))
+      pathCompact ps p (fmap SerialList . h) (list (marshalEncoding net) . (.get))
+    -- routes of what is answered while it is read: a list of items in
+    -- the JSON of the network, or pieces that the handler made
+    marshalledPieces ::
+      (ApiResource a (SerialList b), MarshalJSON Network b) =>
+      (WebMetrics -> StatTiming) ->
+      [Text] ->
+      (Req -> IO a) ->
+      (a -> IO [IO [b]]) ->
+      Route
+    marshalledPieces df ps p h = pieces df ps p (listPieces (marshalEncoding net) <=< h)
+    pieces ::
+      (ApiResource a b) =>
+      (WebMetrics -> StatTiming) ->
+      [Text] ->
+      (Req -> IO a) ->
+      (a -> IO [IO Builder]) ->
+      Route
+    pieces = pathPieces st
     plain :: (ApiResource a b, ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
-    plain ps p h = pathCompact st ps p h toEncoding toJSON
+    plain ps p h = pathCompact ps p h toEncoding
     plainList ::
       (ApiResource a (SerialList b), ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
     plainList ps p h = plain ps p (fmap SerialList . h)
@@ -1122,7 +1127,8 @@ handlePaths st cfg =
           ("derive" : "nocache" : limits)
           (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r)
           (handleXPubTxs st),
-        marshalledList
+        marshalledPieces
+          (.xpubTxFull)
           ("derive" : "nocache" : limits)
           (\r -> GetXPubTxsFull <$> cap r <*> dflt r <*> lim r <*> dflt r)
           (handleXPubTxsFull st),
@@ -1186,43 +1192,50 @@ jsonOnly h req = do
     json "json" = Just ()
     json _ = Nothing
 
--- | Register a handler for an API resource, with compact JSON by default.
-pathCompact ::
-  (ApiResource a b) =>
-  WebState ->
-  [Text] ->
-  (Req -> IO a) ->
-  (a -> IO b) ->
-  (b -> Encoding) ->
-  (b -> Value) ->
-  Route
-pathCompact st ps parser action encJson encValue =
-  pathCommon st ps parser action (const status200) encJson encValue False
-
 -- | The route of an API resource: parse the request, run the handler, and
--- encode the response as JSON. It accepts the parameters given, and
--- @pretty@.
-pathCommon ::
-  (ApiResource a b) =>
-  WebState ->
-  [Text] ->
-  (Req -> IO a) ->
-  (a -> IO b) ->
-  (b -> Status) ->
-  (b -> Encoding) ->
-  (b -> Value) ->
-  Bool ->
-  Route
-pathCommon _ ps parser action status encJson encValue pretty =
-  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ("pretty" : ps) $ \req -> do
-    proto <- serialAs req pretty
+-- encode the response as JSON.
+pathCompact :: (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> (b -> Encoding) -> Route
+pathCompact ps parser action encJson =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req -> do
     res <- action =<< parser req
-    return $
-      responseLBS (status res) [(hContentType, "application/json")] (protoSerial proto encJson encValue res)
+    return $ responseLBS status200 jsonType (encodingToLazyByteString (encJson res))
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
     proxy = toProxy parser
+
+-- | The route of an API resource that is answered while it is read, as
+-- "Haskoin.Store.Web.Pieces" explains: the handler gives the bytes of the
+-- response in pieces.
+pathPieces ::
+  (ApiResource a b) =>
+  WebState ->
+  (WebMetrics -> StatTiming) ->
+  [Text] ->
+  (Req -> IO a) ->
+  (a -> IO [IO Builder]) ->
+  Route
+pathPieces st df ps parser action =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req ->
+    inPieces st df jsonType (action =<< parser req)
+  where
+    toProxy :: (Req -> IO a) -> Proxy a
+    toProxy = const Proxy
+    proxy = toProxy parser
+
+-- | A response in pieces, timed. The timing counts the whole response, the
+-- time that the client takes to read it included.
+inPieces :: WebState -> (WebMetrics -> StatTiming) -> ResponseHeaders -> IO [IO Builder] -> IO Response
+inPieces st df headers pieces = do
+  began <- now
+  let done = forM_ st.metrics $ \m -> now >>= \ended -> addTiming (df m) (ended - began)
+  (pieces >>= piecesResponse headers done) `onException` done
+  where
+    now = round . (* 1000) <$> getPOSIXTime :: IO Int
+
+-- | The headers of a response in JSON.
+jsonType :: ResponseHeaders
+jsonType = [(hContentType, "application/json")]
 
 -- | Respond with JSON.
 streamEncoding :: Encoding -> IO Response
@@ -1235,24 +1248,6 @@ textResponse :: TL.Text -> IO Response
 textResponse t =
   return $
     responseLBS status200 [(hContentType, "text/plain; charset=utf-8")] (TL.encodeUtf8 t)
-
--- | Encode a response in JSON or pretty JSON.
-protoSerial ::
-  SerialAs ->
-  (a -> Encoding) ->
-  (a -> Value) ->
-  a ->
-  L.ByteString
-protoSerial SerialAsJSON f _ = encodingToLazyByteString . f
-protoSerial SerialAsPrettyJSON _ g =
-  encodePretty' defConfig {confTrailingNewline = True} . g
-
--- | The encoding that a request asks for: JSON, pretty if the @pretty@
--- parameter or the default says so.
-serialAs :: Req -> Bool -> IO SerialAs
-serialAs req pretty = do
-  p <- paramOr req readBool "pretty" pretty
-  return $ if p then SerialAsPrettyJSON else SerialAsJSON
 
 -- GET Block / GET Blocks --
 
@@ -1294,27 +1289,33 @@ pruneTx True BlockData {..} = BlockData {txs = take 1 txs, ..}
 -- GET BlockRaw --
 
 -- | Handler for @GET \/block\/:block\/raw@: a block by hash, serialized as in the peer-to-peer protocol.
-handleBlockRaw ::
-  WebState ->
-  GetBlockRaw ->
-  IO (RawResult H.Block)
-handleBlockRaw st (GetBlockRaw h) =
-  withMetrics st (.blockRaw) $
-    RawResult <$> getRawBlock st h
+handleBlockRaw :: WebState -> GetBlockRaw -> IO [IO Builder]
+handleBlockRaw st (GetBlockRaw h) = rawResult <$> getRawBlock st h
 
--- | Block by hash with all its transactions. Responds with an error if not found.
-getRawBlock ::
-  WebState ->
-  H.BlockHash ->
-  IO H.Block
+-- | The pieces of a block by hash, serialized, in hexadecimal. Responds
+-- with an error if not found.
+getRawBlock :: WebState -> H.BlockHash -> IO [IO Builder]
 getRawBlock st h =
-  st.query.getBlock h >>= maybe (raise st ThingNotFound) return >>= toRawBlock st.query
+  st.query.getBlock h >>= maybe (raise st ThingNotFound) (return . rawBlock st.query)
 
--- | Rebuild a block from its data and its transactions.
-toRawBlock :: StoreRead -> BlockData -> IO H.Block
-toRawBlock q b = do
-  txs <- map transactionData . catMaybes <$> C.getTransactions q b.txs
-  return H.Block {header = b.header, txs}
+-- | The pieces of a block serialized as in the peer-to-peer protocol, in
+-- hexadecimal: its header and the number of its transactions, then its
+-- transactions as they are read. The first piece has transactions too, so
+-- that a response does not begin before something of them was read.
+rawBlock :: StoreRead -> BlockData -> [IO Builder]
+rawBlock q b =
+  around (hexOf b.header <> hexOf (VarInt (fromIntegral (length b.txs)))) mempty $
+    pieced pieceSize (fmap (foldMap (hexOf . transactionData) . catMaybes) . C.getTransactions q) b.txs
+
+-- | The pieces of the JSON of a 'RawResult', from those of the hexadecimal.
+rawResult :: [IO Builder] -> [IO Builder]
+rawResult = around "{\"result\":\"" "\"}"
+
+-- | The pieces of the JSON of a 'RawResultList', from those of the
+-- hexadecimal of each of its items.
+rawResultList :: [[IO Builder]] -> [IO Builder]
+rawResultList items =
+  around "[" "]" (concat [around (comma <> "\"") "\"" item | (comma, item) <- zip ("" : repeat ",") items])
 
 -- GET BlockBest / BlockBestRaw --
 
@@ -1328,15 +1329,11 @@ handleBlockBest st (GetBlockBest (NoTx notx)) =
     (bestBlock st.query) >>= maybe (raise st ThingNotFound) (return . pruneTx notx)
 
 -- | Handler for @GET \/block\/best\/raw@: the best block, serialized.
-handleBlockBestRaw ::
-  WebState ->
-  GetBlockBestRaw ->
-  IO (RawResult H.Block)
+handleBlockBestRaw :: WebState -> GetBlockBestRaw -> IO [IO Builder]
 handleBlockBestRaw st _ =
-  withMetrics st (.blockRaw) $
-    st.query.getBestBlock >>= \case
-      Nothing -> raise st ThingNotFound
-      Just h -> RawResult <$> getRawBlock st h
+  st.query.getBestBlock >>= \case
+    Nothing -> raise st ThingNotFound
+    Just h -> rawResult <$> getRawBlock st h
 
 -- GET BlockLatest --
 
@@ -1378,14 +1375,10 @@ handleBlockHeights st (GetBlockHeights (HeightsParam heights) (NoTx notx)) =
       >>= (\hs -> getBlocks st hs notx) . concat
 
 -- | Handler for @GET \/block\/height\/:height\/raw@: the blocks at a height, serialized.
-handleBlockHeightRaw ::
-  WebState ->
-  GetBlockHeightRaw ->
-  IO (RawResultList H.Block)
+handleBlockHeightRaw :: WebState -> GetBlockHeightRaw -> IO [IO Builder]
 handleBlockHeightRaw st (GetBlockHeightRaw h) =
-  withMetrics st (.blockRaw) $
-    fmap RawResultList $
-      mapM (getRawBlock st) =<< st.query.getBlocksAtHeight (fromIntegral h)
+  fmap rawResultList $
+    mapM (getRawBlock st) =<< st.query.getBlocksAtHeight (fromIntegral h)
 
 -- GET BlockTime / BlockTimeRaw --
 
@@ -1414,29 +1407,19 @@ handleBlockMTP st (GetBlockMTP (TimeParam t) (NoTx notx)) =
       Just b -> return $ pruneTx notx b
 
 -- | Handler for @GET \/block\/time\/:time\/raw@: the last block with a timestamp at or before a time, serialized.
-handleBlockTimeRaw ::
-  WebState ->
-  GetBlockTimeRaw ->
-  IO (RawResult H.Block)
+handleBlockTimeRaw :: WebState -> GetBlockTimeRaw -> IO [IO Builder]
 handleBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
-  withMetrics st (.blockRaw) $ do
-    let ch = st.config.store.chain
-    C.blockAtOrBefore st.query ch t >>= \case
-      Nothing -> raise st ThingNotFound
-      Just b -> RawResult <$> (toRawBlock st.query b)
+  C.blockAtOrBefore st.query st.config.store.chain t >>= \case
+    Nothing -> raise st ThingNotFound
+    Just b -> return (rawResult (rawBlock st.query b))
 
 -- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time
 -- past at or after a time, serialized.
-handleBlockMTPRaw ::
-  WebState ->
-  GetBlockMTPRaw ->
-  IO (RawResult H.Block)
+handleBlockMTPRaw :: WebState -> GetBlockMTPRaw -> IO [IO Builder]
 handleBlockMTPRaw st (GetBlockMTPRaw (TimeParam t)) =
-  withMetrics st (.blockRaw) $ do
-    let ch = st.config.store.chain
-    C.blockAtOrAfterMTP st.query ch t >>= \case
-      Nothing -> raise st ThingNotFound
-      Just b -> RawResult <$> (toRawBlock st.query b)
+  C.blockAtOrAfterMTP st.query st.config.store.chain t >>= \case
+    Nothing -> raise st ThingNotFound
+    Just b -> return (rawResult (rawBlock st.query b))
 
 -- GET Transactions --
 
@@ -1477,32 +1460,21 @@ handleTxsRaw st (GetTxsRaw txids) =
     RawResultList . map transactionData . catMaybes
       <$> C.getTransactions st.query (nub txids)
 
--- | Transactions of a block. Responds with an error if not found.
-getTxsBlock ::
-  WebState ->
-  H.BlockHash ->
-  IO [Transaction]
-getTxsBlock st h =
-  st.query.getBlock h >>= \case
-    Nothing -> raise st ThingNotFound
-    Just b -> catMaybes <$> C.getTransactions st.query b.txs
+-- | The hashes of the transactions of a block. Responds with an error if
+-- not found.
+getTxsBlock :: WebState -> H.BlockHash -> IO [TxHash]
+getTxsBlock st h = st.query.getBlock h >>= maybe (raise st ThingNotFound) (return . (.txs))
 
--- | Handler for @GET \/transactions\/block\/:block@: the transactions of a block.
-handleTxsBlock ::
-  WebState ->
-  GetTxsBlock ->
-  IO [Transaction]
-handleTxsBlock st (GetTxsBlock h) =
-  withMetrics st (.txBlock) $ getTxsBlock st h
+-- | Handler for @GET \/transactions\/block\/:block@: the transactions of a block, in pieces.
+handleTxsBlock :: WebState -> GetTxsBlock -> IO [IO [Transaction]]
+handleTxsBlock st (GetTxsBlock h) = transactionPieces st.query <$> getTxsBlock st h
 
--- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized.
-handleTxsBlockRaw ::
-  WebState ->
-  GetTxsBlockRaw ->
-  IO (RawResultList Tx)
+-- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized, in pieces.
+handleTxsBlockRaw :: WebState -> GetTxsBlockRaw -> IO [IO Builder]
 handleTxsBlockRaw st (GetTxsBlockRaw h) =
-  withMetrics st (.txBlockRaw) $
-    RawResultList . map transactionData <$> getTxsBlock st h
+  listPieces hex . transactionPieces st.query =<< getTxsBlock st h
+  where
+    hex t = unsafeToEncoding ("\"" <> hexOf (transactionData t) <> "\"")
 
 -- GET TransactionAfterHeight --
 
@@ -1784,7 +1756,6 @@ webSocketEvents s =
 -- @after@ takes up from an event ('eventsStart').
 handleEvents :: WebState -> Req -> IO Response
 handleEvents st req = do
-  proto <- serialAs req False
   let asked name = lookup name req.params
   (start, watch) <- eventsOpen st asked >>= either (raise st) return
   return . responseStream status200 [(hContentType, "application/json")] $ \write flush' ->
@@ -1796,15 +1767,11 @@ handleEvents st req = do
             Just entries -> do
               forM_ entries $ \e -> do
                 wanted <- atomically (stateTVar watch (relevant own.ctx st.query.maxGap e.seen))
-                when wanted (write (serial proto e.event))
+                when wanted (write (serial e.event))
               send (from + fromIntegral (length entries))
      in withGaugeIncrease st (.events) (send start)
   where
-    serial proto e =
-      lazyByteString $
-        protoSerial proto toEncoding toJSON e <> newLine proto
-    newLine SerialAsJSON = "\n"
-    newLine SerialAsPrettyJSON = mempty
+    serial e = fromEncoding (toEncoding e) <> "\n"
     own = st.config.store
 
 -- | Where a client of the events starts reading the log, and what it hears
@@ -1944,25 +1911,40 @@ handleAddrsTxs st (GetAddrsTxs addrs pLimits) =
   withMetrics st (.addressTx) $
     st.query.getAddressesTxs addrs =<< paramToLimits st False pLimits
 
--- | Handler for @GET \/address\/:address\/transactions\/full@: full transactions of an address.
+-- | Handler for @GET \/address\/:address\/transactions\/full@: full transactions of an address, in the pieces
+-- of 'pathPieces'. Which transactions they are is read at once; their
+-- bodies are read piece by piece.
 handleAddrTxsFull ::
   WebState ->
   GetAddrTxsFull ->
-  IO [Transaction]
-handleAddrTxsFull st (GetAddrTxsFull addr pLimits) =
-  withMetrics st (.addressTxFull) $ do
-    txs <- st.query.getAddressTxs addr =<< paramToLimits st True pLimits
-    catMaybes <$> C.getTransactions st.query (map (.txid) txs)
+  IO [IO [Transaction]]
+handleAddrTxsFull st (GetAddrTxsFull addr pLimits) = do
+  txs <- st.query.getAddressTxs addr =<< paramToLimits st True pLimits
+  return (transactionPieces st.query (map (.txid) txs))
 
--- | Handler for @GET \/address\/transactions\/full?addresses=…@: full transactions of several addresses.
+-- | Handler for @GET \/address\/transactions\/full?addresses=…@: full transactions of several addresses, in
+-- the pieces of 'pathPieces'.
 handleAddrsTxsFull ::
   WebState ->
   GetAddrsTxsFull ->
-  IO [Transaction]
-handleAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) =
-  withMetrics st (.addressTxFull) $ do
-    txs <- st.query.getAddressesTxs addrs =<< paramToLimits st True pLimits
-    catMaybes <$> C.getTransactions st.query (map (.txid) txs)
+  IO [IO [Transaction]]
+handleAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) = do
+  txs <- st.query.getAddressesTxs addrs =<< paramToLimits st True pLimits
+  return (transactionPieces st.query (map (.txid) txs))
+
+-- | Transactions by their hashes, in pieces of 'pieceSize' that are each
+-- read with one multi-get. The hashes are those that the database gave,
+-- of a block or of addresses, so the transactions are there; one that is
+-- gone by the time its piece is read is left out, as it is when the list
+-- is read at once.
+transactionPieces :: StoreRead -> [TxHash] -> [IO [Transaction]]
+transactionPieces q = pieced pieceSize (fmap catMaybes . C.getTransactions q)
+
+-- | Transactions in a piece of a list answered piece by piece. With 20 the
+-- first byte leaves a millisecond or two sooner and with 500 some ten
+-- later; the time of the whole response is the same with all three.
+pieceSize :: Int
+pieceSize = 100
 
 -- | Handler for @GET \/address\/:address\/balance@: balance of an address.
 handleAddrBalance :: WebState -> GetAddrBalance -> IO Balance
@@ -2089,16 +2071,11 @@ handleXPubTxs st (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
   withMetrics st (.xpubTx) $
     getXPubTxs st xpub deriv plimits nocache
 
--- | Handler for @GET \/xpub\/:xpub\/transactions\/full@: full transactions of an extended public key.
-handleXPubTxsFull ::
-  WebState ->
-  GetXPubTxsFull ->
-  IO [Transaction]
+-- | Handler for @GET \/xpub\/:xpub\/transactions\/full@: full transactions of an extended public key, in pieces.
+handleXPubTxsFull :: WebState -> GetXPubTxsFull -> IO [IO [Transaction]]
 handleXPubTxsFull st (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
-  withMetrics st (.xpubTxFull) $
-    fmap catMaybes $
-      C.getTransactions (cacheOr nocache st).query . map (.txid)
-        =<< getXPubTxs st xpub deriv plimits nocache
+  transactionPieces (cacheOr nocache st).query . map (.txid)
+    <$> getXPubTxs st xpub deriv plimits nocache
 
 -- | Handler for @GET \/xpub\/:xpub\/balances@: balances of the used addresses of an extended public key.
 handleXPubBalances ::
@@ -2983,25 +2960,69 @@ getBinfoHex req = paramOr req format "format" False
     format "json" = Just False
     format _ = Nothing
 
--- | Handler for @GET \/blockchain\/block-height\/:height@: the blocks at a height, as Blockchain.info.
+-- | Handler for @GET \/blockchain\/block-height\/:height@: the blocks at a height, as Blockchain.info, in
+-- pieces.
 handleBinfoBlockHeight :: WebState -> Req -> IO Response
 handleBinfoBlockHeight st req =
-  withMetrics st (.binfoBlockHeight) $ do
+  inPieces st (.binfoBlockHeight) binfoType $ do
     numtxid <- getNumTxId req
     height <- captureWith req readNum "height"
     bs <- fmap catMaybes $ st.query.getBlocksAtHeight height >>= mapM (st.query.getBlock)
-    ns <- fmap catMaybes $ st.query.getBlocksAtHeight (height + 1) >>= mapM (st.query.getBlock)
-    is <- mapM (get_binfo_blocks numtxid ns) bs
-    let net = st.config.store.net
-    let ctx = st.config.store.ctx
-    streamEncoding $ marshalEncoding (net, ctx) is
+    blocks <- mapM (binfoBlockPieces st numtxid) bs
+    return . around "{\"blocks\":[" "]}" $
+      concat [around comma mempty block | (comma, block) <- zip ("" : repeat ",") blocks]
+
+-- | The pieces of a block as Blockchain.info, with its transactions as
+-- they are read.
+--
+-- The block is encoded without its transactions, which are the last thing
+-- in it, and they are put where the empty list was. Should the encoding of
+-- haskoin-store-data come to end another way, the block is read and
+-- encoded whole, as it was before.
+binfoBlockPieces :: WebState -> Bool -> BlockData -> IO [IO Builder]
+binfoBlockPieces st numtxid b = do
+  nhs <- fmap catMaybes $ st.query.getBlocksAtHeight (b.height + 1) >>= mapM (st.query.getBlock)
+  let h x = H.headerHash x.header
+      nxt = [h n | n <- nhs, n.header.prev == h b]
+      own = (net, ctx)
+      txs = transactionPieces st.query b.txs
+      -- as 'toBinfoBlock' makes it, with the number of the transactions
+      -- that are not in it yet
+      bare =
+        BinfoBlock
+          { hash = h b,
+            version = b.header.version,
+            prev = b.header.prev,
+            merkle = b.header.merkle,
+            timestamp = b.header.timestamp,
+            bits = b.header.bits,
+            next = nxt,
+            fee = b.fee,
+            nonce = b.header.nonce,
+            ntx = fromIntegral (length b.txs),
+            size = b.size,
+            index = b.height,
+            main = b.main,
+            height = b.height,
+            weight = b.weight,
+            txs = []
+          }
+      bytes = encodingToLazyByteString (marshalEncoding own bare)
+      (before, after) = L.splitAt (L.length bytes - 3) bytes
+  if after == "[]}"
+    then
+      around (lazyByteString before) "}"
+        <$> listPieces (marshalEncoding own . toBinfoTxSimple numtxid) txs
+    else do
+      whole <- map (toBinfoTxSimple numtxid) . concat <$> sequence txs
+      return [return (fromEncoding (marshalEncoding own (toBinfoBlock b whole nxt)))]
   where
-    get_binfo_blocks numtxid ns b = do
-      txs <- catMaybes <$> C.getTransactions st.query b.txs
-      let h x = H.headerHash x.header
-          nbs = [h n | n <- ns, n.header.prev == h b]
-          bts = map (toBinfoTxSimple numtxid) txs
-      return $ toBinfoBlock b bts nbs
+    net = st.config.store.net
+    ctx = st.config.store.ctx
+
+-- | The headers of a response in JSON of the Blockchain.info endpoints.
+binfoType :: ResponseHeaders
+binfoType = [(hContentType, "application/json; charset=utf-8")]
 
 -- | Handler for @GET \/blockchain\/latestblock@: the best block, as Blockchain.info.
 handleBinfoLatest :: WebState -> Req -> IO Response
@@ -3019,35 +3040,20 @@ handleBinfoLatest st req =
             txids = map (encodeBinfoTxId numtxid) b.txs
           }
 
--- | Handler for @GET \/blockchain\/rawblock\/:block@: a block with its transactions, as Blockchain.info.
+-- | Handler for @GET \/blockchain\/rawblock\/:block@: a block with its transactions, as Blockchain.info, in
+-- pieces.
 handleBinfoBlock :: WebState -> Req -> IO Response
-handleBinfoBlock st req =
-  withMetrics st (.binfoBlockRaw) $ do
-    numtxid <- getNumTxId req
-    hex <- getBinfoHex req
-    captureWith req parseBinfoBlockId "block" >>= \case
-      BinfoBlockHash bh -> go numtxid hex bh
-      BinfoBlockIndex i ->
-        st.query.getBlocksAtHeight i >>= \case
-          [] -> raise st ThingNotFound
-          bh : _ -> go numtxid hex bh
-  where
-    go numtxid hex bh = do
-      b <- maybe (raise st ThingNotFound) return =<< st.query.getBlock bh
-      txs <- catMaybes <$> C.getTransactions st.query b.txs
-      nhs <- fmap catMaybes $ st.query.getBlocksAtHeight (b.height + 1) >>= mapM (st.query.getBlock)
-      let h x = H.headerHash x.header
-          nxt = [h n | n <- nhs, n.header.prev == h b]
-      if hex
-        then do
-          let x = H.Block b.header (map transactionData txs)
-          textResponse . encodeHexLazy . runPutL $ serialize x
-        else do
-          let bts = map (toBinfoTxSimple numtxid) txs
-              y = toBinfoBlock b bts nxt
-          let net = st.config.store.net
-          let ctx = st.config.store.ctx
-          streamEncoding $ marshalEncoding (net, ctx) y
+handleBinfoBlock st req = do
+  numtxid <- getNumTxId req
+  hex <- getBinfoHex req
+  let kind = if hex then [(hContentType, "text/plain; charset=utf-8")] else binfoType
+  inPieces st (.binfoBlockRaw) kind $ do
+    bh <-
+      captureWith req parseBinfoBlockId "block" >>= \case
+        BinfoBlockHash bh -> return bh
+        BinfoBlockIndex i -> st.query.getBlocksAtHeight i >>= maybe (raise st ThingNotFound) return . listToMaybe
+    b <- maybe (raise st ThingNotFound) return =<< st.query.getBlock bh
+    if hex then return (rawBlock st.query b) else binfoBlockPieces st numtxid b
 
 -- | Transaction by hash or short number. Fails with 'TxIndexConflict' if a short number matches several.
 getBinfoTx ::
@@ -3356,15 +3362,14 @@ getPeersInformation mgr =
 -- store fit to serve".
 pathHealth :: WebState -> Route
 pathHealth st =
-  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ["pretty"] $ \req -> do
-    proto <- serialAs req False
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) [] $ \_ -> do
     h <- handleHealth st GetHealth
     let (status, extra)
           | not (isOK h) = (status503, [("Retry-After", "5")])
           | h.redis == Just False = (status203, [("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
-      responseLBS status ((hContentType, "application/json") : extra) (protoSerial proto toEncoding toJSON h)
+      responseLBS status ((hContentType, "application/json") : extra) (encodingToLazyByteString (toEncoding h))
   where
     proxy = Proxy :: Proxy GetHealth
 
@@ -3690,9 +3695,14 @@ listToMaybe' _ = Nothing
 -- warning, with how long it took (0 for never). That is the one thing
 -- about a single request that says something of the server: a query that
 -- reads far more than it should, or a database that has become slow. The
--- time is that of making the response, not of sending it, so a client on
--- a slow line is not the server's slow request; and the stream of events,
--- whose response never ends, is left out.
+-- time runs until the last byte of the response is handed to the
+-- connection. A long answer is sent while it is read
+-- ("Haskoin.Store.Web.Pieces"), so the time that its status took to make
+-- says little: the reads that matter come after it. The price is that a
+-- client on a slow line, or a proxy that reads slowly, can make a request
+-- slow too. A response cut short, by the client leaving or by a failure,
+-- is logged with what it took until then. The stream of events, whose
+-- response never ends, is left out.
 --
 -- With the access log on, every request is logged as information instead
 -- of for debugging, with the address of the client and the time it took.
@@ -3704,21 +3714,25 @@ logIt :: Logger -> Bool -> Word32 -> Middleware
 logIt logger access slow app req respond = do
   start <- getPOSIXTime
   app req $ \res -> do
-    took <- subtract start <$> getPOSIXTime
-    let s = responseStatus res
-        msg = fmtReq req <> ": " <> fmtStatus s
-        seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
-        millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
-        client = case lookup "X-Forwarded-For" (requestHeaders req) of
-          Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
-          Nothing -> cs (show (remoteHost req))
-    if
-      | statusIsServerError s && s /= status503 -> logError logger msg
-      | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
-      | otherwise -> logDebug logger msg
-    when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
-      logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
-    respond res
+    sent <- respond res `onException` report start res True
+    report start res False
+    return sent
+  where
+    report start res cut = do
+      took <- subtract start <$> getPOSIXTime
+      let s = responseStatus res
+          msg = fmtReq req <> ": " <> fmtStatus s <> if cut then ", cut short" else ""
+          seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
+          millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
+          client = case lookup "X-Forwarded-For" (requestHeaders req) of
+            Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
+            Nothing -> cs (show (remoteHost req))
+      if
+        | statusIsServerError s && s /= status503 -> logError logger msg
+        | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
+        | otherwise -> logDebug logger msg
+      when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
+        logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
 
 -- | What is wrong with a store whose health check fails, for its log.
 ailments :: HealthCheck -> Text

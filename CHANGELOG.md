@@ -4,7 +4,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
-## [Unreleased]
+## [1.12.0] - 2026-11-13
+
+Long lists of transactions and raw blocks are sent while they are read,
+and pretty JSON is gone.
+
+### Removed
+- **Pretty JSON.** The `pretty` parameter is gone from every endpoint, and
+  a request with it is refused like any other unknown parameter. Pipe an
+  answer through a tool such as `jq` to read it indented.
+
+### Changed
+- **Long answers are sent while they are read.** The endpoints that answer
+  with all the transactions that the database lists somewhere read them a
+  hundred at a time, and send each hundred while they read the next:
+  - `/address/:addr/transactions/full`, `/address/transactions/full` and
+    `/xpub/:xpub/transactions/full`;
+  - `/transactions/block/:block` and `/transactions/block/:block/raw`;
+  - the raw blocks: `/block/:block/raw`, `/block/best/raw`,
+    `/block/height/:height/raw`, `/block/time/:time/raw` and
+    `/block/mtp/:time/raw`;
+  - `/blockchain/rawblock/:block`, in JSON and in hex, and
+    `/blockchain/block-height/:height`.
+
+  The bytes are the same. With 5,000 transactions of an address (15 MB) on
+  regtest, the first byte left after 11 ms where it took 96 ms, and sixteen
+  such requests at once took 197 MB of memory where they took 1,014 MB. The
+  whole response takes as long as before: encoding JSON is most of it.
+- These responses have no `Content-Length`. What can refuse the request is
+  checked before the first byte; a failure after it ends the response
+  before it is complete, where it used to be an error with a status.
+- Lists that the client names, such as `/transactions?txids=`, are read
+  whole before they are answered, as before: what is asked for may not be
+  there.
+- The timings of these endpoints count the whole response, the time that
+  the client takes to read it included.
+- No longer depends on aeson-pretty.
+- **The warning of a slow request counts the whole response**, until its
+  last byte is sent. It counted only the time to make the status, which
+  for an answer sent while it is read is the first hundred transactions.
+  A client or proxy that reads slowly can now make a request slow. A
+  response cut short is logged too, ending in `, cut short`.
 
 ## [1.11.0] - 2026-11-12
 

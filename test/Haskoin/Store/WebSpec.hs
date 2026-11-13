@@ -1,6 +1,7 @@
 module Haskoin.Store.WebSpec (spec) where
 
 import Control.Concurrent (threadDelay)
+import Control.Exception (ErrorCall (..), throwIO, try)
 import Data.ByteString (ByteString)
 import Data.Either (isLeft)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -49,7 +50,12 @@ segwitTxHex =
 -- | What the log has after a request that is answered with a status, after
 -- a number of milliseconds, by a server that warns of requests of a second.
 logged :: Bool -> [T.Text] -> Int -> Int -> IO [T.Text]
-logged access path status wait = do
+logged = loggedSending (return ())
+
+-- | 'logged', with what sending the response does: wait, or fail as when
+-- the client leaves.
+loggedSending :: IO () -> Bool -> [T.Text] -> Int -> Int -> IO [T.Text]
+loggedSending send access path status wait = do
   said <- newIORef []
   let keep line = modifyIORef' said (decodeUtf8 (fromLogStr line) :)
       logger = Logger {level = LevelDebug, source = "", push = keep}
@@ -59,7 +65,8 @@ logged access path status wait = do
         503 -> status503
         _ -> status500
       app _ respond = threadDelay (wait * 1000) >> respond (responseLBS answer [] "")
-  _ <- logIt logger access 1 app defaultRequest {pathInfo = path} (\_ -> return ResponseReceived)
+      sending _ = send >> return ResponseReceived
+  _ <- try @ErrorCall (logIt logger access 1 app defaultRequest {pathInfo = path} sending)
   reverse <$> readIORef said
 
 -- | The level of each line of a log, as the line names it at its start.
@@ -94,6 +101,19 @@ spec = do
       levels slow `shouldBe` ["Debug", "Warn"]
       last slow `shouldSatisfy` T.isInfixOf "Slow request, 1.1 seconds: "
       levels <$> logged False ["events"] 200 1100 `shouldReturn` ["Debug"]
+    it "counts the time of sending the response" $ do
+      slow <- loggedSending (threadDelay 1100000) False ["block", "x", "raw"] 200 0
+      levels slow `shouldBe` ["Debug", "Warn"]
+      last slow `shouldSatisfy` T.isInfixOf "Slow request, 1.1 seconds: "
+    it "logs a response cut short, and passes the failure on" $ do
+      let leave = threadDelay 1100000 >> throwIO (ErrorCall "client left")
+      cut <- loggedSending leave False ["block", "x", "raw"] 200 0
+      levels cut `shouldBe` ["Debug", "Warn"]
+      last cut `shouldSatisfy` T.isInfixOf "200 OK, cut short"
+      let quiet = Logger {level = LevelError, source = "", push = \_ -> return ()}
+          app _ respond = respond (responseLBS status200 [] "")
+          sending _ = throwIO (ErrorCall "client left")
+      logIt quiet False 1 app defaultRequest sending `shouldThrow` (== ErrorCall "client left")
     it "has every request as information when the access log is on" $ do
       lines' <- logged True ["block", "best"] 200 0
       levels lines' `shouldBe` ["Info"]

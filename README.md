@@ -82,7 +82,7 @@ Bitcoin Cash APIs such as api.haskoin.com.
 | Xpubs           | Balances, transactions and UTXO of extended public keys, for legacy, nested SegWit and native SegWit addresses, with an optional Redis cache for large wallets |
 | Blocks and txs  | Lookup by hash, height or time; raw serialized forms; transactions of a block               |
 | Mempool         | Persistent, indexed by arrival time, with replace-by-fee on BTC and pruning of old entries   |
-| Formats         | JSON, or pretty JSON                                                                         |
+| Formats         | JSON                                                                                         |
 | Live events     | New blocks and transactions as a JSON stream or over a WebSocket                            |
 | Compatibility   | Endpoints in the style of Blockchain.info under `/blockchain/`                               |
 | Operations      | Health check, StatsD metrics, RocksDB memory limits, Docker image                           |
@@ -107,7 +107,7 @@ docker run -d --name haskoin-store -p 3000:3000 \
   -e NET=btc -e DISCOVER=true \
   -v haskoin-store-data:/home/haskoin/.haskoin-store \
   haskoin-store
-curl 'http://localhost:3000/block/best?pretty=true'
+curl -s 'http://localhost:3000/block/best' | jq
 ```
 
 The first sync downloads and indexes the whole chain, which takes a long
@@ -183,7 +183,7 @@ kind of addresses it derives (`legacy`, the default, `compat` for nested
 SegWit, `segwit` for native SegWit):
 
 ```sh
-curl 'localhost:3000/xpub/xpub6C...?derive=segwit&pretty=true'
+curl -s 'localhost:3000/xpub/xpub6C...?derive=segwit' | jq
 ```
 
 The answer has confirmed and unconfirmed balances, and the index of the last
@@ -492,7 +492,8 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   one server, `./`, so requests tried from the page go to the server that
   served it, also behind a proxy that mounts it under a path such as
   `/btc/`. The reference always matches the version that is running.
-- Answers are JSON. Add `?pretty=true` for indented JSON.
+- Answers are JSON, without spaces. Pipe them through `jq` to read them
+  indented.
 - Lists are paged with `limit` and `offset`, newest first. `height` begins
   a page at a transaction hash, a block hash, a block height or a Unix time
   instead.
@@ -509,6 +510,19 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   may send from another site.
 - **Answers are compressed** for a client that sends
   `Accept-Encoding: gzip`, but for the stream of events.
+- **Long answers are sent while they are read.** The endpoints that answer
+  with all the transactions that the database lists somewhere read them a
+  hundred at a time and send each hundred while they read the next: the
+  full transactions of addresses and of an xpub (`.../transactions/full`),
+  the transactions of a block (`/transactions/block/:block` and its `/raw`),
+  the raw blocks (`/block/.../raw`), and the blocks of the Blockchain.info
+  API (`/blockchain/rawblock/:block`, `/blockchain/block-height/:height`).
+  The first byte leaves sooner and the server holds two hundred
+  transactions, not the whole answer. These answers have no
+  `Content-Length`. What can refuse a request is checked before the first
+  byte; a failure after it ends the answer before it is complete. Lists
+  that the client names, such as `/transactions?txids=`, are read whole
+  first, because what is asked for may not be there.
 - **Long lists go in a body.** The endpoints that take a list of
   addresses, blocks, heights or transactions also take it under `POST`,
   as a form (`application/x-www-form-urlencoded`), so that it does not
@@ -726,6 +740,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Cache` | The Redis cache of a server alone |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
+| `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
 | `Haskoin.Store.Web.Publish` | Publishing a transaction through a full node |
 
 The rules and queries of version 20 (`Haskoin.Store.Logic`,
@@ -843,8 +858,10 @@ What the log says about the server itself, without `--debug`:
   behind the headers` as a warning, and `Healthy again`. A store that is
   still syncing says `Not healthy yet` once, which is not a warning.
 - **Slow requests.** A warning for a request that took `--slow-request`
-  seconds or more to answer, with the request and how long it took. The
-  stream of events is left out.
+  seconds or more to answer, with the request and how long it took, until
+  the last byte was sent. A client or proxy that reads slowly can make a
+  request slow too. A response cut short ends in `, cut short`. The stream
+  of events is left out.
 - **Every request**, with `--access-log`, which is off by default:
   `203.0.113.7 GET /block/best HTTP/1.1: 200 OK, 0.4 ms`. A public
   server usually has a proxy in front that keeps this log better. The

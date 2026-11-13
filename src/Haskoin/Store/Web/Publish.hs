@@ -656,7 +656,8 @@ publish p tx = do
     say (Refused why) = p.note LevelInfo ("A node refused " <> name <> ": " <> why)
     say Dropped = p.note LevelWarn ("A node closed the connection on receiving " <> name)
     say Unreachable = p.note LevelWarn ("No node to publish " <> name <> " to")
-    say (Unverified i) = p.note LevelInfo ("Not sent to a peer, input " <> T.pack (show i) <> " not verified: " <> name)
+    say (Unverified i) =
+      p.note LevelInfo ("Not sent to a peer, input " <> T.pack (show i) <> " not verified: " <> name)
     say Silent = p.note LevelInfo ("No node announced " <> name <> " after taking it")
 
 -- | Wait for a transaction that another request is publishing.
