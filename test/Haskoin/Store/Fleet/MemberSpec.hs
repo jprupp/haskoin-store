@@ -74,7 +74,7 @@ spec = prepareContext $ \ctx -> do
                           memberForget m out.removed
                           when (isRight out.result) $ case op of
                             Mine _ _ -> best >>= noteBest m
-                            Revert _ -> best >>= noteBest m
+                            Revert _ _ -> best >>= noteBest m
                             -- a store deletes what is too old, and the pool
                             -- does the same by its own clock
                             Delete _ -> void (poolWithdraw conn keys 32 (map encode out.removed))
@@ -153,7 +153,7 @@ spec = prepareContext $ \ctx -> do
                               memberForget bare out.removed
                               when (isRight out.result) $ case op of
                                 Mine _ _ -> best >>= \b -> noteBest m b >> noteBest bare b
-                                Revert _ -> best >>= \b -> noteBest m b >> noteBest bare b
+                                Revert _ _ -> best >>= \b -> noteBest m b >> noteBest bare b
                                 Delete _ -> void (poolWithdraw conn keys 32 (map encode out.removed))
                                 Pay _ _ -> return ()
                               if seed `mod` 5 == 0

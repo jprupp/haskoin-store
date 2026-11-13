@@ -895,7 +895,8 @@ revertToMainChain self = do
     logWarn self $
       "Reverting best block: "
         <> blockHashToHex h
-    runImport self net ctx (`revertBlock` h) >>= \case
+    now <- floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+    runImport self net ctx (\wr -> revertBlock wr now h) >>= \case
       Left e -> do
         logError self $
           "Could not revert block "

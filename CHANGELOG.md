@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+- **`POST /transactions` answers 202, "handed over", at once.** The store
+  checks the transaction, hands it to every peer, each on a connection of
+  its own, and answers as soon as they took it, with the id and a message.
+  It no longer waits up to `--publish-timeout` for a node to announce the
+  transaction back: the wait was arbitrary, and said less than it seemed,
+  as Bitcoin Core refuses in silence. The transaction shows in the store
+  when a node announces it, usually within a second. A transaction that the
+  store has in a block is still answered 200, and one that a node refuses
+  over RPC, or that every peer refuses with a reason, 400. The client of
+  haskoin-store-data takes the new answer as it took the old one.
+- With `--node-rpc`, a transaction that the node takes is answered 202 too.
+- In the library, `Haskoin.Store.Web.Publish` answers with what was done
+  (`Answer`: `ToPeers`, `ToNode`, `InBlock` and refusals) in place of
+  `Verdict`, and has no `Limits` or `Outbox`. `Haskoin.Store.Logic.Layered`'s
+  `revertBlock` takes the time of the revert, and `Haskoin.Store.Logic` has
+  `revertBlockAt`, which the tests compare it with.
+
+### Removed
+- **`--publish-timeout`** (`PUBLISH_TIMEOUT`), and the outbox that kept
+  failed transactions from being sent again for ten minutes.
+
+### Fixed
+- **Transactions that cost the store its connections are refused.** On
+  regtest, a signature pushed in a longer form than it needs, and more
+  CashTokens out than in, both passed the store's checks, and Bitcoin Cash
+  Node closed every connection of the store when it was sent one. The
+  store now refuses an input script that does more than push data or
+  pushes it in a longer form than it needs, tokens that break the rules of
+  CashTokens, and a version that nodes do not take: 1 and 2 on Bitcoin
+  Cash, 1 to 3 on Bitcoin. `docs/publishing.md` has what was measured.
+- **A transaction that a reorganisation puts back in the mempool stays
+  there.** It went back with the time of its block, and the store deletes
+  mempool transactions older than `--mempool-timeout` (14 days) on every
+  clock tick: a transaction of a block older than that was gone in under a
+  second, while the nodes kept it. On a regtest chain whose blocks are
+  older than the timeout, every reorganisation did it. It now goes back
+  with the time of the revert.
+
 ## [1.12.1] - 2026-11-13
 
 ### Fixed

@@ -1957,27 +1957,26 @@ paths:
         must be in the format that nodes of the network read: on BCH,
         which has no SegWit, the format without witness data.
 
-        **A 200 means that a full node accepted the transaction and that this
-        server has it**: the next request for the transaction, or for a balance
-        it changes, shows it.
+        **A 202 means that the transaction was handed over**: to a full node
+        over RPC, or to the peers of this server. It does not say that the
+        network took it. A node that takes it announces it, and this server
+        has it from then on, usually within a second, and seconds with
+        nodes that do not whitelist this server.
 
-        The server does not broadcast. It checks what it can by itself: that
-        the inputs exist and are not spent, the amounts, the lock time, the
-        size and dust rules of relay, and the signature of every input that
-        spends a coin locked to one key. It does not run other scripts: a
-        transaction with an input it cannot verify is published only by a
-        server that reaches a full node over RPC, and refused by others.
-        Then it hands the transaction to one full node, and answers
-        when a node has announced it back, which is how it enters the mempool of
-        this server. That takes milliseconds when the node whitelists the server,
-        and seconds otherwise.
+        The server checks what it can by itself: that the inputs exist and
+        are not spent, the amounts, the lock time, the version, that the
+        input scripts only push data in its shortest form, the tokens of
+        Bitcoin Cash, the size and dust rules of relay, and the signature of
+        every input that spends a coin locked to one key. It does not run
+        other scripts: a transaction with an input it cannot verify is
+        published only by a server that reaches a full node over RPC, and
+        refused by others. Then it hands the transaction to every peer, each
+        on a connection of its own, and answers as soon as they took it.
 
         A transaction that this server has in a block is answered 200 and not
-        sent. One that it has unconfirmed is checked and handed to a full node
-        again, and answered 200 when the node took it: the nodes may have
-        forgotten a transaction that this server lists, after a reorganisation
-        or when a node lost its mempool, and posting it again gets it back to
-        them. Posting the same transaction again is always safe.
+        sent. One that it has unconfirmed is handed over again, as the nodes
+        may have forgotten it: after a reorganisation, or when a node lost
+        its mempool. Posting the same transaction again is always safe.
       operationId: postTransaction
       requestBody:
         description: >-
@@ -1999,8 +1998,19 @@ paths:
                        04e444809abd438d85eb18e8d07c796e364afe88ac399b7c00000000001976a9\
                        1486a7f1a2047ed6719fa1ad5484f15c37c104887c88ac00000000"
       responses:
+        '202':
+          description: |
+            Handed over. `message` says to whom: a full node over RPC, or
+            how many peers took it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TxId'
+              example:
+                txid: 0b7cb07d848959fbd02ad6e2ed21fac888b8e8011c6b8c5362d05c703066ae67
+                message: Handed over to 8 peers. The network decides whether to take it.
         '200':
-          description: A full node accepted the transaction, and this server has it.
+          description: This server has the transaction in a block, and sent nothing.
           content:
             application/json:
               schema:
@@ -2014,16 +2024,22 @@ paths:
             * The body is not one transaction in hexadecimal.
             * It spends an output that this server does not know, or that a
               confirmed transaction has spent, or a coinbase that is not a
-              hundred blocks old.
+              hundred blocks old. The output of a transaction that was handed
+              over is known once a node has announced it.
             * Its outputs are worth more than its inputs, its lock time has
-              not passed, it is larger than nodes relay, or one of its
-              outputs is dust.
+              not passed, its version is not one that nodes take, it is
+              larger than nodes relay, or one of its outputs is dust.
+            * An input script does more than push data, or pushes it in a
+              longer form than it needs.
+            * On Bitcoin Cash, its outputs give tokens that its inputs do not
+              hold, or tokens not written as tokens are.
             * The signature of an input that spends a coin locked to one key
               does not verify.
             * This server cannot verify the signature of an input, such as
               one of a script that is not a key or a multisig, and has no full node to
               give the transaction to over RPC.
-            * A node refused it and said why.
+            * A node refused it over RPC and said why, or every peer that
+              answered refused it and said why.
           content:
             application/json:
               schema:
@@ -2039,16 +2055,8 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: |
-            The server could not find out whether the network took the
-            transaction. Post the same transaction again to ask again.
-
-            * `server-timeout`: a node took the transaction and none announced
-              it within the time this server waits (30 seconds by default).
-              Most likely it was refused: Bitcoin Core does not say when it
-              refuses a transaction.
-            * `server-error`: no node could be reached; or a node closed the
-              connection on receiving the transaction, which a node does with
-              one it finds invalid.
+            `server-error`: this server has no peer to hand the transaction to,
+            or reached none.
           content:
             application/json:
               schema:

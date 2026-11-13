@@ -201,7 +201,10 @@ that two stores at the same block hold the same record.
 - **Its time is the time of its block.** Before, a store that had seen the
   transaction in its mempool kept the time of first sight, so two stores
   gave two values of `time`. A transaction that goes back to the mempool
-  when its block is reverted has the time of that block there.
+  when its block is reverted has the time of the revert there. It had the
+  time of its block until 1.12.1, and the mempool, which deletes what is
+  older than `--mempool-timeout`, deleted a transaction of an old block as
+  soon as it came back, while the nodes kept it.
 - **Its spenders are under keys of their own**, in `spender`
   (`SpenderKey`). Before, each block that spent one of its outputs read the
   whole record and wrote it back. Now the record is written when a block

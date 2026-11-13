@@ -227,15 +227,14 @@ it.
 curl -X POST --data-binary @tx.hex localhost:3000/transactions
 ```
 
-The body is the signed transaction in hex. The store hands it to one full
-node and answers with the transaction id once a node has announced it back
-and the store has it: the wallet's history shows it on the next request.
+The body is the signed transaction in hex. The store checks it, hands it to
+its peers and answers 202 with the transaction id at once. When a node
+announces it, usually within a second, the wallet's history shows it.
 
 A transaction that cannot be valid, or that a node refuses with a reason, is
-answered 400 with the reason. A 500 means that the store could not find out:
-post the same transaction again, which is safe. A transaction that the store
-lists as unconfirmed is given to a node again when it is posted, in case the
-network forgot it.
+answered 400 with the reason. Posting the same transaction again is safe: it
+is handed over again, which gets a payment that the network forgot back to
+it.
 [Publishing](#publishing) has the rest.
 
 ### 6. Stay up to date without polling
@@ -345,8 +344,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
-| `--publish-timeout` | `PUBLISH_TIMEOUT` | `30` | Seconds that `POST /transactions` waits for a node to announce the transaction back |
-| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to a peer |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -578,41 +576,37 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 
 The store does not check scripts, so a transaction that a client posts
 never goes into its mempool directly: anyone could show a payment that will
-never confirm. It is handed to one full node, and comes in when a node
-announces it back.
+never confirm. It is handed over, and comes in when a node announces it.
 
-- **A connection of its own.** The transaction goes to a node on a
-  connection made for it, not on those the store syncs from. A node does
-  not announce a transaction to the connection that gave it. On the others
-  the store hears of it as of any transaction, and imports it the same way.
-- **The answer waits for that**, up to `--publish-timeout` seconds. A 200
-  means that a full node accepted the transaction and the store has it.
-- **The store checks what it can first**: that the inputs exist and are
-  not spent, that a coinbase is old enough, the amounts, the lock time,
-  the size and the dust rule of relay, and the signature of every coin
-  that is locked to one key, on both networks. A transaction that fails
-  is refused with the reason, and nothing is sent. A script of any other
-  kind is left to the node.
+- **Checked first**: that the inputs exist and are not spent, that a
+  coinbase is old enough, the amounts, the lock time, the version, that
+  the input scripts only push data in its shortest form, the tokens of
+  Bitcoin Cash, the size and the dust rule of relay, and the signature of
+  every coin that is locked to one key. A transaction that fails is
+  refused with the reason, and nothing is sent.
+- **Handed to every peer, each on a connection of its own**, and answered
+  202 as soon as they took it. The store does not wait to see what the
+  network makes of it. A node does not announce a transaction to the
+  connection that gave it; on those the store syncs from it hears of it as
+  of any transaction, and imports it the same way.
 - **Over the RPC of a node, when the store has it.** With `--node-rpc`
-  the store gives the transaction to a full node over its RPC. The node
-  checks everything and says why it refuses. If the node does not
-  answer, the transaction goes to a peer instead.
+  the store gives the transaction to a full node over its RPC instead. The
+  node checks everything and says why it refuses. If the node does not
+  answer, the transaction goes to the peers.
 - **To a peer, only what the store verified.** A peer that is sent a
-  transaction it finds invalid may close every connection of the store.
-  So a transaction with an input that the store cannot verify, a script
-  that is not a key or a multisig, is refused unless there is an RPC to
-  send it over. Give the store the RPC of a node to publish those.
-- **The same transaction is sent once**, however often it is posted.
+  transaction it finds invalid may close every connection of the store,
+  and Bitcoin Cash Node does. So a transaction with an input that the store
+  cannot verify, a script that is not a key or a multisig, is refused
+  unless there is an RPC to send it over; and so are the transactions that
+  were measured to cost the store its connections.
 - **Whitelist the store on your nodes** (`-whitelist` in Bitcoin Core and
   Bitcoin Cash Node). A node announces to a whitelisted peer without
-  delay, so the answer takes milliseconds; otherwise Bitcoin Core takes
-  five seconds on average. And a node that finds a transaction invalid may
-  close every connection of the peer that sent it, which it never does to
-  a whitelisted one. The store then connects again, does not send that
-  transaction a second time, and goes on publishing the others.
+  delay, so the transaction shows in the store at once; otherwise Bitcoin
+  Core takes five seconds on average. And a node never closes the
+  connections of a whitelisted peer.
 
 `docs/publishing.md` has the design, what was measured on Bitcoin Core and
-Bitcoin Cash Node, and how it differs from versions before 1.11.0.
+Bitcoin Cash Node, and how it differs from earlier versions.
 
 ### The database
 
@@ -743,7 +737,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
-| `Haskoin.Store.Web.Publish` | Publishing a transaction through a full node |
+| `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
 The rules and queries of version 20 (`Haskoin.Store.Logic`,
 `Haskoin.Store.Database.Query`) stay in the library as a reference. The

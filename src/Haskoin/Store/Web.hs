@@ -233,6 +233,7 @@ import Network.HTTP.Types
     parseQuery,
     renderStdMethod,
     status200,
+    status202,
     status203,
     status204,
     status400,
@@ -347,17 +348,13 @@ data WebLimits = WebLimits
     blockTimeout :: !Word64,
     -- | seconds that a request may take before the log has a warning
     -- about it ('logIt')
-    slowRequest :: !Word32,
-    -- | seconds that @POST \/transactions@ waits for a node to announce
-    -- the transaction back ("Haskoin.Store.Web.Publish")
-    publishTimeout :: !Word32
+    slowRequest :: !Word32
   }
   deriving (Eq, Show)
 
 -- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
 -- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes,
--- block timeout of four hours, a warning for requests of five seconds, and
--- thirty seconds for a published transaction to come back.
+-- block timeout of four hours, and a warning for requests of five seconds.
 instance Default WebLimits where
   def =
     WebLimits
@@ -369,8 +366,7 @@ instance Default WebLimits where
         xpubGapInit = 20,
         txTimeout = 3600 `div` 2,
         blockTimeout = 4 * 3600,
-        slowRequest = 5,
-        publishTimeout = 30
+        slowRequest = 5
       }
 
 -- | Configuration of the web server.
@@ -446,9 +442,9 @@ data WebState = WebState
     cacheUp :: !(TVar Bool),
     -- | the events that the clients of @\/events@ read ('feedEvents')
     eventLog :: !EventLog,
-    -- | the transactions being published, and those that failed not long
-    -- ago ("Haskoin.Store.Web.Publish")
-    outbox :: !(TVar Publish.Outbox)
+    -- | the transactions that were handed over and that the store asks
+    -- for until it has them ("Haskoin.Store.Web.Publish")
+    asking :: !Publish.Asking
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
@@ -674,7 +670,7 @@ serveWeb config serve = do
   forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first))
   cacheUp <- cacheCheck >>= newTVarIO
   eventLog <- newEventLog
-  outbox <- newTVarIO Publish.emptyOutbox
+  asking <- Publish.newAsking
   let db = config.store.db
       stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
       routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
@@ -749,9 +745,10 @@ serveWeb config serve = do
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
       withAsync (feedEvents st) $ \a3 ->
-        link a3 >> do
-          let logged = logIt config.logger config.accessLog config.limits.slowRequest
-          serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed . cappedBody st $ app
+        withAsync (askingLoop st) $ \_a4 ->
+          link a3 >> do
+            let logged = logIt config.logger config.accessLog config.limits.slowRequest
+            serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -1028,7 +1025,7 @@ handlePaths st cfg =
     marshalled ["notx"] (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
     marshalled [] (\r -> GetTx <$> cap r) (handleTx st),
     plain [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
-    plain [] (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
+    pathPosted [] (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
     plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
     marshalledList limits (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
@@ -1199,6 +1196,19 @@ pathCompact ps parser action encJson =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req -> do
     res <- action =<< parser req
     return $ responseLBS status200 jsonType (encodingToLazyByteString (encJson res))
+  where
+    toProxy :: (Req -> IO a) -> Proxy a
+    toProxy = const Proxy
+    proxy = toProxy parser
+
+-- | The route of an API resource whose handler chooses the status of its
+-- answer: @POST \/transactions@, which answers 202 for a transaction that
+-- it handed over.
+pathPosted :: (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO (Status, Encoding)) -> Route
+pathPosted ps parser action =
+  route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req -> do
+    (status, res) <- action =<< parser req
+    return $ responseLBS status jsonType (encodingToLazyByteString res)
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
@@ -1528,27 +1538,36 @@ cbAfterHeight q height txid =
 
 -- POST Transaction --
 
--- | Handler for @POST \/transactions@: hand the transaction to a full node,
--- and answer with its hash once a node has announced it back
--- ("Haskoin.Store.Web.Publish"). One that the store has unconfirmed is
--- handed to a node again, and answered once the node took it. What the
--- store or a node refuses is 400 with the reason; no node, no answer and
--- no announcement are 500.
-handlePostTx :: WebState -> PostTx -> IO TxId
+-- | Handler for @POST \/transactions@: check the transaction and hand it
+-- over ("Haskoin.Store.Web.Publish"). The answer is 202 with its id and a
+-- message once it was handed over, over the RPC of a node or to the peers,
+-- and 200 with its id for one that the store has in a block. What the
+-- store or a node refuses is 400 with the reason; no peer is 500.
+handlePostTx :: WebState -> PostTx -> IO (Status, Encoding)
 handlePostTx st (PostTx tx) =
   withMetrics st (.txPost) $
     Publish.publish (publishing st) tx >>= \case
-      Publish.Verdict Publish.Accepted -> return (TxId (txHash tx))
+      Publish.InBlock -> return (status200, toEncoding (TxId txid))
+      Publish.ToNode -> handed "A full node took the transaction."
+      Publish.ToPeers n ->
+        handed . T.unwords $
+          [ "Handed over to",
+            T.pack (show n),
+            if n == 1 then "peer." else "peers.",
+            "The network decides whether to take it."
+          ]
       Publish.Invalid why -> raise st (UserError (show why))
-      Publish.Verdict (Publish.Refused why) ->
+      Publish.Refused why ->
         raise st (UserError ("A node refused the transaction: " <> T.unpack why))
-      Publish.Verdict (Publish.Unverified i) ->
+      Publish.Unverified i ->
         raise st . UserError $
           "This server cannot verify the signature of input "
             <> show i
             <> ", and sends to its peers only what it has verified"
-      Publish.Verdict Publish.Silent -> raise st ServerTimeout
-      _ -> raise st ServerError
+      Publish.NoPeers -> raise st ServerError
+  where
+    txid = txHash tx
+    handed message = return (status202, A.pairs ("txid" .= txid <> "message" .= (message :: Text)))
 
 -- | The chain as the store has it, for the checks of a transaction to
 -- publish: the height of the best block, and the median of the times of
@@ -1586,7 +1605,7 @@ chainRules st = do
 -- It is an option because the store needs nothing of a node but to be
 -- its peer, and this needs an account on one. A node that does not
 -- answer, or answers what cannot be read, is 'Publish.Unavailable': the
--- transaction then goes to a peer, if the store verified it. A
+-- transaction then goes to the peers, if the store verified it. A
 -- transaction that the node has already was sent.
 sendNode :: WebState -> String -> Tx -> IO Publish.Direct
 sendNode st url tx =
@@ -1623,31 +1642,17 @@ sendNode st url tx =
 
 -- | What "Haskoin.Store.Web.Publish" needs, for a request.
 --
--- The nodes are the peers of the store that relay transactions, in the
--- order of the peer manager.
+-- The peers are those of the store that take transactions. A transaction
+-- that was handed over is asked for again after the answer
+-- ('askingLoop'), unless the store keeps no mempool.
 publishing :: WebState -> Publish.Publishing
 publishing st =
   Publish.Publishing
-    { limits =
-        Publish.Limits
-          { wait = fromIntegral st.config.limits.publishTimeout,
-            handover = 10,
-            tries = 2,
-            capacity = 1000,
-            memory = 600
-          },
-      outbox = st.outbox,
-      rules = chainRules st,
+    { rules = chainRules st,
       direct = maybe (\_ -> return Publish.Unavailable) (sendNode st) st.config.nodeRpc,
       holds = fmap heldOf . st.query.getTxData,
       coin = Publish.coinOf st.query,
-      present = \h -> L.withView own.db $ \v ->
-        maybe False (not . (.deleted)) <$> (L.layeredRead v).getTxData h,
-      events = own.events,
-      mempool = not st.config.noMempool,
-      nodes =
-        map (.address) . filter (maybe False (.relay) . (.version))
-          <$> getPeers own.peerMgr,
+      peers = map (.address) . filter (maybe False (.relay) . (.version)) <$> getPeers own.peerMgr,
       courier =
         Publish.deliver
           Publish.Courier
@@ -1656,6 +1661,7 @@ publishing st =
               patience = 10,
               logger = withSource "Courier" st.config.logger
             },
+      fetch = if st.config.noMempool then \_ -> return () else Publish.askFor st.asking,
       note = \level -> logAt level (withSource "Publish" st.config.logger)
     }
   where
@@ -1666,6 +1672,21 @@ publishing st =
         | confirmed td.block -> Publish.Confirmed
         | otherwise -> Publish.Pending
       Nothing -> Publish.Absent
+
+-- | Ask for the transactions that were handed over until the store has
+-- them ("Haskoin.Store.Web.Publish".'Publish.Asking'): as if each peer had
+-- announced them, so that the block store asks one of them. A failure is
+-- logged and the asking goes on.
+askingLoop :: WebState -> IO ()
+askingLoop st = forever $ do
+  tryAny (Publish.askLoop st.asking present ask) >>= \case
+    Left e -> logWarn (withSource "Publish" st.config.logger) ("Asking for transactions: " <> cs (show e))
+    Right () -> return ()
+  threadDelay 1000000
+  where
+    own = st.config.store
+    present h = L.withView own.db $ \v -> maybe False (not . (.deleted)) <$> (L.layeredRead v).getTxData h
+    ask h = getPeers own.peerMgr >>= mapM_ (\op -> blockStoreTxHash op.mailbox [h] own.block)
 
 -- GET Mempool / Events --
 
