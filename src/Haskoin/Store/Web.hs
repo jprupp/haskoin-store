@@ -3695,9 +3695,14 @@ listToMaybe' _ = Nothing
 -- warning, with how long it took (0 for never). That is the one thing
 -- about a single request that says something of the server: a query that
 -- reads far more than it should, or a database that has become slow. The
--- time is that of making the response, not of sending it, so a client on
--- a slow line is not the server's slow request; and the stream of events,
--- whose response never ends, is left out.
+-- time runs until the last byte of the response is handed to the
+-- connection. A long answer is sent while it is read
+-- ("Haskoin.Store.Web.Pieces"), so the time that its status took to make
+-- says little: the reads that matter come after it. The price is that a
+-- client on a slow line, or a proxy that reads slowly, can make a request
+-- slow too. A response cut short, by the client leaving or by a failure,
+-- is logged with what it took until then. The stream of events, whose
+-- response never ends, is left out.
 --
 -- With the access log on, every request is logged as information instead
 -- of for debugging, with the address of the client and the time it took.
@@ -3709,21 +3714,25 @@ logIt :: Logger -> Bool -> Word32 -> Middleware
 logIt logger access slow app req respond = do
   start <- getPOSIXTime
   app req $ \res -> do
-    took <- subtract start <$> getPOSIXTime
-    let s = responseStatus res
-        msg = fmtReq req <> ": " <> fmtStatus s
-        seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
-        millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
-        client = case lookup "X-Forwarded-For" (requestHeaders req) of
-          Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
-          Nothing -> cs (show (remoteHost req))
-    if
-      | statusIsServerError s && s /= status503 -> logError logger msg
-      | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
-      | otherwise -> logDebug logger msg
-    when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
-      logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
-    respond res
+    sent <- respond res `onException` report start res True
+    report start res False
+    return sent
+  where
+    report start res cut = do
+      took <- subtract start <$> getPOSIXTime
+      let s = responseStatus res
+          msg = fmtReq req <> ": " <> fmtStatus s <> if cut then ", cut short" else ""
+          seconds = cs (showFFloat (Just 1) (realToFrac took :: Double) "")
+          millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
+          client = case lookup "X-Forwarded-For" (requestHeaders req) of
+            Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
+            Nothing -> cs (show (remoteHost req))
+      if
+        | statusIsServerError s && s /= status503 -> logError logger msg
+        | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
+        | otherwise -> logDebug logger msg
+      when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
+        logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
 
 -- | What is wrong with a store whose health check fails, for its log.
 ailments :: HealthCheck -> Text

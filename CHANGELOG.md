@@ -40,6 +40,11 @@ and pretty JSON is gone.
 - The timings of these endpoints count the whole response, the time that
   the client takes to read it included.
 - No longer depends on aeson-pretty.
+- **The warning of a slow request counts the whole response**, until its
+  last byte is sent. It counted only the time to make the status, which
+  for an answer sent while it is read is the first hundred transactions.
+  A client or proxy that reads slowly can now make a request slow. A
+  response cut short is logged too, ending in `, cut short`.
 
 ## [1.11.0] - 2026-11-12
 

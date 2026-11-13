@@ -858,8 +858,10 @@ What the log says about the server itself, without `--debug`:
   behind the headers` as a warning, and `Healthy again`. A store that is
   still syncing says `Not healthy yet` once, which is not a warning.
 - **Slow requests.** A warning for a request that took `--slow-request`
-  seconds or more to answer, with the request and how long it took. The
-  stream of events is left out.
+  seconds or more to answer, with the request and how long it took, until
+  the last byte was sent. A client or proxy that reads slowly can make a
+  request slow too. A response cut short ends in `, cut short`. The stream
+  of events is left out.
 - **Every request**, with `--access-log`, which is off by default:
   `203.0.113.7 GET /block/best HTTP/1.1: 200 OK, 0.4 ms`. A public
   server usually has a proxy in front that keeps this log better. The
