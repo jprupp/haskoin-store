@@ -11,7 +11,7 @@ servers:
   - url: './'
 
 info:
-  version: &version 1.12.0
+  version: &version 1.12.1
   title: Haskoin
   contact:
     name: JP Rupp
@@ -1972,8 +1972,12 @@ paths:
         this server. That takes milliseconds when the node whitelists the server,
         and seconds otherwise.
 
-        A transaction that this server has already is answered 200 and not sent.
-        Posting the same transaction again is always safe: it is sent once.
+        A transaction that this server has in a block is answered 200 and not
+        sent. One that it has unconfirmed is checked and handed to a full node
+        again, and answered 200 when the node took it: the nodes may have
+        forgotten a transaction that this server lists, after a reorganisation
+        or when a node lost its mempool, and posting it again gets it back to
+        them. Posting the same transaction again is always safe.
       operationId: postTransaction
       requestBody:
         description: >-

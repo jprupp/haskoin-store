@@ -1530,8 +1530,10 @@ cbAfterHeight q height txid =
 
 -- | Handler for @POST \/transactions@: hand the transaction to a full node,
 -- and answer with its hash once a node has announced it back
--- ("Haskoin.Store.Web.Publish"). What the store or a node refuses is 400
--- with the reason; no node, no answer and no announcement are 500.
+-- ("Haskoin.Store.Web.Publish"). One that the store has unconfirmed is
+-- handed to a node again, and answered once the node took it. What the
+-- store or a node refuses is 400 with the reason; no node, no answer and
+-- no announcement are 500.
 handlePostTx :: WebState -> PostTx -> IO TxId
 handlePostTx st (PostTx tx) =
   withMetrics st (.txPost) $
@@ -1637,7 +1639,7 @@ publishing st =
       outbox = st.outbox,
       rules = chainRules st,
       direct = maybe (\_ -> return Publish.Unavailable) (sendNode st) st.config.nodeRpc,
-      has = fmap (maybe False (not . (.deleted))) . st.query.getTxData,
+      holds = fmap heldOf . st.query.getTxData,
       coin = Publish.coinOf st.query,
       present = \h -> L.withView own.db $ \v ->
         maybe False (not . (.deleted)) <$> (L.layeredRead v).getTxData h,
@@ -1658,6 +1660,12 @@ publishing st =
     }
   where
     own = st.config.store
+    heldOf = \case
+      Just td
+        | td.deleted -> Publish.Absent
+        | confirmed td.block -> Publish.Confirmed
+        | otherwise -> Publish.Pending
+      Nothing -> Publish.Absent
 
 -- GET Mempool / Events --
 

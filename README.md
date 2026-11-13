@@ -233,7 +233,9 @@ and the store has it: the wallet's history shows it on the next request.
 
 A transaction that cannot be valid, or that a node refuses with a reason, is
 answered 400 with the reason. A 500 means that the store could not find out:
-post the same transaction again, which sends nothing twice.
+post the same transaction again, which is safe. A transaction that the store
+lists as unconfirmed is given to a node again when it is posted, in case the
+network forgot it.
 [Publishing](#publishing) has the rest.
 
 ### 6. Stay up to date without polling

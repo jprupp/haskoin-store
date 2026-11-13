@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.12.1] - 2026-11-13
+
+### Fixed
+- **A transaction that the store has unconfirmed is sent again** when it
+  is posted again. The store answered 200 at once and sent nothing, as
+  for a confirmed one. Its mempool is not held to its node's, so it could
+  list a payment that the nodes forgot, after a reorganisation or when a
+  node lost its mempool, and the wallet had no way to get it back to them:
+  on Bitcoin Cash none at all until the store dropped it after 14 days.
+  Now it goes through the same checks, is given to a node over RPC or on
+  the courier, and is answered 200 when the node took it, or with the
+  node's reason. A confirmed transaction is still answered at once.
+
+### Changed
+- In the library, the field `has` of `Haskoin.Store.Web.Publish.Publishing`
+  is now `holds`, which says whether the store has the transaction in a
+  block, in its mempool or not at all (`Held`).
+
 ## [1.12.0] - 2026-11-13
 
 Long lists of transactions and raw blocks are sent while they are read,

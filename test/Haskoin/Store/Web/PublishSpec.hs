@@ -79,7 +79,7 @@ desk ctx courier go =
               outbox = outbox,
               rules = return (rulesOf),
               direct = \_ -> return Unavailable,
-              has = \h -> elem h <$> readTVarIO here,
+              holds = \h -> (\hs -> if elem h hs then Pending else Absent) <$> readTVarIO here,
               coin = \_ -> return (held 1000),
               present = \h -> elem h <$> readTVarIO here,
               events = events,
@@ -172,12 +172,25 @@ spec = prepareContext $ \ctx -> do
         echo p.events
         publish p tx `shouldReturn` Verdict Accepted
         sent `shouldReturn` 1
-    it "sends nothing for what the store has, or cannot be valid" $
+    it "sends nothing for what the store has in a block, or cannot be valid" $
       desk ctx (\_ _ -> return Took) $ \p sent -> do
-        publish p {has = \_ -> return True} tx `shouldReturn` Verdict Accepted
+        publish p {holds = \_ -> return Confirmed} tx `shouldReturn` Verdict Accepted
         publish p {coin = \_ -> return Missing} tx
           `shouldReturn` Invalid (UnknownOutput (output 1))
         sent `shouldReturn` 0
+    it "sends again what the store has unconfirmed, each time, and waits for no echo" $
+      desk ctx (\_ _ -> return Took) $ \p sent -> do
+        let pending = p {holds = \_ -> return Pending}
+        replicateM_ 2 $ publish pending tx `shouldReturn` Verdict Accepted
+        sent `shouldReturn` 2
+        -- checked first, like any other: a coinbase too young is not sent
+        publish pending {coin = \_ -> return (Coin {output = TxOut 1000 "", mined = Just 950, coinbase = True})} tx
+          `shouldReturn` Invalid (Immature (output 1))
+        sent `shouldReturn` 2
+    it "says why a node refuses what the store has unconfirmed" $
+      desk ctx (\_ _ -> return (Rejected "missing inputs")) $ \p sent -> do
+        publish p {holds = \_ -> return Pending} tx `shouldReturn` Verdict (Refused "missing inputs")
+        sent `shouldReturn` 1
     it "gives the reason of a node, again without asking it again" $
       desk ctx (\_ _ -> return (Rejected "too cheap")) $ \p sent -> do
         replicateM_ 2 $
