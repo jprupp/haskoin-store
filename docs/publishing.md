@@ -35,8 +35,8 @@ script of any other kind is satisfied. So:
 2. **Check.** The store answers from its own index what it can. Each of
    these is an answer a node would give too, and does not depend on what
    else is in a mempool:
-   - a transaction it has already, confirmed or not, is answered 200 and
-     nothing is sent;
+   - a transaction it has in a block is answered 200 and nothing is sent;
+     one it has unconfirmed is checked and sent again, as below;
    - no coinbase, no input twice, and no longer than a block of the network
      can hold: 4,000,000 bytes with SegWit, 1,000,000 on Bitcoin Cash;
    - every input spends an output the store knows, that no confirmed
@@ -80,6 +80,23 @@ script of any other kind is satisfied. So:
 7. **Remember.** A transaction on its way, and one that failed, are kept
    for ten minutes by the hash of their bytes. The same bytes posted again
    join the first request, or get its answer, and are not sent again.
+
+### A transaction the store has unconfirmed
+
+The store does not hold its mempool to its node's. It may list a
+transaction that the nodes forgot: after a reorganisation that left it
+out, or when a node lost its mempool. A wallet that posts it again needs it
+to reach them, or nothing does: on Bitcoin a fee bump gets out of it, on
+Bitcoin Cash nothing, until the store drops the transaction weeks later.
+
+So a transaction that the store has unconfirmed goes through the checks of
+step 2 and the outbox as any other, and is given to a node again, over RPC
+or on the courier. There is no echo to wait for, as the store has it
+already: the answer is 200 when the node took it, and the node's reason
+when it refused it. A node that has the transaction ignores it. One that
+is checked and found wrong now, such as a spend of a coinbase that a
+reorganisation made too young, is refused with the reason, and nothing is
+sent.
 
 ## Signatures
 
@@ -134,20 +151,22 @@ could make it lose its peers with one request, again and again.
 
 | Answer | When |
 | --- | --- |
-| 200 and the id | The store has the transaction: a node announced it back, or it was there already |
+| 200 and the id | The store has the transaction: a node announced it back, it was in a block already, or it was unconfirmed and a node took it again |
 | 400 | The store refused it at step 2, or could not verify it and has no RPC to send it over, or a node refused it and said why: over RPC, or Bitcoin Cash Node as a peer |
 | 413 | The body is longer than a transaction can be |
 | 500 `server-timeout` | A node took it and none announced it in time: most likely it was refused |
 | 500 `server-error` | No node could be reached, or a node closed the connection on receiving it |
 
 Posting the same transaction again is always safe. If it came in the
-meantime the answer is 200.
+meantime, it is given to a node again and the answer is 200.
 
 ## Against abuse
 
 - **Nothing a client wrote is in the mempool** before a node announced it.
-- **One node gets a transaction, once.** Repeats, transactions the store
-  has, and spends of unknown or spent outputs cost no traffic.
+- **One node gets a transaction.** Requests at the same time, transactions
+  the store has in a block, and spends of unknown or spent outputs cost no
+  traffic. A transaction the store has unconfirmed is sent to one node
+  each time it is posted: one transaction to a node that ignores it.
 - **The outbox holds 1,000 transactions.** More are turned away.
 - **A transaction that failed is not sent again** for ten minutes: one
   that a node refused, one that a node closed the connection on, and one
@@ -218,7 +237,7 @@ measured or read in the code.
 | How it comes back | The store asks the same peers for it once, five seconds later | A node announces it on a connection that never sent it |
 | What the client is told | 200 at once, whatever happens | What came of it |
 | What the store checks | That the body is one transaction | Also the inputs and the amounts |
-| The same transaction again | Sent again each time | Sent once |
+| The same transaction again | Sent again each time | Sent again while unconfirmed; in 1.11.0 and 1.12.0, sent once |
 | No peer | 200 | 500 |
 
 - **Asking the same peer.** A node does not announce a transaction to the
@@ -267,7 +286,8 @@ taken for sent when it comes back from the network.
 - `Haskoin.Store.Web.PublishSpec`: the checks of step 2, the outbox, and
   publishing with a courier that does as it is told: the echo, a refusal,
   a closed connection, silence, a node that cannot be reached, two
-  requests at once, and two transactions with one id.
+  requests at once, two transactions with one id, and a transaction that
+  the store has unconfirmed, sent again each time.
 - `IntegrationSpec`, "publishes through a full node": a store against
   Bitcoin Core and Bitcoin Cash Node. A good transaction is answered when
   the store has it and is in the node's mempool. A forged one is refused
@@ -275,6 +295,10 @@ taken for sent when it comes back from the network.
   refused with the node's reason or times out, never shows, and the next
   good one is published. An unknown output, an output spent in a block
   and a body that is too long are refused with the reason.
+- `IntegrationSpec`, "sends again a payment that the nodes forgot": after
+  a reorganisation that made its coinbase too young for a moment, the node
+  has dropped a payment that the store lists unconfirmed. Posted again,
+  it is answered 200 and is in the node's mempool.
 - `IntegrationSpec`, "publishes over the RPC of its node": a store given
   the RPC of its node refuses the transaction that pays no fee with the
   node's reason, on Bitcoin Core too. A good transaction that the store

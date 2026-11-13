@@ -32,7 +32,7 @@
 -- 1. __Check__ what the store can decide from its own index ('judge'): the
 --    coins, the amounts, the lock time, the rules of relay that do not
 --    change, and the signature of every coin locked to one key. A
---    transaction that the store has already is answered at once.
+--    transaction that the store has in a block is answered at once.
 --
 -- 2. __Send over RPC__, where the store was given the RPC of a full node
 --    ('Publishing'.@direct@). The node checks everything, says why it
@@ -57,6 +57,17 @@
 --    refused, are kept for a while by the hash of their bytes. The same
 --    bytes posted again join the first request, or get its answer, and are
 --    not sent again.
+--
+-- A transaction that the store has in its mempool, unconfirmed, is
+-- checked and sent again in the same way, and answered from what the node
+-- did with it: there is no echo to wait for, as the store has it already.
+-- The store does not hold its mempool to its node's, so it may list a
+-- transaction that the nodes forgot: after a reorganisation, or when a
+-- node lost its mempool. Posting it again is how a wallet gets it back to
+-- them. Answering at once, as for a confirmed one, left the wallet with no
+-- way out but a fee bump, which Bitcoin Cash does not have, until the
+-- store dropped the transaction weeks later. It costs a node a
+-- transaction it may have already, which it ignores.
 --
 -- = Why it is this way
 --
@@ -110,6 +121,7 @@ module Haskoin.Store.Web.Publish
     Answer (..),
     Verdict (..),
     Direct (..),
+    Held (..),
     publish,
 
     -- * What the store can check
@@ -239,6 +251,17 @@ data Verdict
   | -- | not sent: the store could not verify the signature of this input,
     -- and had no node to give the transaction to over RPC
     Unverified !Int
+  deriving (Eq, Show)
+
+-- | Whether the store has a transaction, and where.
+data Held
+  = -- | the store does not have it
+    Absent
+  | -- | in its mempool: the network may have forgotten it, so it is sent
+    -- again
+    Pending
+  | -- | in a block: there is nothing to send
+    Confirmed
   deriving (Eq, Show)
 
 -- | What came of giving a transaction to a full node over its RPC.
@@ -557,9 +580,9 @@ data Publishing = Publishing
     -- | give the transaction to a full node over its RPC, where the store
     -- was given the RPC of one
     direct :: !(Tx -> IO Direct),
-    -- | whether the store has the transaction, from the queries of the
-    -- request
-    has :: !(TxHash -> IO Bool),
+    -- | whether the store has the transaction, and where, from the
+    -- queries of the request
+    holds :: !(TxHash -> IO Held),
     -- | the coin of an output, from the queries of the request ('coinOf')
     coin :: !(OutPoint -> IO Coin),
     -- | whether the store has the transaction now, read anew: the queries
@@ -578,11 +601,10 @@ data Publishing = Publishing
 
 -- | Publish a transaction, and say what came of it. See the module header.
 publish :: Publishing -> Tx -> IO Answer
-publish p tx = do
-  known <- p.has txid
-  if known
-    then return (Verdict Accepted)
-    else
+publish p tx =
+  p.holds txid >>= \case
+    Confirmed -> return (Verdict Accepted)
+    held ->
       (judge <$> p.rules <*> pure tx <*> mapM (p.coin . (.outpoint)) tx.inputs) >>= \case
         Left r -> return (Invalid r)
         Right unverified -> do
@@ -594,7 +616,10 @@ publish p tx = do
             Known Silent -> Verdict <$> listening (return Silent)
             Known v -> return (Verdict v)
             Fresh -> do
-              v <- listening (send unverified) `onException` done Unreachable
+              let go
+                    | held == Pending = again unverified
+                    | otherwise = listening (send unverified)
+              v <- go `onException` done Unreachable
               done v
               say v
               return (Verdict v)
@@ -628,6 +653,12 @@ publish p tx = do
                       -- an event may have been missed, never a transaction
                       Nothing -> (\has -> if has then Accepted else Silent) <$> p.present txid
               v -> return v
+    -- The store has it in its mempool, so no echo will come: what the node
+    -- took is accepted.
+    again unverified =
+      send unverified >>= \case
+        Silent -> return Accepted
+        v -> return v
     echo sub =
       receive sub >>= \case
         StoreMempoolNew h | h == txid -> return ()

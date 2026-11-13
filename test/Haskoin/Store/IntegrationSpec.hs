@@ -213,6 +213,7 @@ chainSpec kind = do
   it "serves HTTPS, and nothing else, when given a certificate" tlsTest
   it "tells each client of the transactions it chose, and takes up where it left" eventsTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
+  it "sends again a payment that the nodes forgot and the store lists" resendTest
   it "applies each change once with two stores sharing Redis" onceTest
   it "does not replace what it does not know" unknownTest
   it "leaves the keys of older caches alone" oldKeysTest
@@ -1290,8 +1291,36 @@ deriveTest env = do
 reorgTest :: Env -> IO ()
 reorgTest env = do
   let x = newXPub env "reorg" DeriveNormal
-      k = newXPub env "coinbase" DeriveNormal
   ref <- newLedger
+  (coinbaseSpend, cbValue) <- youngCoinbase env (newXPub env "coinbase" DeriveNormal)
+  txA <- coinbaseSpend (at env x [0, 0]) (cbValue - 100000)
+  record env x ref txA
+  [blockX] <- mine env 1
+  checkXPub env x ref
+  header <- rpc env.node "getblockheader" [String blockX]
+  parent <- maybe (fail "No parent") return (textField "previousblockhash" header)
+  void $ rpc env.node "invalidateblock" [String parent]
+  pool <- rawMempool env.node
+  (txA `elem` pool) `shouldBe` False
+  -- mined to the address of the invalidated parent, in the same second and
+  -- without transactions, the block would be the parent again, which the
+  -- node refuses as known to be invalid
+  other <- getNewAddress env.node
+  void $ generateTo env.node 1 other
+  txB <- coinbaseSpend (at env x [0, 1]) (cbValue - 200000)
+  void $ mine env 2
+  forget ref txA
+  record env x ref txB
+  e <- expect <$> readIORef ref
+  e.txids `shouldBe` [txB]
+  checkXPub env x ref
+
+-- | A coinbase that may be spent in the next block and not before, and a
+-- way to spend it to an address. A spend in that block is dropped by the
+-- node when the parent of the block is invalidated, as the coinbase is
+-- too young again.
+youngCoinbase :: Env -> XPub -> IO (Text -> Word64 -> IO Text, Word64)
+youngCoinbase env k = do
   void $ mine env 1
   [cbBlock] <- generateTo env.node 1 (at env k [0, 0])
   block <- rpc env.node "getblock" [String cbBlock]
@@ -1317,27 +1346,35 @@ reorgTest env = do
           ]
   -- 99 blocks on top: the coinbase may be spent in the next block
   void $ mine env 99
+  return (coinbaseSpend, cbValue)
+
+-- | A payment that the nodes forgot while the store still lists it is sent
+-- again when it is posted again. The payment spends a coinbase in the
+-- first block where it may; invalidating the parent of that block makes
+-- the coinbase too young, and the node drops the payment. The store keeps
+-- the longer chain until the new one is longer, and then has the payment
+-- unconfirmed, as the coinbase may be spent again.
+resendTest :: Env -> IO ()
+resendTest env = do
+  let x = newXPub env "resend" DeriveNormal
+  (coinbaseSpend, cbValue) <- youngCoinbase env (newXPub env "resend-coinbase" DeriveNormal)
   txA <- coinbaseSpend (at env x [0, 0]) (cbValue - 100000)
-  record env x ref txA
   [blockX] <- mine env 1
-  checkXPub env x ref
   header <- rpc env.node "getblockheader" [String blockX]
   parent <- maybe (fail "No parent") return (textField "previousblockhash" header)
   void $ rpc env.node "invalidateblock" [String parent]
-  pool <- rawMempool env.node
-  (txA `elem` pool) `shouldBe` False
-  -- mined to the address of the invalidated parent, in the same second and
-  -- without transactions, the block would be the parent again, which the
-  -- node refuses as known to be invalid
+  -- not to the address of the invalidated parent, as in 'reorgTest'
   other <- getNewAddress env.node
   void $ generateTo env.node 1 other
-  txB <- coinbaseSpend (at env x [0, 1]) (cbValue - 200000)
   void $ mine env 2
-  forget ref txA
-  record env x ref txB
-  e <- expect <$> readIORef ref
-  e.txids `shouldBe` [txB]
-  checkXPub env x ref
+  (txA `elem`) <$> rawMempool env.node `shouldReturn` False
+  (code, v) <- getJSON env.plain ("/transaction/" <> cs txA)
+  code `shouldBe` 200
+  (field "block" v >>= field "mempool") `shouldSatisfy` isJust
+  (_, raw) <- getJSON env.plain ("/transaction/" <> cs txA <> "/raw")
+  tx <- maybe (fail "No raw transaction") (either fail return . decodeTxBody env.net . cs) (textField "result" raw)
+  publishTx env tx >>= \(c, r) -> (c, textField "txid" r) `shouldBe` (200, Just txA)
+  (txA `elem`) <$> rawMempool env.node `shouldReturn` True
 
 -------------------------------------------------------------------------------
 -- Cache
