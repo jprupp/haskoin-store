@@ -42,6 +42,8 @@ module Haskoin.Store.Database.Query
     getTxData,
     getTxRecord,
     getManyTxData,
+    getManyTxBytes,
+    liveTxBytes,
     getChainSpender,
     getChainSpenders,
     withChainSpenders,
@@ -77,6 +79,7 @@ module Haskoin.Store.Database.Query
     count,
     withManyIters,
     retrieveManyCF,
+    retrieveManyBytesCF,
     joinConduits,
     usedAddresses,
   )
@@ -98,6 +101,7 @@ import Conduit
   )
 import Control.Monad (forM, (>=>))
 import Data.Bits ((.&.))
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Default (def)
 import Data.Functor ((<&>))
@@ -156,6 +160,7 @@ import Haskoin.Store.Common
   )
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader
+import Haskoin.Store.Database.Slices (blockData, txBytes)
 import Haskoin.Store.Database.Types
 import System.Metrics.StatsD (decrementGauge, incrementCounter, incrementGauge)
 import UnliftIO
@@ -182,6 +187,7 @@ databaseRead r =
       getBlock = getBlock r,
       getTxData = fmap notDeleted . getTxData r,
       getManyTxData = fmap (map notDeleted) . getManyTxData r,
+      getManyTxBytes = getManyTxBytes r,
       getSpender = getSpender r,
       getBalance = getBalance r,
       getUnspent = getUnspent r,
@@ -236,14 +242,16 @@ getReplacedAt r h = do
   rows <- matchingAsListCF r.db (heightCF r.db) (ReplacedAtKeyH h)
   return [t | (ReplacedAtKey _ t, ()) <- rows]
 
--- | Data of a block.
+-- | Data of a block. Its list of transactions is decoded when it is used,
+-- as "Haskoin.Store.Database.Slices" explains: most reads of a block want
+-- its height or its header.
 getBlock :: DatabaseReader -> BlockHash -> IO (Maybe BlockData)
 getBlock r h =
-  retrieveCF r.db (blockCF r.db) (BlockKey h) >>= \case
+  getCF r.db (blockCF r.db) (encode (BlockKey h)) >>= \case
     Nothing -> return Nothing
-    Just b -> do
+    Just bytes -> do
       count r $ \s -> incrementCounter s.dataBlockCount 1
-      return (Just b)
+      return (Just (either error id (blockData bytes)))
 
 -------------------------------------------------------------------------------
 -- Transactions
@@ -279,6 +287,22 @@ getManyTxData r ths = do
     fill (Just _ : more) (td : tds) = Just td : fill more tds
     fill (Nothing : more) tds = Nothing : fill more tds
     fill _ _ = []
+
+-- | Transactions as stored, in the format of the network, without the
+-- deleted ones: slices of their values ("Haskoin.Store.Database.Slices"),
+-- without the spenders of their outputs.
+getManyTxBytes :: DatabaseReader -> [TxHash] -> IO [Maybe ByteString]
+getManyTxBytes r ths = do
+  found <- map (>>= liveTxBytes) <$> retrieveManyBytesCF r.db (txCF r.db) (map TxKey ths)
+  count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes found))
+  return found
+
+-- | The transaction of a stored 'TxData', unless it is deleted.
+liveTxBytes :: ByteString -> Maybe ByteString
+liveTxBytes value = case txBytes value of
+  Right (bytes, False) -> Just bytes
+  Right (_, True) -> Nothing
+  Left e -> error ("liveTxBytes: " <> e)
 
 -- | The input of a block that spends an output, if one does: one read by
 -- key, of the group of outputs that it is in, in a database of version 22.
@@ -698,10 +722,14 @@ gauge r n = count r $ \s ->
 -- way to read one key, and most requests about one transaction or one
 -- address ask for one.
 retrieveManyCF :: (Serialize key, Serialize value) => DB -> ColumnFamily -> [key] -> IO [Maybe value]
-retrieveManyCF _ _ [] = return []
-retrieveManyCF db cf [key] = pure . fmap (either error id . decode) <$> getCF db cf (encode key)
-retrieveManyCF db cf keys =
-  map (fmap (either error id . decode)) <$> multiGetCF db cf (map encode keys)
+retrieveManyCF db cf keys = map (fmap (either error id . decode)) <$> retrieveManyBytesCF db cf keys
+
+-- | The bytes of the values of many keys, as 'retrieveManyCF' reads them,
+-- for values that are read in part ("Haskoin.Store.Database.Slices").
+retrieveManyBytesCF :: (Serialize key) => DB -> ColumnFamily -> [key] -> IO [Maybe ByteString]
+retrieveManyBytesCF _ _ [] = return []
+retrieveManyBytesCF db cf [key] = pure <$> getCF db cf (encode key)
+retrieveManyBytesCF db cf keys = multiGetCF db cf (map encode keys)
 
 -- | Merge streams sorted newest first, drop duplicates, and apply the offset
 -- and limit.

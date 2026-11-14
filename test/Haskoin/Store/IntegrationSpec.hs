@@ -1156,6 +1156,10 @@ endpointsTest env = do
   rawNode <- rpc env.node "getrawtransaction" [String t1, Bool False]
   raw <- plainJSON env ("/transaction/" <> cs t1 <> "/raw")
   field "result" raw `shouldBe` Just rawNode
+  -- the same bytes as a list of one, and as the text of Blockchain.info
+  plainJSON env ("/transactions/raw?txids=" <> cs t1) `shouldReturn` toJSON [rawNode]
+  rawText <- Wreq.get (env.plain <> "/blockchain/rawtx/" <> cs t1 <> "?format=hex")
+  String (cs (rawText ^. Wreq.responseBody)) `shouldBe` rawNode
   bal <- plainJSON env ("/address/" <> cs a <> "/balance")
   num "confirmed" bal `shouldBe` 400000
   num "unconfirmed" bal `shouldBe` 50000

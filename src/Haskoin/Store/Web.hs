@@ -125,7 +125,8 @@ import Data.Aeson.Encoding
   )
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
-import Data.ByteString.Builder (lazyByteString)
+import Data.ByteString (ByteString)
+import Data.ByteString.Builder (Builder, lazyByteString)
 import Data.ByteString.Char8 qualified as C
 import Data.ByteString.Lazy qualified as L
 import Data.Bytes.Get
@@ -139,7 +140,7 @@ import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.Int (Int64)
 import Data.List qualified
-import Data.List (nub)
+import Data.List (intersperse, nub)
 import Data.Maybe
   ( catMaybes,
     fromJust,
@@ -256,6 +257,7 @@ import Network.Wai
     getRequestBodyChunk,
     mapResponseHeaders,
     modifyResponse,
+    responseBuilder,
     responseLBS,
     responseStatus,
     responseStream,
@@ -1063,7 +1065,7 @@ handlePaths st cfg =
     marshalled ["notx"] (\r -> GetBlockMTP <$> cap r <*> dflt r) (handleBlockMTP st),
     marshalled ["notx"] (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
     marshalled [] (\r -> GetTx <$> cap r) (handleTx st),
-    plain [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
+    pieces (.txRaw) [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
     pathPosted [] (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
     plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
@@ -1080,7 +1082,7 @@ handlePaths st cfg =
     pieces (.blockRaw) [] (\r -> GetBlockTimeRaw <$> cap r) (handleBlockTimeRaw st),
     pieces (.blockRaw) [] (\r -> GetBlockMTPRaw <$> cap r) (handleBlockMTPRaw st),
     marshalledList ["txids"] (\r -> GetTxs <$> need r) (handleTxs st),
-    plain ["txids"] (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
+    pieces (.txRaw) ["txids"] (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
     marshalledPieces (.txBlock) [] (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
     pieces (.txBlockRaw) [] (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
     plain [] (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
@@ -1362,7 +1364,13 @@ getRawBlock st h =
 rawBlock :: StoreRead -> BlockData -> [Piece]
 rawBlock q b =
   around (hexOf b.header <> hexOf (VarInt (fromIntegral (length b.txs)))) mempty $
-    map piece (pieced pieceSize (fmap (foldMap (hexOf . transactionData) . catMaybes) . C.getTransactions q) b.txs)
+    map piece (pieced pieceSize (fmap (foldMap rawHex . catMaybes) . q.getManyTxBytes) b.txs)
+
+-- | The hex of bytes as stored, such as a transaction in the format of the
+-- network: read as they are, and written with the table of haskoin-core's
+-- 'hexBuilder'.
+rawHex :: ByteString -> Builder
+rawHex = hexBuilder . L.fromStrict
 
 -- | The pieces of the JSON of a 'RawResult', from those of the hexadecimal.
 rawResult :: [Piece] -> [Piece]
@@ -1499,23 +1507,24 @@ handleTxs st (GetTxs txids) =
 handleTxRaw ::
   WebState ->
   GetTxRaw ->
-  IO (RawResult Tx)
+  IO [Piece]
 handleTxRaw st (GetTxRaw txid) =
-  withMetrics st (.txRaw) $
-    C.getTransaction st.query txid
-      >>= \case
-        Nothing -> notFoundTx st txid
-        Just tx -> return $ RawResult (transactionData tx)
+  st.query.getManyTxBytes [txid] >>= \case
+    [Just bytes] -> return (rawResult [piece (return (rawHex bytes))])
+    _ -> notFoundTx st txid
 
--- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized.
+-- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized. The client names
+-- them, so they are all read before the answer begins, in one piece.
 handleTxsRaw ::
   WebState ->
   GetTxsRaw ->
-  IO (RawResultList Tx)
-handleTxsRaw st (GetTxsRaw txids) =
-  withMetrics st (.txRaw) $
-    RawResultList . map transactionData . catMaybes
-      <$> C.getTransactions st.query (nub txids)
+  IO [Piece]
+handleTxsRaw st (GetTxsRaw txids) = do
+  found <- catMaybes <$> st.query.getManyTxBytes (nub txids)
+  return [piece (return (listOf (map quoted found)))]
+  where
+    listOf items = "[" <> mconcat (intersperse "," items) <> "]"
+    quoted bytes = "\"" <> rawHex bytes <> "\""
 
 -- | The hashes of the transactions of a block. Responds with an error if
 -- not found.
@@ -1529,9 +1538,9 @@ handleTxsBlock st (GetTxsBlock h) = transactionPieces st.query <$> getTxsBlock s
 -- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized, in pieces.
 handleTxsBlockRaw :: WebState -> GetTxsBlockRaw -> IO [Piece]
 handleTxsBlockRaw st (GetTxsBlockRaw h) =
-  listPieces hex . transactionPieces st.query =<< getTxsBlock st h
+  listPieces hex . pieced pieceSize (fmap catMaybes . st.query.getManyTxBytes) =<< getTxsBlock st h
   where
-    hex t = unsafeToEncoding ("\"" <> hexOf (transactionData t) <> "\"")
+    hex bytes = unsafeToEncoding ("\"" <> rawHex bytes <> "\"")
 
 -- GET TransactionAfterHeight --
 
@@ -3144,7 +3153,7 @@ getBinfoTx st txid = do
     [t] -> return $ Right t
     [] -> return $ Left ThingNotFound
     ts ->
-      let tids = map (txHash . transactionData) ts
+      let tids = map (.txid) ts
        in return $ Left (TxIndexConflict tids)
 
 -- | Handler for @GET \/blockchain\/rawtx\/:txid@: a transaction, as Blockchain.info.
@@ -3164,8 +3173,12 @@ handleBinfoTx st req =
       let net = st.config.store.net
       let ctx = st.config.store.ctx
       streamEncoding $ marshalEncoding (net, ctx) $ toBinfoTxSimple numtxid t
-    hx t = do
-      textResponse . encodeHexLazy . runPutL . serialize $ transactionData t
+    -- the bytes as stored, of the transaction that the id names
+    hx t =
+      st.query.getManyTxBytes [t.txid] >>= \case
+        [Just bytes] -> return (responseBuilder status200 textType (rawHex bytes))
+        _ -> raise st ThingNotFound
+    textType = [(hContentType, "text/plain; charset=utf-8")]
 
 -- | Handler for @GET \/blockchain\/q\/txtotalbtcoutput\/:txid@: total value of the outputs of a transaction.
 handleBinfoTotalOut :: WebState -> Req -> IO Response

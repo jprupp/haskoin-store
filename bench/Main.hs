@@ -13,7 +13,8 @@
 -- output of each transaction pay the "hot" address, so it gains eleven
 -- transactions per block. Nine outputs per block go to the first 100
 -- external and change addresses of the benchmark xpub, in turn. Both are
--- printed once the chain is synced.
+-- printed once the chain is synced. With 400 blocks or more, the last one
+-- also holds 3,000 transactions that spend outputs of the hot address.
 module Main (main) where
 
 import Conduit
@@ -175,18 +176,32 @@ hotAddr ctx = pubKeyAddr ctx (derivePublicKey ctx (wrapSecKey True key))
 scriptOf :: Ctx -> Address -> ByteString
 scriptOf ctx = fromMaybe (error "script") . addressToScriptBS ctx
 
--- | Blocks at heights 1 to n on top of the regtest genesis.
+-- | Blocks at heights 1 to n on top of the regtest genesis. The last block
+-- of a chain of 400 blocks or more also spends 3,000 outputs that earlier
+-- blocks paid to the hot address, one transaction each, so that there is a
+-- large block to answer about.
 chain :: Ctx -> Network -> Int -> [Block]
-chain ctx net n = go 1 net.genesisHeader Nothing
+chain ctx net n = go 1 net.genesisHeader
   where
     hot = scriptOf ctx (hotAddr ctx)
-    go h parent prevcb
+    coinbase h = Tx 1 [TxIn nullOutPoint (encode (fromIntegral h :: Word32)) maxBound] [TxOut 5000000000 hot] [] 0
+    -- the transactions of the block at a height, after its coinbase
+    regular h
+      | h <= 1 = []
+      | otherwise = spends h (txHash (coinbase (h - 1)))
+    go h parent
       | h > n = []
       | otherwise =
-          let cb = Tx 1 [TxIn nullOutPoint (encode (fromIntegral h :: Word32)) maxBound] [TxOut 5000000000 hot] [] 0
-              txs = maybe [] (spends h) prevcb
-              block = mine net parent (cb : txs)
-           in block : go (h + 1) block.header (Just (txHash cb))
+          let extra = if h == n && n >= 400 then wide else []
+              block = mine net parent (coinbase h : regular h <> extra)
+           in block : go (h + 1) block.header
+    -- the outputs to the hot address of the transactions of blocks 2 to
+    -- 335, nine a block, each spent by a transaction of its own
+    wide =
+      [ Tx 1 [TxIn (OutPoint (txHash t) 1) "" maxBound] [TxOut 98990000 hot] [] 0
+      | h <- [2 .. 335],
+        t <- drop 1 (regular h)
+      ]
     spends h cb =
       let t1 = Tx 1 [TxIn (OutPoint cb 0) "" maxBound] (replicate 9 (TxOut 500000000 hot)) [] 0
           tk k =

@@ -113,6 +113,7 @@ import Haskoin.Store.Data
     XPubUnspent (..),
     nullBalance,
     toTransaction,
+    toTransactionWithId,
     zeroBalance,
   )
 
@@ -184,6 +185,11 @@ data StoreRead = StoreRead
     -- | data of many transactions, in the order of their hashes, read
     -- together
     getManyTxData :: [TxHash] -> IO [Maybe TxData],
+    -- | many transactions as stored, in the format of the network, in the
+    -- order of their hashes, read together, and left out where
+    -- 'getManyTxData' leaves them out. Nothing of them is decoded, and the
+    -- spenders of their outputs are not read: this is for raw answers
+    getManyTxBytes :: [TxHash] -> IO [Maybe ByteString],
     -- | transaction input that spends an output, if it is spent
     getSpender :: OutPoint -> IO (Maybe Spender),
     -- | balance of an address, or 'Nothing' if it was never used
@@ -413,11 +419,12 @@ xPubSummary _xspec xbals =
 
 -- | Transaction with its metadata, or 'Nothing' if it is unknown.
 getTransaction :: StoreRead -> TxHash -> IO (Maybe Transaction)
-getTransaction r h = fmap (toTransaction r.net r.ctx) <$> r.getTxData h
+getTransaction r h = fmap (toTransactionWithId r.net r.ctx h) <$> r.getTxData h
 
--- | Many transactions, in the order of their hashes, read together.
+-- | Many transactions, in the order of their hashes, read together. Each is
+-- read by its id, so its id is not computed again ('toTransactionWithId').
 getTransactions :: StoreRead -> [TxHash] -> IO [Maybe Transaction]
-getTransactions r hs = map (fmap (toTransaction r.net r.ctx)) <$> r.getManyTxData hs
+getTransactions r hs = zipWith (fmap . toTransactionWithId r.net r.ctx) hs <$> r.getManyTxData hs
 
 -- | Transactions that match a short numeric identifier; see 'getNumTxData'.
 getNumTransaction :: StoreRead -> Word64 -> IO [Transaction]
