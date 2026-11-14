@@ -4,6 +4,7 @@
 
 module Main (main) where
 
+import Control.Concurrent (getNumCapabilities)
 import Control.Monad (when)
 import Data.Char (toLower)
 import Data.Default (Default (..))
@@ -274,6 +275,15 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
+      -- two requests a core: one may be waiting for the disk, or for its
+      -- client to read, while another computes
+      cores <- getNumCapabilities
+      maxRequests <-
+        env "MAX_REQUESTS" (fromIntegral (2 * cores)) readMaybe
+      requestQueue <-
+        env "REQUEST_QUEUE" d.requestQueue readMaybe
+      requestWait <-
+        env "REQUEST_WAIT" d.requestWait readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -442,6 +452,29 @@ config c = do
           <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
           <> showDefault
           <> value c.webLimits.slowRequest
+    maxRequests <-
+      option auto $
+        metavar "INT"
+          <> long "max-requests"
+          <> helpEnv
+            "MAX_REQUESTS"
+            "Requests answered at once, health checks aside; the default is two a core (0 = no cap)"
+          <> showDefault
+          <> value c.webLimits.maxRequests
+    requestQueue <-
+      option auto $
+        metavar "INT"
+          <> long "request-queue"
+          <> helpEnv "REQUEST_QUEUE" "Requests that may wait for one of those to end; more are refused"
+          <> showDefault
+          <> value c.webLimits.requestQueue
+    requestWait <-
+      option auto $
+        metavar "SECONDS"
+          <> long "request-wait"
+          <> helpEnv "REQUEST_WAIT" "Refuse a request that has waited this long"
+          <> showDefault
+          <> value c.webLimits.requestWait
     return WebLimits {..}
   redis <-
     flag c.redis True $

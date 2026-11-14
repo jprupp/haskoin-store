@@ -96,14 +96,25 @@ data Route = Route
     pattern :: ![Either Text Text],
     -- | the names of the parameters it accepts in the query string or a form
     accepts :: ![Text],
-    handler :: Req -> IO Response
+    handler :: Req -> IO Response,
+    -- | whether it answers from memory alone, at next to no cost, like a
+    -- health check: such a route is answered even by a server that is full
+    -- ("Haskoin.Store.Web.Admission"). 'route' makes routes that are not.
+    light :: !Bool
   }
 
 -- | A route for a method, a path such as @\/block\/:block@, where a segment
 -- that starts with a colon captures what is there under its name, and the
 -- names of the parameters it accepts.
 route :: Method -> Text -> [Text] -> (Req -> IO Response) -> Route
-route m path = Route m [segment t | t <- T.splitOn "/" path, not (T.null t)]
+route m path accepts handler =
+  Route
+    { method = m,
+      pattern = [segment t | t <- T.splitOn "/" path, not (T.null t)],
+      accepts = accepts,
+      handler = handler,
+      light = False
+    }
   where
     segment t = maybe (Left t) Right (T.stripPrefix ":" t)
 
@@ -147,7 +158,7 @@ next = throwIO Next
 -- request is read whole first, and parsed as a form if it is one; handlers
 -- that stream a response still stream it.
 router :: [Route] -> (Req -> Miss -> IO Response) -> Application
-router routes = routerScoped routes ($ routes)
+router routes = routerScoped routes (\_ answer -> answer routes)
 
 -- | 'router' for handlers that need something that lasts as long as one
 -- request does, such as a view of a database that must be the same for
@@ -155,8 +166,9 @@ router routes = routerScoped routes ($ routes)
 --
 -- The routes are given twice. The first list is used for its methods, paths
 -- and parameters only, to find the route of a request. The second argument
--- runs an action with the same routes, in the same order, made for the one
--- request: the handler that answers is taken from those. The response is
+-- is told which route matched, and runs an action with the same routes, in
+-- the same order, made for the one request: the handler that answers is
+-- taken from those. The response is
 -- sent inside that action, so that a handler that streams its response can
 -- go on reading while it is sent.
 --
@@ -166,7 +178,7 @@ router routes = routerScoped routes ($ routes)
 -- many requests do.
 routerScoped ::
   [Route] ->
-  (([Route] -> IO (Maybe ResponseReceived)) -> IO (Maybe ResponseReceived)) ->
+  (Route -> ([Route] -> IO (Maybe ResponseReceived)) -> IO (Maybe ResponseReceived)) ->
   (Req -> Miss -> IO Response) ->
   Application
 routerScoped routes scoped fallback request respond = do
@@ -185,7 +197,7 @@ routerScoped routes scoped fallback request respond = do
         | r.method == requestMethod request,
           Just cs <- match r.pattern path =
             case nub [k | (k, _) <- params, k `notElem` r.accepts] of
-              [] -> scoped (answer i (req cs r.accepts)) >>= maybe (go unknown rs) return
+              [] -> scoped r (answer i (req cs r.accepts)) >>= maybe (go unknown rs) return
               ks -> go (unknown <|> Just ks) rs
         | otherwise = go unknown rs
   go Nothing (zip [0 :: Int ..] routes)

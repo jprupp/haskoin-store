@@ -65,6 +65,8 @@ server args = do
           blocks = chain ctx net nblocks
       requests <- newTVarIO []
       logged <- maybe False (`notElem` ["", "0"]) <$> lookupEnv "BENCH_LOG"
+      -- MAX_REQUESTS: the cap on the requests answered at once; none by default
+      capped <- maybe 0 read <$> lookupEnv "MAX_REQUESTS"
       let withLog f = if logged then withLogger LevelDebug f else f quiet
       withLog $ \logger -> withStore (storeConfig ctx net dir redis blocks requests logger) $ \store -> do
         withSubscription store.pub $ \sub -> waitHeight store sub nblocks
@@ -75,7 +77,7 @@ server args = do
         T.putStrLn $ "best block: " <> maybe "" blockHashToHex bh
         putStrLn $ "serving on port " <> show port
         hFlush stdout
-        runWeb (webConfig store port)
+        runWeb ((webConfig store port) {limits = def {maxRequests = capped}} :: WebConfig)
 
 addrText :: Network -> Address -> T.Text
 addrText net = fromMaybe (error "address") . addrToText net

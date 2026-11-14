@@ -134,6 +134,7 @@ info:
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
+    | 503 | `server-busy` | The server has more requests than it can answer soon. Try again after the seconds of its `Retry-After` header, or ask another server. |
 
     `/health` also answers 203 for a server that works but cannot reach its
     Redis; see there.

@@ -78,6 +78,7 @@ library
       Haskoin.Store.Outage
       Haskoin.Store.Runtime
       Haskoin.Store.Web
+      Haskoin.Store.Web.Admission
       Haskoin.Store.Web.Docs
       Haskoin.Store.Web.Events
       Haskoin.Store.Web.Pieces
@@ -293,6 +294,7 @@ test-suite spec
       Haskoin.Store.LogicSpec
       Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
+      Haskoin.Store.Web.AdmissionSpec
       Haskoin.Store.Web.EventsSpec
       Haskoin.Store.Web.PiecesSpec
       Haskoin.Store.Web.PublishSpec

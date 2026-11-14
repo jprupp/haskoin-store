@@ -213,6 +213,7 @@ import Haskoin.Store.Fleet.Member
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
+import Haskoin.Store.Web.Admission (Admission, Load (..), admitted, load, newAdmission)
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
 import Haskoin.Store.Web.Pieces (Piece, around, hexOf, listPieces, piece, pieced, piecesResponse)
@@ -352,13 +353,22 @@ data WebLimits = WebLimits
     blockTimeout :: !Word64,
     -- | seconds that a request may take before the log has a warning
     -- about it ('logIt')
-    slowRequest :: !Word32
+    slowRequest :: !Word32,
+    -- | requests answered at once, the light ones aside
+    -- ("Haskoin.Store.Web.Admission"); 0 is no cap
+    maxRequests :: !Word32,
+    -- | requests that may wait for one of those to end
+    requestQueue :: !Word32,
+    -- | seconds that a request waits before it is refused
+    requestWait :: !Word32
   }
   deriving (Eq, Show)
 
 -- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
 -- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes,
 -- block timeout of four hours, and a warning for requests of five seconds.
+-- No cap on the requests answered at once, which the executable sets from
+-- the number of cores; with one, 64 may wait, for five seconds.
 instance Default WebLimits where
   def =
     WebLimits
@@ -370,7 +380,10 @@ instance Default WebLimits where
         xpubGapInit = 20,
         txTimeout = 3600 `div` 2,
         blockTimeout = 4 * 3600,
-        slowRequest = 5
+        slowRequest = 5,
+        maxRequests = 0,
+        requestQueue = 64,
+        requestWait = 5
       }
 
 -- | Configuration of the web server.
@@ -448,7 +461,9 @@ data WebState = WebState
     eventLog :: !EventLog,
     -- | the transactions that were handed over and that the store asks
     -- for until it has them ("Haskoin.Store.Web.Publish")
-    asking :: !Publish.Asking
+    asking :: !Publish.Asking,
+    -- | the cap on the requests answered at once
+    admission :: !Admission
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
@@ -509,6 +524,10 @@ data WebMetrics = WebMetrics
     -- Errors
     serverErrors :: StatCounter,
     clientErrors :: StatCounter,
+    -- Admission
+    refused :: StatCounter,
+    running :: !StatGauge,
+    waiting :: !StatGauge,
     -- Others
     health :: !StatTiming,
     peers :: !StatTiming,
@@ -578,6 +597,9 @@ createMetrics s = do
   -- Errors
   serverErrors <- c "server_errors"
   clientErrors <- c "client_errors"
+  refused <- newStatCounter s "web.requests_refused" 1
+  running <- g "requests_running"
+  waiting <- g "requests_waiting"
 
   -- Others
   health <- d "health"
@@ -675,6 +697,11 @@ serveWeb config serve = do
   cacheUp <- cacheCheck >>= newTVarIO
   eventLog <- newEventLog
   asking <- Publish.newAsking
+  admission <-
+    newAdmission
+      (fromIntegral config.limits.maxRequests)
+      (fromIntegral config.limits.requestQueue)
+      (fromIntegral config.limits.requestWait * 1000000)
   let db = config.store.db
       stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
       routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
@@ -729,12 +756,15 @@ serveWeb config serve = do
                     | tries > 0 -> shared member (tries - 1) True answer
                     | otherwise -> behind answer
       behind answer = answer [r {handler = behindResponse st} :: Route | r <- routes]
-      -- the stream of events never ends, and reads nothing from the
-      -- database: answered like the rest it would hold a view, and the
-      -- data under it, for as long as its client listens
-      app request
-        | pathInfo request == ["events"] = routerScoped routes ($ routes) notFound request
-        | otherwise = routerScoped routes scoped notFound request
+      app request = routerScoped routes capped notFound request
+      -- a light route reads nothing from the database, and is answered at
+      -- once, with no view and no slot: the stream of events, which never
+      -- ends, would hold both for as long as its client listens. The others
+      -- are answered in a slot, or told that the server is full.
+      capped r answer
+        | r.light = answer routes
+        | otherwise = admitted admission (answer full) (scoped answer)
+      full = [r {handler = busyResponse st} :: Route | r <- routes]
       routes = routesOf st
       notFound _ NoRoute = errorResponse st ThingNotFound
       notFound _ (Unknown ks) =
@@ -748,11 +778,13 @@ serveWeb config serve = do
   newBlock <- newTVarIO False
   withAsync (priceUpdater session ticker) $ \_a1 ->
     withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
-      withAsync (feedEvents st) $ \a3 ->
-        withAsync (askingLoop st) $ \_a4 ->
-          link a3 >> do
-            let logged = logIt config.logger config.accessLog config.limits.slowRequest
-            serve . webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed . cappedBody st $ app
+      withAsync (admissionLoop metrics admission) $ \_a5 ->
+        withAsync (feedEvents st) $ \a3 ->
+          withAsync (askingLoop st) $ \_a4 ->
+            link a3 >> do
+              let logged = logIt config.logger config.accessLog config.limits.slowRequest
+                  outer = webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed
+              serve . outer . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -918,6 +950,33 @@ notFoundTx st txid = st.query.getReplaced txid >>= maybe (raise st ThingNotFound
 behindResponse :: WebState -> Req -> IO Response
 behindResponse st _ = errorResponse st BehindFleet
 
+-- | What a server that is full answers ("Haskoin.Store.Web.Admission"): 503
+-- with @{"error": "server-busy"}@, and a header that says to try again in a
+-- second. It is not counted as an error of the server: nothing is wrong with
+-- it, and the refusals have a metric of their own.
+busyResponse :: WebState -> Req -> IO Response
+busyResponse st _ = do
+  forM_ st.metrics $ \m -> incrementCounter m.refused 1
+  return $
+    responseLBS
+      status503
+      [(hContentType, "application/json"), ("Retry-After", "1")]
+      "{\"error\":\"server-busy\"}"
+
+-- | Report how full the server is to StatsD, once a second.
+admissionLoop :: Maybe WebMetrics -> Admission -> IO ()
+admissionLoop Nothing _ = return ()
+admissionLoop (Just m) admission = forever $ do
+  full <- load admission
+  setGauge m.running full.busy
+  setGauge m.waiting full.waiting
+  threadDelay 1000000
+
+-- | Mark a route as one that answers from memory alone, to be answered
+-- even by a server that is full.
+lightly :: Route -> Route
+lightly r = r {light = True}
+
 -- | The response to an error, in JSON, counted in the metrics.
 errorResponse :: WebState -> Except -> IO Response
 errorResponse st e = do
@@ -1070,8 +1129,8 @@ handlePaths st cfg =
     plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
     marshalledList limits (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
-    plainList [] (\_ -> return GetPeers) (handlePeers st),
-    pathHealth st,
+    lightly (plainList [] (\_ -> return GetPeers) (handlePeers st)),
+    lightly (pathHealth st),
     plainList ["limit", "offset"] (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
     marshalledList ["blocks", "notx"] (\r -> GetBlocks <$> need r <*> dflt r) (handleBlocks st),
     pieces (.blockRaw) [] (\r -> GetBlockRaw <$> cap r) (handleBlockRaw st),
@@ -1095,11 +1154,11 @@ handlePaths st cfg =
       (handleAddrsTxsFull st),
     marshalledList ["addresses"] (\r -> GetAddrsBalance <$> need r) (handleAddrsBalance st),
     marshalledList ("addresses" : limits) (\r -> GetAddrsUnspent <$> need r <*> lim r) (handleAddrsUnspent st),
-    get "/events" ("after" : eventParams) (handleEvents st),
-    get "/dbstats" [] (handleDbStats st),
+    lightly (get "/events" ("after" : eventParams) (handleEvents st)),
+    lightly (get "/dbstats" [] (handleDbStats st)),
     -- the reference of the API, as a page and as the file that it shows
-    get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage),
-    get "/swagger.yaml" [] (\_ -> file "application/yaml" swaggerYaml)
+    lightly (get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage)),
+    lightly (get "/swagger.yaml" [] (\_ -> file "application/yaml" swaggerYaml))
   ]
     <> (if cfg.noXPub then [] else xpubRoutes)
     <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
