@@ -125,7 +125,7 @@ import Data.Aeson.Encoding
   )
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Base16 (decodeBase16, parseBase16)
-import Data.ByteString.Builder (Builder, lazyByteString)
+import Data.ByteString.Builder (lazyByteString)
 import Data.ByteString.Char8 qualified as C
 import Data.ByteString.Lazy qualified as L
 import Data.Bytes.Get
@@ -214,7 +214,7 @@ import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
-import Haskoin.Store.Web.Pieces (around, hexOf, listPieces, pieced, piecesResponse)
+import Haskoin.Store.Web.Pieces (Piece, around, hexOf, listPieces, piece, pieced, piecesResponse)
 import Haskoin.Store.Web.Publish qualified as Publish
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.WebCommon
@@ -327,7 +327,7 @@ import UnliftIO
     writeTQueue,
     writeTVar,
   )
-import UnliftIO.Concurrent (threadDelay)
+import UnliftIO.Concurrent (getNumCapabilities, threadDelay)
 
 -- | Limits of the API. A value of @0@ means no limit.
 data WebLimits = WebLimits
@@ -1149,7 +1149,7 @@ handlePaths st cfg =
       (WebMetrics -> StatTiming) ->
       [Text] ->
       (Req -> IO a) ->
-      (a -> IO [IO Builder]) ->
+      (a -> IO [Piece]) ->
       Route
     pieces = pathPieces st
     plain :: (ApiResource a b, ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
@@ -1262,7 +1262,7 @@ pathPieces ::
   (WebMetrics -> StatTiming) ->
   [Text] ->
   (Req -> IO a) ->
-  (a -> IO [IO Builder]) ->
+  (a -> IO [Piece]) ->
   Route
 pathPieces st df ps parser action =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req ->
@@ -1274,13 +1274,21 @@ pathPieces st df ps parser action =
 
 -- | A response in pieces, timed. The timing counts the whole response, the
 -- time that the client takes to read it included.
-inPieces :: WebState -> (WebMetrics -> StatTiming) -> ResponseHeaders -> IO [IO Builder] -> IO Response
+inPieces :: WebState -> (WebMetrics -> StatTiming) -> ResponseHeaders -> IO [Piece] -> IO Response
 inPieces st df headers pieces = do
   began <- now
   let done = forM_ st.metrics $ \m -> now >>= \ended -> addTiming (df m) (ended - began)
-  (pieces >>= piecesResponse headers done) `onException` done
+  n <- encoders
+  (pieces >>= piecesResponse n headers done) `onException` done
   where
     now = round . (* 1000) <$> getPOSIXTime :: IO Int
+
+-- | How many pieces of a response are read and encoded at once: one for
+-- each core, so that a long answer is encoded on all of them, but no more
+-- than eight, which bounds what a response holds to some nine pieces, and
+-- leaves cores to other requests on a large machine.
+encoders :: IO Int
+encoders = min 8 <$> getNumCapabilities
 
 -- | The headers of a response in JSON.
 jsonType :: ResponseHeaders
@@ -1338,12 +1346,12 @@ pruneTx True BlockData {..} = BlockData {txs = take 1 txs, ..}
 -- GET BlockRaw --
 
 -- | Handler for @GET \/block\/:block\/raw@: a block by hash, serialized as in the peer-to-peer protocol.
-handleBlockRaw :: WebState -> GetBlockRaw -> IO [IO Builder]
+handleBlockRaw :: WebState -> GetBlockRaw -> IO [Piece]
 handleBlockRaw st (GetBlockRaw h) = rawResult <$> getRawBlock st h
 
 -- | The pieces of a block by hash, serialized, in hexadecimal. Responds
 -- with an error if not found.
-getRawBlock :: WebState -> H.BlockHash -> IO [IO Builder]
+getRawBlock :: WebState -> H.BlockHash -> IO [Piece]
 getRawBlock st h =
   st.query.getBlock h >>= maybe (raise st ThingNotFound) (return . rawBlock st.query)
 
@@ -1351,18 +1359,18 @@ getRawBlock st h =
 -- hexadecimal: its header and the number of its transactions, then its
 -- transactions as they are read. The first piece has transactions too, so
 -- that a response does not begin before something of them was read.
-rawBlock :: StoreRead -> BlockData -> [IO Builder]
+rawBlock :: StoreRead -> BlockData -> [Piece]
 rawBlock q b =
   around (hexOf b.header <> hexOf (VarInt (fromIntegral (length b.txs)))) mempty $
-    pieced pieceSize (fmap (foldMap (hexOf . transactionData) . catMaybes) . C.getTransactions q) b.txs
+    map piece (pieced pieceSize (fmap (foldMap (hexOf . transactionData) . catMaybes) . C.getTransactions q) b.txs)
 
 -- | The pieces of the JSON of a 'RawResult', from those of the hexadecimal.
-rawResult :: [IO Builder] -> [IO Builder]
+rawResult :: [Piece] -> [Piece]
 rawResult = around "{\"result\":\"" "\"}"
 
 -- | The pieces of the JSON of a 'RawResultList', from those of the
 -- hexadecimal of each of its items.
-rawResultList :: [[IO Builder]] -> [IO Builder]
+rawResultList :: [[Piece]] -> [Piece]
 rawResultList items =
   around "[" "]" (concat [around (comma <> "\"") "\"" item | (comma, item) <- zip ("" : repeat ",") items])
 
@@ -1378,7 +1386,7 @@ handleBlockBest st (GetBlockBest (NoTx notx)) =
     (bestBlock st.query) >>= maybe (raise st ThingNotFound) (return . pruneTx notx)
 
 -- | Handler for @GET \/block\/best\/raw@: the best block, serialized.
-handleBlockBestRaw :: WebState -> GetBlockBestRaw -> IO [IO Builder]
+handleBlockBestRaw :: WebState -> GetBlockBestRaw -> IO [Piece]
 handleBlockBestRaw st _ =
   st.query.getBestBlock >>= \case
     Nothing -> raise st ThingNotFound
@@ -1424,7 +1432,7 @@ handleBlockHeights st (GetBlockHeights (HeightsParam heights) (NoTx notx)) =
       >>= (\hs -> getBlocks st hs notx) . concat
 
 -- | Handler for @GET \/block\/height\/:height\/raw@: the blocks at a height, serialized.
-handleBlockHeightRaw :: WebState -> GetBlockHeightRaw -> IO [IO Builder]
+handleBlockHeightRaw :: WebState -> GetBlockHeightRaw -> IO [Piece]
 handleBlockHeightRaw st (GetBlockHeightRaw h) =
   fmap rawResultList $
     mapM (getRawBlock st) =<< st.query.getBlocksAtHeight (fromIntegral h)
@@ -1456,7 +1464,7 @@ handleBlockMTP st (GetBlockMTP (TimeParam t) (NoTx notx)) =
       Just b -> return $ pruneTx notx b
 
 -- | Handler for @GET \/block\/time\/:time\/raw@: the last block with a timestamp at or before a time, serialized.
-handleBlockTimeRaw :: WebState -> GetBlockTimeRaw -> IO [IO Builder]
+handleBlockTimeRaw :: WebState -> GetBlockTimeRaw -> IO [Piece]
 handleBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
   C.blockAtOrBefore st.query st.config.store.chain t >>= \case
     Nothing -> raise st ThingNotFound
@@ -1464,7 +1472,7 @@ handleBlockTimeRaw st (GetBlockTimeRaw (TimeParam t)) =
 
 -- | Handler for @GET \/block\/mtp\/:time\/raw@: the first block with a median time
 -- past at or after a time, serialized.
-handleBlockMTPRaw :: WebState -> GetBlockMTPRaw -> IO [IO Builder]
+handleBlockMTPRaw :: WebState -> GetBlockMTPRaw -> IO [Piece]
 handleBlockMTPRaw st (GetBlockMTPRaw (TimeParam t)) =
   C.blockAtOrAfterMTP st.query st.config.store.chain t >>= \case
     Nothing -> raise st ThingNotFound
@@ -1519,7 +1527,7 @@ handleTxsBlock :: WebState -> GetTxsBlock -> IO [IO [Transaction]]
 handleTxsBlock st (GetTxsBlock h) = transactionPieces st.query <$> getTxsBlock st h
 
 -- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized, in pieces.
-handleTxsBlockRaw :: WebState -> GetTxsBlockRaw -> IO [IO Builder]
+handleTxsBlockRaw :: WebState -> GetTxsBlockRaw -> IO [Piece]
 handleTxsBlockRaw st (GetTxsBlockRaw h) =
   listPieces hex . transactionPieces st.query =<< getTxsBlock st h
   where
@@ -3047,7 +3055,7 @@ handleBinfoBlockHeight st req =
 -- in it, and they are put where the empty list was. Should the encoding of
 -- haskoin-store-data come to end another way, the block is read and
 -- encoded whole, as it was before.
-binfoBlockPieces :: WebState -> Bool -> BlockData -> IO [IO Builder]
+binfoBlockPieces :: WebState -> Bool -> BlockData -> IO [Piece]
 binfoBlockPieces st numtxid b = do
   nhs <- fmap catMaybes $ st.query.getBlocksAtHeight (b.height + 1) >>= mapM (st.query.getBlock)
   let h x = H.headerHash x.header
@@ -3083,7 +3091,7 @@ binfoBlockPieces st numtxid b = do
         <$> listPieces (marshalEncoding own . toBinfoTxSimple numtxid) txs
     else do
       whole <- map (toBinfoTxSimple numtxid) . concat <$> sequence txs
-      return [return (fromEncoding (marshalEncoding own (toBinfoBlock b whole nxt)))]
+      return [piece (return (fromEncoding (marshalEncoding own (toBinfoBlock b whole nxt))))]
   where
     net = st.config.store.net
     ctx = st.config.store.ctx
