@@ -739,6 +739,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
+| `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
 | `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
 The rules and queries of version 20 (`Haskoin.Store.Logic`,
@@ -793,6 +794,7 @@ With `--statsd`, the store reports:
 | `cache.*` | Cache hits, misses, reloads and full reloads |
 | `store.*` | Block and header heights, mempool size and other gauges |
 | `fleet.cache.*` | What a server of a fleet does with the fleet's cache of xpubs |
+| `rts.*` | GHC's garbage collector |
 
 The metrics of the fleet's cache:
 
@@ -815,6 +817,33 @@ The metrics of the fleet's cache:
   server stops at the wrong moment. The log says why each time.
 - With `--debug` the log also has a line for each entry built and each
   block that the cache was brought to.
+
+The metrics of the garbage collector, sent once a second:
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `rts.gcs` | counter | Collections |
+| `rts.major_gcs` | counter | Collections of the whole heap |
+| `rts.gc_pause_us` | counter | Microseconds that every thread was stopped for the collector |
+| `rts.gc_pause_mean_us` | gauge | Mean pause of a collection in the last second |
+| `rts.gc_pause_percent` | gauge | Share of the last second that every thread was stopped |
+| `rts.gc_cpu_us` | counter | Microseconds of CPU that the collector used, on all cores |
+| `rts.nonmoving_sync_us` | counter | Microseconds stopped to end a mark of the non-moving collector |
+| `rts.nonmoving_mark_us` | counter | Microseconds that the non-moving collector marked, while the store ran |
+| `rts.allocated_bytes` | counter | Bytes allocated |
+| `rts.live_bytes` | gauge | Bytes live after the last collection |
+| `rts.heap_bytes` | gauge | Bytes that the heap holds from the system |
+
+- **Every collection stops every thread**, the small ones too. While it is
+  stopped the store answers nothing, not even `/health`, so a high
+  `rts.gc_pause_percent` shows up as slow answers everywhere.
+- **The executable runs with `+RTS -T`**, which GHC needs to keep these
+  statistics. Without it, as in a program that uses the library, the log
+  says so and there are no `rts.*` metrics.
+- **The `rts.nonmoving_*` metrics** stay at zero unless the store runs with
+  `+RTS --nonmoving-gc`, for example with `GHCRTS=--nonmoving-gc` in its
+  environment. That collector handles the old generation while the store
+  runs, so its pauses do not grow with the heap.
 
 ### Database statistics
 

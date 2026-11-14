@@ -11,7 +11,7 @@ servers:
   - url: './'
 
 info:
-  version: &version 1.15.0
+  version: &version 1.15.1
   title: Haskoin
   contact:
     name: JP Rupp
