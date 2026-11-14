@@ -33,6 +33,7 @@ import Haskoin.Store
     withStore,
   )
 import Haskoin.Store.Common (loopForever)
+import Haskoin.Store.Runtime (runtimeMetrics)
 import NQE (receive, withSubscription)
 import Options.Applicative
   ( Mod,
@@ -75,6 +76,7 @@ import UnliftIO.Directory
   ( createDirectoryIfMissing,
     getAppUserDataDirectory,
   )
+import UnliftIO.Async (withAsync)
 import UnliftIO.Environment (lookupEnv)
 
 -- | Version of the package, set at build time.
@@ -802,7 +804,8 @@ run cfg =
                 reportSamples = not cfg.statsdNoEvents,
                 reportStats = cfg.statsdAggregates
               }
-            (go . Just)
+            -- the metrics of the garbage collector, beside those of the store
+            (\stats -> withAsync (runtimeMetrics (withSource "Runtime" logger) stats) (\_ -> go (Just stats)))
       | otherwise = go Nothing
     level
       | cfg.debug = LevelDebug

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.15.1] - 2026-11-14
+
+### Added
+- **Metrics of the garbage collector.** With `--statsd`, the store sends
+  GHC's statistics under `rts.*` once a second: collections, the time that
+  every thread was stopped for them, the CPU that they used, the work of
+  the non-moving collector, allocation, and the size of the live data and
+  of the heap. Every collection stops every thread, so they say how much
+  of a slow answer is the collector's. The executable now runs with
+  `+RTS -T`, which GHC needs to keep them.
+
+### Changed
+- **The old generation is collected while the store runs.** The executable
+  uses GHC's non-moving collector (`--nonmoving-gc`). The copying collector
+  stopped every thread while it copied all live data, gigabytes for a store
+  of mainnet, and under load every request waited for it, `/health`
+  included. The heap can be larger, as old objects are not moved together.
+  `GHCRTS=--copying-gc` goes back to the copying collector.
+
 ## [1.15.0] - 2026-11-14
 
 Answers decode less of what they read, and write hex faster.

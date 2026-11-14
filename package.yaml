@@ -1,5 +1,5 @@
 name: haskoin-store
-version: 1.15.0
+version: 1.15.1
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: |
   An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
@@ -110,10 +110,17 @@ executables:
     # like it grew without end in the stress test, from 45 to 260 MiB in six
     # minutes with 10 MiB live, most of it given back already; with the flag
     # it stayed between 50 and 90 MiB, and memory figures mean what they say.
+    # -T: keep the statistics of the garbage collector, for the rts.* metrics
+    # of StatsD (Haskoin.Store.Runtime); it costs a few counters per collection.
+    # --nonmoving-gc: collect the old generation while the store runs. The
+    # copying collector stops every thread to copy all live data, which takes
+    # longer as the heap grows: a store of mainnet holds gigabytes, and under
+    # load even /health waited behind it. The price is a heap that can be
+    # larger, as old objects are not moved together.
     ghc-options:
       - -threaded
       - -rtsopts
-      - '"-with-rtsopts=-N --disable-delayed-os-memory-return"'
+      - '"-with-rtsopts=-N -T --nonmoving-gc --disable-delayed-os-memory-return"'
     dependencies:
       - haskoin-store
       - filepath ^>= 1.5.5.0

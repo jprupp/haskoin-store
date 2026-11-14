@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.15.0
+version:        1.15.1
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes them in RocksDB, and
@@ -76,6 +76,7 @@ library
       Haskoin.Store.Logic.Layered
       Haskoin.Store.Manager
       Haskoin.Store.Outage
+      Haskoin.Store.Runtime
       Haskoin.Store.Web
       Haskoin.Store.Web.Docs
       Haskoin.Store.Web.Events
@@ -218,7 +219,7 @@ executable haskoin-store
       NoFieldSelectors
       OverloadedRecordDot
       OverloadedStrings
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N --disable-delayed-os-memory-return"
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-N -T --nonmoving-gc --disable-delayed-os-memory-return"
   build-depends:
       aeson >=2.2.5.1 && <2.3
     , base >=4.21.2.0 && <4.22
