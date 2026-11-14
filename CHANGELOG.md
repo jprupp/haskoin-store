@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `web.requests_refused` say how full the server is.
 
 ### Changed
+- **The heap collects less often.** The executable runs with `-A64m`: 64
+  MiB of new objects for each core between collections, where GHC's
+  default is 4. Under load, collections fell from 50 to 110 a second to 2
+  to 4, the time that every thread was stopped fell by half, and a testnet
+  store answered 19% more requests. It costs about 60 MiB more memory for
+  each core, and pauses of about 30 ms.
+- **The collector is GHC's default again**, which the executable no longer
+  chooses. The non-moving collector of 1.15.1 gained nothing under the
+  same load. `GHCRTS=--nonmoving-gc` selects it.
 - **`Haskoin.Store.Web.Router`:** a `Route` has a `light` field, and the
   scope of `routerScoped` is told which route matched.
 

@@ -873,10 +873,10 @@ The metrics of the garbage collector, sent once a second:
 - **The executable runs with `+RTS -T`**, which GHC needs to keep these
   statistics. Without it, as in a program that uses the library, the log
   says so and there are no `rts.*` metrics.
-- **The `rts.nonmoving_*` metrics** are the work of the non-moving
-  collector, which the executable uses for the old generation (see
-  [Memory](#memory)). They stay at zero if the store runs with the copying
-  collector instead.
+- **The `rts.nonmoving_*` metrics** stay at zero unless the store runs
+  with GHC's non-moving collector, as with `GHCRTS=--nonmoving-gc` in its
+  environment. The executable uses GHC's default collector (see
+  [Memory](#memory)).
 
 The metrics of the cap on requests ([Overload](#overload)):
 
@@ -902,18 +902,21 @@ The resident memory of the store is its GHC heap plus RocksDB.
   `--disable-delayed-os-memory-return` for that. Without the flag, Linux
   keeps counting returned memory as resident until it needs it, and the
   heap looks as if it never shrinks after a peak.
-- **The old generation is collected while the store runs**, with GHC's
-  non-moving collector (`--nonmoving-gc`). The default copying collector
-  stops every thread while it copies all live data, which takes longer as
-  the heap grows. A store of mainnet holds gigabytes, and under load every
-  request waited for it, `/health` included. Small collections of new
-  objects still stop every thread, but they are short.
-- **The price is memory.** Old objects are not moved together, so the heap
-  can hold more than the copying collector would for the same live data.
-  To go back to the copying collector, run the store with
-  `GHCRTS=--copying-gc` in its environment, or `+RTS --copying-gc -RTS`.
+- **The heap collects less often**, with 64 MiB of new objects for each
+  core between collections (`-A64m`), where GHC's default is 4. Every
+  collection stops every thread. Measured under load on a store of mainnet
+  and one of testnet, collections fell from 50 to 110 a second to 2 to 4,
+  the time that the stores spent stopped fell by half (11% to 6%, and 24%
+  to 14%), and the testnet store answered 19% more requests.
+- **The price** is about 60 MiB more memory for each core, and pauses of
+  about 30 ms where they were 2 to 4 ms. To change it, set for example
+  `GHCRTS=-A16m` in the environment of the store.
+- **The collector is GHC's default**, which the executable does not
+  choose: in GHC 9.12 it copies. Version 1.15.1 chose the non-moving
+  collector; in the same measurements it gained nothing, and with `-A64m`
+  the copying one did a little better. `GHCRTS=--nonmoving-gc` selects it.
 - If you build the store some other way, pass
-  `+RTS --nonmoving-gc --disable-delayed-os-memory-return -RTS` yourself.
+  `+RTS -A64m --disable-delayed-os-memory-return -RTS` yourself.
 - **To tell such memory from a leak**, see
   `stress/results/2026-11-09-memory/README.md`: how to read `smaps`, and a
   heap profile of a busy store, with live data flat at about 10 MiB.
