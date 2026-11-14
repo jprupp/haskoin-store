@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   of a slow answer is the collector's. The executable now runs with
   `+RTS -T`, which GHC needs to keep them.
 
+### Changed
+- **The old generation is collected while the store runs.** The executable
+  uses GHC's non-moving collector (`--nonmoving-gc`). The copying collector
+  stopped every thread while it copied all live data, gigabytes for a store
+  of mainnet, and under load every request waited for it, `/health`
+  included. The heap can be larger, as old objects are not moved together.
+  `GHCRTS=--copying-gc` goes back to the copying collector.
+
 ## [1.15.0] - 2026-11-14
 
 Answers decode less of what they read, and write hex faster.

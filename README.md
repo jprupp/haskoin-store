@@ -840,10 +840,10 @@ The metrics of the garbage collector, sent once a second:
 - **The executable runs with `+RTS -T`**, which GHC needs to keep these
   statistics. Without it, as in a program that uses the library, the log
   says so and there are no `rts.*` metrics.
-- **The `rts.nonmoving_*` metrics** stay at zero unless the store runs with
-  `+RTS --nonmoving-gc`, for example with `GHCRTS=--nonmoving-gc` in its
-  environment. That collector handles the old generation while the store
-  runs, so its pauses do not grow with the heap.
+- **The `rts.nonmoving_*` metrics** are the work of the non-moving
+  collector, which the executable uses for the old generation (see
+  [Memory](#memory)). They stay at zero if the store runs with the copying
+  collector instead.
 
 ### Database statistics
 
@@ -861,8 +861,18 @@ The resident memory of the store is its GHC heap plus RocksDB.
   `--disable-delayed-os-memory-return` for that. Without the flag, Linux
   keeps counting returned memory as resident until it needs it, and the
   heap looks as if it never shrinks after a peak.
+- **The old generation is collected while the store runs**, with GHC's
+  non-moving collector (`--nonmoving-gc`). The default copying collector
+  stops every thread while it copies all live data, which takes longer as
+  the heap grows. A store of mainnet holds gigabytes, and under load every
+  request waited for it, `/health` included. Small collections of new
+  objects still stop every thread, but they are short.
+- **The price is memory.** Old objects are not moved together, so the heap
+  can hold more than the copying collector would for the same live data.
+  To go back to the copying collector, run the store with
+  `GHCRTS=--copying-gc` in its environment, or `+RTS --copying-gc -RTS`.
 - If you build the store some other way, pass
-  `+RTS --disable-delayed-os-memory-return -RTS` yourself.
+  `+RTS --nonmoving-gc --disable-delayed-os-memory-return -RTS` yourself.
 - **To tell such memory from a leak**, see
   `stress/results/2026-11-09-memory/README.md`: how to read `smaps`, and a
   heap profile of a busy store, with live data flat at about 10 MiB.
