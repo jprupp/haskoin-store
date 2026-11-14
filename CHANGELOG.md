@@ -6,8 +6,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [1.14.0] - 2026-11-14
 
-Long answers are encoded on several cores, and the load-test server works
-again.
+Long answers are encoded on several cores, addresses are written faster,
+and the load-test server works again.
 
 ### Changed
 - **Long answers are encoded on several cores.** The answers that are
@@ -19,6 +19,13 @@ again.
   the pieces of `Haskoin.Store.Web.Pieces` are a `Piece`, made with
   `piece` from an action that gives bytes, and `piecesResponse` takes how
   many to read at once.
+- **Addresses are written faster**, with haskoin-core 1.6.3, which this
+  version needs. Every input and output of a transaction in JSON carries
+  its address. For 20,000 of them, reading the address from its script
+  takes 3 ms where it took 33, writing a legacy address 60 ms where it
+  took 81, and a SegWit address 50 ms where it took 81. CashAddr was fast
+  already. A whole answer of transactions takes some 30% less to build and
+  encode.
 
 ### Fixed
 - The load-test server, `haskoin-store-bench`, builds and syncs again. It
