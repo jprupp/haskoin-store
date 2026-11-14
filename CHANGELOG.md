@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+- **A peer that does not deliver a block no longer holds up the store.**
+  The store asks one peer at a time for blocks, and waited out the whole
+  peer timeout, two minutes, on one that announced a block and did not
+  send it: a new block could take two minutes and six seconds to arrive on
+  a store with twenty good peers. Now a peer that delivers nothing for
+  `--block-stall` seconds, ten by default, is passed over: the next
+  fastest peer is asked for the same blocks, and whichever delivers first
+  is taken. The stall doubles for each peer passed over, up to the peer
+  timeout, so a slow link still gets its blocks. The peer passed over is
+  not disconnected unless it still owes its blocks after the peer timeout.
+- **The peer timeout is 30 seconds by default**, where it was 120
+  (`--peer-timeout`). It is how long a peer may be silent, leave a ping
+  unanswered, or owe blocks. A block must still arrive within it, which
+  for a block of 32 MB takes a link of 9 Mbit/s: set it higher on a slower
+  one.
+- **`StoreConfig` and `BlockStoreConfig` have a `blockStall` field.**
+
 ## [1.15.1] - 2026-11-14
 
 ### Added

@@ -25,6 +25,7 @@ import System.Mem (performMajorGC)
 import System.Random
 import Test.Hspec
 import UnliftIO
+import UnliftIO.Concurrent (threadDelay)
 
 data TestStore = TestStore
   { testStoreDB :: !DatabaseReader,
@@ -76,6 +77,18 @@ spec = prepareContext $ \ctx -> do
         bestNodeM <- chainGetBlock testStoreChain (last bs)
         fmap (.height) bestNodeM `shouldBe` Just 80
         readTVarIO testStoreBlockRequests `shouldReturn` [64, 16]
+    it "asks another peer for the blocks that the first one does not deliver" $
+      -- The first peer to connect sends headers and never a block; the
+      -- second connects a second later and delivers. With a stall of one
+      -- second the store has its blocks in a few; waiting out the timeout
+      -- of the first peer, as it used to, would take a minute.
+      withStalledStore bchRegTest ctx "stalled-peer" $ \TestStore {..} -> do
+        got <- timeout 20000000 . replicateM 8 . receiveMatch testStoreEvents $ \case
+          StoreBestBlock b -> Just b
+          _ -> Nothing
+        fmap length got `shouldBe` Just 8
+        -- both were asked: the silent one first, then the one that delivers
+        length <$> readTVarIO testStoreBlockRequests `shouldReturn` 2
 
   describe "Memory" $
     it "keeps the heap flat while syncing" $ do
@@ -124,7 +137,37 @@ withTestStoreBlocks ::
   String ->
   (TestStore -> IO a) ->
   IO a
-withTestStoreBlocks blocks net ctx t f =
+withTestStoreBlocks blocks = withTestStoreConfig (dummyPeerConnect 0 mockPeerReact blocks) id
+
+-- | A store with two mock peers: one that connects at once and never sends
+-- a block, and one that connects a second later and behaves. The store
+-- passes over a peer that delivers nothing for a second.
+withStalledStore ::
+  Network ->
+  Ctx ->
+  String ->
+  (TestStore -> IO a) ->
+  IO a
+withStalledStore = withTestStoreConfig peers $ \cfg ->
+  cfg {initPeers = ["127.0.0.1:18444", "127.0.0.1:18445"], blockStall = 1}
+  where
+    peers requests net ad sa = case sa of
+      SockAddrInet 18444 _ -> dummyPeerConnect 0 silent allBlocks requests net ad sa
+      _ -> dummyPeerConnect 1000000 mockPeerReact allBlocks requests net ad sa
+    silent _ (MGetData _) = []
+    silent blocks msg = mockPeerReact blocks msg
+
+-- | A store whose peers are made by a function, with its configuration
+-- changed by another.
+withTestStoreConfig ::
+  (TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection) ->
+  (StoreConfig -> StoreConfig) ->
+  Network ->
+  Ctx ->
+  String ->
+  (TestStore -> IO a) ->
+  IO a
+withTestStoreConfig peers change net ctx t f =
   withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
     requests <- newTVarIO []
     let ad =
@@ -132,7 +175,7 @@ withTestStoreBlocks blocks net ctx t f =
             nodeNetwork
             (sockToHostAddress (SockAddrInet 0 0))
         cfg =
-          StoreConfig
+          change StoreConfig
             { maxPeers = 20,
               -- the mock peer, by name: since haskoin-node 2.5 the seed of
               -- a regtest network is not an address that discovery takes
@@ -154,8 +197,9 @@ withTestStoreBlocks blocks net ctx t f =
               blockWindow = 64,
               mempoolTimeout = 14,
               peerTimeout = 60,
+              blockStall = 10,
               maxPeerLife = 48 * 3600,
-              connect = dummyPeerConnect blocks requests net ad,
+              connect = peers requests net ad,
               stats = Nothing,
               bloom = True,
               maxOpenFiles = Nothing,
@@ -252,8 +296,18 @@ cannedBlocksBase64 =
   \AAAAAAAAAAAAAAAAAAD/////DF8BAQgvRUIzMi4wL/////8BAPIFKgEAAAAjIQME7KZAozHsyrOO\
   \wT6Wn6LtY47B39Th44JKsZ8BGJCvc6wAAAAA"
 
-dummyPeerConnect :: [Block] -> TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
-dummyPeerConnect blocks requests net ad sa f = do
+-- | A mock peer that waits so many microseconds before it says anything,
+-- and then answers each message with a function of the blocks that it has.
+dummyPeerConnect ::
+  Int ->
+  ([Block] -> Message -> [Message]) ->
+  [Block] ->
+  TVar [Int] ->
+  Network ->
+  NetworkAddress ->
+  SockAddr ->
+  WithConnection
+dummyPeerConnect wait react blocks requests net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
@@ -264,6 +318,7 @@ dummyPeerConnect blocks requests net ad sa f = do
   where
     go :: Inbox ByteString -> Mailbox ByteString -> IO ()
     go r s = do
+      threadDelay wait
       nonce <- randomIO
       now <- round <$> liftIO getPOSIXTime
       let rmt = NetworkAddress 0 (sockToHostAddress sa)
@@ -273,7 +328,7 @@ dummyPeerConnect blocks requests net ad sa f = do
         forever (receive r >>= yield)
           .| inc
           .| iterMC (recordBlockRequest requests)
-          .| concatMapC (mockPeerReact blocks)
+          .| concatMapC (react blocks)
           .| outc
           .| awaitForever (`send` s)
     outc = mapMC $ \msg' -> return $ runPut (putMessage net msg')

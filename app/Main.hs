@@ -115,6 +115,7 @@ data Config = Config
     syncMempool :: !Bool,
     blockWindow :: !Int,
     peerTimeout :: !Int,
+    blockStall :: !Int,
     maxPeerLife :: !Int,
     mempoolTimeout :: !Int,
     maxPeers :: !Int,
@@ -196,7 +197,9 @@ defConfig = do
   mempoolTimeout <-
     env "MEMPOOL_TIMEOUT" 14 readMaybe
   peerTimeout <-
-    env "PEER_TIMEOUT" 120 readMaybe
+    env "PEER_TIMEOUT" 30 readMaybe
+  blockStall <-
+    env "BLOCK_STALL" 10 readMaybe
   maxPeerLife <-
     env "MAX_PEER_LIFE" (48 * 3600) readMaybe
   maxPeers <-
@@ -514,9 +517,16 @@ config c = do
     option auto $
       metavar "SECONDS"
         <> long "peer-timeout"
-        <> helpEnv "PEER_TIMEOUT" "Unresponsive peer timeout"
+        <> helpEnv "PEER_TIMEOUT" "Disconnect a peer that is silent, or owes blocks, for this long"
         <> showDefault
         <> value c.peerTimeout
+  blockStall <-
+    option auto $
+      metavar "SECONDS"
+        <> long "block-stall"
+        <> helpEnv "BLOCK_STALL" "Ask another peer for blocks that the syncing peer has not delivered for this long"
+        <> showDefault
+        <> value c.blockStall
   maxPeerLife <-
     option auto $
       metavar "SECONDS"
@@ -740,6 +750,7 @@ run cfg =
             blockWindow = cfg.blockWindow,
             mempoolTimeout = cfg.mempoolTimeout,
             peerTimeout = fromIntegral cfg.peerTimeout,
+            blockStall = fromIntegral cfg.blockStall,
             maxPeerLife = fromIntegral cfg.maxPeerLife,
             connect = withConnection,
             stats = stats,

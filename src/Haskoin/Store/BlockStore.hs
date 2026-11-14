@@ -19,9 +19,11 @@
 -- the block store picks one online peer as its syncing peer and asks it for
 -- blocks in batches of 'blockWindow'. Each block is imported as soon as it
 -- arrives. If the best block of the database is no longer in the main chain of
--- headers, blocks are reverted until it is. A syncing peer that sends a block
--- that was not requested, cannot find a block, or stays silent for longer than
--- 'peerTimeout' is disconnected. The state of the download, and every rule
+-- headers, blocks are reverted until it is. A syncing peer that delivers
+-- nothing for 'blockStall' is passed over: the next fastest peer is asked for
+-- the same blocks, and whichever delivers first is taken. A peer that sends a
+-- block that it was not asked for, cannot find a block, or still owes blocks
+-- after 'peerTimeout' is disconnected. The state of the download, and every rule
 -- about it, is the pure state machine of "Haskoin.Store.BlockStore.Sync";
 -- this module carries out what its transitions decide.
 --
@@ -170,7 +172,7 @@ import Haskoin.Store.BlockStore.Pending (Pending, PendingTx (..))
 import Haskoin.Store.BlockStore.Pending qualified as Pending
 import Haskoin.Store.BlockStore.Sync
   ( Accept (..),
-    Sync (..),
+    Sync,
     needsMoreBlocks,
   )
 import Haskoin.Store.BlockStore.Sync qualified as Sync
@@ -398,6 +400,9 @@ data BlockStoreConfig = BlockStoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
+    -- | ask another peer for the blocks that the syncing peer has not
+    -- delivered for this long ("Haskoin.Store.BlockStore.Sync")
+    blockStall :: !NominalDiffTime,
     -- | StatsD client, if metrics are enabled
     stats :: !(Maybe Stats),
     -- | log messages here
@@ -493,7 +498,7 @@ withBlockStore ::
   (BlockStore -> IO a) ->
   IO a
 withBlockStore cfg action = do
-  pb <- newTVarIO Idle
+  pb <- newTVarIO . Sync.idle =<< getCurrentTime
   ts <- newTVarIO Pending.empty
   sy <- newTVarIO HashSet.empty
   inbox <- newInbox
@@ -588,9 +593,11 @@ syncMempool self p =
 -- the block is unknown to the node, or if the block cannot be imported.
 processBlock :: BlockStore -> Peer -> Block -> IO ()
 processBlock self peer block =
-  Sync.accept peer blockhash <$> readTVarIO self.sync >>= \case
+  transition self (Sync.accept peer blockhash) >>= \case
     NotSyncingPeer -> refuse "Non-syncing peer"
     NotRequested -> refuse "Syncing peer"
+    -- a peer that was passed over for being slow, and another was faster
+    Late -> logDebug self $ "Block " <> hexhash <> " from peer " <> peer.label <> " came after another's"
     Requested ->
       getBlockNode self blockhash >>= \case
         Nothing -> do
@@ -874,15 +881,53 @@ processTxs self p hs = guardMempool self . guardSync self $ do
           msg = MGetData (GetData vec)
       msg `sendMessage` p
 
--- | Disconnect the syncing peer if it has been silent for too long.
+-- | Deal with peers that do not deliver: disconnect the syncing peer if it
+-- has been silent for the timeout, else ask another peer for its blocks if
+-- it has been silent for the stall; and disconnect the peers passed over
+-- before that still owe their blocks after the timeout.
 checkTime :: BlockStore -> IO ()
 checkTime self = do
   now <- getCurrentTime
-  Sync.timedOut self.config.peerTimeout now <$> readTVarIO self.sync >>= \case
-    Nothing -> return ()
+  st <- readTVarIO self.sync
+  let timeout = self.config.peerTimeout
+  case Sync.timedOut timeout now st of
     Just p -> do
       logWarn self $ "Syncing peer timeout: " <> p.label
       killPeer p
+    Nothing -> forM_ (Sync.stalled self.config.blockStall timeout now st) (passOver self now)
+  forM_ (Sync.expired timeout now st) $ \p -> do
+    logWarn self $ "Peer did not deliver its blocks: " <> p.label
+    killPeer p
+
+-- | Ask the fastest peer that has not been asked yet for the blocks that
+-- the syncing peer is not delivering, and make it the syncing peer. The
+-- one passed over stays connected, and its blocks are still taken if they
+-- come first. Without another peer to ask, nothing changes.
+passOver :: BlockStore -> UTCTime -> Peer -> IO ()
+passOver self now slow = do
+  asked <- (slow :) . Sync.passedPeers <$> readTVarIO self.sync
+  others <- filter (`notElem` asked) . map (.mailbox) <$> getPeers self.config.peerMgr
+  firstM (reservePeer self.owner) others >>= \case
+    Nothing -> return ()
+    Just p ->
+      transition self (Sync.pass now p) >>= \case
+        Nothing -> void (releasePeer self.owner p)
+        Just (old, blocks) -> do
+          logWarn self $
+            "Peer "
+              <> old.label
+              <> " is not delivering: asking "
+              <> p.label
+              <> " for "
+              <> cs (show (length blocks))
+              <> " blocks"
+          void (releasePeer self.owner old)
+          unless (null blocks) $ MGetData (GetData (map inv blocks)) `sendMessage` p
+  where
+    inv = InvVector kind . (.get)
+    kind = if self.config.net.segWit then InvWitnessBlock else InvBlock
+    firstM _ [] = return Nothing
+    firstM f (x : xs) = f x >>= \ok -> if ok then return (Just x) else firstM f xs
 
 -- | Revert blocks until the best block in the database is in the main chain of headers.
 revertToMainChain :: BlockStore -> IO ()
@@ -1037,7 +1082,11 @@ trySyncing self =
     False ->
       isJust . Sync.syncingPeer <$> readTVarIO self.sync >>= \case
         True -> return ()
-        False -> getPeers self.config.peerMgr >>= recurse . map (.mailbox)
+        False -> do
+          -- the peers that still owe blocks from before are asked last
+          slow <- Sync.passedPeers <$> readTVarIO self.sync
+          peers <- map (.mailbox) <$> getPeers self.config.peerMgr
+          recurse (filter (`notElem` slow) peers <> filter (`elem` slow) peers)
   where
     recurse [] = return ()
     recurse (p : ps) =

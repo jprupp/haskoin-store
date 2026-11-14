@@ -368,6 +368,7 @@ storeConfig net ctx logger dir redisURL p2pPort fleet =
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 120,
+      blockStall = 10,
       maxPeerLife = 48 * 3600,
       connect = withConnection,
       stats = Nothing,

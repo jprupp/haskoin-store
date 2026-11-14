@@ -197,6 +197,9 @@ data StoreConfig = StoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect peer if message not received for this many seconds
     peerTimeout :: !NominalDiffTime,
+    -- | ask another peer for the blocks that the syncing peer has not
+    -- delivered for this many seconds
+    blockStall :: !NominalDiffTime,
     -- | disconnect peer if it has been connected this long
     maxPeerLife :: !NominalDiffTime,
     -- | connect to peers using the function 'Haskoin.Node.withConnection'
@@ -413,6 +416,7 @@ blockStoreCfg cfg node pub db member =
       blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,
+      blockStall = cfg.blockStall,
       stats = cfg.stats,
       logger = withSource "BlockStore" cfg.logger
     }

@@ -117,6 +117,7 @@ storeConfig ctx net dir redis blocks requests logger =
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 60,
+      blockStall = 10,
       maxPeerLife = 48 * 3600,
       connect = mockPeer blocks requests net ad,
       stats = Nothing,

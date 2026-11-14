@@ -318,7 +318,8 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER` |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
-| `--peer-timeout` | `PEER_TIMEOUT` | `120` | Seconds before an unresponsive peer is dropped |
+| `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
+| `--block-stall` | `BLOCK_STALL` | `10` | Seconds without a block from the syncing peer before another peer is asked for it too |
 | `--max-peer-life` | `MAX_PEER_LIFE` | `172800` | Seconds after which a peer is dropped, so connections rotate |
 | `--block-window` | `BLOCK_WINDOW` | `64` | Blocks to request from the syncing peer at a time |
 
@@ -567,6 +568,12 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 - The **block store** downloads blocks from one peer at a time and mempool
   transactions from all of them, and imports them. Each import is one
   atomic RocksDB batch, so a crash never leaves a half-written block.
+- **A peer that does not deliver is passed over, not waited for.** The
+  fastest peer is asked first. If it sends nothing for `--block-stall`
+  seconds, the next fastest is asked for the same blocks, and whichever
+  delivers first is taken. The stall doubles each time, up to
+  `--peer-timeout`, so that a slow link still gets its blocks; a peer that
+  still owes blocks after `--peer-timeout` is disconnected.
 - **Reorganisations** are handled by reverting blocks until the best block
   is back on the main chain of headers.
 - The **web server** answers from RocksDB, and from Redis for what is
