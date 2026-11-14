@@ -90,10 +90,11 @@ where
 
 import Control.Exception (evaluate)
 import Data.Aeson.Encoding (Encoding, fromEncoding)
-import Data.ByteString.Builder (Builder, lazyByteString, lazyByteStringHex, toLazyByteString)
+import Data.ByteString.Builder (Builder, lazyByteString, toLazyByteString)
 import Data.ByteString.Lazy qualified as L
 import Data.Bytes.Put (runPutL)
 import Data.Bytes.Serial (Serial (..))
+import Haskoin.Util (hexBuilder)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intersperse)
 import Data.Sequence (Seq (..), (|>))
@@ -204,4 +205,4 @@ around open close = \case
 
 -- | The serialization of a value, in hexadecimal.
 hexOf :: (Serial a) => a -> Builder
-hexOf = lazyByteStringHex . runPutL . serialize
+hexOf = hexBuilder . runPutL . serialize

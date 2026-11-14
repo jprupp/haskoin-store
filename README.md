@@ -733,6 +733,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Logic.Layered` | The rules that import blocks and transactions |
 | `Haskoin.Store.Database.Mempool` | The keys of the mempool area, and what it does to balances |
 | `Haskoin.Store.Database.Query.Layered` | The queries over both areas, each on a snapshot |
+| `Haskoin.Store.Database.Slices` | Stored blocks and transactions read in part, for what an answer needs |
 | `Haskoin.Store.Database.Migrate` | The migrations from versions 20 and 21 |
 | `Haskoin.Store.Cache` | The Redis cache of a server alone |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |

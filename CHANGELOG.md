@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.15.0] - 2026-11-14
+
+Answers decode less of what they read, and write hex faster.
+
+### Changed
+- **Raw answers send the transactions as stored.** A raw transaction,
+  raw block, or the raw transactions of a block, were decoded, built into
+  their JSON form, with addresses and ids, turned back and serialized
+  again; and the spenders of their outputs were read for nothing. Now the
+  bytes of each transaction are found in its stored value and written as
+  they are. The raw block of 3,011 transactions of the load test takes 21
+  ms of CPU where it took 60, and its raw transactions 24 ms where they
+  took 65. This covers `/transaction/:txid/raw`, `/transactions/raw`,
+  `/transactions/block/:block/raw`, the five `/block/…/raw` routes, and
+  the hex of `/blockchain/rawtx` and `/blockchain/rawblock`.
+- **A block's list of transactions is decoded when it is used.** Reading
+  a block decoded the hashes of all its transactions, 180 µs for a block
+  of 3,000, for the many reads that want its height or its header: the
+  health check, the best block of a request, the median time of a new
+  transaction, blocks without their transactions. `/block/best?notx=true`
+  on a block of 3,011 transactions takes 0.06 ms of CPU where it took
+  0.24, and `/block/latest?notx=true` 31% less.
+- **Transactions in JSON are built without serializing them.** Their size
+  and weight are counted from their parts, and the id of a transaction
+  read by its id is not computed again (haskoin-store-data's
+  `toTransactionWithId`). With the faster hex of haskoin-core, 5,000 full
+  transactions of an address take 20% less CPU, and the 3,011 of a block
+  21% less.
+- **Hex is written faster** (haskoin-core): from a table of digit pairs,
+  and the hashes of transactions and blocks in one step, five times as
+  fast. A list of 100 transactions of an address takes 12% less CPU.
+- `StoreRead` has `getManyTxBytes`, the transactions as stored, and the
+  new module `Haskoin.Store.Database.Slices` reads stored values in part.
+- The load test's last block holds 3,000 more transactions, when the chain
+  has 400 blocks or more, and `scripts/bench-web.sh` measures the raw
+  answers.
+
 ## [1.14.0] - 2026-11-14
 
 Long answers are encoded on several cores, addresses are written faster,

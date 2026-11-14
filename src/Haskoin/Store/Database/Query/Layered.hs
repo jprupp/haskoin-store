@@ -79,6 +79,7 @@ module Haskoin.Store.Database.Query.Layered
     -- * Transactions
     getTxData,
     getManyTxData,
+    getManyTxBytes,
     getNumTxData,
     getSpender,
 
@@ -119,6 +120,7 @@ import Conduit
   )
 import Control.Monad (forM)
 import Data.Bits ((.&.))
+import Control.Applicative ((<|>))
 import Data.ByteString qualified as BS
 import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
@@ -243,6 +245,7 @@ layeredRead v@(View r) =
       getBlock = getBlock v,
       getTxData = fmap notDeleted . getTxData v,
       getManyTxData = fmap (map notDeleted) . getManyTxData v,
+      getManyTxBytes = getManyTxBytes v,
       getSpender = getSpender v,
       getBalance = getBalance v,
       getUnspent = getUnspent v,
@@ -279,6 +282,7 @@ standaloneRead r =
       getBlock = \h -> one (\q -> q.getBlock h),
       getTxData = \h -> one (\q -> q.getTxData h),
       getManyTxData = \hs -> one (\q -> q.getManyTxData hs),
+      getManyTxBytes = \hs -> one (\q -> q.getManyTxBytes hs),
       getSpender = \p -> one (\q -> q.getSpender p),
       getBalance = \a -> one (\q -> q.getBalance a),
       getUnspent = \p -> one (\q -> q.getUnspent p),
@@ -343,6 +347,20 @@ getManyTxData (View r) hs = do
   let tds = [withSpenders spent h <$> Map.lookup h found | h <- hs]
   Q.count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes tds))
   return tds
+
+-- | Transactions as stored, in the format of the network, from the mempool
+-- area or the chain, as 'getManyTxData' finds them, without the deleted
+-- ones and without reading the spenders of their outputs.
+getManyTxBytes :: View -> [TxHash] -> IO [Maybe BS.ByteString]
+getManyTxBytes (View r) hs = do
+  unconfirmed <- look (mempoolCF r.db) hs
+  chain <- look (txCF r.db) (filter (`Map.notMember` unconfirmed) hs)
+  let found = [Map.lookup h unconfirmed <|> Map.lookup h chain >>= Q.liveTxBytes | h <- hs]
+  Q.count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes found))
+  return found
+  where
+    look _ [] = return Map.empty
+    look cf ks = Map.fromList . catMaybes . zipWith (fmap . (,)) ks <$> Q.retrieveManyBytesCF r.db cf (map TxKey ks)
 
 -- | Transactions whose hash, read as a number, matches a short identifier of
 -- the Blockchain.info API, in the order of their hashes. There may be more

@@ -61,6 +61,9 @@ import Conduit
   )
 import Control.Monad (forM)
 import Data.Bits ((.&.))
+import Control.Applicative ((<|>))
+import Data.Bytes.Put (runPutS)
+import Data.Bytes.Serial (serialize)
 import Data.ByteString qualified as BS
 import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
@@ -179,6 +182,7 @@ pooledRead r pool =
       getBlock = Q.getBlock r,
       getTxData = \h -> only <$> getManyTxData r pool [h],
       getManyTxData = getManyTxData r pool,
+      getManyTxBytes = getManyTxBytes r pool,
       getSpender = getSpender r pool,
       getBalance = getBalance r pool,
       getUnspent = getUnspent r pool,
@@ -221,6 +225,20 @@ getManyTxData _ _ [] = return []
 getManyTxData r pool hs = do
   found <- known r pool hs
   return [Map.lookup h found | h <- hs]
+
+-- | Transactions in the format of the network: those that the pool has,
+-- serialized from what it gives, and those that the chain has, as stored,
+-- for the others, without the deleted ones and without spenders.
+getManyTxBytes :: DatabaseReader -> PoolReads -> [TxHash] -> IO [Maybe BS.ByteString]
+getManyTxBytes _ _ [] = return []
+getManyTxBytes r pool hs = do
+  inPool <- zip hs <$> pool.bodies hs
+  let unconfirmed = Map.fromList [(h, runPutS (serialize td.tx)) | (h, (Just td, _)) <- inPool]
+      rest = filter (`Map.notMember` unconfirmed) hs
+  chain <-
+    Map.fromList . catMaybes . zipWith (\h v -> (,) h <$> (v >>= Q.liveTxBytes)) rest
+      <$> Q.retrieveManyBytesCF r.db (txCF r.db) (map TxKey rest)
+  return [Map.lookup h unconfirmed <|> Map.lookup h chain | h <- hs]
 
 -- | The data of transactions by hash: those that the pool has, and those
 -- that the chain has for the others, each with the spenders that blocks
