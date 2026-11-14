@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.14.0] - 2026-11-14
+
+Long answers are encoded on several cores, addresses are written faster,
+and the load-test server works again.
+
+### Changed
+- **Long answers are encoded on several cores.** The answers that are
+  sent in pieces, such as the full transactions of an address, an xpub or
+  a block, and raw blocks, now encode up to eight pieces at once, as many
+  as the server has cores. On 5,000 transactions of an address, with eight
+  cores, a request took 77 ms where it took 176 ms. A server whose cores
+  are all busy answers about as many requests as before. In the library,
+  the pieces of `Haskoin.Store.Web.Pieces` are a `Piece`, made with
+  `piece` from an action that gives bytes, and `piecesResponse` takes how
+  many to read at once.
+- **Addresses are written faster**, with haskoin-core 1.6.3, which this
+  version needs. Every input and output of a transaction in JSON carries
+  its address. For 20,000 of them, reading the address from its script
+  takes 3 ms where it took 33, writing a legacy address 60 ms where it
+  took 81, and a SegWit address 50 ms where it took 81. CashAddr was fast
+  already. A whole answer of transactions takes some 30% less to build and
+  encode.
+
+### Fixed
+- The load-test server, `haskoin-store-bench`, builds and syncs again. It
+  lacked the `nodeRpc` setting of 1.11.0, and it found no peer: since
+  haskoin-node 2.5 the mock peer has to be named, as the unit tests do.
+  `scripts/bench-web.sh` measures two answers of 5,000 transactions too,
+  and `BENCH_LOG=1` prints the log of the server.
+
 ## [1.13.0] - 2026-11-13
 
 Transactions are handed over at once, a payment that a block replaced is

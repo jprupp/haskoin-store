@@ -6,6 +6,9 @@
 --
 -- > haskoin-store-bench PORT BLOCKS [REDIS_URL]
 --
+-- Set @BENCH_LOG=1@ to print the log of the store, such as to see why it
+-- does not sync.
+--
 -- Every block holds a coinbase and ten transactions. The coinbase and one
 -- output of each transaction pay the "hot" address, so it gains eleven
 -- transactions per block. Nine outputs per block go to the first 100
@@ -38,7 +41,7 @@ import Haskoin.Store
 import Haskoin.Store.Database.Query qualified as Q
 import NQE
 import Network.Socket (SockAddr (..))
-import System.Environment (getArgs)
+import System.Environment (getArgs, lookupEnv)
 import System.Random (randomIO)
 import UnliftIO
 
@@ -60,7 +63,9 @@ server args = do
       let net = bchRegTest
           blocks = chain ctx net nblocks
       requests <- newTVarIO []
-      withStore (storeConfig ctx net dir redis blocks requests) $ \store -> do
+      logged <- maybe False (`notElem` ["", "0"]) <$> lookupEnv "BENCH_LOG"
+      let withLog f = if logged then withLogger LevelDebug f else f quiet
+      withLog $ \logger -> withStore (storeConfig ctx net dir redis blocks requests logger) $ \store -> do
         withSubscription store.pub $ \sub -> waitHeight store sub nblocks
         T.putStrLn $ "hot address: " <> addrText net (hotAddr ctx)
         T.putStrLn $ "xpub: " <> xPubExport net ctx (benchXPub ctx)
@@ -87,12 +92,14 @@ waitHeight store sub n = do
     waitHeight store sub n
 
 storeConfig ::
-  Ctx -> Network -> FilePath -> Maybe String -> [Block] -> TVar [Int] -> StoreConfig
-storeConfig ctx net dir redis blocks requests =
+  Ctx -> Network -> FilePath -> Maybe String -> [Block] -> TVar [Int] -> Logger -> StoreConfig
+storeConfig ctx net dir redis blocks requests logger =
   StoreConfig
     { maxPeers = 20,
-      initPeers = [],
-      discover = True,
+      -- the mock peer, by name: since haskoin-node 2.5 the seed of a regtest
+      -- network is not an address that discovery takes
+      initPeers = ["127.0.0.1:18444"],
+      discover = False,
       db = dir,
       net = net,
       ctx = ctx,
@@ -117,7 +124,7 @@ storeConfig ctx net dir redis blocks requests =
       writeBufferSize = Nothing,
       maxWalSize = Nothing,
       blockCache = Just (1024 * 1024 * 1024),
-      logger = quiet
+      logger = logger
     }
   where
     ad = NetworkAddress nodeNetwork (sockToHostAddress (SockAddrInet 0 0))
@@ -146,6 +153,7 @@ webConfig store port =
       healthCheckInterval = 30,
       accessLog = False,
       tls = Nothing,
+      nodeRpc = Nothing,
       logger = quiet
     }
 

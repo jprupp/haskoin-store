@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.13.0
+version:        1.14.0
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes them in RocksDB, and
@@ -108,7 +108,7 @@ library
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
@@ -172,7 +172,7 @@ library integration
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store-data >=2.0.1 && <2.1
     , hedis >=0.16.4 && <0.17
@@ -234,7 +234,7 @@ executable haskoin-store
     , filepath >=1.5.5.0 && <1.6
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data >=2.0.1 && <2.1
@@ -325,7 +325,7 @@ test-suite spec
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data >=2.0.1 && <2.1
@@ -391,7 +391,7 @@ benchmark haskoin-store-bench
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data >=2.0.1 && <2.1
@@ -454,7 +454,7 @@ benchmark haskoin-store-stress
     , file-embed >=0.0.16.0 && <0.1
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
-    , haskoin-core >=1.6.2 && <1.7
+    , haskoin-core >=1.6.3 && <1.7
     , haskoin-node >=2.5.1 && <2.6
     , haskoin-store
     , haskoin-store-data >=2.0.1 && <2.1
