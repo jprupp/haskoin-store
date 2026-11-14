@@ -354,7 +354,7 @@ data WebLimits = WebLimits
     -- | seconds that a request may take before the log has a warning
     -- about it ('logIt')
     slowRequest :: !Word32,
-    -- | requests answered at once, the light ones aside
+    -- | long requests answered at once
     -- ("Haskoin.Store.Web.Admission"); 0 is no cap
     maxRequests :: !Word32,
     -- | requests that may wait for one of those to end
@@ -758,12 +758,13 @@ serveWeb config serve = do
       behind answer = answer [r {handler = behindResponse st} :: Route | r <- routes]
       app request = routerScoped routes capped notFound request
       -- a light route reads nothing from the database, and is answered at
-      -- once, with no view and no slot: the stream of events, which never
-      -- ends, would hold both for as long as its client listens. The others
-      -- are answered in a slot, or told that the server is full.
-      capped r answer
-        | r.light = answer routes
-        | otherwise = admitted admission (answer full) (scoped answer)
+      -- once, with no view of it: the stream of events, which never ends,
+      -- would hold one for as long as its client listens. A long one is
+      -- answered in a slot, or told that the server is full.
+      capped r answer = case r.cost of
+        Light -> answer routes
+        Short -> scoped answer
+        Long -> admitted admission (answer full) (scoped answer)
       full = [r {handler = busyResponse st} :: Route | r <- routes]
       routes = routesOf st
       notFound _ NoRoute = errorResponse st ThingNotFound
@@ -975,7 +976,18 @@ admissionLoop (Just m) admission = forever $ do
 -- | Mark a route as one that answers from memory alone, to be answered
 -- even by a server that is full.
 lightly :: Route -> Route
-lightly r = r {light = True}
+lightly r = r {cost = Light}
+
+-- | Mark a route as one whose answer may be long: a list, or all of
+-- something. A server with too many of those to answer makes the next ones
+-- wait ("Haskoin.Store.Web.Admission").
+long :: Route -> Route
+long r = r {cost = Long}
+
+-- | Mark a route as one that looks up one thing, where the kind of its
+-- response would have made it long.
+short :: Route -> Route
+short r = r {cost = Short}
 
 -- | The response to an error, in JSON, counted in the metrics.
 errorResponse :: WebState -> Except -> IO Response
@@ -1119,12 +1131,12 @@ eventParams = ["quiet", "addresses", "xpub", "derive", "filter", "functions", "t
 handlePaths :: WebState -> WebConfig -> [Route]
 handlePaths st cfg =
   [ marshalled ["notx"] (\r -> GetBlockBest <$> dflt r) (handleBlockBest st),
-    marshalledList ["notx"] (\r -> GetBlockHeight <$> cap r <*> dflt r) (handleBlockHeight st),
+    short (marshalledList ["notx"] (\r -> GetBlockHeight <$> cap r <*> dflt r) (handleBlockHeight st)),
     marshalled ["notx"] (\r -> GetBlockTime <$> cap r <*> dflt r) (handleBlockTime st),
     marshalled ["notx"] (\r -> GetBlockMTP <$> cap r <*> dflt r) (handleBlockMTP st),
     marshalled ["notx"] (\r -> GetBlock <$> cap r <*> dflt r) (handleBlock st),
     marshalled [] (\r -> GetTx <$> cap r) (handleTx st),
-    pieces (.txRaw) [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st),
+    short (pieces (.txRaw) [] (\r -> GetTxRaw <$> cap r) (handleTxRaw st)),
     pathPosted [] (\r -> PostTx <$> parseTxBody st r) (handlePostTx st),
     plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
@@ -1144,7 +1156,7 @@ handlePaths st cfg =
     pieces (.txRaw) ["txids"] (\r -> GetTxsRaw <$> need r) (handleTxsRaw st),
     marshalledPieces (.txBlock) [] (\r -> GetTxsBlock <$> cap r) (handleTxsBlock st),
     pieces (.txBlockRaw) [] (\r -> GetTxsBlockRaw <$> cap r) (handleTxsBlockRaw st),
-    plain [] (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st),
+    long (plain [] (\r -> GetTxAfter <$> cap r <*> cap r) (handleTxAfter st)),
     plainList ("addresses" : limits) (\r -> GetAddrsTxs <$> need r <*> lim r) (handleAddrsTxs st),
     marshalledPieces (.addressTxFull) limits (\r -> GetAddrTxsFull <$> cap r <*> lim r) (handleAddrTxsFull st),
     marshalledPieces
@@ -1187,14 +1199,15 @@ handlePaths st cfg =
     lim = parseLimits st
     off = parseOffset st
     -- routes by how they encode their responses: in the JSON of the
-    -- network, as a list of those, or in plain JSON
+    -- network, as a list of those, or in plain JSON. A list is a long
+    -- route, as is one answered in pieces; the few that are not say so.
     marshalled ::
       (ApiResource a b, MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
     marshalled ps p h = pathCompact ps p h (marshalEncoding net)
     marshalledList ::
       (ApiResource a (SerialList b), MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
     marshalledList ps p h =
-      pathCompact ps p (fmap SerialList . h) (list (marshalEncoding net) . (.get))
+      long (pathCompact ps p (fmap SerialList . h) (list (marshalEncoding net) . (.get)))
     -- routes of what is answered while it is read: a list of items in
     -- the JSON of the network, or pieces that the handler made
     marshalledPieces ::
@@ -1212,14 +1225,14 @@ handlePaths st cfg =
       (Req -> IO a) ->
       (a -> IO [Piece]) ->
       Route
-    pieces = pathPieces st
+    pieces df ps p h = long (pathPieces st df ps p h)
     plain :: (ApiResource a b, ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
     plain ps p h = pathCompact ps p h toEncoding
     plainList ::
       (ApiResource a (SerialList b), ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
-    plainList ps p h = plain ps p (fmap SerialList . h)
+    plainList ps p h = long (plain ps p (fmap SerialList . h))
     xpubRoutes =
-      [ plain ["derive", "nocache"] (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st),
+      [ long (plain ["derive", "nocache"] (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st)),
         plainList
           ("derive" : "nocache" : limits)
           (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r)
@@ -1240,26 +1253,28 @@ handlePaths st cfg =
         plain ["derive"] (\r -> DelCachedXPub <$> cap r <*> dflt r) (handleDelXPub st)
       ]
     binfoRoutes =
-      [ post "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st)),
-        get "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st)),
-        get "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st)),
-        post "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st)),
-        get "/blockchain/rawaddr/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
-        get "/blockchain/address/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
-        get "/blockchain/xpub/:addr" rawaddrParams (jsonOnly (handleRawAddr st)),
-        post "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st)),
-        get "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st)),
+      [ long (post "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st))),
+        long (get "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st))),
+        long (get "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st))),
+        long (post "/blockchain/balance" balanceParams (jsonOnly (handleShortBal st))),
+        long (get "/blockchain/rawaddr/:addr" rawaddrParams (jsonOnly (handleRawAddr st))),
+        long (get "/blockchain/address/:addr" rawaddrParams (jsonOnly (handleRawAddr st))),
+        long (get "/blockchain/xpub/:addr" rawaddrParams (jsonOnly (handleRawAddr st))),
+        long (post "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st))),
+        long (get "/blockchain/unspent" unspentParams (jsonOnly (handleBinfoUnspent st))),
         get "/blockchain/rawtx/:txid" ["format", "txidindex"] (handleBinfoTx st),
-        get "/blockchain/rawblock/:block" ["format", "txidindex"] (handleBinfoBlock st),
+        long (get "/blockchain/rawblock/:block" ["format", "txidindex"] (handleBinfoBlock st)),
         get "/blockchain/latestblock" ["format", "txidindex"] (jsonOnly (handleBinfoLatest st)),
-        get
-          "/blockchain/unconfirmed-transactions"
-          ["format", "limit", "offset", "txidindex"]
-          (jsonOnly (handleBinfoMempool st)),
-        get "/blockchain/block-height/:height" ["format", "txidindex"] (jsonOnly (handleBinfoBlockHeight st)),
-        get "/blockchain/blocks/:milliseconds" ["format"] (jsonOnly (handleBinfoBlocksDay st)),
-        get "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st)),
-        post "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st)),
+        long $
+          get
+            "/blockchain/unconfirmed-transactions"
+            ["format", "limit", "offset", "txidindex"]
+            (jsonOnly (handleBinfoMempool st)),
+        long $
+          get "/blockchain/block-height/:height" ["format", "txidindex"] (jsonOnly (handleBinfoBlockHeight st)),
+        long (get "/blockchain/blocks/:milliseconds" ["format"] (jsonOnly (handleBinfoBlocksDay st))),
+        long (get "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st))),
+        long (post "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st))),
         get "/blockchain/q/addresstohash/:addr" [] (handleBinfoAddrToHash st),
         get "/blockchain/q/hashtoaddress/:hash" [] (handleBinfoHashToAddr st),
         get "/blockchain/q/addrpubkey/:pubkey" [] (handleBinfoAddrPubkey st),
@@ -1272,10 +1287,10 @@ handlePaths st cfg =
         get "/blockchain/q/txtotalbtcinput/:txid" [] (handleBinfoTotalInput st),
         get "/blockchain/q/txfee/:txid" [] (handleBinfoTxFees st),
         get "/blockchain/q/txresult/:txid/:addr" [] (handleBinfoTxResult st),
-        get "/blockchain/q/getreceivedbyaddress/:addr" [] (handleBinfoReceived st),
-        get "/blockchain/q/getsentbyaddress/:addr" [] (handleBinfoSent st),
+        long (get "/blockchain/q/getreceivedbyaddress/:addr" [] (handleBinfoReceived st)),
+        long (get "/blockchain/q/getsentbyaddress/:addr" [] (handleBinfoSent st)),
         get "/blockchain/q/addressbalance/:addr" [] (handleBinfoAddrBalance st),
-        get "/blockchain/q/addressfirstseen/:addr" [] (handleFirstSeen st)
+        long (get "/blockchain/q/addressfirstseen/:addr" [] (handleFirstSeen st))
       ]
 
 -- | A handler of the Blockchain.info endpoints that answer in JSON only. They

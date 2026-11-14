@@ -275,11 +275,11 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
-      -- two requests a core: one may be waiting for the disk, or for its
-      -- client to read, while another computes
+      -- four long requests a core: most of the time of one goes in RocksDB,
+      -- on a thread of its own, often waiting for the disk
       cores <- getNumCapabilities
       maxRequests <-
-        env "MAX_REQUESTS" (fromIntegral (2 * cores)) readMaybe
+        env "MAX_REQUESTS" (fromIntegral (4 * cores)) readMaybe
       requestQueue <-
         env "REQUEST_QUEUE" d.requestQueue readMaybe
       requestWait <-
@@ -458,21 +458,21 @@ config c = do
           <> long "max-requests"
           <> helpEnv
             "MAX_REQUESTS"
-            "Requests answered at once, health checks aside; the default is two a core (0 = no cap)"
+            "Long requests (lists, whole blocks, xpubs) answered at once; the default is four a core (0 = no cap)"
           <> showDefault
           <> value c.webLimits.maxRequests
     requestQueue <-
       option auto $
         metavar "INT"
           <> long "request-queue"
-          <> helpEnv "REQUEST_QUEUE" "Requests that may wait for one of those to end; more are refused"
+          <> helpEnv "REQUEST_QUEUE" "Long requests that may wait for one of those to end; more are refused"
           <> showDefault
           <> value c.webLimits.requestQueue
     requestWait <-
       option auto $
         metavar "SECONDS"
           <> long "request-wait"
-          <> helpEnv "REQUEST_WAIT" "Refuse a request that has waited this long"
+          <> helpEnv "REQUEST_WAIT" "Refuse a long request that has waited this long"
           <> showDefault
           <> value c.webLimits.requestWait
     return WebLimits {..}

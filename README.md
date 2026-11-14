@@ -344,9 +344,9 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
-| `--max-requests` | `MAX_REQUESTS` | two a core | Requests answered at once, health checks aside; see [Overload](#overload) (0 = no cap) |
-| `--request-queue` | `REQUEST_QUEUE` | `64` | Requests that may wait for one of those to end; more are refused with 503 |
-| `--request-wait` | `REQUEST_WAIT` | `5` | Seconds that a request waits before it is refused with 503 |
+| `--max-requests` | `MAX_REQUESTS` | four a core | Long requests answered at once; see [Overload](#overload) (0 = no cap) |
+| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for one of those to end; more are refused with 503 |
+| `--request-wait` | `REQUEST_WAIT` | `5` | Seconds that a long request waits before it is refused with 503 |
 | `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
@@ -742,7 +742,7 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
-| `Haskoin.Store.Web.Admission` | The cap on the requests answered at once |
+| `Haskoin.Store.Web.Admission` | The cap on the long requests answered at once |
 | `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
 | `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
@@ -790,8 +790,18 @@ alert if one keeps saying it: its `/health` will say why.
 ### Overload
 
 A server that is asked for more than its cores can do answers only so many
-requests at once, `--max-requests`, two a core by default. The next ones
-wait in line, in the order that they came.
+long requests at once, `--max-requests`, four a core by default. The next
+ones wait in line, in the order that they came.
+
+- **Long requests** are those whose answer is as long as their parameters
+  ask for: lists of transactions, unspent outputs or balances, the
+  transactions of a block, raw blocks, extended public keys, and the
+  Blockchain.info endpoints that do the same.
+- **Not capped:** requests for one thing by its key, such as a
+  transaction, the balance of an address or a block without its
+  transactions; and `/health`, `/peers`, `/dbstats`, `/events` and the
+  API reference, which read nothing from the database. They are what most
+  clients ask for most, and how you see what a full server is doing.
 
 - **A request that cannot be served soon is refused**, with 503,
   `{"error": "server-busy"}` and `Retry-After: 1`. That happens when
@@ -801,11 +811,8 @@ wait in line, in the order that they came.
 - **Why:** GHC gives every request a turn, with no priorities. Without a
   cap, more load makes every request slower, the quick ones included: on
   a store of mainnet with 56 connections asking for long lists, `/health`
-  took over a second. With it, the requests let in are answered at the
-  speed of a server that is not overloaded.
-- **Not capped:** `/health`, `/peers`, `/dbstats`, `/events` and the API
-  reference. They read nothing from the database, and they are how you see
-  what a full server is doing.
+  took over a second. With it, the long requests let in are answered
+  sooner, and the short ones do not wait behind them.
 - **A slot is held until the response is sent.** A client that reads
   slowly holds one while it does. A proxy that buffers responses, as nginx
   does by default, takes them at the speed of the server. Without one,
@@ -882,9 +889,9 @@ The metrics of the cap on requests ([Overload](#overload)):
 
 | Metric | Kind | Meaning |
 | --- | --- | --- |
-| `web.requests_running` | gauge | Requests being answered in a slot |
-| `web.requests_waiting` | gauge | Requests waiting for a slot |
-| `web.requests_refused` | counter | Requests refused with `server-busy` |
+| `web.requests_running` | gauge | Long requests being answered in a slot |
+| `web.requests_waiting` | gauge | Long requests waiting for a slot |
+| `web.requests_refused` | counter | Long requests refused with `server-busy` |
 
 ### Database statistics
 

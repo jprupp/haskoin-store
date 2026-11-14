@@ -10,8 +10,8 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- A cap on the requests that are answered at once, so that a server with
--- more work than it can do stays quick at what it does.
+-- A cap on the long requests that are answered at once, so that a server
+-- with more work than it can do stays quick at what is quick.
 --
 -- The web server answers each request in a thread of its own, and GHC gives
 -- every thread a turn, with no priorities. A server that is asked for more
@@ -22,7 +22,8 @@
 -- memory, took over a second, as did a path that does not exist. Nothing was
 -- wrong with either: they waited for their turn behind everything else.
 --
--- Here only so many requests are answered at once ('slots'). The next ones
+-- Here only so many long requests are answered at once ('slots'): those
+-- for a list, for all of a block, for an extended public key. The next ones
 -- wait in line, in the order that they came, and are answered as slots come
 -- free. The line has a length ('room') and a wait has a limit ('patience'):
 -- a request that finds the line full, or that waits that long, is refused,
@@ -31,12 +32,22 @@
 -- that is let in is answered at the speed of a server that is not
 -- overloaded, and a load balancer hears at once that this server is full.
 --
--- = What is not capped
+-- = What is capped
 --
--- The routes that are marked light ('Haskoin.Store.Web.Router.light') are
--- answered without a slot: the health check and the others that read only
--- memory. They are what tells an operator, or a load balancer, how the
--- server is, and that matters most when it is full.
+-- Each route has a cost ('Haskoin.Store.Web.Router.Cost'), and only the
+-- long ones take a slot. Those that answer from memory, like the health
+-- check, and those that look up one thing by its key, like a transaction or
+-- a balance, are answered at once: they are what tells an operator, or a
+-- load balancer, how the server is, and what most clients ask for most.
+--
+-- The first version of this capped everything but the routes that answer
+-- from memory, with two slots a core. Measured on stores of mainnet and
+-- testnet under the load above, the health check went from 1.65 seconds
+-- to 0.03 at the 95th percentile, and the server answered a third of the
+-- requests that it had: a transaction asked for by its id waited in the
+-- same line as a block of twenty seconds, and eight requests in flight
+-- left the machine idle, since most of the time of a request goes in
+-- RocksDB, on a thread of its own, often waiting for the disk.
 --
 -- = Alternatives
 --

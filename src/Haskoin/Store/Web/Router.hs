@@ -44,6 +44,7 @@
 module Haskoin.Store.Web.Router
   ( -- * Routes
     Route (..),
+    Cost (..),
     Miss (..),
     Undeclared (..),
     route,
@@ -97,11 +98,27 @@ data Route = Route
     -- | the names of the parameters it accepts in the query string or a form
     accepts :: ![Text],
     handler :: Req -> IO Response,
-    -- | whether it answers from memory alone, at next to no cost, like a
-    -- health check: such a route is answered even by a server that is full
-    -- ("Haskoin.Store.Web.Admission"). 'route' makes routes that are not.
-    light :: !Bool
+    -- | what answering it may cost; 'route' makes routes that are 'Short'
+    cost :: !Cost
   }
+
+-- | What a request to a route may cost the server, by which a server with
+-- too much to do tells what to answer at once from what has to wait
+-- ("Haskoin.Store.Web.Admission").
+--
+-- It is the route that has a cost, and not the request: a list may turn out
+-- to have one item, and is 'Long' all the same. Telling by the request
+-- would mean reading what it asks for before deciding to, which is the
+-- work that a full server is trying not to do.
+data Cost
+  = -- | answered from memory alone, like a health check
+    Light
+  | -- | one thing looked up by its key: a transaction, a balance, a block
+    Short
+  | -- | as much as its parameters ask for: a list, the transactions of a
+    -- block, the addresses of an extended public key
+    Long
+  deriving stock (Eq, Show)
 
 -- | A route for a method, a path such as @\/block\/:block@, where a segment
 -- that starts with a colon captures what is there under its name, and the
@@ -113,7 +130,7 @@ route m path accepts handler =
       pattern = [segment t | t <- T.splitOn "/" path, not (T.null t)],
       accepts = accepts,
       handler = handler,
-      light = False
+      cost = Short
     }
   where
     segment t = maybe (Left t) Right (T.stripPrefix ":" t)

@@ -7,15 +7,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ### Added
-- **A cap on the requests answered at once.** A server asked for more than
-  its cores can do slowed down for everyone, quick requests included: GHC
-  gives every request a turn, with no priorities, and `/health` took over
-  a second on a busy store of mainnet. Now `--max-requests` requests are
-  answered at once, two a core by default; `--request-queue` more wait in
-  line for at most `--request-wait` seconds; and the rest are refused with
-  503, `{"error": "server-busy"}` and `Retry-After: 1`. `/health`,
-  `/peers`, `/dbstats`, `/events` and the API reference are not capped,
-  and no longer take a view of the database. The metrics
+- **A cap on the long requests answered at once.** A server asked for more
+  than its cores can do slowed down for everyone, quick requests included:
+  GHC gives every request a turn, with no priorities, and `/health` took
+  over a second on a busy store of mainnet. Now `--max-requests` long
+  requests are answered at once, four a core by default: lists, the
+  transactions of a block, raw blocks, extended public keys.
+  `--request-queue` more wait in line for at most `--request-wait`
+  seconds, and the rest are refused with 503, `{"error": "server-busy"}`
+  and `Retry-After: 1`. Requests for one thing by its key are not capped.
+  Nor are `/health`, `/peers`, `/dbstats`, `/events` and the API
+  reference, which no longer take a view of the database. The metrics
   `web.requests_running`, `web.requests_waiting` and
   `web.requests_refused` say how full the server is.
 
@@ -29,8 +31,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - **The collector is GHC's default again**, which the executable no longer
   chooses. The non-moving collector of 1.15.1 gained nothing under the
   same load. `GHCRTS=--nonmoving-gc` selects it.
-- **`Haskoin.Store.Web.Router`:** a `Route` has a `light` field, and the
-  scope of `routerScoped` is told which route matched.
+- **`Haskoin.Store.Web.Router`:** a `Route` has a `cost`, light, short or
+  long, and the scope of `routerScoped` is told which route matched.
 
 ## [1.15.1] - 2026-11-14
 
