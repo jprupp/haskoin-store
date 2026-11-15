@@ -3,9 +3,11 @@
 -- share their indices, and the layered layout of @docs/layered-database.md@.
 --
 -- A history is a sequence of operations: transactions for the mempool,
--- blocks, deletions and reversals, some of them invalid. Each is chosen from
--- a number and from what a database of today's layout holds at that point,
--- so that the same history can be given to both sets of rules.
+-- blocks, deletions and reversals, some of them invalid. The transactions
+-- of a block are always ones that could be mined: a mined block is not
+-- validated. Each operation is chosen from a number and from what a
+-- database of today's layout holds at that point, so that the same history
+-- can be given to both sets of rules.
 --
 -- Payments go to a handful of fixed scripts and to a few addresses of an
 -- extended public key, 'wallet', so that the queries about extended public
@@ -14,10 +16,12 @@ module Haskoin.Store.Histories
   ( -- * Databases and rules
     open20,
     openLayered,
+    openOlder,
     withShadow,
     Rules (..),
     mixedRules,
     layeredRules,
+    sequentialRules,
     run,
 
     -- * Histories
@@ -60,24 +64,29 @@ module Haskoin.Store.Histories
     Chain (..),
     chainOf,
     dump,
+    copyIsArea,
+    spentIsChain,
   )
 where
 
-import Control.Monad (void)
+import Control.Exception (try)
+import Control.Monad (forM_, void)
 import Data.Bifunctor (first)
 import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
 import Data.Either (isLeft, rights)
+import Data.HashMap.Strict qualified as HashMap
 import Data.Hashable (hashWithSalt)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort, sortOn)
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Serialize (decode, encode, getWord64be, runGet)
 import Data.Word (Word16, Word32, Word64, Word8)
-import Database.RocksDB (ColumnFamily, iterEntry, iterFirst, iterNext, withIterCF)
+import Database.RocksDB (ColumnFamily, Config (..), iterEntry, iterFirst, iterNext, withIterCF)
+import Database.RocksDB.Query (retrieveCF)
 import Haskoin
   ( Address,
     Block (..),
@@ -85,7 +94,6 @@ import Haskoin
     BlockHeader (..),
     BlockHeight,
     BlockNode (..),
-    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -128,6 +136,7 @@ import Haskoin.Store.Data
     confirmed,
     zeroBalance,
   )
+import Haskoin.Store.Database.Copy (Family (..), copyEntries, spentOutputs, spentUnspent)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Query.Pooled qualified as P
@@ -136,20 +145,27 @@ import Haskoin.Store.Database.Reader
     addrOutCF,
     addrTxCF,
     balanceCF,
+    knownMempoolCopy,
+    layeredFamilyConfig,
+    mempoolAddrCF,
+    mempoolCF,
+    mergeGuardFamily,
     spenderCF,
     txCF,
     unspentCF,
     withDatabaseReader,
     withLayeredReader,
+    withReader,
   )
-import Haskoin.Store.Database.Types (BalVal (..), SpenderKey (..), SpenderVal (..))
-import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool)
+import Haskoin.Store.Database.Types (BalVal (..), MemSpenderKey (..), SpenderKey (..), SpenderVal (..))
+import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool, withoutReadCache)
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic (ImportException)
 import Haskoin.Store.Logic qualified as Mixed
 import Haskoin.Store.Logic.Layered qualified as Layered
 import Haskoin.Store.TestBlocks (nextBlock, script)
+import Test.Hspec (expectationFailure, shouldBe)
 import Test.QuickCheck (Gen, choose, elements, frequency, vectorOf)
-import UnliftIO (try, withSystemTempDirectory)
 
 -------------------------------------------------------------------------------
 -- Databases and rules
@@ -157,9 +173,24 @@ import UnliftIO (try, withSystemTempDirectory)
 
 -- | Open a database as the store does today, and as the layered layout
 -- needs it.
-open20, openLayered :: Network -> Ctx -> FilePath -> (DatabaseReader -> IO a) -> IO a
-open20 net ctx dir = withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
-openLayered net ctx dir = withLayeredReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
+open20, openLayered :: Network -> FilePath -> (DatabaseReader -> IO a) -> IO a
+open20 net dir = withDatabaseReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing
+openLayered net dir = withLayeredReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing
+
+-- | Open a database of the layered layout as a store of database version
+-- 22 did: without merge operators, and without the column family that is
+-- there since version 23 to keep such a store out. It is how the tests
+-- make a database that such a store left, and how they try what such a
+-- store would do to a newer one.
+openOlder :: Network -> FilePath -> (DatabaseReader -> IO a) -> IO a
+openOlder net dir =
+  withReader older (\_ -> return ()) net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing
+  where
+    older bloom cached =
+      [ (name, config {mergeOperator = Nothing})
+      | (name, config) <- layeredFamilyConfig bloom cached,
+        name /= mergeGuardFamily
+      ]
 
 -- | Run an action with a new database of the layout of version 20 that has
 -- the start of a history ('start'), in a directory of its own.
@@ -171,10 +202,10 @@ openLayered net ctx dir = withLayeredReader net ctx 20 32 dir False Nothing Noth
 -- these beside its own database, plans from it, and applies each
 -- operation to both, as 'mixedRules' and 'layeredRules' take the same
 -- operations and give the same outcomes.
-withShadow :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
-withShadow net ctx action =
+withShadow :: Network -> (DatabaseReader -> IO a) -> IO a
+withShadow net action =
   withSystemTempDirectory "haskoin-store-shadow-" $ \dir ->
-    open20 net ctx dir $ \shadow -> start mixedRules shadow >> action shadow
+    open20 net dir $ \shadow -> start mixedRules shadow >> action shadow
 
 -- | The rules that import blocks and transactions, for one layout.
 data Rules = Rules
@@ -207,10 +238,26 @@ layeredRules =
       deleteUnconfirmedTx = Layered.deleteUnconfirmedTx
     }
 
+-- | The rules of the layered layout as they were until version 1.15.1:
+-- blocks imported one transaction after another
+-- ('Layered.importBlockSequential'), and every read made from the database
+-- when the rules come to it, with nothing remembered between two reads of a
+-- key ('withoutReadCache'). They are what the import of a block in stages,
+-- its reads made ahead, is held to.
+sequentialRules :: Rules
+sequentialRules =
+  Rules
+    { initBest = Layered.initBest . withoutReadCache,
+      importBlock = Layered.importBlockSequential . withoutReadCache,
+      revertBlock = Layered.revertBlock . withoutReadCache,
+      newMempoolTx = Layered.newMempoolTx . withoutReadCache,
+      deleteUnconfirmedTx = Layered.deleteUnconfirmedTx . withoutReadCache
+    }
+
 -- | Run a batch of writes, and give what it returned with how it changed
 -- the mempool, or the reason why it wrote nothing.
 run :: DatabaseReader -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
-run db = try . runWriterMempool db.net db.ctx db quiet
+run db = try . runWriterMempool db.net db quiet
   where
     quiet = Logger {level = LevelError, source = "", push = \_ -> return ()}
 
@@ -286,7 +333,7 @@ record db hist op out = case op of
             [ OutPoint (txHash tx) i
             | tx <- new,
               (i, o) <- zip [0 ..] tx.outputs,
-              isLeft (scriptToAddressBS db.net db.ctx o.script)
+              isLeft (scriptToAddressBS db.net o.script)
             ]
        in hist {made = new <> hist.made, loose = unlisted <> hist.loose}
 
@@ -295,7 +342,7 @@ record db hist op out = case op of
 start :: Rules -> DatabaseReader -> IO History
 start rules db = do
   void (run db rules.initBest) :: IO ()
-  let hist = History {chain = [], made = [], loose = [], clock = 1000, scripts = places db.ctx}
+  let hist = History {chain = [], made = [], loose = [], clock = 1000, scripts = places}
   block <- blockOn db []
   record db hist block <$> apply rules db block
 
@@ -315,19 +362,19 @@ coinOf hist = case hist.chain of
 -- | The scripts that the payments of a history go to: one that has no
 -- address on Bitcoin, that of every coinbase, four more of the same kind,
 -- and those of five addresses of the 'wallet'.
-places :: Ctx -> [ByteString]
-places ctx = hashLock : script : map p2pkh [1 .. 4] <> mapMaybe (addressToScriptBS ctx) paid
+places :: [ByteString]
+places = hashLock : script : map p2pkh [1 .. 4] <> mapMaybe addressToScriptBS paid
   where
-    spec = wallet ctx
-    branch m = map snd (deriveAddresses (deriveFunction ctx spec.deriv) (pubSubKey ctx spec.key m) 0)
+    spec = wallet
+    branch m = map snd (deriveAddresses (deriveFunction spec.deriv) (pubSubKey spec.key m) 0)
     -- with addresses that are never paid between them, so that whether the
     -- later ones are within the gap depends on which earlier ones are used
     paid = map (branch 0 !!) [0, 2, 5] <> map (branch 1 !!) [0, 2]
 
 -- | An extended public key. Five of its addresses are paid in histories:
 -- three that it gives out to be paid, and two for its change.
-wallet :: Ctx -> XPubSpec
-wallet ctx = XPubSpec {key = deriveXPubKey ctx (makeXPrvKey seed), deriv = DeriveNormal}
+wallet :: XPubSpec
+wallet = XPubSpec {key = deriveXPubKey (makeXPrvKey seed), deriv = DeriveNormal}
   where
     seed = "the wallet of the histories of the tests of haskoin-store" :: ByteString
 
@@ -339,8 +386,8 @@ hashLock :: ByteString
 hashLock = "\xaa\x20" <> B.replicate 32 0xbb <> "\x87"
 
 -- | The addresses of the scripts of a history that have one on a network.
-addressesOf :: Network -> Ctx -> History -> [Address]
-addressesOf net ctx hist = rights (map (scriptToAddressBS net ctx) hist.scripts)
+addressesOf :: Network -> History -> [Address]
+addressesOf net hist = rights (map (scriptToAddressBS net) hist.scripts)
 
 -- | Eight payments, each from the change of the one before, starting from
 -- a coin: a chain in the mempool.
@@ -410,7 +457,7 @@ plan db hist0 seed = (hist,) <$> chosen
     pool = map snd <$> Q.getMempool db
     -- outputs that nothing spends, in a block or in the mempool
     unspent = do
-      listed <- concat <$> mapM (\a -> Q.getAddressUnspents db a def) (addressesOf db.net db.ctx hist)
+      listed <- concat <$> mapM (\a -> Q.getAddressUnspents db a def) (addressesOf db.net hist)
       (listed <>) . catMaybes <$> mapM (Q.getUnspent db) hist.loose
     -- a payment from some of them, in equal shares: now and then in ten of
     -- them, for a transaction with many outputs to spend
@@ -454,7 +501,11 @@ plan db hist0 seed = (hist,) <$> chosen
                            in make (Tx 2 [TxIn i.outpoint "" maxBound] [TxOut value (target 0)] [] 0)
                     _ -> return Nothing
             _ -> return Nothing
-    -- a transaction or a block that the rules must refuse
+    -- a transaction or a block that the rules must refuse. The one block
+    -- here does not build on the best block. None has a transaction that
+    -- could not be mined: the import of a block takes a mined block to be
+    -- valid ('Layered.importBlock'), and what it does with one that is not
+    -- is tested on its own ("Haskoin.Store.Logic.StagedSpec")
     refused = do
       us <- rotate (s `div` 8) <$> unspent
       let spent = [i.outpoint | (b, _) <- hist.chain, mined <- drop 1 b.txs, i <- take 1 mined.inputs]
@@ -470,11 +521,6 @@ plan db hist0 seed = (hist,) <$> chosen
         (3, u : _, _) -> send (Tx 2 [TxIn u.outpoint "" maxBound] [TxOut (u.value + 1) script] [] 0)
         -- a coinbase
         (4, _, _) -> send (Tx 1 [TxIn nullOutPoint (encode seed) maxBound] [TxOut 1000 script] [] 0)
-        -- a block that spends an output that does not exist
-        (5, _, _) -> block [unknown]
-        -- a block that spends an output that a confirmed transaction has
-        -- spent
-        (6, _, p : _) -> block [again' p]
         -- a block that does not build on the best block, but beside it
         (7, _, _) | (_, best) : _ <- hist.chain -> do
           parent <- Q.getBlock db best.header.prev >>= maybe (fail "no data for the parent") return
@@ -543,7 +589,7 @@ ask hist queries = do
   mempool <- queries.getMempool
   return Answers {balances, addressTxs, addressUnspents, txs, numbered, spenders, unspents, mempool}
   where
-    as = addressesOf queries.net queries.ctx hist
+    as = addressesOf queries.net hist
     hashes = map txHash hist.made
     outpoints = [OutPoint (txHash tx) i | tx <- hist.made, i <- [0 .. fromIntegral (length tx.outputs)]]
 
@@ -621,7 +667,7 @@ answer queries = \case
   SetUnspents as limits -> PathOutputs <$> (set as >>= \bals -> queries.xPubUnspents spec bals limits)
   SetCount as -> Number <$> (set as >>= queries.xPubTxCount spec)
   where
-    spec = wallet queries.ctx
+    spec = wallet
     -- the queries about an extended public key take the balances of its
     -- addresses, so any addresses can be given to them
     set as = zipWith (\i b -> XPubBal {path = [0, i], balance = b}) [0 ..] <$> queries.getBalances as
@@ -672,8 +718,8 @@ startOf = \case
 -- was never made, and from heights up to above the best block; about the
 -- addresses of the history, one at a time and several together, with one
 -- that was never used and with repetitions; and about the 'wallet'.
-questions :: Network -> Ctx -> History -> Int -> Gen [Question]
-questions net ctx hist n = vectorOf n question
+questions :: Network -> History -> Int -> Gen [Question]
+questions net hist n = vectorOf n question
   where
     question =
       frequency
@@ -693,8 +739,8 @@ questions net ctx hist n = vectorOf n question
           (3, SetUnspents <$> several address <*> limits),
           (1, SetCount <$> several address)
         ]
-    address = frequency [(12, elements (addressesOf net ctx hist)), (1, elements unused)]
-    unused = rights [scriptToAddressBS net ctx (p2pkh 9)]
+    address = frequency [(12, elements (addressesOf net hist)), (1, elements unused)]
+    unused = rights [scriptToAddressBS net (p2pkh 9)]
     hash = frequency [(12, elements (map txHash hist.made)), (1, pure (TxHash (sha256 ("never made" :: ByteString))))]
     several :: Gen a -> Gen [a]
     several one = frequency [(1, pure 0), (12, choose (1, 6))] >>= (`vectorOf` one)
@@ -781,3 +827,38 @@ dump db cf = withIterCF db.db cf $ \iter -> iterFirst iter >> go iter
       iterEntry iter >>= \case
         Nothing -> return []
         Just e -> iterNext iter >> (e :) <$> go iter
+
+-- | The database has a copy in memory of its mempool area
+-- ("Haskoin.Store.Database.Copy"), and the copy has the keys and values
+-- that a scan of the two column families gives, byte for byte. The text
+-- says where a failure happened.
+copyIsArea :: String -> DatabaseReader -> IO ()
+copyIsArea what db =
+  knownMempoolCopy db >>= \case
+    Nothing -> expectationFailure (what <> ": the database has no copy of its mempool area")
+    Just copy -> do
+      general <- dump db (mempoolCF db.db)
+      byAddress <- dump db (mempoolAddrCF db.db)
+      (what, copyEntries General copy) `shouldBe` (what, general)
+      (what, copyEntries ByAddress copy) `shouldBe` (what, byAddress)
+
+-- | What the database remembers of the outputs that mempool transactions
+-- spend ("Haskoin.Store.Database.Copy") is right: every output that is
+-- remembered is, in the database, the unspent output of the chain that
+-- was remembered, and has a mempool spender. Gives how many are
+-- remembered. The text says where a failure happened.
+--
+-- It is not checked that every such output is remembered: one that is not
+-- is read from the database.
+spentIsChain :: String -> DatabaseReader -> IO Int
+spentIsChain what db =
+  knownMempoolCopy db >>= \case
+    Nothing -> expectationFailure (what <> ": the database has no copy of its mempool area") >> return 0
+    Just copy -> do
+      let entries = HashMap.toList (spentOutputs copy)
+      forM_ entries $ \(p, kept) -> do
+        stored <- Q.getUnspent db p
+        (what, p, stored) `shouldBe` (what, p, Just (spentUnspent db.net p kept))
+        spender <- retrieveCF db.db (mempoolCF db.db) (MemSpenderKey p)
+        (what, p, isJust (spender :: Maybe Spender)) `shouldBe` (what, p, True)
+      return (length entries)

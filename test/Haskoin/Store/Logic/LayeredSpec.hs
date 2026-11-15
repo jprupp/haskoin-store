@@ -9,9 +9,8 @@ import Data.Maybe (isJust)
 import Data.Serialize (decode)
 import Haskoin
   ( Block (..),
-    BlockHeight,
     BlockHash,
-    Ctx,
+    BlockHeight,
     Network,
     OutPoint (..),
     Tx (..),
@@ -21,7 +20,6 @@ import Haskoin
     bchRegTest,
     btcRegTest,
     headerHash,
-    prepareContext,
     txHash,
   )
 import Haskoin.Store.Common (Replaced (..), Start (..), StoreRead (..), replacedKept)
@@ -39,6 +37,7 @@ import Haskoin.Store.Database.Reader
     txCF,
   )
 import Haskoin.Store.Histories
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic (ImportException (..))
 import Haskoin.Store.TestBlocks (coinbaseTx, script)
 import Test.Hspec
@@ -46,17 +45,16 @@ import Test.Hspec.QuickCheck (modifyMaxSuccess)
 import Test.QuickCheck (choose, forAll, ioProperty, property, tabulate, vectorOf)
 import Test.QuickCheck.Gen (unGen)
 import Test.QuickCheck.Random (mkQCGen)
-import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
+spec = describe "rules of the layered layout" $ do
   forM_ [("Bitcoin", btcRegTest), ("Bitcoin Cash, without replace-by-fee", bchRegTest)] $ \(name, net) ->
     modifyMaxSuccess (const 40) $
       it ("leave the database that today's rules and the migration leave, on " <> name) $
         -- the number says when the third store is upgraded, and which
         -- pages are asked for at the end
         property . forAll ((,) <$> vectorOf 70 anyNumber <*> choose (0, 1000000)) $ \(seeds, number) -> ioProperty $ do
-          (outcomes, hist) <- sameHistory ctx net number [\db h -> plan db h seed | seed <- seeds]
+          (outcomes, hist) <- sameHistory net number [\db h -> plan db h seed | seed <- seeds]
           let count p = length (filter p outcomes)
               bucket n
                 | n == 0 = "none"
@@ -79,12 +77,12 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
           (b, _) : _ -> (h, Just (Revert (headerHash b.header) h.clock))
           [] -> (h, Nothing)
     -- the third store is upgraded with the spend in its mempool
-    (outcomes, _) <- sameHistory ctx btcRegTest 2 [mine [twice], pay spend, mine [spend], revert, revert]
+    (outcomes, _) <- sameHistory btcRegTest 2 [mine [twice], pay spend, mine [spend], revert, revert]
     map (either show (const "done") . (.result)) outcomes `shouldBe` replicate 5 "done"
 
   it "refuse a block that spends an output of the mempool, which today's rules import" $
     withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         hist <- start layeredRules db
         let parent = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4000 script] [] 0
             child = Tx 2 [TxIn (OutPoint (txHash parent) 0) "" maxBound] [TxOut 3000 (p2pkh 1)] [] 0
@@ -97,7 +95,7 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
 
   it "keep what a block replaced, and forget it when the block is reverted" $
     withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         (gone, height) <- replacedByBlock db
         best <- Q.getBestBlock db >>= maybe (fail "no best block") return
         isRight . (.result) <$> apply layeredRules db (Revert best 2000) `shouldReturn` True
@@ -106,7 +104,7 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
 
   it "forget what a block replaced 2016 blocks later" $
     withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         (gone, height) <- replacedByBlock db
         let mineEmpty = blockOn db [] >>= apply layeredRules db
         replicateM_ (fromIntegral replacedKept - 1) mineEmpty
@@ -117,13 +115,13 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
 
   it "leave the keys of a mempool transaction alone when a block confirms what it spends" $
     withSystemTempDirectory "haskoin-store-layered-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         hist <- start layeredRules db
         let parent = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4000 script, TxOut 5000 (p2pkh 2)] [] 0
             child = Tx 2 [TxIn (OutPoint (txHash parent) 0) "" maxBound] [TxOut 3000 (p2pkh 1)] [] 0
             keysOf tx = do
               Just td <- M.getMempoolTx db (txHash tx)
-              let r = M.mempoolRecords db.net db.ctx 1000 td
+              let r = M.mempoolRecords db.net 1000 td
               return (fst (M.recordEntries r), M.addressArea [r])
         forM_ [parent, child] $ \tx ->
           (.result) <$> apply layeredRules db (Pay tx 1000) `shouldReturn` Right "True"
@@ -158,20 +156,19 @@ spec = prepareContext $ \ctx -> describe "rules of the layered layout" $ do
 -- deleted transactions, which each set of rules leaves in its own place.
 -- Gives the outcomes and the history.
 sameHistory ::
-  Ctx ->
   Network ->
   Int ->
   [DatabaseReader -> History -> IO (History, Maybe Op)] ->
   IO ([Outcome], History)
-sameHistory ctx net number choices =
+sameHistory net number choices =
   withSystemTempDirectory "haskoin-store-mixed-" $ \dirOld ->
     withSystemTempDirectory "haskoin-store-layered-" $ \dirNew ->
       withSystemTempDirectory "haskoin-store-upgraded-" $ \dirUp -> do
         -- the store to upgrade begins with a database of version 20
-        open20 net ctx dirUp (\_ -> return ())
-        openLayered net ctx dirNew $ \new ->
-          openLayered net ctx dirUp $ \up -> do
-            (outcomes, hist) <- open20 net ctx dirOld $ \old -> do
+        open20 net dirUp (\_ -> return ())
+        openLayered net dirNew $ \new ->
+          openLayered net dirUp $ \up -> do
+            (outcomes, hist) <- open20 net dirOld $ \old -> do
               hist0 <- start mixedRules old
               void (start layeredRules new)
               void (start mixedRules up)
@@ -187,7 +184,7 @@ sameHistory ctx net number choices =
               done@(_, hist) <- foldM (next old new upgraded) half later
               -- pages, of databases that the new rules built or carried on
               -- with, against today's
-              let asked = unGen (questions net ctx hist 60) (mkQCGen number) 30
+              let asked = unGen (questions net hist 60) (mkQCGen number) 30
               was <- mixed old (\queries -> mapM (answer queries) asked)
               -- but for pages that start at a deleted transaction, which
               -- the layered layout does not know
@@ -208,7 +205,7 @@ sameHistory ctx net number choices =
               shared <- pooled new (\queries -> mapM (answer queries) (kept asked))
               take 2 (differences (kept asked) (kept was) shared) `shouldBe` []
               return done
-            migrated <- openLayered net ctx dirOld $ \old -> upgradeDatabase (\_ -> return ()) old >> everything old
+            migrated <- openLayered net dirOld $ \old -> upgradeDatabase (\_ -> return ()) old >> everything old
             mine <- everything new
             -- the same, but for the bodies of deleted transactions, which
             -- version 20 left in the chain: the layered rules keep none

@@ -46,6 +46,9 @@
 --   killed run left.
 module Main (main) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
@@ -74,6 +77,7 @@ import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Word (Word64)
 import Database.Redis qualified as Redis
 import Haskoin hiding (Coin, Key)
+import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Integration.Image (testImage, valkeyBin, wrkBin)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
@@ -83,14 +87,12 @@ import Network.Socket.ByteString qualified as SocketB
 import Network.Wreq qualified as Wreq
 import Numeric (readHex)
 import Options.Applicative
+import System.Directory (createDirectoryIfMissing, makeAbsolute)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, IOMode (..), hFlush, hPutStrLn, stderr, withFile)
 import System.Process
 import System.Random.Stateful (IOGenM, StdGen, mkStdGen, newIOGenM, uniformRM)
 import Text.Read (readMaybe)
-import UnliftIO (MVar, bracket, newMVar, tryAny, withAsync, withMVar)
-import UnliftIO.Concurrent (threadDelay)
-import UnliftIO.Directory (createDirectoryIfMissing, makeAbsolute)
 
 -------------------------------------------------------------------------------
 -- Options
@@ -147,20 +149,19 @@ main = do
   podmanUsable >>= either fail return
   say "Building or finding the test image"
   image <- testImage
-  withContext $ \ctx ->
-    withContainer (valkey image) $ \rc -> do
-      redisURL <- ("redis://127.0.0.1:" <>) . show <$> hostPort rc 6379
-      waitRedis redisURL
-      withContainer (nodeSpec o image) $ \nc -> do
-        rpcPort <- hostPort nc 18443
-        p2p <- hostPort nc 18444
-        let node = Node {kind = BitcoinCore, url = "http://127.0.0.1:" <> show rpcPort <> "/", p2p = p2p}
-        waitRpc node
-        withContainer (wrkSpec image outDir) $ \wc ->
-          withStatsd $ \statsPort stats ->
-            withRamDir $ \dir ->
-              withServer o outDir dir redisURL p2p statsPort $ \srv ->
-                stress o {out = outDir} ctx node redisURL srv stats wc
+  withContainer (valkey image) $ \rc -> do
+    redisURL <- ("redis://127.0.0.1:" <>) . show <$> hostPort rc 6379
+    waitRedis redisURL
+    withContainer (nodeSpec o image) $ \nc -> do
+      rpcPort <- hostPort nc 18443
+      p2p <- hostPort nc 18444
+      let node = Node {kind = BitcoinCore, url = "http://127.0.0.1:" <> show rpcPort <> "/", p2p = p2p}
+      waitRpc node
+      withContainer (wrkSpec image outDir) $ \wc ->
+        withStatsd $ \statsPort stats ->
+          withRamDir $ \dir ->
+            withServer o outDir dir redisURL p2p statsPort $ \srv ->
+              stress o {out = outDir} node redisURL srv stats wc
 
 -- | Valkey with room for the bodies of every transaction.
 valkey :: String -> ContainerSpec
@@ -319,20 +320,20 @@ data Coin = Coin
   }
 
 -- | The wallets, derived from a fixed seed, and the key of the miner.
-makeWallets :: Ctx -> Opts -> ([Wallet], Key)
-makeWallets ctx o = ([wallet (fromIntegral i) | i <- [0 .. o.wallets - 1]], keyOf (hardSubKey ctx root 9999) 0 0)
+makeWallets :: Opts -> ([Wallet], Key)
+makeWallets o = ([wallet (fromIntegral i) | i <- [0 .. o.wallets - 1]], keyOf (hardSubKey root 9999) 0 0)
   where
     root = makeXPrvKey (C8.pack ("haskoin-store-stress-" <> show o.seed))
     wallet i =
-      let w = hardSubKey ctx root i
+      let w = hardSubKey root i
        in Wallet
-            { xpub = xPubExport btcRegTest ctx (deriveXPubKey ctx w),
+            { xpub = xPubExport btcRegTest (deriveXPubKey w),
               receive = Seq.fromList [keyOf w 0 j | j <- [0 .. fromIntegral o.addresses - 1]],
               change = Seq.fromList [keyOf w 1 j | j <- [0 .. fromIntegral o.addresses - 1]]
             }
     keyOf w c j =
-      let k = prvSubKey ctx (prvSubKey ctx w c) j
-          a = xPubAddr ctx (deriveXPubKey ctx k)
+      let k = prvSubKey (prvSubKey w c) j
+          a = xPubAddr (deriveXPubKey k)
        in Key {script = fromMaybe (error "no script") (addressToOutput a), secret = k.key}
 
 -- | Address of a key, as text.
@@ -342,20 +343,19 @@ keyAddress k = case k.script of
   _ -> error "not a key hash"
 
 -- | Sign a transaction that spends coins.
-sign :: Ctx -> Tx -> [Coin] -> Tx
-sign ctx tx coins =
+sign :: Tx -> [Coin] -> Tx
+sign tx coins =
   either error id $
     signTx
       btcRegTest
-      ctx
       tx
       [SigInput c.key.script c.value c.outpoint sigHashAll Nothing | c <- coins]
       [c.key.secret | c <- coins]
 
 -- | A payment from a coin to another wallet, with change back to the wallet
 -- of the coin. Gives the transaction and its new coins.
-pay :: Ctx -> IOGenM StdGen -> [Wallet] -> Coin -> IO (Tx, [Coin])
-pay ctx g ws c = do
+pay :: IOGenM StdGen -> [Wallet] -> Coin -> IO (Tx, [Coin])
+pay g ws c = do
   w' <- (\i -> (c.wallet + i) `mod` length ws) <$> uniformRM (1, max 1 (length ws - 1)) g
   let to = ws !! w'
       from = ws !! c.wallet
@@ -367,7 +367,7 @@ pay ctx g ws c = do
       outs
         | c.value >= amount + fee + 10000 = [(r.script, amount), (ch.script, c.value - amount - fee)]
         | otherwise = [(r.script, c.value - fee)]
-      tx = sign ctx (buildTx ctx [c.outpoint] outs) [c]
+      tx = sign (buildTx [c.outpoint] outs) [c]
       h = txHash tx
       owners = [(w', r), (c.wallet, ch)]
       coins = [Coin (OutPoint h i) v w k | (i, (_, v), (w, k)) <- zip3 [0 ..] outs owners]
@@ -433,10 +433,10 @@ nodeHeight node =
 -- The stress test
 -------------------------------------------------------------------------------
 
-stress :: Opts -> Ctx -> Node -> String -> Server -> IORef Stats -> Container -> IO ()
-stress o ctx node redisURL srv stats wc = do
+stress :: Opts -> Node -> String -> Server -> IORef Stats -> Container -> IO ()
+stress o node redisURL srv stats wc = do
   g <- newIOGenM (mkStdGen o.seed)
-  let (ws, miner) = makeWallets ctx o
+  let (ws, miner) = makeWallets o
       minerAddr = keyAddress miner
       perFanOut = 1000
       fanOuts = max 1 ((o.blockTxs * 3 `div` 2 + perFanOut - 1) `div` perFanOut)
@@ -461,7 +461,7 @@ stress o ctx node redisURL srv stats wc = do
         each = (v - 200000) `div` fromIntegral n
         -- every receiving address of every wallet, in turn
         targets = take n (cycle [(wi, Seq.index w.receive j) | j <- [0 .. o.addresses - 1], (wi, w) <- zip [0 ..] ws])
-        tx = sign ctx (buildTx ctx [op] [(k.script, each) | (_, k) <- targets]) [Coin op v (-1) miner]
+        tx = sign (buildTx [op] [(k.script, each) | (_, k) <- targets]) [Coin op v (-1) miner]
     errs <- sendRaw node [tx]
     forM_ errs $ mapM_ (\e -> fail ("The node refused a funding transaction: " <> show e))
     return [Coin (OutPoint (txHash tx) i) each wi k | (i, (wi, k)) <- zip [0 ..] targets]
@@ -484,7 +484,7 @@ stress o ctx node redisURL srv stats wc = do
       withAsync (sampler start node srv redisURL stats stop sh) $ \_ ->
         withAsync (wrkAll o ws srv wc start stop wlock) $ \_ -> do
           (sent, refused) <- withFile (o.out <> "/rounds.jsonl") WriteMode $ \rh ->
-            rounds o ctx g node ws minerAddr start rh (Seq.fromList coins0)
+            rounds o g node ws minerAddr start rh (Seq.fromList coins0)
           say "Waiting for the server to catch up"
           t0 <- getCurrentTime
           waitSynced node srv
@@ -511,8 +511,8 @@ stress o ctx node redisURL srv stats wc = do
 
 -- | Make the transactions, a block at a time. Gives how many were sent and
 -- how many the node refused.
-rounds :: Opts -> Ctx -> IOGenM StdGen -> Node -> [Wallet] -> Text -> UTCTime -> Handle -> Seq Coin -> IO (Int, Int)
-rounds o ctx g node ws minerAddr start rh = go 0 (0, 0)
+rounds :: Opts -> IOGenM StdGen -> Node -> [Wallet] -> Text -> UTCTime -> Handle -> Seq Coin -> IO (Int, Int)
+rounds o g node ws minerAddr start rh = go 0 (0, 0)
   where
     total = o.txs
     go :: Int -> (Int, Int) -> Seq Coin -> IO (Int, Int)
@@ -523,7 +523,7 @@ rounds o ctx g node ws minerAddr start rh = go 0 (0, 0)
               (spend, rest) = Seq.splitAt n pool
           when (n == 0) $ fail "No coins left to spend"
           t0 <- getCurrentTime
-          made <- mapM (pay ctx g ws) (toList spend)
+          made <- mapM (pay g ws) (toList spend)
           -- sign now, not when the transactions are sent
           mapM_ (evaluate . force . fst) made
           t1 <- getCurrentTime

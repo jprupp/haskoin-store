@@ -99,12 +99,14 @@ import Conduit
     yield,
     (.|),
   )
-import Control.Monad (forM, (>=>))
+import Control.Exception (mask_)
+import Control.Monad (forM, when, (>=>))
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Default (def)
 import Data.Functor ((<&>))
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, listToMaybe)
@@ -112,15 +114,15 @@ import Data.Ord (Down (..))
 import Data.Serialize (Serialize, decode, encode)
 import Data.Word (Word32, Word64)
 import Database.RocksDB
-  ( ColumnFamily,
+  ( ChunkConfig (..),
+    ColumnFamily,
     DB,
     IterConfig (..),
     Iterator,
     createIteratorConfig,
     getCF,
-    iterKey,
+    iterChunk,
     iterLast,
-    iterNext,
     iterPrev,
     iterSeek,
     iterValid,
@@ -162,15 +164,8 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Slices (blockData, txBytes)
 import Haskoin.Store.Database.Types
+import Haskoin.Store.Exception (bracket, bracket_)
 import System.Metrics.StatsD (decrementGauge, incrementCounter, incrementGauge)
-import UnliftIO
-  ( bracket,
-    bracket_,
-    mask_,
-    modifyIORef',
-    newIORef,
-    readIORef,
-  )
 
 -- | The queries of a database as a 'StoreRead', for code that takes its
 -- queries as a value, such as the web server, which puts the Redis cache in
@@ -181,7 +176,6 @@ databaseRead :: DatabaseReader -> StoreRead
 databaseRead r =
   StoreRead
     { net = r.net,
-      ctx = r.ctx,
       getBestBlock = getBestBlock r,
       getBlocksAtHeight = getBlocksAtHeight r,
       getBlock = getBlock r,
@@ -412,7 +406,7 @@ getUnspent r p =
     Nothing -> return Nothing
     Just val -> do
       count r $ \s -> incrementCounter s.dataUnspentCount 1
-      return (Just (valToUnspent r.net r.ctx p val))
+      return (Just (valToUnspent r.net p val))
 
 -- | Transactions of an address, newest first.
 getAddressTxs :: DatabaseReader -> Address -> Limits -> IO [TxRef]
@@ -493,7 +487,7 @@ unspentConduit ::
   Iterator ->
   ConduitT i Unspent IO ()
 unspentConduit r a s it =
-  x .| mapC (uncurry (toUnspent r.net r.ctx)) .| concatC
+  x .| mapC (uncurry (toUnspent r.net)) .| concatC
   where
     x = case s of
       Nothing ->
@@ -560,15 +554,21 @@ mempoolNewestC it = do
     iterValid it >>= \case
       True -> iterPrev it
       False -> iterLast it
-  go
+  go 16
   where
-    go =
-      lift (iterKey it) >>= \case
-        Just k | Right (MemTimeKey t h) <- decode k -> do
-          yield (t, h)
-          lift (iterPrev it)
-          go
-        _ -> return ()
+    -- A few entries first and then more at a time, for one foreign call
+    -- each: who reads this usually wants one page, and each call costs the
+    -- thread its core, which is what made a long list slow.
+    go n = do
+      (rows, more) <- lift (iterChunk it def {chunkEntries = n, chunkPrefix = timePrefix, chunkBackwards = True})
+      whole <- yieldAll rows
+      when (whole && more) (go (min 256 (n * 4)))
+    -- the prefix of 'MemTimeKey'
+    timePrefix = BS.singleton 0x0b
+    yieldAll [] = return True
+    yieldAll ((k, _) : rest) = case decode k of
+      Right (MemTimeKey t h) -> yield (t, h) >> yieldAll rest
+      _ -> return False
 
 -------------------------------------------------------------------------------
 -- Extended public keys
@@ -644,23 +644,45 @@ getAddressesTxCount r as =
 usedAddresses :: [XPubBal] -> [Address]
 usedAddresses = map (.address) . filter (not . nullBalance) . map (.balance)
 
+-- | The keys of one prefix that an iterator walks, with those already read
+-- from it: 'countDistinctSuffixes' takes them one at a time, and the
+-- iterator gives them a few hundred at a time.
+data Suffixes = Suffixes
+  { prefix :: !BS.ByteString,
+    iterator :: !Iterator,
+    -- | keys read and not yet taken, without their prefix
+    ahead :: ![BS.ByteString],
+    -- | whether the iterator has more of them
+    more :: !Bool
+  }
+
 -- | Number of distinct keys, after their prefix, in a set of iterators that
 -- each walk the keys with one prefix, in order.
+--
+-- The keys are read in chunks, one foreign call for a few hundred of them.
+-- Read one at a time, each key cost the thread its core for the call and a
+-- wait to get one back, which on a busy server was most of the time of
+-- counting the transactions of a large wallet.
 countDistinctSuffixes :: [(BS.ByteString, Iterator)] -> IO Int
 countDistinctSuffixes streams = do
   heads <- mapM start streams
   go 0 (Map.fromListWith (<>) [(k, [x]) | (k, x) <- catMaybes heads])
   where
-    start x@(pfx, it) = iterSeek it pfx >> current x
-    current x@(pfx, it) =
-      iterKey it <&> \case
-        Just k | pfx `BS.isPrefixOf` k -> Just (BS.drop (BS.length pfx) k, x)
-        _ -> Nothing
-    advance x@(_, it) = iterNext it >> current x
+    start (pfx, it) = iterSeek it pfx >> next (Suffixes pfx it [] True)
+    -- the next key of a stream, and the stream after it
+    next s = case s.ahead of
+      k : ks -> return (Just (k, s {ahead = ks} :: Suffixes))
+      []
+        | s.more -> do
+            (rows, more) <- iterChunk s.iterator def {chunkPrefix = s.prefix}
+            case map (BS.drop (BS.length s.prefix) . fst) rows of
+              [] -> return Nothing
+              k : ks -> return (Just (k, s {ahead = ks, more = more} :: Suffixes))
+        | otherwise -> return Nothing
     go !n m = case Map.minViewWithKey m of
       Nothing -> return n
       Just ((_, xs), m') -> do
-        nexts <- catMaybes <$> mapM advance xs
+        nexts <- catMaybes <$> mapM next xs
         go (n + 1) (foldr (\(k, x) -> Map.insertWith (<>) k [x]) m' nexts)
 
 -------------------------------------------------------------------------------

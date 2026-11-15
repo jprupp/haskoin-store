@@ -13,7 +13,6 @@ import Haskoin
     TxOut (..),
     bchRegTest,
     btcRegTest,
-    prepareContext,
     scriptToAddressBS,
     sha256,
     txHash,
@@ -30,16 +29,16 @@ import Haskoin.Store.Database.Migrate (upgradeDatabase)
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import Haskoin.Store.Histories
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.TestBlocks (coinbaseTx, script)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
 import Test.QuickCheck (arbitrary, forAll, ioProperty, property, tabulate, vectorOf)
 import Test.QuickCheck.Gen (unGen)
 import Test.QuickCheck.Random (mkQCGen)
-import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
+spec = describe "queries of the layered layout" $ do
   forM_ [("Bitcoin", btcRegTest), ("Bitcoin Cash", bchRegTest)] $ \(name, net) ->
     modifyMaxSuccess (const 30) $
       it ("give the pages of today's queries on a migrated database, on " <> name) $
@@ -48,16 +47,16 @@ spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
             withSystemTempDirectory "haskoin-store-pages-" $ \dir -> do
               -- anything at first, then payments, so that the mempool has
               -- something; and questions about what came of it
-              (asked, was, starts, fair) <- open20 net ctx dir $ \db -> do
+              (asked, was, starts, fair) <- open20 net dir $ \db -> do
                 hist <- start mixedRules db >>= \hist0 -> foldM (step db) hist0 (seeds <> onlyPayments last')
-                let asked = unGen (questions net ctx hist 150) (mkQCGen seed) 30
+                let asked = unGen (questions net hist 150) (mkQCGen seed) 30
                 was <- replies mixed db asked
                 starts <- mixed db (\queries -> mapM (from queries) asked)
                 -- pages that start at a deleted transaction are not
                 -- compared: the layered layout does not know those
                 fair <- mapM (startsKnown db) asked
                 return (asked, was, starts, fair)
-              now <- openLayered net ctx dir $ \db -> do
+              now <- openLayered net dir $ \db -> do
                 void (upgradeDatabase (\_ -> return ()) db)
                 replies layered db asked
               length now `shouldBe` length was
@@ -70,7 +69,7 @@ spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
 
   it "cut pages from a list that is part in the mempool and part in the chain" $
     withSystemTempDirectory "haskoin-store-pages-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         hist <- start layeredRules db
         -- a payment from the coin of the first block, with change to the
         -- miner, and a payment from that change, in the same second
@@ -85,7 +84,7 @@ spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
             amounts = L.withView db $ \v -> fmap numbers <$> L.getBalance v miner
             numbers b = (b.confirmed, b.unconfirmed, b.utxo, b.txs, b.received)
             miner :: Address
-            miner = either error id (scriptToAddressBS btcRegTest ctx script)
+            miner = either error id (scriptToAddressBS btcRegTest script)
         forM_ [one, two] $ \tx ->
           (.result) <$> apply layeredRules db (Pay tx 1000) `shouldReturn` Right "True"
         page def `shouldReturn` unconfirmed <> [coinbase]
@@ -118,12 +117,12 @@ spec = prepareContext $ \ctx -> describe "queries of the layered layout" $ do
 
   it "answer from one moment, whatever is written in the meantime" $
     withSystemTempDirectory "haskoin-store-pages-" $ \dir ->
-      openLayered btcRegTest ctx dir $ \db -> do
+      openLayered btcRegTest dir $ \db -> do
         hist0 <- start layeredRules db
         let chained = payments (coinOf hist0)
             pay hist tx = record db hist (Pay tx hist.clock) <$> apply layeredRules db (Pay tx hist.clock)
         hist <- foldM pay hist0 (take 4 chained)
-        let asked = unGen (questions btcRegTest ctx hist 100) (mkQCGen 7) 30
+        let asked = unGen (questions btcRegTest hist 100) (mkQCGen 7) 30
             everything queries = (,) <$> ask hist queries <*> mapM (answer queries) asked
         (early, during) <- L.withView db $ \v -> do
           early <- everything (L.layeredRead v)

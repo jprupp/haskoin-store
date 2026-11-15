@@ -3,6 +3,9 @@
 module Haskoin.StoreSpec (spec) where
 
 import Conduit
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Monad
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -18,13 +21,14 @@ import Haskoin
 import Haskoin.Node
 import Haskoin.Store
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.TestBlocks (nextBlock)
 import NQE
 import Network.Socket
 import System.Mem (performMajorGC)
 import System.Random
+import System.Timeout (timeout)
 import Test.Hspec
-import UnliftIO
 
 data TestStore = TestStore
   { testStoreDB :: !DatabaseReader,
@@ -36,10 +40,10 @@ data TestStore = TestStore
   }
 
 spec :: Spec
-spec = prepareContext $ \ctx -> do
+spec = do
   describe "Download" $ do
     it "gets 8 blocks" $
-      withTestStore bchRegTest ctx "eight-blocks" $ \TestStore {..} -> do
+      withTestStore bchRegTest "eight-blocks" $ \TestStore {..} -> do
         bs <- replicateM 8 . receiveMatch testStoreEvents $ \case
           StoreBestBlock b -> Just b
           _ -> Nothing
@@ -50,7 +54,7 @@ spec = prepareContext $ \ctx -> do
             bestHeight = bestNode.height
         bestHeight `shouldBe` 8
     it "get a block and its transactions" $
-      withTestStore bchRegTest ctx "get-block-txs" $ \TestStore {..} ->
+      withTestStore bchRegTest "get-block-txs" $ \TestStore {..} ->
         do
           let h1 = "5369ef2386c72acdf513ffd80aeba2a1774e2f004d120761e54a8bf614173f3e"
               get_the_block h =
@@ -69,13 +73,25 @@ spec = prepareContext $ \ctx -> do
           listToMaybe bd.txs `shouldBe` Just h1
           fmap (txHash . (.tx)) t1 `shouldBe` Just h1
     it "downloads 80 blocks with a request for 64 and one for the remaining 16" $
-      withTestStore bchRegTest ctx "block-window" $ \TestStore {..} -> do
+      withTestStore bchRegTest "block-window" $ \TestStore {..} -> do
         bs <- replicateM 80 . receiveMatch testStoreEvents $ \case
           StoreBestBlock b -> Just b
           _ -> Nothing
         bestNodeM <- chainGetBlock testStoreChain (last bs)
         fmap (.height) bestNodeM `shouldBe` Just 80
         readTVarIO testStoreBlockRequests `shouldReturn` [64, 16]
+    it "asks another peer for the blocks that the first one does not deliver" $
+      -- The first peer to connect sends headers and never a block; the
+      -- second connects a second later and delivers. With a stall of one
+      -- second the store has its blocks in a few; waiting out the timeout
+      -- of the first peer, as it used to, would take a minute.
+      withStalledStore bchRegTest "stalled-peer" $ \TestStore {..} -> do
+        got <- timeout 20000000 . replicateM 8 . receiveMatch testStoreEvents $ \case
+          StoreBestBlock b -> Just b
+          _ -> Nothing
+        fmap length got `shouldBe` Just 8
+        -- both were asked: the silent one first, then the one that delivers
+        length <$> readTVarIO testStoreBlockRequests `shouldReturn` 2
 
   describe "Memory" $
     it "keeps the heap flat while syncing" $ do
@@ -89,7 +105,7 @@ spec = prepareContext $ \ctx -> do
       -- length is a multiple of 2000, so the last headers message the mock
       -- peer sends is empty, which haskoin-node before 2.1.2 did not handle.
       let blocks = chainOf 6000
-      withTestStoreBlocks blocks bchRegTest ctx "heap" $ \TestStore {..} -> do
+      withTestStoreBlocks blocks bchRegTest "heap" $ \TestStore {..} -> do
         let wait_for height =
               receive testStoreEvents >>= \case
                 StoreBestBlock b ->
@@ -110,7 +126,6 @@ spec = prepareContext $ \ctx -> do
 
 withTestStore ::
   Network ->
-  Ctx ->
   String ->
   (TestStore -> IO a) ->
   IO a
@@ -120,11 +135,38 @@ withTestStore = withTestStoreBlocks allBlocks
 withTestStoreBlocks ::
   [Block] ->
   Network ->
-  Ctx ->
   String ->
   (TestStore -> IO a) ->
   IO a
-withTestStoreBlocks blocks net ctx t f =
+withTestStoreBlocks blocks = withTestStoreConfig (dummyPeerConnect 0 mockPeerReact blocks) id
+
+-- | A store with two mock peers: one that connects at once and never sends
+-- a block, and one that connects a second later and behaves. The store
+-- passes over a peer that delivers nothing for a second.
+withStalledStore ::
+  Network ->
+  String ->
+  (TestStore -> IO a) ->
+  IO a
+withStalledStore = withTestStoreConfig peers $ \cfg ->
+  cfg {initPeers = ["127.0.0.1:18444", "127.0.0.1:18445"], blockStall = 1}
+  where
+    peers requests net ad sa = case sa of
+      SockAddrInet 18444 _ -> dummyPeerConnect 0 silent allBlocks requests net ad sa
+      _ -> dummyPeerConnect 1000000 mockPeerReact allBlocks requests net ad sa
+    silent _ (MGetData _) = []
+    silent blocks msg = mockPeerReact blocks msg
+
+-- | A store whose peers are made by a function, with its configuration
+-- changed by another.
+withTestStoreConfig ::
+  (TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection) ->
+  (StoreConfig -> StoreConfig) ->
+  Network ->
+  String ->
+  (TestStore -> IO a) ->
+  IO a
+withTestStoreConfig peers change net t f =
   withSystemTempDirectory ("haskoin-store-test-" <> t <> "-") $ \w -> do
     requests <- newTVarIO []
     let ad =
@@ -132,38 +174,41 @@ withTestStoreBlocks blocks net ctx t f =
             nodeNetwork
             (sockToHostAddress (SockAddrInet 0 0))
         cfg =
-          StoreConfig
-            { maxPeers = 20,
-              -- the mock peer, by name: since haskoin-node 2.5 the seed of
-              -- a regtest network is not an address that discovery takes
-              initPeers = ["127.0.0.1:18444"],
-              discover = False,
-              db = w,
-              net = net,
-              ctx = ctx,
-              redis = Nothing,
-              gap = gap,
-              initGap = 20,
-              redisMinAddrs = 100,
-              redisMinTxs = 1000,
-              redisMaxXPubs = 10000,
-              noMempool = False,
-              wipeMempool = False,
-              fleet = False,
-              syncMempool = False,
-              blockWindow = 64,
-              mempoolTimeout = 14,
-              peerTimeout = 60,
-              maxPeerLife = 48 * 3600,
-              connect = dummyPeerConnect blocks requests net ad,
-              stats = Nothing,
-              bloom = True,
-              maxOpenFiles = Nothing,
-              writeBufferSize = Nothing,
-              maxWalSize = Nothing,
-              blockCache = Nothing,
-              logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
-            }
+          change
+            StoreConfig
+              { maxPeers = 20,
+                -- the mock peer, by name: since haskoin-node 2.5 the seed of
+                -- a regtest network is not an address that discovery takes
+                initPeers = ["127.0.0.1:18444"],
+                discover = False,
+                db = w,
+                net = net,
+                redis = Nothing,
+                gap = gap,
+                initGap = 20,
+                redisMinAddrs = 100,
+                redisMinTxs = 1000,
+                redisMaxXPubs = 10000,
+                noMempool = False,
+                wipeMempool = False,
+                fleet = False,
+                syncMempool = False,
+                blockWindow = 64,
+                mempoolTimeout = 14,
+                peerTimeout = 60,
+                blockStall = 10,
+                blockPing = 5,
+                maxPeerLife = 48 * 3600,
+                connect = peers requests net ad,
+                stats = Nothing,
+                bloom = True,
+                maxOpenFiles = Nothing,
+                writeBufferSize = Nothing,
+                maxWalSize = Nothing,
+                backgroundJobs = Nothing,
+                blockCache = Nothing,
+                logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
+              }
     withStore cfg $ \store ->
       withSubscription store.pub $ \sub ->
         f
@@ -252,30 +297,41 @@ cannedBlocksBase64 =
   \AAAAAAAAAAAAAAAAAAD/////DF8BAQgvRUIzMi4wL/////8BAPIFKgEAAAAjIQME7KZAozHsyrOO\
   \wT6Wn6LtY47B39Th44JKsZ8BGJCvc6wAAAAA"
 
-dummyPeerConnect :: [Block] -> TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
-dummyPeerConnect blocks requests net ad sa f = do
+-- | A mock peer that waits so many microseconds before it says anything,
+-- and then answers each message with a function of the blocks that it has.
+dummyPeerConnect ::
+  Int ->
+  ([Block] -> Message -> [Message]) ->
+  [Block] ->
+  TVar [Int] ->
+  Network ->
+  NetworkAddress ->
+  SockAddr ->
+  WithConnection
+dummyPeerConnect wait react blocks requests net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
   withAsync (go r s') $ \_ -> do
-    let o = awaitForever (`send` r)
-        i = forever (receive s >>= yield)
+    let o = conduitMailbox r
+        i = repeatMC (receive s)
     f (Conduits i o) :: IO ()
   where
     go :: Inbox ByteString -> Mailbox ByteString -> IO ()
     go r s = do
+      threadDelay wait
       nonce <- randomIO
-      now <- round <$> liftIO getPOSIXTime
+      now <- round <$> getPOSIXTime
       let rmt = NetworkAddress 0 (sockToHostAddress sa)
-          ver = buildVersion net nonce 0 ad rmt now
+          ver = buildVersion net nonce (fromIntegral (length blocks)) ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
       runConduit $
-        forever (receive r >>= yield)
+        repeatMC (receive r)
           .| inc
           .| iterMC (recordBlockRequest requests)
-          .| concatMapC (mockPeerReact blocks)
+          .| concatMapC (react blocks)
           .| outc
-          .| awaitForever (`send` s)
+          .| conduitMailbox s
     outc = mapMC $ \msg' -> return $ runPut (putMessage net msg')
     inc = forever $ do
       x <- takeCE 24 .| foldC

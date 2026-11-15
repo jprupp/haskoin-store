@@ -34,19 +34,19 @@ module Haskoin.Store.Runtime
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Monad (forever, unless)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Haskoin.Node (Logger, logInfo)
 import System.Metrics.StatsD
-  ( Stats,
-    StatCounter,
+  ( StatCounter,
     StatGauge,
+    Stats,
     incrementCounter,
     newStatCounter,
     newStatGauge,
     setGauge,
   )
-import UnliftIO.Concurrent (threadDelay)
 
 -- | The metrics of the collector.
 data Metrics = Metrics

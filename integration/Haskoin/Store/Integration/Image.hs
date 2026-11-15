@@ -47,9 +47,9 @@ import Data.List (intercalate)
 import Data.Serialize (encode)
 import Data.Text qualified as T
 import Haskoin (encodeHex, sha256)
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import System.Exit (ExitCode (..))
 import System.Process (readProcessWithExitCode)
-import UnliftIO.Temporary (withSystemTempDirectory)
 
 -- | Ubuntu 26.04, by the digest of its multi-architecture index.
 base :: String

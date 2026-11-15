@@ -55,6 +55,7 @@ module Haskoin.Store.Common
     applyLimit,
     applyLimitC,
     sortTxs,
+    sortTxsWith,
     nub',
     microseconds,
     streamThings,
@@ -87,13 +88,13 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (Serialize (..), encode)
-import GHC.Generics (Generic)
 import Data.Time.Clock.System
   ( getSystemTime,
     systemNanoseconds,
     systemSeconds,
   )
 import Data.Word (Word32, Word64)
+import GHC.Generics (Generic)
 import Haskoin
 import Haskoin.Node (Chain, Peer, chainRunHeaders)
 import Haskoin.Store.Data
@@ -169,8 +170,6 @@ instance Default Limits where
 data StoreRead = StoreRead
   { -- | network the store indexes
     net :: !Network,
-    -- | context for secp256k1 operations, needed to parse and derive keys
-    ctx :: !Ctx,
     -- | hash of the best block imported, or 'Nothing' if none yet
     getBestBlock :: IO (Maybe BlockHash),
     -- | hashes of all blocks imported at a height, side chains included
@@ -321,10 +320,10 @@ deriveAddresses derive xpub start = map (\i -> (i, derive xpub i)) [start ..]
 -- | Address derivation function for a type of address: legacy pay-to-public-key
 -- hash, pay-to-witness-public-key-hash nested in pay-to-script-hash, or native
 -- pay-to-witness-public-key-hash.
-deriveFunction :: Ctx -> DeriveType -> DeriveAddr
-deriveFunction ctx DeriveNormal i = fst . deriveAddr ctx i
-deriveFunction ctx DeriveP2SH i = fst . deriveCompatWitnessAddr ctx i
-deriveFunction ctx DeriveP2WPKH i = fst . deriveWitnessAddr ctx i
+deriveFunction :: DeriveType -> DeriveAddr
+deriveFunction DeriveNormal i = fst . deriveAddr i
+deriveFunction DeriveP2SH i = fst . deriveCompatWitnessAddr i
+deriveFunction DeriveP2WPKH i = fst . deriveWitnessAddr i
 
 -- | Balances of the addresses of an extended public key, derived up to the
 -- gap: every address of each chain up to the last used one, followed by
@@ -419,16 +418,16 @@ xPubSummary _xspec xbals =
 
 -- | Transaction with its metadata, or 'Nothing' if it is unknown.
 getTransaction :: StoreRead -> TxHash -> IO (Maybe Transaction)
-getTransaction r h = fmap (toTransactionWithId r.net r.ctx h) <$> r.getTxData h
+getTransaction r h = fmap (toTransactionWithId r.net h) <$> r.getTxData h
 
 -- | Many transactions, in the order of their hashes, read together. Each is
 -- read by its id, so its id is not computed again ('toTransactionWithId').
 getTransactions :: StoreRead -> [TxHash] -> IO [Maybe Transaction]
-getTransactions r hs = zipWith (fmap . toTransactionWithId r.net r.ctx) hs <$> r.getManyTxData hs
+getTransactions r hs = zipWith (fmap . toTransactionWithId r.net) hs <$> r.getManyTxData hs
 
 -- | Transactions that match a short numeric identifier; see 'getNumTxData'.
 getNumTransaction :: StoreRead -> Word64 -> IO [Transaction]
-getNumTransaction r i = map (toTransaction r.net r.ctx) <$> r.getNumTxData i
+getNumTransaction r i = map (toTransaction r.net) <$> r.getNumTxData i
 
 -- | First block in the main chain whose timestamp is at or after the given time,
 -- or 'Nothing' if there is none.
@@ -530,20 +529,30 @@ applyLimitC l = takeC (fromIntegral l)
 -- | Sort transactions so that every transaction comes after those it spends.
 -- Each transaction is returned with its position in the original list.
 sortTxs :: [Tx] -> [(Word32, Tx)]
-sortTxs txs = ts
+sortTxs = sortTxsWith txHash id
+
+-- | 'sortTxs' for transactions that come with something else, given how to
+-- get the hash and the transaction of each. The order is the one that
+-- 'sortTxs' gives the same transactions.
+--
+-- It is for a caller that has the hashes already. A hash is two rounds of
+-- SHA-256 over the whole transaction, and working out those of a block
+-- again here cost more than the sort itself.
+sortTxsWith :: forall a. (a -> TxHash) -> (a -> Tx) -> [a] -> [(Word32, a)]
+sortTxsWith hashOf txOf xs = ts
   where
     hm :: M.HashMap TxHash Int
-    hm = M.fromList $ zip (map txHash txs) [0 ..]
-    ns :: [(Tx, Int, [Int])]
+    hm = M.fromList $ zip (map hashOf xs) [0 ..]
+    ns :: [(a, Int, [Int])]
     ns =
-      let is tx = nub' $ map (.outpoint.hash) tx.inputs
-          hs tx = mapMaybe (`M.lookup` hm) (is tx)
-          tp i tx = (tx, i, hs tx)
-       in zipWith tp [0 ..] txs
+      let is x = nub' $ map (.outpoint.hash) (txOf x).inputs
+          hs x = mapMaybe (`M.lookup` hm) (is x)
+          tp i x = (x, i, hs x)
+       in zipWith tp [0 ..] xs
     (g, n, _) = G.graphFromEdges ns
     vs = G.reverseTopSort g
     ts =
-      let f (tx, i, _) = (fromIntegral i, tx)
+      let f (x, i, _) = (fromIntegral i, x)
        in map (f . n) vs
 
 -- | Remove duplicates from a list. The order of the result is unspecified.

@@ -8,7 +8,7 @@ import Data.Maybe (isJust)
 import Data.Serialize (encode)
 import Data.Text qualified as T
 import Data.Word (Word16)
-import Haskoin (btcRegTest, prepareContext, txHash)
+import Haskoin (btcRegTest, txHash)
 import Haskoin.Node (LogLevel (..))
 import Haskoin.Store.Common (Limits (..), Start (..), StoreRead)
 import Haskoin.Store.Database.Query qualified as Q
@@ -21,13 +21,13 @@ import Haskoin.Store.Fleet.RedisSpec (withRedis)
 import Haskoin.Store.Fleet.XPub
 import Haskoin.Store.Histories
 import Haskoin.Store.Integration.Podman (podmanUsable)
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
 import Test.QuickCheck (forAll, ioProperty, property, sized, vectorOf)
-import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> do
+spec = do
   usable <- runIO podmanUsable
   describe "member of a fleet" $ case usable of
     Left why -> it "answers as the store does when it is the whole fleet" (pendingWith why)
@@ -43,7 +43,7 @@ spec = prepareContext $ \ctx -> do
           -- on top must be the answer that it gives from its own database.
           property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
             withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-              openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
+              openLayered btcRegTest dir $ \db -> withShadow btcRegTest $ \shadow -> do
                 keys <- fresh
                 let config =
                       MemberConfig
@@ -111,7 +111,7 @@ spec = prepareContext $ \ctx -> do
           let histories = sized (\n -> if n == 0 then return leftAndBack else vectorOf 60 anyNumber)
            in property . forAll histories $ \seeds -> ioProperty $
                 withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-                  openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
+                  openLayered btcRegTest dir $ \db -> withShadow btcRegTest $ \shadow -> do
                     keys <- fresh
                     said <- newIORef []
                     let config =
@@ -128,7 +128,7 @@ spec = prepareContext $ \ctx -> do
                               note = \level line -> modifyIORef' said ((level, line) :)
                             }
                         best = Q.getBestBlock db >>= maybe (fail "no best block") return
-                        key = wallet ctx
+                        key = wallet
                     m <- newMember config conn db
                     -- the same store, as it takes its turns without the cache
                     bare <- newMember (config {cacheMax = 0} :: MemberConfig) conn db
@@ -259,7 +259,7 @@ spec = prepareContext $ \ctx -> do
         -- and empties the pool, and both offer their mempools again: what
         -- they answer afterwards is what the store answers by itself.
         withSystemTempDirectory "haskoin-store-member-" $ \dir ->
-          openLayered btcRegTest ctx dir $ \db -> withShadow btcRegTest ctx $ \shadow -> do
+          openLayered btcRegTest dir $ \db -> withShadow btcRegTest $ \shadow -> do
             keys <- fresh
             said <- newIORef []
             let config name =

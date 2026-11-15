@@ -113,6 +113,9 @@ module Haskoin.Store.Web.Publish
   )
 where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (mapConcurrently, race, waitCatch, withAsync)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, stateTVar, writeTVar)
 import Control.Monad (forM_, forever, unless, when)
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -172,21 +175,7 @@ import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), isCoinbaseT
 import NQE (newMailbox, receive, withPublisher, withSubscription)
 import Network.Socket (SockAddr (..))
 import System.Random (randomIO)
-import UnliftIO
-  ( TVar,
-    atomically,
-    mapConcurrently,
-    modifyTVar',
-    newTVarIO,
-    race,
-    readTVarIO,
-    stateTVar,
-    timeout,
-    waitCatch,
-    withAsync,
-    writeTVar,
-  )
-import UnliftIO.Concurrent (threadDelay)
+import System.Timeout (timeout)
 
 -- | Whether the store has a transaction, and where.
 data Held

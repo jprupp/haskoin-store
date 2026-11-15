@@ -59,12 +59,12 @@ import Conduit
     yieldMany,
     (.|),
   )
+import Control.Applicative ((<|>))
 import Control.Monad (forM)
 import Data.Bits ((.&.))
-import Control.Applicative ((<|>))
+import Data.ByteString qualified as BS
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (serialize)
-import Data.ByteString qualified as BS
 import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
@@ -176,7 +176,6 @@ pooledRead :: DatabaseReader -> PoolReads -> StoreRead
 pooledRead r pool =
   StoreRead
     { net = r.net,
-      ctx = r.ctx,
       getBestBlock = Q.getBestBlock r,
       getBlocksAtHeight = Q.getBlocksAtHeight r,
       getBlock = Q.getBlock r,
@@ -322,7 +321,7 @@ getUnspent r pool p =
               outpoint = p,
               value = o.value,
               script = o.script,
-              address = eitherToMaybe (scriptToAddressBS r.net r.ctx o.script)
+              address = eitherToMaybe (scriptToAddressBS r.net o.script)
             }
       [] -> Nothing
 

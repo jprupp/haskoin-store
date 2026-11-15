@@ -46,13 +46,14 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Char (isDigit, isSpace)
 import Data.List (dropWhileEnd)
 import Data.Text qualified as T
+import Haskoin.Store.Exception (bracket, onException, tryAny)
+import Haskoin.Store.Integration.Temp (withTempDirectory)
+import System.Directory (doesDirectoryExist, doesPathExist, getTemporaryDirectory)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
 import System.Process (getCurrentPid, readProcessWithExitCode)
-import UnliftIO (bracket, onException, timeout, tryAny)
-import UnliftIO.Directory (doesDirectoryExist, doesPathExist, getTemporaryDirectory)
-import UnliftIO.Temporary (withTempDirectory)
+import System.Timeout (timeout)
 
 -- | Whether Podman can run containers here, or why not. Set
 -- @HASKOIN_STORE_NO_PODMAN@ to a value other than @0@ to skip the tests that

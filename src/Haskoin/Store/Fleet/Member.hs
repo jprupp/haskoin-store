@@ -97,7 +97,18 @@ module Haskoin.Store.Fleet.Member
   )
 where
 
-import Control.Exception (Exception, throwIO)
+import Control.Concurrent.STM
+  ( TVar,
+    atomically,
+    modifyTVar',
+    newTVarIO,
+    readTVar,
+    readTVarIO,
+    retry,
+    stateTVar,
+    writeTVar,
+  )
+import Control.Exception (Exception, handle, throwIO)
 import Control.Monad (filterM, forM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -108,6 +119,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
@@ -122,7 +134,6 @@ import Database.Redis qualified as R
 import Haskoin
   ( BlockHash,
     BlockHeader (..),
-    Ctx,
     Network (..),
     OutPoint (..),
     Tx (..),
@@ -159,6 +170,7 @@ import Haskoin.Store.Database.Types
     TxKey (..),
   )
 import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, takeView, withViewAt)
+import Haskoin.Store.Exception (handleAny)
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
@@ -175,24 +187,7 @@ import System.Metrics.StatsD
     newStatTiming,
     setGauge,
   )
-import UnliftIO
-  ( TVar,
-    atomically,
-    handle,
-    handleAny,
-    modifyIORef',
-    modifyTVar',
-    newIORef,
-    newTVarIO,
-    readIORef,
-    readTVar,
-    readTVarIO,
-    retrySTM,
-    stateTVar,
-    timeout,
-    writeIORef,
-    writeTVar,
-  )
+import System.Timeout (timeout)
 
 -- | How a store takes part in a fleet.
 data MemberConfig = MemberConfig
@@ -458,7 +453,7 @@ memberEvents m whole tell = newIORef (if whole then Just "0-0" else Nothing) >>=
   where
     go at = do
       heard <- attempt m.outage m.config.note "read the events of the fleet" (listen at)
-      unless heard (void (timeout 1000000 (atomically retrySTM) :: IO (Maybe ())))
+      unless heard (void (timeout 1000000 (atomically retry) :: IO (Maybe ())))
       go at
     -- what there is after the place, waiting a second for it
     listen at = do
@@ -649,7 +644,7 @@ wayBetween db from to = L.withView db $ \view -> do
                 fmap (named h) <$> Q.getReplaced r h
               let pool =
                     PoolChange
-                      { returned = [poolTx r.net r.ctx td | (_, Just td) <- old, not (coinbase td)],
+                      { returned = [poolTx r.net td | (_, Just td) <- old, not (coinbase td)],
                         gone = [encode h | (h, found) <- old, maybe True coinbase found],
                         confirmed = map (encode . txHash . (.tx)) new,
                         -- with what spends each output and where, for what
@@ -681,8 +676,8 @@ wayBetween db from to = L.withView db $ \view -> do
 -- | A transaction as the pool keeps it: its body without spenders, and
 -- what it does at each address, as "Haskoin.Store.Database.Mempool" works
 -- them out for the store's own mempool area.
-poolTx :: Network -> Ctx -> TxData -> PoolTx
-poolTx net ctx td =
+poolTx :: Network -> TxData -> PoolTx
+poolTx net td =
   PoolTx
     { txid = encode records.txid,
       time,
@@ -695,7 +690,7 @@ poolTx net ctx td =
     time = case td.block of
       MemRef t -> t
       BlockRef {} -> 0
-    records = M.mempoolRecords net ctx time td
+    records = M.mempoolRecords net time td
     entry = \case
       (MemAddrTxKey a _ _, _) -> Just (PoolTouches (encode a))
       (MemAddrSpentKey a p, MemAddrSpentVal v) -> Just (PoolSpends (encode a) (encode p) v)
@@ -769,7 +764,7 @@ offerMempool m =
       M.getMempoolTx m.db h >>= \case
         Nothing -> forget h >> go at tip rest
         Just td -> do
-          let tx = poolTx m.db.net m.db.ctx td
+          let tx = poolTx m.db.net td
           unspent <- forM [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
             isJust <$> Q.getUnspent at p
           let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) tx unspent
@@ -995,7 +990,7 @@ memberCacheLoop m = go
       spec <- atomically $ do
         w <- readTVar m.wanted
         case HashMap.toList w of
-          [] -> retrySTM
+          [] -> retry
           (k, x) : _ -> x <$ writeTVar m.wanted (HashMap.delete k w)
       void (attempt m.outage m.config.note "cache an xpub for the fleet" (build spec))
       go
@@ -1035,7 +1030,7 @@ advanceCache :: Member -> Maybe ByteString -> ByteString -> Maybe Between -> IO 
 advanceCache m seen target between = when (m.config.cacheMax > 0) $ do
   changes <- case (between, decode target) of
     (Just b, Right to) | not b.reorganised -> withViewAt m.views to $ \r -> do
-      let touched = HashMap.toList (blockChanges r.net r.ctx b.added)
+      let touched = HashMap.toList (blockChanges r.net b.added)
       flags <- cacheTracked m.redis m.keys (map fst touched)
       forM [x | (x, True) <- zip touched flags] $ \(a, change) -> do
         bal <- Q.getBalance r a

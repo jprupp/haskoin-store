@@ -22,6 +22,8 @@ module Haskoin.Store.Manager
   )
 where
 
+import Control.Concurrent.Async (link, withAsync)
+import Control.Concurrent.STM (STM, atomically)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
@@ -32,7 +34,7 @@ import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
   ( BlockHash (..),
-    Ctx,
+    Headers (..),
     Inv (..),
     InvType (..),
     InvVector (..),
@@ -45,6 +47,7 @@ import Haskoin
     Reject (..),
     TxHash (..),
     VarString (..),
+    headerHash,
     sockToHostAddress,
   )
 import Haskoin.Node
@@ -65,11 +68,13 @@ import Haskoin.Node
 import Haskoin.Store.BlockStore
   ( BlockStore,
     BlockStoreConfig (..),
+    blockStoreAnnouncedSTM,
     blockStoreBlockSTM,
     blockStoreHeadSTM,
     blockStoreNotFoundSTM,
     blockStorePeerConnectSTM,
     blockStorePeerDisconnectSTM,
+    blockStorePongSTM,
     blockStoreTxHashSTM,
     blockStoreTxSTM,
     withBlockStore,
@@ -108,12 +113,6 @@ import NQE
 import Network.Socket (SockAddr (..))
 import System.Metrics.StatsD
 import System.Random (randomIO)
-import UnliftIO
-  ( STM,
-    atomically,
-    link,
-    withAsync,
-  )
 
 -- | Store mailboxes. Handles to the running components of a store, given by
 -- 'withStore'.
@@ -141,8 +140,6 @@ data Store = Store
     pub :: !(Publisher StoreEvent),
     -- | network constants
     net :: !Network,
-    -- | secp256k1 context
-    ctx :: !Ctx,
     -- | how the store opens a connection to a node, for those it makes
     -- besides the ones of the peer manager
     -- ("Haskoin.Store.Web.Publish")
@@ -164,8 +161,6 @@ data StoreConfig = StoreConfig
     -- | Redis URL for the cache of extended public keys ("Haskoin.Store.Cache");
     -- 'Nothing' for no cache, an empty URL for the local Redis
     redis :: !(Maybe String),
-    -- | Secp256k1 context
-    ctx :: !Ctx,
     -- | gap on extended public key with no transactions
     initGap :: !Word32,
     -- | gap for extended public keys
@@ -197,6 +192,12 @@ data StoreConfig = StoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect peer if message not received for this many seconds
     peerTimeout :: !NominalDiffTime,
+    -- | ask another peer for the blocks that the syncing peer has not
+    -- delivered for this many seconds
+    blockStall :: !NominalDiffTime,
+    -- | a peer is asked for blocks if it answers a ping within this long,
+    -- or if none does
+    blockPing :: !NominalDiffTime,
     -- | disconnect peer if it has been connected this long
     maxPeerLife :: !NominalDiffTime,
     -- | connect to peers using the function 'Haskoin.Node.withConnection'
@@ -205,8 +206,12 @@ data StoreConfig = StoreConfig
     stats :: !(Maybe Stats),
     -- | Bloom filters on the column families that are read by key
     bloom :: !Bool,
-    -- | RocksDB max_open_files ('Nothing' = unlimited: every SST file's index
-    -- and filter blocks stay resident for the life of the process)
+    -- | RocksDB max_open_files ('Nothing' = unlimited, which is what a
+    -- store with a block cache wants: its index and filter blocks are in
+    -- the cache, an open file costs a few kilobytes, and a file that is
+    -- not open has to be opened for every lookup that lands in it. Without
+    -- a block cache every open file keeps its index and filter in memory,
+    -- and the limit is what bounds them)
     maxOpenFiles :: !(Maybe Int),
     -- | bytes of RocksDB memtables across all column families ('Nothing' =
     -- unlimited: each column family keeps up to two 64 MiB memtables)
@@ -214,6 +219,11 @@ data StoreConfig = StoreConfig
     -- | bytes of write-ahead log after which the column families holding the
     -- oldest log file are flushed ('Nothing' = RocksDB default)
     maxWalSize :: !(Maybe Int),
+    -- | threads that RocksDB may use at once for flushes and compactions
+    -- together ('Nothing' = RocksDB default: two, one of each). More of
+    -- them shorten a backlog of compactions where the disk and the cores
+    -- have room, and take both from the requests where they have not
+    backgroundJobs :: !(Maybe Int),
     -- | bytes of RocksDB block cache shared by all column families, which
     -- also holds their index and filter blocks ('Nothing' = RocksDB default:
     -- 32 MiB per column family, index and filter blocks outside it)
@@ -255,7 +265,6 @@ withStore cfg action =
                           events = events,
                           pub = pub,
                           net = cfg.net,
-                          ctx = cfg.ctx,
                           connect = cfg.connect
                         }
 
@@ -370,7 +379,6 @@ connectDB cfg f = do
   stats <- mapM createDataMetrics cfg.stats
   withLayeredReader
     cfg.net
-    cfg.ctx
     cfg.initGap
     cfg.gap
     cfg.db
@@ -378,6 +386,7 @@ connectDB cfg f = do
     cfg.maxOpenFiles
     cfg.writeBufferSize
     cfg.maxWalSize
+    cfg.backgroundJobs
     cfg.blockCache
     stats
     $ \db -> do
@@ -405,7 +414,6 @@ blockStoreCfg cfg node pub db member =
       pub = pub,
       db = db,
       net = cfg.net,
-      ctx = cfg.ctx,
       noMempool = cfg.noMempool,
       wipeMempool = cfg.wipeMempool,
       onBest = maybe (\_ -> return ()) noteBest member,
@@ -413,6 +421,8 @@ blockStoreCfg cfg node pub db member =
       blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,
+      blockStall = cfg.blockStall,
+      blockPing = cfg.blockPing,
       stats = cfg.stats,
       logger = withSource "BlockStore" cfg.logger
     }
@@ -471,8 +481,13 @@ storeDispatch b pub (PeerEvent pe) =
       blockStorePeerDisconnectSTM p b
     PeerMessage p msg ->
       case msg of
-        MPong (Pong n) ->
+        MPong (Pong n) -> do
           publishSTM (StorePeerPong p n) pub
+          blockStorePongSTM p n b
+        -- the headers of a message are a chain: the last says what the
+        -- peer has
+        MHeaders (Headers hs)
+          | (h, _) : _ <- reverse hs -> blockStoreAnnouncedSTM p [headerHash h] b
         MBlock block ->
           blockStoreBlockSTM p block b
         MTx tx ->
@@ -490,7 +505,13 @@ storeDispatch b pub (PeerEvent pe) =
                 | InvVector t h <- is,
                   t == InvTx || t == InvWitnessTx
                 ]
+              blocks =
+                [ BlockHash h
+                | InvVector t h <- is,
+                  t == InvBlock || t == InvWitnessBlock
+                ]
           publishSTM (StoreTxAnnounce p txs) pub
+          unless (null blocks) $ blockStoreAnnouncedSTM p blocks b
           unless (null txs) $ blockStoreTxHashSTM p txs b
         -- A reject that names no transaction hash cannot be attributed to a
         -- transaction and falls through to the catch-all below.

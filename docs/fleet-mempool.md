@@ -170,6 +170,53 @@ A request is one block, but not one moment of the pool: a transaction can
 enter between two reads of the same request. A balance and a list can
 differ by it. A server alone has no such gap.
 
+## What a fleet reads of a server's database
+
+A fleet reads a server's database, and nothing that the block store keeps
+in memory:
+
+- **The server's own mempool**, which it offers, from the two column
+  families of the mempool area, in RocksDB.
+- **The blocks between two tips** (`moveTip`): the blocks, the records of
+  the transactions that they confirmed, with their inputs, and the
+  server's record of what replaced a payment of an abandoned block.
+- **The chain at the fleet tip**, through a view of the database at that
+  block.
+
+The block store imports a block [in stages](block-import.md), and takes a
+mined block to be valid without checking it. That changes nothing here:
+for a block that could be mined, the import leaves the database that it
+always left, key for key, in every column family, and the mempool gives
+way to a block as before, with the same records of what was replaced. The
+tests compare every key after every operation of random histories.
+
+The block store keeps two things in memory, for its own reads while it
+imports:
+
+- **a copy of its mempool area**, the two column families of its own
+  mempool;
+- **the chain's unspent output of each output that a mempool transaction
+  spends**, which it read when the transaction came, so that the block
+  which confirms the transaction does not read it again.
+
+Both are what the server's database has now, between two batches. A fleet
+answers from the database as it was at the fleet tip, which may be behind
+the server's best block or, for a moment, on a block that the server has
+reverted. So a fleet must never see either, and it cannot:
+
+- **Only a batch of the block store reads them**
+  (`Haskoin.Store.Database.Writer`). The offer, the move of the tip and
+  the requests of the API read RocksDB.
+- **A view of the database has no way to them.** Every view, of the
+  database as it is now or as it was at a block, reads through a handle
+  that has a place of its own for a copy, with nothing in it
+  (`snapshotReader`). A test checks that for both kinds of view.
+- **They change nothing that is written.** The database that a block
+  leaves is the same key for key whether an output came from memory or
+  from RocksDB; the tests compare the two after every operation of
+  random histories, with reorganisations and with blocks that conflict
+  with the mempool.
+
 ## Why it holds
 
 These hold after every script call:

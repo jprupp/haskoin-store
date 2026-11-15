@@ -77,33 +77,33 @@ timed what act = do
   return x
 
 main :: IO ()
-main = withContext $ \ctx ->
+main =
   getArgs >>= \case
     ["make", dir, count] ->
-      withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing $ \db -> do
-        runWriter net ctx db quiet initBest
+      withDatabaseReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing $ \db -> do
+        runWriter net db quiet initBest
         Just best <- Q.getBestBlock db
         Just parent <- Q.getBlock db best
         let merkle = either error id (buildMerkleRoot [txHash coinbase])
             candidate = BlockHeader 0x20000000 best merkle (parent.header.timestamp + 600) parent.header.bits
         header <- maybe (fail "no nonce") return (find (isValidPOW net) (map candidate [0 ..]))
         let node = BlockNode header 1 0 best
-        void (runWriter net ctx db quiet (\w -> importBlock w (Block header [coinbase]) node))
+        void (runWriter net db quiet (\w -> importBlock w (Block header [coinbase]) node))
         timed ("adding " <> count <> " transactions to the mempool") $
           forM_ (zip [0 :: Word64 ..] (chunks 1000 (tree (read count)))) $ \(i, txs) ->
-            runWriter net ctx db quiet (\w -> forM_ txs (\tx -> newMempoolTx w tx (1000 + i)))
+            runWriter net db quiet (\w -> forM_ txs (\tx -> newMempoolTx w tx (1000 + i)))
         n <- length <$> Q.getMempool db
         printf "%d transactions in the mempool\n" n
     ["wipe", dir] ->
-      withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing $ \db -> do
+      withDatabaseReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing $ \db -> do
         pool <- Q.getMempool db
         timed ("wiping " <> show (length pool) <> " transactions, as version 20 does") $
           forM_ (chunks 1000 pool) $ \txs ->
-            runWriter net ctx db quiet (\w -> forM_ txs (\(_, h) -> deleteUnconfirmedTx w False h))
+            runWriter net db quiet (\w -> forM_ txs (\(_, h) -> deleteUnconfirmedTx w False h))
         left <- length <$> Q.getMempool db
         unless (left == 0) (fail "mempool not empty")
     ["migrate", dir] ->
-      withLayeredReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing $ \db -> do
+      withLayeredReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing $ \db -> do
         m <- timed "migrating" (migrateLayered db)
         print m
     _ -> fail "usage: make DIR COUNT | wipe DIR | migrate DIR"

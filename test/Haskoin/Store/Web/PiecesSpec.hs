@@ -3,13 +3,13 @@
 module Haskoin.Store.Web.PiecesSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_)
 import Control.Exception (ErrorCall (..), throwIO, try)
+import Control.Monad (forM_)
 import Data.Aeson (encode, toEncoding)
 import Data.ByteString.Builder (Builder, toLazyByteString)
 import Data.ByteString.Lazy qualified as L
-import Data.List (sort)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.List (sort)
 import Haskoin.Store.Web.Pieces
 import Network.Wai.Internal (Response (..))
 import Test.Hspec hiding (around)

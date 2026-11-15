@@ -88,19 +88,20 @@ module Haskoin.Store.Web.Pieces
   )
 where
 
-import Control.Exception (evaluate)
+import Control.Concurrent.Async (asyncWithUnmask, cancel, wait)
+import Control.Exception (evaluate, mask_)
 import Data.Aeson.Encoding (Encoding, fromEncoding)
 import Data.ByteString.Builder (Builder, lazyByteString, toLazyByteString)
 import Data.ByteString.Lazy qualified as L
 import Data.Bytes.Put (runPutL)
 import Data.Bytes.Serial (Serial (..))
-import Haskoin.Util (hexBuilder)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intersperse)
 import Data.Sequence (Seq (..), (|>))
+import Haskoin.Store.Exception (finally)
+import Haskoin.Util (hexBuilder)
 import Network.HTTP.Types (ResponseHeaders, status200)
 import Network.Wai (Response, responseStream)
-import UnliftIO (asyncWithUnmask, cancel, finally, mask_, wait)
 
 -- | A piece of a response. Its outer action reads what the piece is made of
 -- and encodes it to bytes, and may run at the same time as those of other

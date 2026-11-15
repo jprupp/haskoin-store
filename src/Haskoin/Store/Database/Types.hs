@@ -47,7 +47,7 @@
 -- = Keys of the layered layout
 --
 -- They belong to the layout that the store runs on, that of
--- @docs\/layered-database.md@, version 22, in which the column families of
+-- @docs\/layered-database.md@, version 23, in which the column families of
 -- the chain hold nothing from the mempool and everything about the mempool
 -- is in two column families of its own. t'TxKey' is used there too, for the
 -- bodies of mempool transactions. "Haskoin.Store.Database.Mempool" reads
@@ -72,6 +72,10 @@
 -- | 0x10      | t'SpenderKey'    | t'SpenderVal': inputs of blocks that      |
 -- |           |                  | spend outputs of a transaction            |
 -- +-----------+------------------+-------------------------------------------+
+--
+-- Since version 23 the values of 'BalKey' and of t'SpenderKey' can also
+-- be written as merge records, which RocksDB combines into the value:
+-- "Haskoin.Store.Database.Merge".
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),
@@ -101,6 +105,7 @@ module Haskoin.Store.Database.Types
     BalVal (..),
     valToBalance,
     balanceToVal,
+    addBalVal,
     UnspentVal (..),
     toUnspent,
     unspentToVal,
@@ -148,7 +153,6 @@ import Haskoin
     eitherToMaybe,
     scriptToAddressBS,
   )
-import Haskoin.Crypto
 import Haskoin.Store.Common (Replaced)
 import Haskoin.Store.Data
   ( Balance (..),
@@ -320,17 +324,17 @@ instance Key UnspentKey
 instance KeyValue UnspentKey UnspentVal
 
 -- | Build an 'Unspent' from an address output entry. Returns 'Nothing' for a short key.
-toUnspent :: Network -> Ctx -> AddrOutKey -> OutVal -> Maybe Unspent
-toUnspent net ctx (AddrOutKey _address block outpoint) (OutVal value script) =
+toUnspent :: Network -> AddrOutKey -> OutVal -> Maybe Unspent
+toUnspent net (AddrOutKey _address block outpoint) (OutVal value script) =
   Just
     Unspent
       { block = block,
         value = value,
         script = script,
         outpoint = outpoint,
-        address = eitherToMaybe (scriptToAddressBS net ctx script)
+        address = eitherToMaybe (scriptToAddressBS net script)
       }
-toUnspent _ _ _ _ = Nothing
+toUnspent _ _ _ = Nothing
 
 -- | Mempool transaction database key. Legacy: databases of version 18 kept the
 -- whole mempool under this key. It is only read to migrate them.
@@ -753,6 +757,19 @@ spenderKey p = SpenderKey p.hash (p.index `div` spenderGroup)
 -- | The inputs of blocks that spend outputs of a group, by the number of
 -- the output in its transaction. A group none of whose outputs is spent
 -- has no key.
+--
+-- The value is one byte with the number of entries, then the entries in
+-- ascending order of output, each of forty bytes: the number of the output
+-- (four bytes, most significant first), the hash of the transaction that
+-- spends it (32) and the number of the input that does (four, most
+-- significant first).
+--
+-- Since database version 23 the column family has merge records too, which
+-- the import of a block writes instead of reading a group to add to it
+-- ("Haskoin.Store.Database.Merge"). A merge record is of this type and
+-- these bytes, with the spenders to add. RocksDB joins them with the group
+-- when it is read, the newest entry winning for an output that several
+-- have, and a reader never sees one.
 newtype SpenderVal = SpenderVal (IntMap Spender)
   deriving (Show, Eq)
 
@@ -855,6 +872,17 @@ instance KeyValue VersionKey Word32
 
 -- | Balance of an address as stored in the database. The address itself is in
 -- the key.
+--
+-- The value is the five numbers, each of eight bytes with the most
+-- significant first: forty bytes.
+--
+-- Since database version 23 the column family has merge records too, which
+-- the import of a block writes instead of reading a balance to change it
+-- ("Haskoin.Store.Database.Merge"). A merge record is of this type and
+-- these bytes, with five differences in place of the five numbers: each is
+-- added to its number modulo 2^64, so that a number goes down by the two's
+-- complement of what is taken off. RocksDB adds them up when the balance
+-- is read ('addBalVal' is the same sum), and a reader never sees one.
 data BalVal = BalVal
   { -- | confirmed balance in satoshi
     confirmed :: !Word64,
@@ -878,6 +906,20 @@ valToBalance address BalVal {..} =
 balanceToVal :: Balance -> BalVal
 balanceToVal Balance {..} =
   BalVal {..}
+
+-- | The sum of two stored balances, or of a balance and its differences,
+-- or of two sets of differences: each number modulo 2^64. It is what the
+-- merge operator of the column family does
+-- ('Haskoin.Store.Database.Merge.balanceOperator').
+addBalVal :: BalVal -> BalVal -> BalVal
+addBalVal a b =
+  BalVal
+    { confirmed = a.confirmed + b.confirmed,
+      unconfirmed = a.unconfirmed + b.unconfirmed,
+      utxo = a.utxo + b.utxo,
+      txs = a.txs + b.txs,
+      received = a.received + b.received
+    }
 
 -- | Default balance for an address.
 instance Default BalVal where
@@ -906,8 +948,8 @@ unspentToVal :: Unspent -> (OutPoint, UnspentVal)
 unspentToVal Unspent {..} = (outpoint, UnspentVal {..})
 
 -- | Build an 'Unspent' from its outpoint and stored value, decoding the address from the script.
-valToUnspent :: Network -> Ctx -> OutPoint -> UnspentVal -> Unspent
-valToUnspent net ctx outpoint UnspentVal {..} =
+valToUnspent :: Network -> OutPoint -> UnspentVal -> Unspent
+valToUnspent net outpoint UnspentVal {..} =
   Unspent {..}
   where
-    address = eitherToMaybe (scriptToAddressBS net ctx script)
+    address = eitherToMaybe (scriptToAddressBS net script)

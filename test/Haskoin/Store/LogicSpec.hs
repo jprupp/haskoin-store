@@ -1,5 +1,6 @@
 module Haskoin.Store.LogicSpec (spec) where
 
+import Control.Exception (catch, evaluate, try)
 import Control.Monad (forM_, void)
 import Data.ByteString qualified as B
 import Data.Functor ((<&>))
@@ -15,7 +16,6 @@ import Haskoin
     BlockHash,
     BlockHeader (..),
     BlockNode (..),
-    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -26,7 +26,6 @@ import Haskoin
     btcRegTest,
     genesisNode,
     headerHash,
-    prepareContext,
     scriptToAddressBS,
     sha256,
     txHash,
@@ -53,6 +52,7 @@ import Haskoin.Store.Database.Writer
     runWriter,
     runWriterMempool,
   )
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic
   ( ImportException (..),
     deleteUnconfirmedTx,
@@ -64,20 +64,19 @@ import Haskoin.Store.Logic
 import Haskoin.Store.TestBlocks (coinbaseTx, nextBlock, script)
 import System.Log.FastLogger (fromLogStr)
 import Test.Hspec
-import UnliftIO (catch, evaluate, try, withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> do
+spec = do
   describe "initBest" $
     it "imports the genesis block once" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         importing db initBest `shouldReturn` Right ()
         importing db initBest `shouldReturn` Right ()
         Q.getBestBlock db `shouldReturn` Just genesis
 
   describe "memoryReport" $
     it "lists the memory of every column family" $
-      withCoin btcRegTest ctx $ \db _ -> do
+      withCoin btcRegTest $ \db _ -> do
         report <- memoryReport db.db
         forM_ ["default", "addr-tx", "unspent", "balance", "total", "block cache"] $ \name ->
           report `shouldSatisfy` T.isInfixOf name
@@ -87,7 +86,7 @@ spec = prepareContext $ \ctx -> do
     it "moves the mempool into its column family when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
         let open :: (DatabaseReader -> IO ()) -> IO ()
-            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
+            open = withDatabaseReader btcRegTest 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing
             h1 = TxHash (sha256 ("one" :: B.ByteString))
             h2 = TxHash (sha256 ("two" :: B.ByteString))
             old = [(200, h2), (100, h1)] :: [(Word64, TxHash)]
@@ -104,7 +103,7 @@ spec = prepareContext $ \ctx -> do
     it "indexes the mempool by time when opened" $
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
         let open :: (DatabaseReader -> IO ()) -> IO ()
-            open = withDatabaseReader btcRegTest ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing
+            open = withDatabaseReader btcRegTest 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing
             old = sortOn Down (zip [300, 100, 200] (hashes 3))
         open $ \r -> do
           insert r.db VersionKey (19 :: Word32)
@@ -120,25 +119,25 @@ spec = prepareContext $ \ctx -> do
         newest = sortOn Down entries
         fill db = importing db (\w -> forM_ entries (\(t, h) -> addToMempool w h t))
     it "pages the mempool newest first" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         _ <- fill db
         Q.getMempool db `shouldReturn` newest
         forM_ [(0, 0), (3, 0), (3, 2), (2, 5), (4, 7), (0, 3)] $ \(l, o) ->
           Q.getMempoolPage db (Limits l o Nothing)
             `shouldReturn` take' l (drop (fromIntegral o) newest)
     it "reads the oldest entries before a time" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         _ <- fill db
         let oldest = reverse newest
         Q.getMempoolBefore db 4 10 `shouldReturn` takeWhile ((< 4) . fst) oldest
         Q.getMempoolBefore db 4 2 `shouldReturn` take 2 oldest
         Q.getMempoolBefore db 1 10 `shouldReturn` []
     it "reports and indexes what a batch changes" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         let hs = hashes 3
             (h1, h2, h3) = (hs !! 0, hs !! 1, hs !! 2)
             batch :: (Writer -> IO ()) -> IO MempoolChanges
-            batch = fmap snd . runWriterMempool db.net db.ctx db quietLogger
+            batch = fmap snd . runWriterMempool db.net db quietLogger
         c <- batch (\w -> addToMempool w h1 10 >> addToMempool w h2 20)
         (sort c.added, c.removed) `shouldBe` (sort [h1, h2], [])
         -- a new time moves the entry in the index, and is no change
@@ -155,7 +154,7 @@ spec = prepareContext $ \ctx -> do
 
   describe "newMempoolTx" $ do
     it "imports a transaction and spends its input" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let tx = spend [coin] [1000, 2000]
         importing db (\w -> newMempoolTx w tx 1700000000) `shouldReturn` Right True
         Q.getMempool db `shouldReturn` [(1700000000, txHash tx)]
@@ -163,7 +162,7 @@ spec = prepareContext $ \ctx -> do
         fmap (.value) <$> Q.getUnspent db (out tx 1) `shouldReturn` Just 2000
 
     it "ignores a transaction it already has" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let tx = spend [coin] [1000]
         mapM (addTx db) [tx, tx] `shouldReturn` [Right True, Right False]
         _ <- mine db [tx]
@@ -171,7 +170,7 @@ spec = prepareContext $ \ctx -> do
         fmap (.block) <$> txData db tx `shouldReturn` Just (BlockRef 2 1)
 
     it "rejects invalid transactions" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         addTx db (spend [out (coinbaseTx 9) 0] [1]) `shouldReturn` Left Orphan
         addTx db (spend [coin, coin] [1]) `shouldReturn` Left DuplicatePrevOutput
         addTx db (spend [coin] [5000000001]) `shouldReturn` Left InsufficientFunds
@@ -179,7 +178,7 @@ spec = prepareContext $ \ctx -> do
         mempool db `shouldReturn` []
 
     it "flags BIP125 signalling transactions and their descendants" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spendRBF [coin] [1000]
             child = spend [out parent 0] [900]
         importing db (\w -> mapM (\t -> newMempoolTx w t 0) [parent, child])
@@ -187,18 +186,18 @@ spec = prepareContext $ \ctx -> do
         mapM (rbfFlag db) [parent, child] `shouldReturn` [Just True, Just True]
 
     it "does not flag other transactions" $ do
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spend [coin] [1000]
             child = spend [out parent 0] [900]
         mapM (addTx db) [parent, child] `shouldReturn` [Right True, Right True]
         mapM (rbfFlag db) [parent, child] `shouldReturn` [Just False, Just False]
-      withCoin bchRegTest ctx $ \db coin -> do
+      withCoin bchRegTest $ \db coin -> do
         let tx = spendRBF [coin] [1000]
         addTx db tx `shouldReturn` Right True
         rbfFlag db tx `shouldReturn` Just False
 
     it "replaces conflicting transactions and their descendants" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let original = spend [coin] [1000]
             child = spend [out original 0] [900]
             replacement = spend [coin] [2000]
@@ -216,7 +215,7 @@ spec = prepareContext $ \ctx -> do
           `shouldReturn` [Nothing, Nothing, Just (txHash replacement)]
 
     it "replaces a transaction and its descendant when both conflict" $
-      withCoin btcRegTest ctx $ \db coin1 -> do
+      withCoin btcRegTest $ \db coin1 -> do
         _ <- mine db []
         let coin2 = out (coinbaseTx 2) 0
             parent = spend [coin1] [1000]
@@ -227,7 +226,7 @@ spec = prepareContext $ \ctx -> do
         mempool db `shouldReturn` [txHash replacement]
 
     it "leaves the mempool unchanged when it rejects a replacement" $
-      withCoin btcRegTest ctx $ \db coin1 -> do
+      withCoin btcRegTest $ \db coin1 -> do
         _ <- mine db []
         let coin2 = out (coinbaseTx 2) 0
             original = spend [coin1] [1000]
@@ -246,19 +245,19 @@ spec = prepareContext $ \ctx -> do
         mempool db `shouldReturn` [txHash original]
 
     it "rejects double spends on networks without RBF" $
-      withCoin bchRegTest ctx $ \db coin -> do
+      withCoin bchRegTest $ \db coin -> do
         let original = spendRBF [coin] [1000]
         mapM (addTx db) [original, spend [coin] [2000]]
           `shouldReturn` [Right True, Left DoubleSpend]
         mempool db `shouldReturn` [txHash original]
 
     it "rejects double spends of confirmed transactions" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         _ <- mine db [spend [coin] [1000]]
         addTx db (spend [coin] [2000]) `shouldReturn` Left TxConfirmed
 
     it "commits nothing from a batch that fails" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let good = spend [coin] [1000]
             orphan = spend [out (coinbaseTx 9) 0] [1]
         importing db (\w -> newMempoolTx w good 0 >> newMempoolTx w orphan 0)
@@ -268,7 +267,7 @@ spec = prepareContext $ \ctx -> do
 
   describe "importBlock" $ do
     it "confirms mempool transactions" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let tx = spendRBF [coin] [1000]
         addTx db tx `shouldReturn` Right True
         _ <- mine db [tx]
@@ -277,7 +276,7 @@ spec = prepareContext $ \ctx -> do
         fmap (.block) <$> Q.getUnspent db (out tx 0) `shouldReturn` Just (BlockRef 2 1)
 
     it "confirms a transaction whose outputs are spent in the mempool" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spend [coin] [1000]
             child = spend [out parent 0] [900]
         mapM (addTx db) [parent, child] `shouldReturn` [Right True, Right True]
@@ -287,7 +286,7 @@ spec = prepareContext $ \ctx -> do
         Q.getSpender db (out parent 0) `shouldReturn` Just (Spender (txHash child) 0)
 
     it "stops flagging a descendant once its signalling ancestor confirms" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spendRBF [coin] [1000]
             child = spend [out parent 0] [900]
         mapM (addTx db) [parent, child] `shouldReturn` [Right True, Right True]
@@ -295,7 +294,7 @@ spec = prepareContext $ \ctx -> do
         rbfFlag db child `shouldReturn` Just False
 
     it "imports transactions in any order and records the block" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spend [coin] [4000000000]
             child = spend [out parent 0] [3999990000]
         block <- mine db [child, parent]
@@ -306,7 +305,7 @@ spec = prepareContext $ \ctx -> do
 
     it "evicts conflicting mempool transactions and their descendants" $
       forM_ [btcRegTest, bchRegTest] $ \net ->
-        withCoin net ctx $ \db coin -> do
+        withCoin net $ \db coin -> do
           let original = spend [coin] [1000]
               child = spend [out original 0] [900]
           mapM (addTx db) [original, child] `shouldReturn` [Right True, Right True]
@@ -315,13 +314,13 @@ spec = prepareContext $ \ctx -> do
           mapM (txData db) [original, child] `shouldReturn` [Nothing, Nothing]
 
     it "rejects blocks that spend unknown outputs, changing nothing" $
-      withCoin btcRegTest ctx $ \db _ -> do
+      withCoin btcRegTest $ \db _ -> do
         best <- Q.getBestBlock db
         tryMine db [spend [out (coinbaseTx 9) 0] [1]] `shouldReturn` Left Orphan
         Q.getBestBlock db `shouldReturn` best
 
     it "rejects blocks that do not build on the best block" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         let (block1, node1) = nextBlock btcRegTest 0 (genesisNode btcRegTest).header []
             (block2, node2) = nextBlock btcRegTest 1 node1.header []
         importing db (\w -> void (importBlock w block1 node1)) `shouldReturn` Left BestBlockNotFound
@@ -330,7 +329,7 @@ spec = prepareContext $ \ctx -> do
 
   describe "revertBlock" $ do
     it "returns the block's transactions to the mempool" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let tx = spendRBF [coin] [1000]
         block <- mine db [tx]
         let h = headerHash block.header
@@ -342,7 +341,7 @@ spec = prepareContext $ \ctx -> do
         txData db (coinbaseTx 2) `shouldReturn` Nothing
 
     it "flags mempool descendants of the signalling transactions it returns" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spendRBF [coin] [1000]
             child = spend [out parent 0] [900]
         block <- mine db [parent]
@@ -352,7 +351,7 @@ spec = prepareContext $ \ctx -> do
         rbfFlag db child `shouldReturn` Just True
 
     it "only reverts the best block" $
-      withDB btcRegTest ctx $ \db -> do
+      withDB btcRegTest $ \db -> do
         importing db (`revertBlock` genesis) `shouldReturn` Left BestBlockNotFound
         importing db initBest `shouldReturn` Right ()
         _ <- mine db []
@@ -360,7 +359,7 @@ spec = prepareContext $ \ctx -> do
 
   describe "deleteUnconfirmedTx" $ do
     it "deletes a transaction and its descendants" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         let parent = spend [coin] [1000]
             child = spend [out parent 0] [900]
         mapM (addTx db) [parent, child] `shouldReturn` [Right True, Right True]
@@ -369,19 +368,19 @@ spec = prepareContext $ \ctx -> do
         fmap (.value) <$> Q.getUnspent db coin `shouldReturn` Just 5000000000
 
     it "ignores unknown transactions" $
-      withCoin btcRegTest ctx $ \db _ ->
+      withCoin btcRegTest $ \db _ ->
         importing db (\w -> deleteUnconfirmedTx w False (txHash (coinbaseTx 9)))
           `shouldReturn` Right ()
 
     it "refuses to delete confirmed transactions" $
-      withCoin btcRegTest ctx $ \db _ ->
+      withCoin btcRegTest $ \db _ ->
         importing db (\w -> deleteUnconfirmedTx w False (txHash (coinbaseTx 1)))
           `shouldReturn` Left TxConfirmed
 
   describe "address balances" $
     it "follow transactions through the mempool, a block and its reversal" $
-      withCoin btcRegTest ctx $ \db coin -> do
-        a <- either fail return (scriptToAddressBS btcRegTest ctx script)
+      withCoin btcRegTest $ \db coin -> do
+        a <- either fail return (scriptToAddressBS btcRegTest script)
         let tx = spend [coin] [1000, 2000]
             -- confirmed, unconfirmed, outputs, transactions, received
             balance = do
@@ -397,7 +396,7 @@ spec = prepareContext $ \ctx -> do
 
   describe "a coin whose script has no address on the network" $
     it "is kept without an address" $
-      withCoin btcRegTest ctx $ \db coin -> do
+      withCoin btcRegTest $ \db coin -> do
         -- OP_HASH256, a push of 32 bytes, OP_EQUAL. Bitcoin Cash has an
         -- address for this script. Bitcoin has none.
         let hashLock = "\xaa\x20" <> B.replicate 32 0xbb <> "\x87"
@@ -407,22 +406,22 @@ spec = prepareContext $ \ctx -> do
         coinAddress `shouldBe` Just Nothing
 
 -- | Run with an empty database in a temporary directory.
-withDB :: Network -> Ctx -> (DatabaseReader -> IO a) -> IO a
-withDB net ctx go =
+withDB :: Network -> (DatabaseReader -> IO a) -> IO a
+withDB net go =
   withSystemTempDirectory "haskoin-store-logic-" $ \dir ->
-    withDatabaseReader net ctx 20 32 dir False Nothing Nothing Nothing Nothing Nothing go
+    withDatabaseReader net 20 32 dir False Nothing Nothing Nothing Nothing Nothing Nothing go
 
 -- | Run with the genesis block and one mined block, passing the output of
 -- that block's coinbase, worth 5000000000.
-withCoin :: Network -> Ctx -> (DatabaseReader -> OutPoint -> IO a) -> IO a
-withCoin net ctx go =
-  withDB net ctx $ \db -> do
+withCoin :: Network -> (DatabaseReader -> OutPoint -> IO a) -> IO a
+withCoin net go =
+  withDB net $ \db -> do
     importing db initBest `shouldReturn` Right ()
     _ <- mine db []
     go db (out (coinbaseTx 1) 0)
 
 importing :: DatabaseReader -> (Writer -> IO a) -> IO (Either ImportException a)
-importing db = try . runWriter db.net db.ctx db quietLogger
+importing db = try . runWriter db.net db quietLogger
 
 -- | Build every message, so that log lines are tested too, but print none.
 quietLogger :: Logger

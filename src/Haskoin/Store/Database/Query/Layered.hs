@@ -118,9 +118,9 @@ import Conduit
     yieldMany,
     (.|),
   )
+import Control.Applicative ((<|>))
 import Control.Monad (forM)
 import Data.Bits ((.&.))
-import Control.Applicative ((<|>))
 import Data.ByteString qualified as BS
 import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
@@ -188,6 +188,7 @@ import Haskoin.Store.Database.Reader
     derivedAddrs,
     mempoolAddrCF,
     mempoolCF,
+    snapshotReader,
     txCF,
   )
 import Haskoin.Store.Database.Types
@@ -231,7 +232,7 @@ viewReader (View r) = r
 -- gives back something lazy or something that reads later, such as the body
 -- of a streamed response, has to run inside.
 withView :: DatabaseReader -> (View -> IO a) -> IO a
-withView r action = withSnapshot r.db $ \snapshot -> action (View r {db = snapshot})
+withView r action = withSnapshot r.db $ \snapshot -> snapshotReader r snapshot >>= action . View
 
 -- | The queries of a view as a t'StoreRead', for the web server, as
 -- 'Q.databaseRead' gives those of a database of version 20.
@@ -239,7 +240,6 @@ layeredRead :: View -> StoreRead
 layeredRead v@(View r) =
   StoreRead
     { net = r.net,
-      ctx = r.ctx,
       getBestBlock = getBestBlock v,
       getBlocksAtHeight = getBlocksAtHeight v,
       getBlock = getBlock v,
@@ -276,7 +276,6 @@ standaloneRead :: DatabaseReader -> StoreRead
 standaloneRead r =
   StoreRead
     { net = r.net,
-      ctx = r.ctx,
       getBestBlock = one (.getBestBlock),
       getBlocksAtHeight = \h -> one (\q -> q.getBlocksAtHeight h),
       getBlock = \h -> one (\q -> q.getBlock h),
@@ -510,7 +509,7 @@ getUnspent (View r) p =
               outpoint = p,
               value = o.value,
               script = o.script,
-              address = eitherToMaybe (scriptToAddressBS r.net r.ctx o.script)
+              address = eitherToMaybe (scriptToAddressBS r.net o.script)
             }
       [] -> Nothing
 
@@ -740,7 +739,7 @@ chainUnspentsC r from a it = chain .| concatMapC output
       InChain position -> matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a position)
       _ -> matching it (AddrOutKeyA a)
     output :: (AddrOutKey, OutVal) -> Maybe Unspent
-    output = uncurry (toUnspent r.net r.ctx)
+    output = uncurry (toUnspent r.net)
 
 -------------------------------------------------------------------------------
 -- Mempool

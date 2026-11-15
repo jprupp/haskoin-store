@@ -84,11 +84,28 @@
 -- whole transactions, the keys with the record that they come out of, and
 -- running it again skips what is done, so it can be interrupted and
 -- started over.
+--
+-- = Version 23: merge records for balances and spenders
+--
+-- From version 23 the import of a block does not read the balances of its
+-- addresses or the groups of spenders of the outputs that it spends: it
+-- writes how they change, as merge records, which RocksDB combines with
+-- the values when they are read ("Haskoin.Store.Database.Merge"). What a
+-- database of version 22 holds is what version 23 reads, so there is
+-- nothing to migrate: 'upgradeDatabase' writes the version.
+--
+-- It cannot go back. A store that does not know the merge operators could
+-- not read the merge records, and RocksDB would drop those of its
+-- write-ahead log when it opened the database for such a store. So a
+-- database that this version has opened has a column family that older
+-- versions do not know of, and RocksDB refuses to open it for them
+-- ('Haskoin.Store.Database.Reader.layeredFamilyConfig').
 module Haskoin.Store.Database.Migrate
   ( upgradeDatabase,
     currentVersion,
     migrateRecords,
     layeredVersion,
+    recordsVersion,
     Migration (..),
     MigrationError (..),
     MigrationOptions (..),
@@ -98,12 +115,14 @@ module Haskoin.Store.Database.Migrate
   )
 where
 
+import Control.Exception (Exception (..), finally, throwIO)
 import Control.Monad (forM_, unless, void, when)
 import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Maybe (isJust, mapMaybe)
 import Data.Serialize (decode, encode)
@@ -162,6 +181,7 @@ import Haskoin.Store.Database.Reader
     addrOutCF,
     addrTxCF,
     balanceCF,
+    forgetMempoolCopy,
     initRocksDB,
     mempoolCF,
     spenderCF,
@@ -184,25 +204,24 @@ import Haskoin.Store.Database.Types
     VersionKey (..),
     spenderGroup,
   )
-import UnliftIO
-  ( Exception,
-    IORef,
-    modifyIORef',
-    newIORef,
-    readIORef,
-    throwIO,
-    writeIORef,
-  )
 
 -- | Version of the layered layout as it was first written, with the time
 -- at which a store first saw a transaction kept in the chain.
 layeredVersion :: Word32
 layeredVersion = 21
 
--- | Version that the store runs on: the layered layout, with the time of
--- its block for every confirmed transaction.
+-- | Version of the layered layout with the time of its block for every
+-- confirmed transaction, and the spenders of its outputs under keys of
+-- their own: what 'migrateRecords' brings a database of 'layeredVersion'
+-- to.
+recordsVersion :: Word32
+recordsVersion = 22
+
+-- | Version that the store runs on: that of 'recordsVersion', in which the
+-- import of a block writes merge records for balances and spenders
+-- ("Haskoin.Store.Database.Merge").
 currentVersion :: Word32
-currentVersion = 22
+currentVersion = 23
 
 -- | Version that the migration starts from.
 mixedVersion :: Word32
@@ -231,7 +250,31 @@ data MigrationError
   | -- | the database is not as its version says it should be; nothing was
     -- written for the transaction that showed it
     Inconsistent !Text
-  deriving (Eq, Show, Exception)
+  deriving (Eq, Show)
+
+-- | In words, for whoever reads the last line of a store that did not
+-- start: a version above 'currentVersion' is that of a newer store.
+instance Exception MigrationError where
+  displayException = \case
+    UnknownVersion (Just v)
+      | v > currentVersion ->
+          unwords
+            [ "The database is of version",
+              show v <> ",",
+              "written by a newer haskoin-store: this one runs on version",
+              show currentVersion,
+              "and cannot read it. Nothing was changed."
+            ]
+      | otherwise ->
+          unwords
+            [ "The database is of version",
+              show v <> ",",
+              "which this haskoin-store cannot bring to version",
+              show currentVersion <> ".",
+              "Nothing was changed."
+            ]
+    UnknownVersion Nothing -> "The database has no version where one was expected. Nothing was changed."
+    Inconsistent what -> "The database is not as its version says: " <> cs what
 
 -- | How to run a migration.
 data MigrationOptions = MigrationOptions
@@ -259,13 +302,32 @@ defaultMigrationOptions =
 -- store runs on, whatever it was, telling a function what is being done:
 -- a new database gets the current version, one of version 18 or 19 is
 -- first brought to version 20 as it always was, one of version 20 is
--- migrated to the layered layout ('migrateLayered'), and one of version 21
+-- migrated to the layered layout ('migrateLayered'), one of version 21
 -- gets the time of its block for every confirmed transaction
--- ('migrateRecords'), each from the start or after an earlier run that was
--- interrupted. Throws a 'MigrationError' for any other version.
+-- ('migrateRecords'), and one of version 22 gets the current version, each
+-- from the start or after an earlier run that was interrupted. Throws a
+-- 'MigrationError' for any other version, that of a newer store among
+-- them, without writing anything.
 --
 -- This is the point of no return for a database of an older version: a
 -- store older than the layout refuses it afterwards.
+--
+-- = From version 22 to 23
+--
+-- Nothing that a database of version 22 holds changes: its balances and
+-- its groups of spenders are the values that version 23 reads, and what
+-- is new is the merge records that blocks will write from now on. So the
+-- step is one write, of the version, made last: every state that an
+-- earlier migration can be interrupted in is one of the versions before,
+-- as it was, and is carried on from as it was.
+--
+-- What keeps an older store away from the merge records is not the
+-- version, which it would only read after RocksDB had opened the database
+-- for it and dropped the merge records of its write-ahead log. It is the
+-- column family that 'Haskoin.Store.Database.Reader.withLayeredReader'
+-- adds, which makes RocksDB refuse to open the database for a store that
+-- does not know it ('Haskoin.Store.Database.Reader.layeredFamilyConfig').
+-- That happens when the database is opened, before this function runs.
 upgradeDatabase :: (Text -> IO ()) -> DatabaseReader -> IO Migration
 upgradeDatabase report r = do
   version <- retrieve r.db VersionKey
@@ -278,27 +340,44 @@ upgradeDatabase report r = do
       | v == 18 || v == 19 -> do
           report $ "Upgrading the database from version " <> cs (show v) <> " to " <> cs (show mixedVersion)
           initRocksDB r
-          layered >>= times
+          layered >>= times >>= merges
       | v == currentVersion && marker == Nothing -> return nothing
+      -- no migration leaves its marker with this version
+      | v >= currentVersion -> throwIO (UnknownVersion version)
+      | v == recordsVersion && marker == Nothing -> merges nothing
       -- the times were being set when the store last stopped
-      | v == currentVersion && marker == Just layeredVersion -> times nothing
-      | v == currentVersion -> throwIO (UnknownVersion version)
-    Just (_ :: Word32) -> layered >>= times
+      | v == recordsVersion && marker == Just layeredVersion -> times nothing >>= merges
+      | v == recordsVersion -> throwIO (UnknownVersion version)
+    Just (_ :: Word32) -> layered >>= times >>= merges
   where
     nothing = Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
     layered = migrateLayeredWith defaultMigrationOptions {report = report} r
     times done = do
       rewritten <- migrateRecords report r
       return (done :: Migration) {rewritten}
+    -- from 'recordsVersion', with no migration under way
+    merges done = do
+      report $
+        "Upgrading the database from version "
+          <> cs (show recordsVersion)
+          <> " to "
+          <> cs (show currentVersion)
+          <> ": blocks will write merge records, which no older haskoin-store can read"
+      writeBatch r.db [insertOp VersionKey currentVersion]
+      return done
 
 -- | Bring the records of the confirmed transactions of a database of
 -- version 21 to what version 22 writes, and make the database one of that
 -- version; or carry that on in a database where it was interrupted. Each
 -- record gets the time of its block, and the spenders of its outputs go
 -- from the record to keys of their own. Says how many records it wrote.
--- Throws a 'MigrationError' for a database of another version, and for
--- one with a confirmed transaction at a height where the main chain has
--- no block.
+-- Does nothing to a database that is past it, of version 22 or of the
+-- current one. Throws a 'MigrationError' for a database of another
+-- version, and for one with a confirmed transaction at a height where the
+-- main chain has no block.
+--
+-- The spenders are written as whole values, not as merge records: a
+-- record is read here, and a transaction is taken once.
 --
 -- Every record is read, and nearly every one is written: the whole of the
 -- largest column family, which on a database of Bitcoin is many hours,
@@ -318,11 +397,12 @@ migrateRecords report r = do
   if
     | version == Just layeredVersion && marker == Nothing -> do
         report "Making the record of every confirmed transaction one that is written once: this reads them all"
-        writeBatch db [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
+        writeBatch db [insertOp VersionKey recordsVersion, insertOp MigrationKey layeredVersion]
         run
-    | version == Just currentVersion && marker == Just layeredVersion -> do
+    | version == Just recordsVersion && marker == Just layeredVersion -> do
         report "Carrying on with the records of confirmed transactions, from the first"
         run
+    | version == Just recordsVersion && marker == Nothing -> return 0
     | version == Just currentVersion && marker == Nothing -> return 0
     | otherwise -> throwIO (UnknownVersion version)
   where
@@ -412,7 +492,7 @@ migrateLayeredWith opts r = do
     -- a database that is past this migration, whatever came after it
     | version == Just layeredVersion && marker == Nothing ->
         return Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
-    | version == Just currentVersion ->
+    | version == Just recordsVersion || version == Just currentVersion ->
         return Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
     | version == Just layeredVersion && marker == Just mixedVersion -> do
         opts.report "Carrying on with the migration to the layered layout"
@@ -510,6 +590,13 @@ op :: Env -> BatchOp -> IO ()
 op env o = modifyIORef' env.ops (o :)
 
 -- | Write the batch, and start another.
+--
+-- The batch writes the keys of the transactions that it moves to the
+-- mempool area, and it is not a batch of the block store: so the copy of
+-- the area in memory is forgotten, however the write ends
+-- ('forgetMempoolCopy'). A migration runs before the block store has
+-- imported anything, when no copy is loaded yet, and this keeps it right
+-- for a caller that runs one later.
 flush :: Env -> IO ()
 flush env = do
   count <- HashSet.size <$> readIORef env.moving
@@ -517,7 +604,7 @@ flush env = do
     others <- reverse <$> readIORef env.ops
     bodies <- HashMap.toList <$> readIORef env.bodies
     balances <- HashMap.toList <$> readIORef env.balances
-    writeBatch db $
+    (`finally` forgetMempoolCopy env.reader) . writeBatch db $
       others
         <> [maybe (deleteOpCF (txCF db) (TxKey h)) (insertOpCF (txCF db) (TxKey h)) b | (h, b) <- bodies]
         <> [balanceOp a b | (a, b) <- balances]
@@ -562,7 +649,7 @@ moveTx env h = do
       MemRef t -> return t
       BlockRef {} -> stop "is confirmed"
     takeOut env td'
-    mapM_ (op env) (insertRecordOps db (mempoolRecords env.reader.net env.reader.ctx time td'))
+    mapM_ (op env) (insertRecordOps db (mempoolRecords env.reader.net time td'))
     modifyIORef' env.moving (HashSet.insert h)
     modifyIORef' env.total (+ 1)
     count <- HashSet.size <$> readIORef env.moving
@@ -625,7 +712,7 @@ takeOut env td = do
   where
     db = env.reader.db
     h = txHash td.tx
-    address = eitherToMaybe . scriptToAddressBS env.reader.net env.reader.ctx
+    address = eitherToMaybe . scriptToAddressBS env.reader.net
     touched =
       nub' $
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)

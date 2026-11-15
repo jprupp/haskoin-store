@@ -4,6 +4,8 @@
 
 module Main (main) where
 
+import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.Async (withAsync)
 import Control.Monad (when)
 import Data.Char (toLower)
 import Data.Default (Default (..))
@@ -15,7 +17,6 @@ import Haskoin
   ( Network (..),
     allNets,
     netByName,
-    withContext,
   )
 import Haskoin.Node
   ( LogLevel (..),
@@ -58,6 +59,8 @@ import Options.Applicative
     switch,
     value,
   )
+import System.Directory (createDirectoryIfMissing, getAppUserDataDirectory)
+import System.Environment (lookupEnv)
 import System.Exit (exitSuccess)
 import System.FilePath ((</>))
 import System.Metrics.StatsD
@@ -72,12 +75,6 @@ import System.Metrics.StatsD
     withStats,
   )
 import Text.Read (readMaybe)
-import UnliftIO.Directory
-  ( createDirectoryIfMissing,
-    getAppUserDataDirectory,
-  )
-import UnliftIO.Async (withAsync)
-import UnliftIO.Environment (lookupEnv)
 
 -- | Version of the package, set at build time.
 haskoinStoreVersion :: String
@@ -115,6 +112,8 @@ data Config = Config
     syncMempool :: !Bool,
     blockWindow :: !Int,
     peerTimeout :: !Int,
+    blockStall :: !Int,
+    blockPing :: !Int,
     maxPeerLife :: !Int,
     mempoolTimeout :: !Int,
     maxPeers :: !Int,
@@ -139,6 +138,7 @@ data Config = Config
     maxOpenFiles :: !Int,
     writeBufferMB :: !Int,
     maxWalMB :: !Int,
+    backgroundJobs :: !Int,
     blockCacheMB :: !Int
   }
 
@@ -196,7 +196,11 @@ defConfig = do
   mempoolTimeout <-
     env "MEMPOOL_TIMEOUT" 14 readMaybe
   peerTimeout <-
-    env "PEER_TIMEOUT" 120 readMaybe
+    env "PEER_TIMEOUT" 30 readMaybe
+  blockStall <-
+    env "BLOCK_STALL" 10 readMaybe
+  blockPing <-
+    env "BLOCK_PING" 5 readMaybe
   maxPeerLife <-
     env "MAX_PEER_LIFE" (48 * 3600) readMaybe
   maxPeers <-
@@ -238,11 +242,13 @@ defConfig = do
   tlsKey <-
     env "TLS_KEY" "" pure
   maxOpenFiles <-
-    env "MAX_OPEN_FILES" 2000 readMaybe
+    env "MAX_OPEN_FILES" 0 readMaybe
   writeBufferMB <-
     env "WRITE_BUFFER_MB" 256 readMaybe
   maxWalMB <-
     env "MAX_WAL_MB" 1024 readMaybe
+  backgroundJobs <-
+    env "BACKGROUND_JOBS" 0 readMaybe
   blockCacheMB <-
     env "BLOCK_CACHE_MB" 1024 readMaybe
   return Config {version = False, ..}
@@ -274,6 +280,15 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
+      -- four long requests a core: most of the time of one goes in RocksDB,
+      -- on a thread of its own, often waiting for the disk
+      cores <- getNumCapabilities
+      maxRequests <-
+        env "MAX_REQUESTS" (fromIntegral (4 * cores)) readMaybe
+      requestQueue <-
+        env "REQUEST_QUEUE" d.requestQueue readMaybe
+      requestWait <-
+        env "REQUEST_WAIT" d.requestWait readMaybe
       return WebLimits {..}
 
 -- | Names of the supported networks, separated by pipes.
@@ -442,6 +457,29 @@ config c = do
           <> helpEnv "SLOW_REQUEST" "Warn in the log of requests that take this long (0 = never)"
           <> showDefault
           <> value c.webLimits.slowRequest
+    maxRequests <-
+      option auto $
+        metavar "INT"
+          <> long "max-requests"
+          <> helpEnv
+            "MAX_REQUESTS"
+            "Long requests (lists, whole blocks, xpubs) answered at once; the default is four a core (0 = no cap)"
+          <> showDefault
+          <> value c.webLimits.maxRequests
+    requestQueue <-
+      option auto $
+        metavar "INT"
+          <> long "request-queue"
+          <> helpEnv "REQUEST_QUEUE" "Long requests that may wait for one of those to end; more are refused"
+          <> showDefault
+          <> value c.webLimits.requestQueue
+    requestWait <-
+      option auto $
+        metavar "SECONDS"
+          <> long "request-wait"
+          <> helpEnv "REQUEST_WAIT" "Refuse a long request that has waited this long"
+          <> showDefault
+          <> value c.webLimits.requestWait
     return WebLimits {..}
   redis <-
     flag c.redis True $
@@ -514,9 +552,23 @@ config c = do
     option auto $
       metavar "SECONDS"
         <> long "peer-timeout"
-        <> helpEnv "PEER_TIMEOUT" "Unresponsive peer timeout"
+        <> helpEnv "PEER_TIMEOUT" "Disconnect a peer that is silent, or owes blocks, for this long"
         <> showDefault
         <> value c.peerTimeout
+  blockStall <-
+    option auto $
+      metavar "SECONDS"
+        <> long "block-stall"
+        <> helpEnv "BLOCK_STALL" "Ask another peer for blocks that the syncing peer has not delivered for this long"
+        <> showDefault
+        <> value c.blockStall
+  blockPing <-
+    option auto $
+      metavar "SECONDS"
+        <> long "block-ping"
+        <> helpEnv "BLOCK_PING" "Ask a peer for blocks if it answers a ping within this long, or if none does"
+        <> showDefault
+        <> value c.blockPing
   maxPeerLife <-
     option auto $
       metavar "SECONDS"
@@ -635,7 +687,7 @@ config c = do
     option auto $
       metavar "COUNT"
         <> long "max-open-files"
-        <> helpEnv "MAX_OPEN_FILES" "RocksDB max_open_files; bounds index/filter memory (0 = unlimited)"
+        <> helpEnv "MAX_OPEN_FILES" "Table files that RocksDB keeps open (0 = all of them)"
         <> showDefault
         <> value c.maxOpenFiles
   writeBufferMB <-
@@ -658,6 +710,19 @@ config c = do
           )
         <> showDefault
         <> value c.maxWalMB
+  backgroundJobs <-
+    option auto $
+      metavar "COUNT"
+        <> long "background-jobs"
+        <> helpEnv
+          "BACKGROUND_JOBS"
+          ( unwords
+              [ "RocksDB threads for flushes and compactions together",
+                "(0 = RocksDB default of two)"
+              ]
+          )
+        <> showDefault
+        <> value c.backgroundJobs
   blockCacheMB <-
     option auto $
       metavar "MB"
@@ -704,21 +769,20 @@ main = do
 -- Data goes in a directory named after the network inside the data directory.
 run :: Config -> IO ()
 run cfg =
-  withContext $ \ctx ->
-    withLogger level $ \logger -> do
-      net <- either error return $ networkReader cfg.net
-      with_stats logger net $ \stats -> do
-        let dir = cfg.dir </> net.name
-        logInfo (withSource "haskoin-store" logger) $
-          "Creating working directory (if not found): " <> cs dir
-        createDirectoryIfMissing True dir
-        run_store logger net ctx stats dir $ \store ->
-          if cfg.noWeb
-            then withSubscription store.pub $ \sub ->
-              loopForever (receive sub)
-            else run_web logger stats store
+  withLogger level $ \logger -> do
+    net <- either error return $ networkReader cfg.net
+    with_stats logger net $ \stats -> do
+      let dir = cfg.dir </> net.name
+      logInfo (withSource "haskoin-store" logger) $
+        "Creating working directory (if not found): " <> cs dir
+      createDirectoryIfMissing True dir
+      run_store logger net stats dir $ \store ->
+        if cfg.noWeb
+          then withSubscription store.pub $ \sub ->
+            loopForever (receive sub)
+          else run_web logger stats store
   where
-    run_store logger net ctx stats dir =
+    run_store logger net stats dir =
       withStore
         StoreConfig
           { maxPeers = cfg.maxPeers,
@@ -726,7 +790,6 @@ run cfg =
             discover = cfg.discover,
             db = dir </> "db",
             net = net,
-            ctx = ctx,
             redis = if cfg.redis then Just cfg.redisURL else Nothing,
             fleet = cfg.fleet,
             gap = cfg.webLimits.xpubGap,
@@ -740,6 +803,8 @@ run cfg =
             blockWindow = cfg.blockWindow,
             mempoolTimeout = cfg.mempoolTimeout,
             peerTimeout = fromIntegral cfg.peerTimeout,
+            blockStall = fromIntegral cfg.blockStall,
+            blockPing = fromIntegral cfg.blockPing,
             maxPeerLife = fromIntegral cfg.maxPeerLife,
             connect = withConnection,
             stats = stats,
@@ -753,6 +818,7 @@ run cfg =
               if cfg.maxWalMB > 0
                 then Just (cfg.maxWalMB * 1024 * 1024)
                 else Nothing,
+            backgroundJobs = if cfg.backgroundJobs > 0 then Just cfg.backgroundJobs else Nothing,
             blockCache =
               if cfg.blockCacheMB > 0
                 then Just (cfg.blockCacheMB * 1024 * 1024)

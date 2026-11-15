@@ -9,8 +9,9 @@ The database of the store has two areas, and a query reads both.
   changes to apply on top of the chain when a query is answered. Emptying
   it leaves a store with an empty mempool and an untouched chain.
 
-This is database version 22. A database of version 20 or 21 is migrated when
-the store opens it, and [cannot go back](#upgrading-from-version-20-or-21).
+This is database version 23. A database of version 20, 21 or 22 is
+migrated when the store opens it, and
+[cannot go back](#upgrading-from-version-20-21-or-22).
 
 ## Where things are
 
@@ -20,7 +21,8 @@ the store opens it, and [cannot go back](#upgrading-from-version-20-or-21).
 | Keys of one mempool transaction; summaries | `Haskoin.Store.Database.Mempool` |
 | Rules that import blocks and transactions | `Haskoin.Store.Logic.Layered` |
 | Queries over both areas, on a view | `Haskoin.Store.Database.Query.Layered` |
-| Migrations from versions 20 and 21 | `Haskoin.Store.Database.Migrate` |
+| Migrations from versions 20, 21 and 22 | `Haskoin.Store.Database.Migrate` |
+| Merge operators of balances and spenders | `Haskoin.Store.Database.Merge`, `cbits/haskoin_store_merge.c` |
 | A view of the database for each recent block | `Haskoin.Store.Database.Views` |
 | Fleet tip and shared pool: rules | `Haskoin.Store.Fleet`, `Haskoin.Store.Fleet.Pool` |
 | The same, carried out in Redis | `Haskoin.Store.Fleet.Redis` |
@@ -49,11 +51,13 @@ The column families and encodings of version 20, with other contents:
 
 - **`tx`:** the record of each confirmed transaction,
   [written once](#records-of-confirmed-transactions-are-written-once).
-- **`spender`:** which confirmed transaction spends each output.
+- **`spender`:** which confirmed transaction spends each output. A block
+  [adds to it without reading it](#balances-and-spenders-are-merged-not-read).
 - **`unspent`, `addr-out`:** outputs of confirmed transactions that no
   confirmed transaction spends.
 - **`addr-tx`:** confirmed transactions by address.
 - **`balance`:** balances of the chain alone. The unconfirmed part is zero.
+  A block [changes them without reading them](#balances-and-spenders-are-merged-not-read).
 - **`block`, `height`:** the blocks, and since 1.13.0 what is kept of a
   mempool transaction that a block replaced: the transaction of the block
   that won, and its height (`ReplacedKey`), and an index by height
@@ -188,6 +192,30 @@ Each event is one atomic RocksDB batch across both areas.
 - **The mempool is wiped (`--wipe-mempool`):** every key of the mempool
   area is deleted. That is safe at any time.
 
+**A copy of the mempool area in memory.** The block store is the only
+writer, one batch at a time. It keeps every key and value of the mempool
+area in memory, and its batches read the area from there and not from
+RocksDB (`Haskoin.Store.Database.Copy`).
+
+- **A batch changes the copy when it is written**, with what it changed
+  in the two column families.
+- **Whatever else writes to the area has the copy loaded again:** the
+  migration, the wipe and the repair of the summaries
+  (`forgetMempoolCopy`). Anything new that writes to the area outside a
+  batch has to do the same.
+- **Queries do not use it.** They read RocksDB through a view, as above,
+  and a view cannot reach the copy: its handle on the database has a
+  place of its own for one, with nothing in it.
+- **With it, the outputs of the chain that mempool transactions spend**
+  are remembered, so that the block which confirms a transaction does not
+  read them again. It is a cache: what is missing is read from RocksDB.
+  An entry goes with the mempool spender of its output, follows every
+  change that a batch makes to its unspent output, and a reverted block
+  empties the table. Anything new that writes unspent outputs outside a
+  batch has to forget the copy too.
+
+`docs/block-import.md` has the design and what it gained.
+
 **One door into the chain.** Only importing and reverting a block write to
 the chain area, and both check the block against the chain area alone,
 whether or not the store had seen its transactions.
@@ -255,6 +283,141 @@ that two stores at the same block hold the same record.
   thousand. With sixteen, nearly every transaction has one key.
 - **Whoever reads a record by its hash passes the hash along** to read the
   spenders. Working it out from the record cost more than both reads.
+
+## Balances and spenders are merged, not read
+
+Version 23 changes how a block writes two of the column families of the
+chain, and nothing that they hold.
+
+**The problem.** A block changes the balance of every address that it pays
+or spends from, and adds a spender to the group of every output that it
+spends. Each was read, changed and written back. On a store of Bitcoin
+mainnet those were most of the reads of a block. Four blocks at the tip,
+milliseconds of the read ahead by kind of key:
+
+| Unspent outputs | Groups of spenders | Balances | Mempool |
+| ---: | ---: | ---: | ---: |
+| 259 | 719 | 94 | 306 |
+| 87 | 304 | 70 | 180 |
+| 98 | 852 | 300 | 186 |
+| 47 | 764 | 194 | 232 |
+
+And they were read only to be changed.
+
+**Merge records.** RocksDB has a third kind of write besides a put and a
+delete: a merge record, which says how a value changes and is written
+without reading anything. A function that the column family is opened
+with, its merge operator, works out the value later, from the value that
+the key had and the records written since. RocksDB calls it when the key
+is read, and when a compaction brings the records and the value together,
+after which the key holds a plain value again.
+
+So the import of a block writes, for each address, the differences to its
+balance, and for each group of outputs, the spenders to add. It reads
+neither.
+
+**The two operators** are C functions of the store
+(`cbits/haskoin_store_merge.c`), since RocksDB calls them from its own
+threads. In both, a merge record has the format of a value, so that
+applying records to a value and combining records with each other are one
+operation.
+
+| Column family | A value, and a merge record | Merging |
+| --- | --- | --- |
+| `balance` | Five numbers of 64 bits, big-endian: 40 bytes | Adds each number modulo 2^64 |
+| `spender` | A count byte, then entries of 40 bytes in order of output | The union; the newest entry wins |
+
+- **A merge record of a balance** is five differences. A key without a
+  value counts from five zeros.
+- **A merge record of a group** is the entries to add.
+- **A number goes down by its two's complement.** A spent output adds
+  2^64 minus its amount to the confirmed balance.
+- **An entry of a group** is the number of the output (4 bytes,
+  big-endian), the hash of the spending transaction (32) and the number of
+  its input (4, big-endian).
+- **Input of another size makes the merge fail**, and the read of that key
+  with it. The functions check lengths and nothing else.
+
+**Who writes merge records.** Only the import of a block
+(`importBlock`). Everything else reads the value and writes it whole, or
+deletes it, as before:
+
+- **A revert reads.** Taking a block out checks that no count or amount
+  goes below zero, deletes a balance that goes back to nothing, and takes
+  spenders out of their groups. All of that needs the value. A put or a
+  delete hides the merge records under it, so the two mix freely.
+- **The import no longer checks a balance against going below zero**: that
+  takes the value. It spends outputs that it found unspent in the chain,
+  whose amounts are in the balances.
+- **The import never deletes a balance**: the count of transactions of
+  every address that it touches goes up.
+- **In a batch**, a balance or a group is held either whole or as pending
+  merge data, never both, and a read through the batch sees the pending
+  data applied (`Haskoin.Store.Database.Writer`).
+
+**What a block still reads of the two.** Nothing: no balance and no
+spender. The groups of spenders that were still read after version 23
+were read to check the block: that the chain has no spender for an output
+that the block both makes and spends, and, with transactions in the
+mempool, who spent an output that was not there to be spent. A mined block
+is taken to be valid, and is not checked: `docs/block-import.md`.
+
+**What readers pay.** A read of a key that has merge records which no
+compaction has reached looks into every table file that holds one of them,
+down to the value, and merges. `haskoin-store-bench merge` builds keys
+with a whole value at the last level and none, one, three or six merge
+records, each in a table file of its own, and times reads of them; then it
+compacts, and times the same reads of whole values, here the mean of the
+four kinds of key. Microseconds a read, from one thread:
+
+| Merge records over the value | 0 | 1 | 3 | 6 | Compacted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| The balance of an address | 10.6 | 13.5 | 18.2 | 25.2 | 7.5 |
+| The spender of an output | 11.7 | 14.8 | 19.7 | 27.2 | 9.0 |
+| The spenders of a transaction, by a scan | 17.9 | 22.5 | 26.9 | 35.4 | 13.2 |
+| The same with a block cache too small for the data: | | | | | |
+| The balance of an address | 20.3 | 27.4 | 38.1 | 53.2 | 11.1 |
+| The spender of an output | 21.8 | 26.3 | 39.7 | 56.7 | 13.8 |
+| The spenders of a transaction, by a scan | 29.8 | 37.5 | 49.8 | 67.5 | 19.7 |
+
+- **Each merge record in a file of its own costs 2.5 microseconds** when
+  everything is in the block cache, and 6 when every block is fetched and
+  decompressed again. That is the worst case for a number of records:
+  RocksDB merges the records of a memtable when it flushes it, and those
+  of the files that it compacts.
+- **The files themselves cost 3 to 10 microseconds**, records or not: a key
+  with none is read in 10.6 microseconds while six table files lie above
+  the last level, and in 7.5 once they are compacted. A store has such
+  files after every flush, whatever is in them.
+- **On a disk, a file that has a record of the key is a block to read.**
+  The benchmark has its files in memory. A balance that the last few
+  blocks changed and nobody has read since takes one read from the disk
+  for the value, as before, and one for each of those files until they
+  are compacted. An address that blocks pay often and that is asked for
+  often is where this shows: its blocks are then in the block cache.
+- **It lasts until a compaction.** RocksDB compacts the first level when
+  four files are in it, so the records of a key seldom lie in more than a
+  few files.
+
+`docs/layered-database/merge-bench.txt` has the output.
+
+**Older versions cannot open the database, by design.** RocksDB opens a
+database for a program that does not set the merge operators. As seen on
+RocksDB 11.1, it then drops the merge records that are still in its
+write-ahead log, without an error, which is the balances and spenders of
+the last blocks; and a read of a key that has merge records over a value
+crashes the process. A store of an older version would only find out
+about the database version after that.
+
+So the layout has one more column family, `merge-operators`, with nothing
+in it. RocksDB refuses to open a database when it is not given all its
+column families, before it reads the write-ahead log. An older store stops
+there, with an error that names the column family, and the database is as
+it was.
+
+That stops a program that names the column families it knows. It does not
+stop one that opens whatever column families it finds, without the merge
+operators, to write: do not point such a tool at the database of a store.
 
 ## A fleet that answers as one
 
@@ -374,11 +537,13 @@ each address. A store alone keeps `Haskoin.Store.Cache`.
   keys with at least `--redis-min-addrs` addresses or `--redis-min-txs`
   transactions. The least recently used go beyond `--redis-max-xpubs`.
 
-## Upgrading from version 20 or 21
+## Upgrading from version 20, 21 or 22
 
 The store migrates when it opens a database (`upgradeDatabase`). **There is
 no way back**: a store of version 20 cannot open a database that has the
-`mempool-addr` column family. Take a copy or a file system snapshot first.
+`mempool-addr` column family, and no store older than version 23 can open
+one that has the `merge-operators` column family, which it gets the first
+time this version opens it. Take a copy or a file system snapshot first.
 
 **From version 20: moving the mempool.** For each mempool transaction,
 descendants first, the migration takes it out of the chain's indices as
@@ -405,6 +570,17 @@ which go to their keys in the same write.
   until RocksDB has compacted the old one away.
 - Interrupted, it starts again and skips what is done. Leaving old records
   and reading around them was rejected: stores would differ for ever.
+
+**From version 22: one write.** Nothing that the database holds changes,
+so the version is written and that is all. What changes is what blocks
+write from then on: see
+[balances and spenders are merged](#balances-and-spenders-are-merged-not-read).
+
+- **It is the last step of every upgrade.** A migration from 20 or 21 that
+  was interrupted, by this version or by an older one, is carried on as it
+  was and ends here.
+- **A database of a newer version is refused**, untouched, with a message
+  that says so.
 
 ## What it costs
 
@@ -520,9 +696,26 @@ and reorganisations are compared with them after every operation.
   store's own. Integration tests run two stores against a real node.
   One test builds a tip that is too far for both of two live stores,
   which used to stay where it was for good.
+- **Merges:** the two merge operators are called as RocksDB calls them,
+  with random values and records, and held to the same fold written in
+  Haskell: applying records, combining them first, and no value to start
+  from. Through a database, merge records, puts and deletes in any order,
+  in memtables and table files, read as that fold, before and after a
+  compaction. The import in stages, which merges, is compared with the
+  sequential one, which reads and writes whole values, after every
+  operation of random histories, in which blocks are reverted and
+  imported again: every key and value of every column family, as an
+  iterator returns them, with flushes in between and a compaction at the
+  end. A database written as version 22 wrote it is upgraded and then
+  imports blocks to the same contents as a new one.
 - **Mutations were tried**, one at a time, in the migration, the rules, the
   queries (thirteen), the records (four), the cache (twelve) and the way
-  out of a tip that is too far (two). Each made the tests fail.
+  out of a tip that is too far (two). Each made the tests fail. So did
+  two in the merges, tried together, each in tests of its own: a whole
+  balance that leaves the pending differences of its batch in place,
+  which only the histories of blocks that leave and come back caught
+  among the random ones, and a union of spenders in which the older entry
+  wins.
 
 Not shown: load, and a database of real size.
 
@@ -535,4 +728,7 @@ Not shown: load, and a database of real size.
 - **Spenders next to their record**, read with one seek, would bring a
   page of full transactions back to about what it cost.
 - **Bloom filters on a full database** were not measured for memory.
+- **How long merge records stay** before a compaction merges them is left
+  to RocksDB. Nothing here bounds how many a key can have, and a key that
+  is written by many blocks in a row and read meanwhile pays for each.
 - **How long a store may lag** before it leaves the fleet is not a setting.

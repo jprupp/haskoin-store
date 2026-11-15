@@ -66,6 +66,7 @@ module Haskoin.Store.Logic
   )
 where
 
+import Control.Exception (Exception, throwIO)
 import Control.Monad
   ( forM,
     forM_,
@@ -97,7 +98,6 @@ import Haskoin
     BlockHash,
     BlockHeader (..),
     BlockNode (..),
-    Ctx,
     Network (..),
     OutPoint (..),
     Tx (..),
@@ -120,7 +120,6 @@ import Haskoin.Node (LogLevel (..), logAt)
 import Haskoin.Store.Common (nub', sortTxs)
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Writer hiding (deleteSpender, insertSpender)
-import UnliftIO (Exception, throwIO)
 
 -- | Log a message with the logger of the writer.
 logDebug, logError :: Writer -> Text -> IO ()
@@ -130,10 +129,6 @@ logError wr = logAt LevelError (writerLogger wr)
 -- | Network of the database being written.
 getNetwork :: Writer -> IO Network
 getNetwork wr = return (writerNet wr)
-
--- | Secp256k1 context of the database being written.
-getCtx :: Writer -> IO Ctx
-getCtx wr = return (writerCtx wr)
 
 -- | Data of a transaction that is in the database and not deleted.
 getActiveTxData :: Writer -> TxHash -> IO (Maybe TxData)
@@ -475,8 +470,7 @@ confirmTx wr t br = confTx wr t (Just br)
 replaceAddressTx :: Writer -> TxData -> BlockRef -> IO ()
 replaceAddressTx wr t new = do
   net <- getNetwork wr
-  ctx <- getCtx wr
-  forM_ (txDataAddresses net ctx t) $ \a -> do
+  forM_ (txDataAddresses net t) $ \a -> do
     deleteAddrTx
       wr
       a
@@ -513,8 +507,7 @@ adjustAddressOutput wr op o old new = do
   where
     replace_unspent pk = do
       net <- getNetwork wr
-      ctx <- getCtx wr
-      let ma = eitherToMaybe (scriptToAddressBS net ctx pk)
+      let ma = eitherToMaybe (scriptToAddressBS net pk)
       deleteUnspent wr op
       insertUnspent
         wr
@@ -732,8 +725,7 @@ commitAddTx wr = commitModTx wr True
 commitModTx :: Writer -> Bool -> TxData -> IO ()
 commitModTx wr add tx_data = do
   net <- getNetwork wr
-  ctx <- getCtx wr
-  mapM_ mod_addr_tx (txDataAddresses net ctx td)
+  mapM_ mod_addr_tx (txDataAddresses net td)
   mod_outputs
   mod_unspent
   insertTx wr td
@@ -826,8 +818,7 @@ modOutput ::
   IO ()
 modOutput wr add br op o = do
   net <- getNetwork wr
-  ctx <- getCtx wr
-  let ma = eitherToMaybe (scriptToAddressBS net ctx o.script)
+  let ma = eitherToMaybe (scriptToAddressBS net o.script)
   mod_unspent ma
   forM_ ma $ \a -> do
     mod_addr_unspent a (u ma)
@@ -903,8 +894,7 @@ spendOutput wr th ix op = do
   insertSpender wr op (Spender th ix)
   let pk = u.script
   net <- getNetwork wr
-  ctx <- getCtx wr
-  forM_ (scriptToAddressBS net ctx pk) $ \a -> do
+  forM_ (scriptToAddressBS net pk) $ \a -> do
     decreaseBalance wr (confirmed u.block) a u.value
     deleteAddrUnspent wr a u
 
@@ -916,7 +906,6 @@ unspendOutputs wr = mapM_ (unspendOutput wr) . prevOuts
 unspendOutput :: Writer -> OutPoint -> IO ()
 unspendOutput wr op = do
   net <- getNetwork wr
-  ctx <- getCtx wr
   t <-
     getActiveTxData wr op.hash >>= \case
       Nothing -> error $ "Could not find tx data: " <> show op.hash
@@ -925,7 +914,7 @@ unspendOutput wr op = do
         fromMaybe
           (error ("Could not find output: " <> show op))
           (getTxOut op.index t.tx)
-      m = eitherToMaybe (scriptToAddressBS net ctx o.script)
+      m = eitherToMaybe (scriptToAddressBS net o.script)
       u =
         Unspent
           { value = o.value,
@@ -987,20 +976,20 @@ modAddressCount wr add a = do
       | otherwise = subtract 1
 
 -- | Addresses of a list of outputs, without duplicates.
-txOutAddrs :: Network -> Ctx -> [TxOut] -> [Address]
-txOutAddrs net ctx =
-  nub' . rights . map (scriptToAddressBS net ctx . (.script))
+txOutAddrs :: Network -> [TxOut] -> [Address]
+txOutAddrs net =
+  nub' . rights . map (scriptToAddressBS net . (.script))
 
 -- | Addresses of the outputs spent by a transaction, without duplicates.
-txInAddrs :: Network -> Ctx -> [Prev] -> [Address]
-txInAddrs net ctx =
-  nub' . rights . map (scriptToAddressBS net ctx . (.script))
+txInAddrs :: Network -> [Prev] -> [Address]
+txInAddrs net =
+  nub' . rights . map (scriptToAddressBS net . (.script))
 
 -- | Addresses that a transaction is indexed under. An output script counts
 -- only when it has an address on the network.
-txDataAddresses :: Network -> Ctx -> TxData -> [Address]
-txDataAddresses net ctx t =
-  nub' $ txInAddrs net ctx prevs <> txOutAddrs net ctx outs
+txDataAddresses :: Network -> TxData -> [Address]
+txDataAddresses net t =
+  nub' $ txInAddrs net prevs <> txOutAddrs net outs
   where
     prevs = I.elems t.prevs
     outs = t.tx.outputs

@@ -117,7 +117,6 @@ import Haskoin
   ( Address,
     BlockHash,
     BloomFilter,
-    Ctx,
     Network,
     Tx (..),
     TxHash,
@@ -151,11 +150,11 @@ data Seen = Seen
   deriving (Eq, Show)
 
 -- | A transaction as the log keeps it.
-seenOf :: Network -> Ctx -> TxData -> Seen
-seenOf net ctx td =
+seenOf :: Network -> TxData -> Seen
+seenOf net td =
   Seen
     { tx = td.tx,
-      addresses = HashSet.fromList (rights (map (scriptToAddressBS net ctx) scripts)),
+      addresses = HashSet.fromList (rights (map (scriptToAddressBS net) scripts)),
       size = 256 + sum (map B.length scripts) + sum (map (sum . map B.length) td.tx.witness)
     }
   where
@@ -308,22 +307,22 @@ maxWatchXPubs = 100
 --
 -- A client that has not chosen is told of everything, and every client is
 -- told of a block and of a transaction that the server does not know.
-relevant :: Ctx -> Word32 -> Maybe Seen -> Watch -> (Bool, Watch)
-relevant _ _ Nothing w = (True, w)
-relevant ctx gap (Just s) w
+relevant :: Word32 -> Maybe Seen -> Watch -> (Bool, Watch)
+relevant _ Nothing w = (True, w)
+relevant gap (Just s) w
   | not w.filtered = (True, w)
   | otherwise = (named || not (null hits) || matched, foldl' moved w hits)
   where
     touched = HashSet.toList s.addresses
     named = any (`HashSet.member` w.plain) touched
     hits = mapMaybe (`HashMap.lookup` w.derived) touched
-    matched = maybe False (\f -> isJust (bloomRelevantUpdate ctx f s.tx)) w.bloom
-    moved now (spec, chain, index) = extend ctx spec chain (index + 1 + gap) now
+    matched = maybe False (\f -> isJust (bloomRelevantUpdate f s.tx)) w.bloom
+    moved now (spec, chain, index) = extend spec chain (index + 1 + gap) now
 
 -- | Derive the addresses of a watched key on one chain up to a number of
 -- them, if there are fewer.
-extend :: Ctx -> XPubSpec -> Word32 -> Word32 -> Watch -> Watch
-extend ctx spec chain upto w = case HashMap.lookup spec w.keys of
+extend :: XPubSpec -> Word32 -> Word32 -> Watch -> Watch
+extend spec chain upto w = case HashMap.lookup spec w.keys of
   Just (external, change)
     | upto > have ->
         w
@@ -332,14 +331,14 @@ extend ctx spec chain upto w = case HashMap.lookup spec w.keys of
           }
     where
       have = if chain == 0 then external else change
-      derive = deriveFunction ctx spec.deriv (pubSubKey ctx spec.key chain)
+      derive = deriveFunction spec.deriv (pubSubKey spec.key chain)
   _ -> w
 
 -- | Do what a client asked with a command, and say why not when it cannot
 -- be done, in which case the connection is to be closed. The function
 -- reads the balances of an extended public key from the database.
-command :: Ctx -> Word32 -> (XPubSpec -> IO [XPubBal]) -> TVar Watch -> EventCommand -> IO (Either String ())
-command ctx gap balances var = \case
+command :: Word32 -> (XPubSpec -> IO [XPubBal]) -> TVar Watch -> EventCommand -> IO (Either String ())
+command gap balances var = \case
   EventWatch as -> change $ \w ->
     let plain = foldl' (flip HashSet.insert) w.plain as
      in if HashSet.size plain > maxWatchAddresses
@@ -357,7 +356,7 @@ command ctx gap balances var = \case
         | HashMap.size w.keys >= maxWatchXPubs -> Left "Too many extended public keys"
         | otherwise ->
             let named = (chosen w) {keys = HashMap.insert spec (0, 0) w.keys}
-             in Right (extend ctx spec 1 (upto 1) (extend ctx spec 0 (upto 0) named))
+             in Right (extend spec 1 (upto 1) (extend spec 0 (upto 0) named))
   EventUnwatchXPub spec -> change $ \w ->
     Right
       (chosen w)

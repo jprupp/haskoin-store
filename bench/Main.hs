@@ -6,6 +6,12 @@
 --
 -- > haskoin-store-bench PORT BLOCKS [REDIS_URL]
 --
+-- Three other things are measured without a server: @haskoin-store-bench
+-- micro@ times the pure functions that encode a response,
+-- @haskoin-store-bench import@ the import of full blocks ("Import"), and
+-- @haskoin-store-bench merge@ what the merge records of those blocks cost
+-- the readers of the database ("Merge").
+--
 -- Set @BENCH_LOG=1@ to print the log of the store, such as to see why it
 -- does not sync.
 --
@@ -18,7 +24,10 @@
 module Main (main) where
 
 import Conduit
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.STM (TVar, newTVarIO)
 import Control.DeepSeq (NFData, force)
+import Control.Exception (evaluate)
 import Control.Monad (forever, unless)
 import Data.Aeson (toEncoding)
 import Data.Aeson.Encoding (encodingToLazyByteString)
@@ -40,17 +49,22 @@ import Haskoin
 import Haskoin.Node
 import Haskoin.Store
 import Haskoin.Store.Database.Query qualified as Q
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
+import Import (importBench)
+import Merge (mergeBench)
 import NQE
 import Network.Socket (SockAddr (..))
 import System.Environment (getArgs, lookupEnv)
+import System.IO (hFlush, stdout)
 import System.Random (randomIO)
-import UnliftIO
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
     ["micro"] -> micro
+    "import" : more -> importBench more
+    "merge" : more -> mergeBench more
     _ -> server args
 
 server :: [String] -> IO ()
@@ -59,23 +73,24 @@ server args = do
         [p, n] -> (read p, read n, Nothing)
         [p, n, r] -> (read p, read n, Just r)
         _ -> error "usage: haskoin-store-bench PORT BLOCKS [REDIS_URL]"
-  createContext >>= \ctx ->
-    withSystemTempDirectory "haskoin-store-bench-" $ \dir -> do
-      let net = bchRegTest
-          blocks = chain ctx net nblocks
-      requests <- newTVarIO []
-      logged <- maybe False (`notElem` ["", "0"]) <$> lookupEnv "BENCH_LOG"
-      let withLog f = if logged then withLogger LevelDebug f else f quiet
-      withLog $ \logger -> withStore (storeConfig ctx net dir redis blocks requests logger) $ \store -> do
-        withSubscription store.pub $ \sub -> waitHeight store sub nblocks
-        T.putStrLn $ "hot address: " <> addrText net (hotAddr ctx)
-        T.putStrLn $ "xpub: " <> xPubExport net ctx (benchXPub ctx)
-        T.putStrLn $ "xpub address: " <> addrText net (xpubAddr ctx 0 0)
-        bh <- Q.getBestBlock store.db
-        T.putStrLn $ "best block: " <> maybe "" blockHashToHex bh
-        putStrLn $ "serving on port " <> show port
-        hFlush stdout
-        runWeb (webConfig store port)
+  withSystemTempDirectory "haskoin-store-bench-" $ \dir -> do
+    let net = bchRegTest
+        blocks = chain net nblocks
+    requests <- newTVarIO []
+    logged <- maybe False (`notElem` ["", "0"]) <$> lookupEnv "BENCH_LOG"
+    -- MAX_REQUESTS: the cap on the requests answered at once; none by default
+    capped <- maybe 0 read <$> lookupEnv "MAX_REQUESTS"
+    let withLog f = if logged then withLogger LevelDebug f else f quiet
+    withLog $ \logger -> withStore (storeConfig net dir redis blocks requests logger) $ \store -> do
+      withSubscription store.pub $ \sub -> waitHeight store sub nblocks
+      T.putStrLn $ "hot address: " <> addrText net hotAddr
+      T.putStrLn $ "xpub: " <> xPubExport net benchXPub
+      T.putStrLn $ "xpub address: " <> addrText net (xpubAddr 0 0)
+      bh <- Q.getBestBlock store.db
+      T.putStrLn $ "best block: " <> maybe "" blockHashToHex bh
+      putStrLn $ "serving on port " <> show port
+      hFlush stdout
+      runWeb ((webConfig store port) {limits = def {maxRequests = capped}} :: WebConfig)
 
 addrText :: Network -> Address -> T.Text
 addrText net = fromMaybe (error "address") . addrToText net
@@ -93,8 +108,8 @@ waitHeight store sub n = do
     waitHeight store sub n
 
 storeConfig ::
-  Ctx -> Network -> FilePath -> Maybe String -> [Block] -> TVar [Int] -> Logger -> StoreConfig
-storeConfig ctx net dir redis blocks requests logger =
+  Network -> FilePath -> Maybe String -> [Block] -> TVar [Int] -> Logger -> StoreConfig
+storeConfig net dir redis blocks requests logger =
   StoreConfig
     { maxPeers = 20,
       -- the mock peer, by name: since haskoin-node 2.5 the seed of a regtest
@@ -103,7 +118,6 @@ storeConfig ctx net dir redis blocks requests logger =
       discover = False,
       db = dir,
       net = net,
-      ctx = ctx,
       redis = redis,
       gap = 32,
       initGap = 20,
@@ -117,6 +131,8 @@ storeConfig ctx net dir redis blocks requests logger =
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 60,
+      blockStall = 10,
+      blockPing = 5,
       maxPeerLife = 48 * 3600,
       connect = mockPeer blocks requests net ad,
       stats = Nothing,
@@ -124,6 +140,7 @@ storeConfig ctx net dir redis blocks requests logger =
       maxOpenFiles = Nothing,
       writeBufferSize = Nothing,
       maxWalSize = Nothing,
+      backgroundJobs = Nothing,
       blockCache = Just (1024 * 1024 * 1024),
       logger = logger
     }
@@ -162,28 +179,28 @@ webConfig store port =
 -- Synthetic chain --
 ---------------------
 
-benchXPub :: Ctx -> XPubKey
-benchXPub ctx = deriveXPubKey ctx (makeXPrvKey "haskoin-store benchmark seed")
+benchXPub :: XPubKey
+benchXPub = deriveXPubKey (makeXPrvKey "haskoin-store benchmark seed")
 
-xpubAddr :: Ctx -> KeyIndex -> KeyIndex -> Address
-xpubAddr ctx m i = fst (deriveAddr ctx (pubSubKey ctx (benchXPub ctx) m) i)
+xpubAddr :: KeyIndex -> KeyIndex -> Address
+xpubAddr m i = fst (deriveAddr (pubSubKey benchXPub m) i)
 
-hotAddr :: Ctx -> Address
-hotAddr ctx = pubKeyAddr ctx (derivePublicKey ctx (wrapSecKey True key))
+hotAddr :: Address
+hotAddr = pubKeyAddr (derivePublicKey (wrapSecKey True key))
   where
     key = fromMaybe (error "key") (secKey (B.replicate 32 0x42))
 
-scriptOf :: Ctx -> Address -> ByteString
-scriptOf ctx = fromMaybe (error "script") . addressToScriptBS ctx
+scriptOf :: Address -> ByteString
+scriptOf = fromMaybe (error "script") . addressToScriptBS
 
 -- | Blocks at heights 1 to n on top of the regtest genesis. The last block
 -- of a chain of 400 blocks or more also spends 3,000 outputs that earlier
 -- blocks paid to the hot address, one transaction each, so that there is a
 -- large block to answer about.
-chain :: Ctx -> Network -> Int -> [Block]
-chain ctx net n = go 1 net.genesisHeader
+chain :: Network -> Int -> [Block]
+chain net n = go 1 net.genesisHeader
   where
-    hot = scriptOf ctx (hotAddr ctx)
+    hot = scriptOf hotAddr
     coinbase h = Tx 1 [TxIn nullOutPoint (encode (fromIntegral h :: Word32)) maxBound] [TxOut 5000000000 hot] [] 0
     -- the transactions of the block at a height, after its coinbase
     regular h
@@ -206,11 +223,11 @@ chain ctx net n = go 1 net.genesisHeader
       let t1 = Tx 1 [TxIn (OutPoint cb 0) "" maxBound] (replicate 9 (TxOut 500000000 hot)) [] 0
           tk k =
             let j = fromIntegral (h * 9 + k) :: Word32
-                a = xpubAddr ctx (j `mod` 2) ((j `div` 2) `mod` 50)
+                a = xpubAddr (j `mod` 2) ((j `div` 2) `mod` 50)
              in Tx
                   1
                   [TxIn (OutPoint (txHash t1) (fromIntegral k)) "" maxBound]
-                  [TxOut 400000000 (scriptOf ctx a), TxOut 99000000 hot]
+                  [TxOut 400000000 (scriptOf a), TxOut 99000000 hot]
                   []
                   0
        in t1 : map tk [0 .. 8]
@@ -233,12 +250,11 @@ mine net parent txs = Block header txs
 -- result between calls.
 micro :: IO ()
 micro = do
-  ctx <- createContext
   let net = bchRegTest
-      blocks = chain ctx net 66
+      blocks = chain net 66
       txs = V.fromList [b.txs !! 2 | b <- drop 2 blocks]
-      addrs = V.generate 64 (xpubAddr ctx 0 . fromIntegral)
-      hot = scriptOf ctx (hotAddr ctx)
+      addrs = V.generate 64 (xpubAddr 0 . fromIntegral)
+      hot = scriptOf hotAddr
       txdata tx =
         TxData
           { block = BlockRef 3 2,
@@ -251,7 +267,7 @@ micro = do
           }
       tds = V.map txdata txs
       tdbytes = V.map encode tds
-      ts = V.map (toTransaction net ctx) tds
+      ts = V.map (toTransaction net) tds
       pick :: V.Vector a -> Int -> a
       pick v i = v V.! (i `mod` 64)
   _ <- evaluate (force (tds, tdbytes, ts, addrs))
@@ -260,7 +276,7 @@ micro = do
   bench "Address JSON (cashaddr)" (encodingToLazyByteString . marshalEncoding net . pick addrs)
   bench "txHash" (txHash . pick txs)
   bench "TxData decode" (\i -> either error id (decode (pick tdbytes i)) :: TxData)
-  bench "toTransaction" (toTransaction net ctx . pick tds)
+  bench "toTransaction" (toTransaction net . pick tds)
   bench "Transaction JSON" (encodingToLazyByteString . marshalEncoding net . pick ts)
   bench "TxHash JSON" (encodingToLazyByteString . toEncoding . txHash . pick txs)
   bench "BlockRef JSON" (\i -> encodingToLazyByteString (toEncoding (BlockRef (fromIntegral i) 1)))
@@ -290,8 +306,8 @@ mockPeer blocks _requests net ad sa f = do
   s <- newInbox
   let s' = inboxToMailbox s
   withAsync (go r s') $ \_ -> do
-    let o = awaitForever (`send` r)
-        i = forever (receive s >>= yield)
+    let o = conduitMailbox r
+        i = repeatMC (receive s)
     f (Conduits i o) :: IO ()
   where
     heights = HashMap.fromList (zip (map (headerHash . (.header)) blocks) [1 :: Int ..])
@@ -299,16 +315,16 @@ mockPeer blocks _requests net ad sa f = do
     go :: Inbox ByteString -> Mailbox ByteString -> IO ()
     go r s = do
       nonce <- randomIO
-      now <- round <$> liftIO getPOSIXTime
+      now <- round <$> getPOSIXTime
       let rmt = NetworkAddress 0 (sockToHostAddress sa)
           ver = buildVersion net nonce 0 ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
       runConduit $
-        forever (receive r >>= yield)
+        repeatMC (receive r)
           .| inc
           .| concatMapC react
           .| mapC (runPut . putMessage net)
-          .| awaitForever (`send` s)
+          .| conduitMailbox s
     inc = forever $ do
       x <- takeCE 24 .| foldC
       case decode x of

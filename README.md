@@ -318,7 +318,9 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER` |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
-| `--peer-timeout` | `PEER_TIMEOUT` | `120` | Seconds before an unresponsive peer is dropped |
+| `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
+| `--block-stall` | `BLOCK_STALL` | `10` | Seconds without a block from the syncing peer before another peer is asked for it too |
+| `--block-ping` | `BLOCK_PING` | `5` | Seconds that a peer has to answer a ping to be asked for blocks, unless none answers in time |
 | `--max-peer-life` | `MAX_PEER_LIFE` | `172800` | Seconds after which a peer is dropped, so connections rotate |
 | `--block-window` | `BLOCK_WINDOW` | `64` | Blocks to request from the syncing peer at a time |
 
@@ -344,6 +346,9 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
+| `--max-requests` | `MAX_REQUESTS` | four a core | Long requests answered at once; see [Overload](#overload) (0 = no cap) |
+| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for one of those to end; more are refused with 503 |
+| `--request-wait` | `REQUEST_WAIT` | `5` | Seconds that a long request waits before it is refused with 503 |
 | `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
@@ -446,13 +451,59 @@ that answers as one" in `docs/layered-database.md`.
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--no-bloom` | `BLOOM` | on | No Bloom filters on what is read by key; `BLOOM=false` is the same |
-| `--max-open-files` | `MAX_OPEN_FILES` | `2000` | Open files; bounds index and filter memory (0 = unlimited) |
+| `--max-open-files` | `MAX_OPEN_FILES` | `0` | Table files kept open (0 = all of them) |
 | `--write-buffer-mb` | `WRITE_BUFFER_MB` | `256` | Memtables across all column families (0 = unlimited) |
 | `--max-wal-mb` | `MAX_WAL_MB` | `1024` | Write-ahead log size that forces flushes (0 = RocksDB default) |
+| `--background-jobs` | `BACKGROUND_JOBS` | `0` | Threads for flushes and compactions together (0 = RocksDB default of two) |
 | `--block-cache-mb` | `BLOCK_CACHE_MB` | `1024` | Shared block cache, holding index and filter blocks too (0 = RocksDB default) |
 
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
+
+Every table file stays open by default, and the index and the filter of
+each are written in pieces of 4 KiB that the block cache holds as they are
+needed.
+
+- **Why all files open:** a lookup in a file that is not open opens it
+  first, which reads its footer and properties again. A store of Bitcoin
+  Cash with 8,357 files and the old limit of 2,000 opened some 70,000 files
+  to send one block of 166,739 transactions. An open file costs a file
+  descriptor and a few kilobytes, so raise the limit on open files of the
+  process (`LimitNOFILE` in systemd) above the number of table files:
+  about one for each 64 MiB of database.
+- **Why in pieces:** the index and the filter of a file were one block
+  each, one to three mebibytes together on a large database, and a lookup
+  loaded both whole. With more of them than the block cache holds, nearly
+  every lookup loaded megabytes again: 0.8 ms of processor time each on an
+  idle disk, and 18 seconds to import a block of Bitcoin. A lookup now
+  loads two pieces of 4 KiB.
+- **An existing database** keeps the old layout in the files that it has,
+  and gets the new one in the files written from now on. Until most of
+  them are rewritten, give it a block cache that holds its indices and
+  filters: about 1% of the size of the database, 24 GiB for Bitcoin and
+  12 GiB for Bitcoin Cash (`--block-cache-mb`). `/dbstats` and the line
+  `Block cache entry stats` in the `LOG` file of the database say what the
+  cache holds.
+- **Without a block cache** (`--block-cache-mb 0`) neither applies: each
+  open file keeps its whole index and filter in memory, so set
+  `--max-open-files` to bound them.
+
+RocksDB flushes and compacts in the background, with two threads by
+default: one for each. `--background-jobs` gives it more, a quarter of them
+for flushes and the rest for compactions.
+
+- **When it helps:** a backlog of compactions on a machine whose disk and
+  cores have room: the first sync, or the hours after a migration (see
+  [Upgrading an existing database](#upgrading-an-existing-database)). One
+  thread compacts about 90 MiB a second if the disk keeps up.
+- **When it does not:** on a disk that is already the limit. Measured on a
+  store of Bitcoin on a SATA SSD, the one compaction thread was on a core a
+  third of the time and waiting for the disk the rest, with the machine at
+  75% I/O wait. A second thread there would have made every request wait
+  longer for the same disk.
+- **What it costs:** cores and disk that the requests would otherwise have.
+  Leave it at the default on a machine that serves traffic with all its
+  cores.
 
 Bloom filters are on by default. They let RocksDB skip the table files that
 cannot have a key, which is most of what a lookup of a transaction, an
@@ -567,10 +618,180 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 - The **block store** downloads blocks from one peer at a time and mempool
   transactions from all of them, and imports them. Each import is one
   atomic RocksDB batch, so a crash never leaves a half-written block.
+- **A block is imported in stages**, so that a full block takes a second
+  or two: what it needs is worked out on all cores, everything it will
+  read is read from RocksDB ahead of time, many keys at once, and then the
+  rules run in memory. See [Importing a block](#importing-a-block).
+- **The block store keeps a copy of the mempool area of the database in
+  memory**, and answers its own reads of it from there. With it, it
+  remembers the outputs that mempool transactions spend, so that the block
+  which confirms them does not read them a second time. Requests of the
+  API read RocksDB.
+- **A peer is asked only for blocks that it has announced:** it sent the
+  header of the block or of a later one, or gave a height at least that of
+  the block when it connected. A peer asked for a block that it does not
+  have yet answers nothing.
+- **A peer is pinged before it is asked.** The peers that have the block
+  are pinged at once, and the first to answer is asked. One that takes
+  longer than `--block-ping` seconds is asked only if none answers in
+  time. This costs each new block one round trip to the quickest peer.
+- **A peer that does not deliver is passed over, not waited for.** If the
+  peer that was asked sends nothing for `--block-stall` seconds, another
+  is found the same way and asked for the same blocks, and whichever
+  delivers first is taken. The stall doubles each time, up to
+  `--peer-timeout`, so that a slow link still gets its blocks; a peer that
+  still owes blocks after `--peer-timeout` is disconnected.
 - **Reorganisations** are handled by reverting blocks until the best block
   is back on the main chain of headers.
 - The **web server** answers from RocksDB, and from Redis for what is
   cached there.
+
+### Importing a block
+
+A full block of Bitcoin, 4,000 transactions, took a store of mainnet 13 to
+18 seconds to import, with its disk and half its cores idle. The time went
+into some 30,000 reads of RocksDB, made one after another from one thread,
+many of them of a key that had just been read.
+
+Now a block goes through four stages:
+
+1. **Prepare:** the hash of each transaction, the address of each output
+   and the sizes, from the block alone, on all cores.
+2. **Read ahead:** every key of the chain that the rules will read, with
+   RocksDB multi-gets, eight at a time for each core, into a cache that
+   belongs to the batch. Each key is read once. What the mempool has for
+   the block comes from [a copy in memory](#the-mempool-area-in-memory),
+   and so do the outputs that its transactions spend, which the store
+   read when they came.
+3. **Apply:** the rules, one transaction after another, as before. They
+   find everything in memory.
+4. **Write:** one atomic batch, as before, serialised on all cores and
+   handed to RocksDB a buffer of 256 KiB at a time.
+
+The balances of the addresses of a block and the spenders of the outputs
+that it spends are in none of the stages: since database version 23 they
+are not read. The block writes how they change, as RocksDB merge records,
+and RocksDB works out the values when they are read. On a store of mainnet
+they were more than half of the read ahead.
+
+- **The database that comes out is the same**, byte for byte. The tests
+  give random histories to this import and to the one of version 1.15.1,
+  which stays in the library for that, and compare every key.
+- **A mined block is not validated.** It passed proof of work and the
+  node took it, so the store takes it that every output it spends is
+  unspent in the chain or made by the block itself, and that none is
+  spent twice. The import reads the outputs that the block spends, which
+  it needs to write the block, and nothing to check it: no spender of the
+  chain, no output that the block itself makes, and no conflict of a
+  transaction that the mempool already has. Only a coinbase is looked up
+  in the chain in case it is confirmed already, as two of 2010 were. A
+  block that is not valid is written whole or not at all, and is refused
+  when what the import needs to read is not there.
+- **What keeps the store's own data right stays:** the order in which
+  transactions are applied, and all that the mempool does to give way to a
+  block. Reverts and the rules of the mempool check what they always did.
+
+Measured with `haskoin-store-bench import`, on four cores of an AMD Ryzen
+9 3900X, with a database of a million unspent outputs on tmpfs and blocks
+of 3,500 transactions, milliseconds a block:
+
+| | 1.15.1 | Now |
+| --- | ---: | ---: |
+| Syncing: the mempool is empty | 1,381 | 382 |
+| At the tip: every transaction is in the mempool first | 2,321 | 841 |
+
+Of the 382 ms, 36 prepare, 75 read ahead, 63 apply the rules and 208
+write a batch of 65,410 keys and 6.6 MB.
+
+That was with the batch given to RocksDB one key at a time. Packed into
+buffers, its write took 86 ms where it took 134, in later runs of the same
+benchmark in which the whole block went from 250 to 198 ms, and from 522
+to 447 ms at the tip. Without the reads of balances and spenders, in a
+third set of runs, the read ahead went from 56 to 21 ms and the block from
+189 to 148 ms, and from 433 to 398 ms at the tip. With the mempool area
+read from a copy in memory, in a fourth set, a block at the tip went from
+371 to 337 ms. Without the reads that checked a mined block, in a fifth
+set, a block of chains of transactions that the mempool had not seen went
+from 161 to 138 ms, and a block at the tip from 351 to 339 ms. With the
+outputs that mempool transactions spend kept in memory, in a sixth set, a
+block at the tip went from 329 to 322 ms. `docs/block-import.md` has the
+six sets of numbers.
+
+A store of mainnet gains more than the benchmark shows. In the benchmark
+a read is 30 microseconds of CPU, as the files are in memory. On the
+store of mainnet that this was made for, a read waits for a disk, which
+gave five times more reads a second when asked for 32 at a time than one
+at a time: its reads are slower than the benchmark's, and gain more from
+being made together.
+
+`docs/block-import.md` has the design, what was measured, and what is left.
+`docs/block-import-next.md` says what could bring a block well below a
+second, and what each step would do to reads.
+The stages are timed for StatsD: see [StatsD](#statsd).
+
+### The mempool area, in memory
+
+At the tip of the chain a block takes its transactions out of the
+mempool. For that it read some fifty thousand keys of the mempool area of
+the database, the two column families of the unconfirmed transactions: 180
+to 460 ms of a block on a store of mainnet. None of it was the disk. The
+area is small and in RocksDB's memory, and a lookup in RocksDB still costs
+about 8 microseconds of processor time.
+
+So the block store keeps a copy of the area in memory, every key and
+value as bytes, and its batches read the area from the copy
+(`Haskoin.Store.Database.Copy`). A read is half a microsecond.
+
+- **It is right because the area has one writer.** The block store writes
+  one batch at a time. When a batch is written, its changes to the area
+  are applied to the copy. If the write fails, the copy is forgotten and
+  loaded again.
+- **Requests of the API do not use it.** They read RocksDB, as before.
+- **It takes memory:** 3.5 kB of heap for each transaction in the mempool,
+  85 MiB for 25,000 of them. See [Memory](#memory).
+- **It is loaded when it is first needed**, with a scan of the area: 0.3 s
+  for 25,000 transactions.
+- **One read is not made at all.** When a transaction leaves the mempool,
+  the store asked whether the transaction that made each output that it
+  spends is in the mempool. It no longer asks when the chain has the
+  output as unspent: then that transaction is confirmed.
+- **The tests** compare the copy with a scan of the two column families,
+  byte for byte, after every operation of their random histories.
+
+In `haskoin-store-bench import`, a block of 3,500 transactions that were
+all in the mempool went from 371 to 337 ms. The mempool was 73 ms of its
+read ahead and is 18. A store of mainnet should gain more: its reads of
+the area took several times what the benchmark's did.
+`docs/block-import.md` has the design and the measurements.
+
+#### The outputs that the mempool spends
+
+When a transaction enters the mempool, the store reads from the chain the
+unspent outputs that it spends. The block that confirms the transaction
+needs them again: their values and scripts for the balances, and their
+positions for the keys of the address index that it deletes. Reading them
+a second time was the largest part of what was left of the read ahead of
+a block at the tip: 40 to 375 ms a block on a store of mainnet.
+
+So the block store keeps them, with the copy, from the one read to the
+other, and a block takes them from memory.
+
+- **It is a cache.** An output that is not remembered is read from
+  RocksDB. After a restart nothing is remembered, and blocks read their
+  outputs as before until the mempool has turned over.
+- **An entry is never stale.** It goes when the mempool spender of its
+  output goes. Every unspent output that a batch writes is looked up, and
+  its entry follows. A reverted block empties the table.
+- **Only the block store reads it**, as it does the copy. Requests of the
+  API and the members of a [fleet](#a-fleet-of-servers) read the database
+  through views, which cannot reach either.
+- **It takes memory:** 162 bytes of heap for each output, 7.4 MiB for a
+  mempool of 25,000 transactions. See [Memory](#memory).
+
+In `haskoin-store-bench import`, the unspent outputs of a block at the
+tip took 6 ms where they took 19, and the block 322 ms where it took 329.
+There a read of RocksDB costs three microseconds, from files in memory.
+On a store of mainnet these reads were 40 to 375 ms of a block.
 
 ### Publishing
 
@@ -631,16 +852,33 @@ The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
 
-This is version 22 of the database. The store migrates an older database
+This is version 23 of the database. The store migrates an older database
 the first time it opens it. **There is no way back**: an older store
-refuses the database afterwards, so take a copy first.
+cannot open the database afterwards, so take a copy first.
 
 | From | What the migration does | How long |
 | --- | --- | --- |
 | 20 | Moves the mempool to its own area | Seconds to minutes |
 | 21 | Reads every transaction and writes nearly every one again | Many hours for Bitcoin |
+| 22 | Writes the new version | At once |
 
-The second step is the long one. Nothing lists the records that need a
+**From 22 to 23 nothing in the database changes, and it is still one
+way.** From version 23 a block writes the balances of its addresses and
+the spenders of the outputs that it spends as RocksDB merge records, which
+only a store with the merge operators can read (see
+[Importing a block](#importing-a-block)). An older haskoin-store does not
+have them:
+
+- **It fails to open the database**, with a RocksDB error that names a
+  column family that it does not know, `merge-operators`. That column
+  family is empty, and is there for this: without it, RocksDB would open
+  the database for the older store and silently drop the merge records
+  that were still in its write-ahead log.
+- **The database is unchanged by the attempt**, and this version opens it
+  as before.
+- **To go back to an older version,** restore the copy, or sync again.
+
+The step from 21 is the long one. Nothing lists the records that need a
 change, and nearly all do.
 
 - **Time:** a database of Bitcoin has more than a billion transactions.
@@ -649,8 +887,22 @@ change, and nearly all do.
 - **Disk:** it needs room for a second copy of the transactions, until
   RocksDB has compacted the first away.
 - **Interrupted,** it starts again and skips what is done.
+- **Afterwards** RocksDB writes the spenders once more, in the background,
+  while the store runs. The migration writes them in the order of their
+  keys, so their files reach the last level without being compacted, and
+  RocksDB compacts each such file by itself once the store starts. On a
+  store of Bitcoin that was 196 GiB in about two hours on a SATA SSD, with
+  the machine waiting for its disk most of that time: the store answered
+  and imported blocks slowly until it was over. It needs no more room, and
+  nothing has to be done about it. On a faster disk `--background-jobs`
+  shortens it.
 - **Deleted transactions** that an old database still holds are left where
   they are and ignored. Finding them would mean reading everything again.
+
+What changed for clients in version 23: nothing in the answers. A balance
+or the spenders of a transaction that recent blocks changed take a few
+microseconds more to read until RocksDB has compacted them:
+`docs/layered-database.md` has the figures.
 
 What changed for clients in version 22:
 
@@ -731,6 +983,10 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | --- | --- |
 | `Haskoin.Store.BlockStore` | Downloads and imports blocks and mempool transactions |
 | `Haskoin.Store.Logic.Layered` | The rules that import blocks and transactions |
+| `Haskoin.Store.Database.Writer` | A batch of writes, with its read cache and its reads ahead |
+| `Haskoin.Store.Database.Copy` | The copy in memory of the mempool area, and of the outputs that it spends |
+| `Haskoin.Store.Database.Table` | The hash tables of a batch, whose keys are hashed quickly |
+| `Haskoin.Store.Database.Merge` | The merge operators of balances and spenders, which are C functions (`cbits/`) |
 | `Haskoin.Store.Database.Mempool` | The keys of the mempool area, and what it does to balances |
 | `Haskoin.Store.Database.Query.Layered` | The queries over both areas, each on a snapshot |
 | `Haskoin.Store.Database.Slices` | Stored blocks and transactions read in part, for what an answer needs |
@@ -739,7 +995,9 @@ is emptied. `docs/layered-database.md` has the design and the tests.
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
+| `Haskoin.Store.Web.Admission` | The cap on the long requests answered at once |
 | `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
+| `Haskoin.Store.Exception` | Handlers that let a thread be stopped, and cleanups that cannot be cut short |
 | `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
 The rules and queries of version 20 (`Haskoin.Store.Logic`,
@@ -783,6 +1041,42 @@ fleet answers from can answer any request with 503 and
 `{"error": "behind-fleet"}`. Have the load balancer try another server, and
 alert if one keeps saying it: its `/health` will say why.
 
+### Overload
+
+A server that is asked for more than its cores can do answers only so many
+long requests at once, `--max-requests`, four a core by default. The next
+ones wait in line, in the order that they came.
+
+- **Long requests** are those whose answer is as long as their parameters
+  ask for: lists of transactions, unspent outputs or balances, the
+  transactions of a block, raw blocks, extended public keys, and the
+  Blockchain.info endpoints that do the same.
+- **Not capped:** requests for one thing by its key, such as a
+  transaction, the balance of an address or a block without its
+  transactions; and `/health`, `/peers`, `/dbstats`, `/events` and the
+  API reference, which read nothing from the database. They are what most
+  clients ask for most, and how you see what a full server is doing.
+
+- **A request that cannot be served soon is refused**, with 503,
+  `{"error": "server-busy"}` and `Retry-After: 1`. That happens when
+  `--request-queue` requests are waiting already, or when it has waited
+  `--request-wait` seconds. Have the load balancer try another server, and
+  clients try again.
+- **Why:** GHC gives every request a turn, with no priorities. Without a
+  cap, more load makes every request slower, the quick ones included: on
+  a store of mainnet with 56 connections asking for long lists, `/health`
+  took over a second. With it, the long requests let in are answered
+  sooner, and the short ones do not wait behind them.
+- **A slot is held until the response is sent.** A client that reads
+  slowly holds one while it does. A proxy that buffers responses, as nginx
+  does by default, takes them at the speed of the server. Without one,
+  give the server more slots.
+- **Sharing a machine:** the default counts all its cores. Several stores
+  on one machine should each have a smaller `--max-requests`.
+- **Watch** `web.requests_running`, `web.requests_waiting` and
+  `web.requests_refused` in StatsD. Requests that wait often, or any that
+  are refused, say that the server needs more cores or fewer requests.
+
 ### StatsD
 
 With `--statsd`, the store reports:
@@ -795,6 +1089,34 @@ With `--statsd`, the store reports:
 | `store.*` | Block and header heights, mempool size and other gauges |
 | `fleet.cache.*` | What a server of a fleet does with the fleet's cache of xpubs |
 | `rts.*` | GHC's garbage collector |
+
+The metrics of the block store:
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `store.blocks` | gauge | Height of the best block |
+| `store.headers` | gauge | Height of the best header |
+| `store.peers` | gauge | Peers online |
+| `store.mempool` | gauge | Transactions in the mempool |
+| `store.queued_txs` | gauge | Transactions waiting to be imported |
+| `store.block` | timing | Milliseconds to import a block, with publishing its events |
+| `store.block_prepare` | timing | Of those, working out what the import needs of the block |
+| `store.block_prefetch` | timing | Reading ahead what the rules will read |
+| `store.block_read_unspents` | timing | Of the read ahead: the unspent outputs that the block spends |
+| `store.block_read_spenders` | timing | Zero: a block no longer reads spenders, as a mined block is not validated |
+| `store.block_read_balances` | timing | Zero since database version 23: a block no longer reads balances |
+| `store.block_read_mempool` | timing | Bodies and address summaries of the mempool, from its copy in memory |
+| `store.block_apply` | timing | The rules, in memory |
+| `store.block_write` | timing | Writing the batch to RocksDB |
+
+- **The four stages add up to nearly all of `store.block`.** A slow
+  `store.block_prefetch` is the disk or RocksDB's cache, and the four
+  `store.block_read_*` timings say which kind of key it waited for. The
+  other three stages are mostly CPU: the write too, which serialises the
+  batch and has RocksDB add it to its tables in memory.
+- **Every sample of these timings is sent**: there is one a block. Until
+  version 1.15.1 `store.block` was made with a sampling rate of zero and
+  never reached the StatsD server.
 
 The metrics of the fleet's cache:
 
@@ -840,10 +1162,31 @@ The metrics of the garbage collector, sent once a second:
 - **The executable runs with `+RTS -T`**, which GHC needs to keep these
   statistics. Without it, as in a program that uses the library, the log
   says so and there are no `rts.*` metrics.
-- **The `rts.nonmoving_*` metrics** are the work of the non-moving
-  collector, which the executable uses for the old generation (see
-  [Memory](#memory)). They stay at zero if the store runs with the copying
-  collector instead.
+- **The `rts.nonmoving_*` metrics** stay at zero unless the store runs
+  with GHC's non-moving collector, as with `GHCRTS=--nonmoving-gc` in its
+  environment. The executable uses GHC's default collector (see
+  [Memory](#memory)).
+
+The metrics of the cap on requests ([Overload](#overload)):
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `web.requests_running` | gauge | Long requests being answered in a slot |
+| `web.requests_waiting` | gauge | Long requests waiting for a slot |
+| `web.requests_refused` | counter | Long requests refused with `server-busy` |
+
+And for each long route, named by the fixed segments of its path, such as
+`address_transactions_full` or `blockchain_multiaddr`:
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `web.cap.<route>.running` | gauge | Slots that the route holds |
+| `web.cap.<route>.waited` | timing | Milliseconds that a request waited for its slot |
+| `web.cap.<route>.held` | timing | Milliseconds that a request held its slot, to the last byte sent |
+| `web.cap.<route>.refused` | counter | Requests to the route refused with `server-busy` |
+
+They say what the server is full of: the routes that hold the slots, and
+those that wait or are refused. Every sample of these is sent.
 
 ### Database statistics
 
@@ -861,21 +1204,32 @@ The resident memory of the store is its GHC heap plus RocksDB.
   `--disable-delayed-os-memory-return` for that. Without the flag, Linux
   keeps counting returned memory as resident until it needs it, and the
   heap looks as if it never shrinks after a peak.
-- **The old generation is collected while the store runs**, with GHC's
-  non-moving collector (`--nonmoving-gc`). The default copying collector
-  stops every thread while it copies all live data, which takes longer as
-  the heap grows. A store of mainnet holds gigabytes, and under load every
-  request waited for it, `/health` included. Small collections of new
-  objects still stop every thread, but they are short.
-- **The price is memory.** Old objects are not moved together, so the heap
-  can hold more than the copying collector would for the same live data.
-  To go back to the copying collector, run the store with
-  `GHCRTS=--copying-gc` in its environment, or `+RTS --copying-gc -RTS`.
+- **The heap has a copy of the mempool area of the database**, which the
+  block store reads instead of RocksDB: 3.5 kB for each transaction in
+  the mempool, 85 MiB for 25,000 of them. A full collection copies it,
+  which took 11 ms more on four cores. With it are the outputs of the
+  chain that those transactions spend, 162 bytes each, 7 MiB more. See
+  [The mempool area, in memory](#the-mempool-area-in-memory).
+- **The heap collects less often**, with 64 MiB of new objects for each
+  core between collections (`-A64m`), where GHC's default is 4. Every
+  collection stops every thread. Measured under load on a store of mainnet
+  and one of testnet, collections fell from 50 to 110 a second to 2 to 4,
+  the time that the stores spent stopped fell by half (11% to 6%, and 24%
+  to 14%), and the testnet store answered 19% more requests.
+- **The price** is about 60 MiB more memory for each core, and pauses of
+  about 30 ms where they were 2 to 4 ms. To change it, set for example
+  `GHCRTS=-A16m` in the environment of the store.
+- **The collector is GHC's default**, which the executable does not
+  choose: in GHC 9.12 it copies. Version 1.15.1 chose the non-moving
+  collector; in the same measurements it gained nothing, and with `-A64m`
+  the copying one did a little better. `GHCRTS=--nonmoving-gc` selects it.
 - If you build the store some other way, pass
-  `+RTS --nonmoving-gc --disable-delayed-os-memory-return -RTS` yourself.
+  `+RTS -A64m --disable-delayed-os-memory-return -RTS` yourself.
 - **To tell such memory from a leak**, see
   `stress/results/2026-11-09-memory/README.md`: how to read `smaps`, and a
-  heap profile of a busy store, with live data flat at about 10 MiB.
+  heap profile of a busy store, with live data flat at about 10 MiB. That
+  was before the copy of the mempool area, which grows and shrinks with
+  the mempool.
 
 ### Logs
 
@@ -919,14 +1273,14 @@ Query a running server with `haskoin-store-data`:
 
 ```haskell
 import Data.Default (def)
-import Haskoin (btc, textToAddr, withContext)
+import Haskoin (btc, textToAddr)
 import Haskoin.Store.WebClient
 
 main :: IO ()
-main = withContext $ \ctx -> do
+main = do
   let cfg = def {net = btc} -- https://api.haskoin.com/btc/...
       Just addr = textToAddr btc "bc1q…"
-  r <- apiCall ctx cfg (GetAddrBalance addr)
+  r <- apiCall cfg (GetAddrBalance addr)
   print r
 ```
 
@@ -970,6 +1324,8 @@ stack build --test --no-run-tests
 stack test                     # includes a 6000-block heap-growth test
 scripts/format                 # ormolu, the code style used here
 scripts/bench-web.sh           # load-test the API with wrk
+stack bench haskoin-store:bench:haskoin-store-bench \
+  --ba 'import +RTS -N4 -A64m' # time the import of full blocks
 scripts/stress-cache.sh        # stress the Redis cache, with a report
 scripts/check-local-deps.sh    # what CI checks: no local paths in stack.yaml
 scripts/install-system-libraries.sh  # the C libraries, on Ubuntu or Debian
@@ -1074,6 +1430,48 @@ package; each says in its header how to build and run it.
   are the same, and times both. It asks about wallets a third way too,
   through the fleet's cache of xpubs.
 
+### Measurements for importing blocks
+
+`haskoin-store-bench import [OUTPUTS [TXS [BLOCKS [CACHE_MIB [DIR]]]]]`
+(`bench/Import.hs`) times the import of full blocks, in stages and as
+version 1.15.1 did it.
+
+1. It builds a regtest database with a million unspent outputs at half a
+   million addresses, closes it so that RocksDB writes it to table files,
+   and copies it.
+2. It imports the same blocks of 3,500 transactions into each copy, five
+   of each of four kinds:
+   - with an empty mempool, as when syncing;
+   - with an empty mempool and chains of transactions in the block, so
+     that three inputs in four spend an output of the same block, as on
+     Bitcoin mainnet today;
+   - with every transaction in the mempool first, as at the tip of the
+     chain;
+   - with a mempool of 3,500 other transactions and a block of chains that
+     the mempool has not seen, as when a miner was given transactions
+     directly.
+3. It prints milliseconds a block for each stage, and the number of keys
+   and bytes of the batch of a block.
+4. Before the fourth kind it gives the transactions of one more block to
+   the mempool, where they stay, and says what the copy of the mempool
+   area in memory costs: its keys and bytes, how long it takes to load,
+   and with `+RTS -T` its heap and what it adds to a full collection. It
+   says how many outputs that those transactions spend are remembered,
+   and their heap. For a mempool of the size of mainnet's, ask for blocks
+   of 25,000 transactions:
+   `haskoin-store-bench import 1000000 25000 1 +RTS -N4 -A64m -T`.
+
+Give it the cores of the machine you care about with `+RTS -N4`, and the
+allocation area of the store with `-A64m`. Its output
+for the numbers in this file is in `docs/block-import/import-bench.txt`.
+
+`haskoin-store-bench merge [KEYS [READS [CACHE_MIB [DIR]]]]`
+(`bench/Merge.hs`) times what the merge records of blocks cost the readers
+of the database: the balance of an address, the spender of an output and
+the spenders of a transaction, for keys with no merge record, one, three
+and six, each in a table file of its own, and then the same keys once
+compacted. Its output is in `docs/layered-database/merge-bench.txt`.
+
 ### Contributing
 
 Pull requests are welcome.
@@ -1083,6 +1481,13 @@ Pull requests are welcome.
 - Put scripts in files of their own rather than embedding them: Lua for
   Redis under `src/Haskoin/Store/Cache/lua/`, shell under `scripts/`, called
   from CI rather than written into the workflow.
+- Catch any error with `catchAny`, `handleAny` or `tryAny` of
+  `Haskoin.Store.Exception`, and clean up with its `bracket`, `finally` and
+  `onException`, not with those of `Control.Exception`. A request that
+  times out and a loop that is cancelled are stopped by an exception: a
+  handler for `SomeException` would take it for an error and go on, and a
+  cleanup of `Control.Exception` can be cut short, with a snapshot not
+  released or a gauge left too high. The module says more.
 - Add tests for the behaviour you change.
 - Describe the change under a new version in `CHANGELOG.md`, which follows
   [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).

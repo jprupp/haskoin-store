@@ -9,8 +9,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Serialize (encode)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Word (Word32, Word64, Word8)
 import Haskoin hiding (Coin (..))
 import Haskoin.Store.Web.Publish
@@ -199,8 +199,11 @@ spec = do
         `shouldBe` Left (TokensUnbacked (concatMap (const "09") [1 .. 32 :: Int]))
     it "makes tokens of a new category at will, from an input that spends an output 0" $ do
       let genesisId = TxHash (doubleSHA256 ("genesis" :: ByteString))
-          genesis = (tx [] [fungible newCategory 5000, nft newCategory 2 ""])
-            {inputs = [TxIn (OutPoint genesisId 0) "" maxBound]} :: Tx
+          genesis =
+            (tx [] [fungible newCategory 5000, nft newCategory 2 ""])
+              { inputs = [TxIn (OutPoint genesisId 0) "" maxBound]
+              } ::
+              Tx
       tokenRules genesis [coin plain] `shouldBe` Right ()
       -- the same category from an input that spends an output 1 is not new
       let notNew = genesis {inputs = [TxIn (OutPoint genesisId 1) "" maxBound]} :: Tx

@@ -148,6 +148,9 @@ module Haskoin.Store.Cache
   )
 where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Async (link, replicateConcurrently_, withAsync)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.Bits (shift, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -160,6 +163,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub)
 import Data.List.NonEmpty qualified as NonEmpty
@@ -203,6 +207,7 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
+import Haskoin.Store.Exception (handleAny)
 import Haskoin.Store.Outage (Outage, attempt, attempting, newOutage)
 import NQE (Inbox, Publisher, receive, withSubscription)
 import System.Metrics.StatsD
@@ -215,27 +220,8 @@ import System.Metrics.StatsD
     newStatTiming,
   )
 import System.Random (randomIO)
+import System.Timeout (timeout)
 import Text.Read (readMaybe)
-import UnliftIO
-  ( IORef,
-    TVar,
-    atomicModifyIORef',
-    atomically,
-    checkSTM,
-    handleAny,
-    link,
-    modifyTVar',
-    newIORef,
-    newTVarIO,
-    pooledForConcurrentlyN_,
-    readIORef,
-    readTVar,
-    timeout,
-    withAsync,
-    writeIORef,
-    writeTVar,
-  )
-import UnliftIO.Concurrent (forkIO, threadDelay)
 
 -- | Settings of the cache.
 data CacheConfig = CacheConfig
@@ -1062,8 +1048,8 @@ fullDiff c x changed m height bals _ = do
 txAddresses :: Cache -> TxData -> [Address]
 txAddresses c td =
   nub . rights $
-    map (scriptToAddressBS c.db.net c.db.ctx . (.script)) (IntMap.elems td.prevs)
-      <> map (scriptToAddressBS c.db.net c.db.ctx . (.script)) td.tx.outputs
+    map (scriptToAddressBS c.db.net . (.script)) (IntMap.elems td.prevs)
+      <> map (scriptToAddressBS c.db.net . (.script)) td.tx.outputs
 
 -- | Outpoints whose unspent output a transaction may change at addresses that
 -- pass a test: those it creates, and those it spends.
@@ -1076,7 +1062,7 @@ outpointsAt c ours td =
          at prev.script
        ]
   where
-    at s = either (const False) ours (scriptToAddressBS c.db.net c.db.ctx s)
+    at s = either (const False) ours (scriptToAddressBS c.db.net s)
 
 -- | What a reload needs to know of an entry first: the height it is stamped
 -- with, its generation, which every commit increments, the version of its
@@ -1257,7 +1243,7 @@ worker c = do
   loopForever $ do
     js <- atomically $ do
       xs <- readTVar c.jobs
-      checkSTM (not (null xs))
+      check (not (null xs))
       writeTVar c.jobs []
       return (reverse xs)
     synced <- inSync c
@@ -1300,6 +1286,23 @@ work c lastBest js = do
 -- one large xpub from holding up the others.
 parallelReloads :: Int
 parallelReloads = 4
+
+-- | Run an action on each item of a list, on this many threads at once at
+-- most: each thread takes the next item that none has taken, until there
+-- are none left. If the action throws, the other threads are cancelled and
+-- the exception is thrown here.
+--
+-- A thread for each item ('Control.Concurrent.Async.forConcurrently_')
+-- would be less code, and would read the database and Redis for every xpub
+-- that changed at once, however many they are.
+pooledForConcurrentlyN_ :: Int -> [a] -> (a -> IO b) -> IO ()
+pooledForConcurrentlyN_ threads items action = do
+  left <- newIORef items
+  let next = atomicModifyIORef' left $ \case
+        [] -> ([], Nothing)
+        x : xs -> (xs, Just x)
+      drain = next >>= mapM_ (\x -> action x >> drain)
+  replicateConcurrently_ (max 1 threads) drain
 
 -- | Changes that an event makes to cached xpubs: for each xpub, the key of
 -- the claim for the change, and the transactions that make it. Also keeps the
@@ -1416,12 +1419,11 @@ lostTxs c hs = map (\td -> (td :: TxData) {deleted = True}) . catMaybes <$> cach
 affectedXPubs :: Cache -> [TxData] -> IO [(XPubSpec, HashSet TxHash)]
 affectedXPubs c tds = do
   let net = c.db.net
-      ctx = c.db.ctx
       addrsOf :: TxData -> [Address]
       addrsOf td =
         nub . rights $
-          map (scriptToAddressBS net ctx . (.script)) (IntMap.elems td.prevs)
-            <> map (scriptToAddressBS net ctx . (.script)) td.tx.outputs
+          map (scriptToAddressBS net . (.script)) (IntMap.elems td.prevs)
+            <> map (scriptToAddressBS net . (.script)) td.tx.outputs
       byAddr =
         HashMap.fromListWith (<>) [(a, HashSet.singleton (txHash td.tx)) | td <- tds, a <- addrsOf td]
       addrs = HashMap.keys byAddr

@@ -43,6 +43,8 @@ module Haskoin.Store.Integration.Node
   )
 where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (Exception, throwIO)
 import Control.Lens ((&), (?~), (^.))
 import Control.Monad (void)
 import Data.Aeson (Value (..), eitherDecode, object, (.=))
@@ -53,11 +55,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
 import Haskoin (Network, bchRegTest, btcRegTest)
+import Haskoin.Store.Exception (tryAny)
 import Haskoin.Store.Integration.Image (bchnBin, coreBin)
 import Haskoin.Store.Integration.Podman (ContainerSpec (..))
 import Network.Wreq qualified as Wreq
-import UnliftIO (Exception, throwIO, tryAny)
-import UnliftIO.Concurrent (threadDelay)
 
 -- | Which node software.
 data NodeKind = BitcoinCore | BitcoinCashNode

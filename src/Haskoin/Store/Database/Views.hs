@@ -42,22 +42,14 @@ module Haskoin.Store.Database.Views
   )
 where
 
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Exception (mask_)
 import Control.Monad (forM_, when)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Database.RocksDB (DB, Snapshot, createSnapshot, releaseSnapshot)
-import Haskoin.Store.Database.Reader (DatabaseReader (..))
-import UnliftIO
-  ( TVar,
-    atomically,
-    bracket,
-    mask_,
-    newTVarIO,
-    readTVar,
-    readTVarIO,
-    stateTVar,
-    writeTVar,
-  )
+import Haskoin.Store.Database.Reader (DatabaseReader (..), snapshotReader)
+import Haskoin.Store.Exception (bracket)
 
 -- | The views of a database, by block.
 data Views b = Views
@@ -119,7 +111,7 @@ withViewAt views block action = bracket enter leave (mapM run)
           writeTVar views.held (Map.insert block h {readers = h.readers + 1} m)
           return (Just h)
         _ -> return Nothing
-    run h = action views.reader {db = fst h.snapshot}
+    run h = snapshotReader views.reader (fst h.snapshot) >>= action
     leave Nothing = return ()
     leave (Just _) = do
       free <- atomically . stateTVar views.held $ \m -> case Map.lookup block m of

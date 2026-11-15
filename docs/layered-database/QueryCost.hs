@@ -151,9 +151,9 @@ data Layout = Mixed | Layered
 -- | Open a database of a layout with the settings that the store has by
 -- default: gaps of 20 and 32, 2,000 open files, write buffers of 256 MiB, a
 -- log of 1 GiB and a block cache of 1 GiB.
-open :: Ctx -> Layout -> Bool -> FilePath -> (DatabaseReader -> IO a) -> IO a
-open ctx layout bloom dir =
-  reader net ctx 20 32 dir bloom (Just 2000) (Just (256 * mib)) (Just (1024 * mib)) (Just (1024 * mib)) Nothing
+open :: Layout -> Bool -> FilePath -> (DatabaseReader -> IO a) -> IO a
+open layout bloom dir =
+  reader net 20 32 dir bloom (Just 2000) (Just (256 * mib)) (Just (1024 * mib)) Nothing (Just (1024 * mib)) Nothing
   where
     mib = 1024 * 1024
     reader = case layout of
@@ -182,21 +182,21 @@ hot = plain 4000000000
 miner = plain 3999999999
 
 -- | The wallets of the history.
-busyWallet, coldWallet, quietWallet, smallWallet :: Ctx -> XPubSpec
-busyWallet ctx = wallet ctx "the busy wallet of the measurements of haskoin-store"
-coldWallet ctx = wallet ctx "the cold wallet of the measurements of haskoin-store"
-quietWallet ctx = wallet ctx "the quiet wallet of the measurements of haskoin-store"
-smallWallet ctx = wallet ctx "the small wallet of the measurements of haskoin-store"
+busyWallet, coldWallet, quietWallet, smallWallet :: XPubSpec
+busyWallet = wallet "the busy wallet of the measurements of haskoin-store"
+coldWallet = wallet "the cold wallet of the measurements of haskoin-store"
+quietWallet = wallet "the quiet wallet of the measurements of haskoin-store"
+smallWallet = wallet "the small wallet of the measurements of haskoin-store"
 
-wallet :: Ctx -> ByteString -> XPubSpec
-wallet ctx seed = XPubSpec {key = deriveXPubKey ctx (makeXPrvKey seed), deriv = DeriveNormal}
+wallet :: ByteString -> XPubSpec
+wallet seed = XPubSpec {key = deriveXPubKey (makeXPrvKey seed), deriv = DeriveNormal}
 
 -- | The scripts of the first addresses of each of the two chains of a
 -- wallet, as many of each as given.
-scriptsOf :: Ctx -> XPubSpec -> Int -> Seq ByteString
-scriptsOf ctx spec n = Seq.fromList (mapMaybe (addressToScriptBS ctx) (branch 0 <> branch 1))
+scriptsOf :: XPubSpec -> Int -> Seq ByteString
+scriptsOf spec n = Seq.fromList (mapMaybe addressToScriptBS (branch 0 <> branch 1))
   where
-    branch m = map snd (take n (deriveAddresses (deriveFunction ctx spec.deriv) (pubSubKey ctx spec.key m) 0))
+    branch m = map snd (take n (deriveAddresses (deriveFunction spec.deriv) (pubSubKey spec.key m) 0))
 
 -- | The scripts of the wallets, and how long the chain and the mempool of
 -- the history are, in transactions.
@@ -209,13 +209,13 @@ data Places = Places
     poolTxs :: !Word64
   }
 
-places :: Ctx -> Int -> Int -> Places
-places ctx chainTxs poolTxs =
+places :: Int -> Int -> Places
+places chainTxs poolTxs =
   Places
-    { busy = scriptsOf ctx (busyWallet ctx) 200,
-      cold = scriptsOf ctx (coldWallet ctx) 200,
-      calm = scriptsOf ctx (quietWallet ctx) 200,
-      few = scriptsOf ctx (smallWallet ctx) 10,
+    { busy = scriptsOf busyWallet 200,
+      cold = scriptsOf coldWallet 200,
+      calm = scriptsOf quietWallet 200,
+      few = scriptsOf smallWallet 10,
       chainTxs = fromIntegral chainTxs,
       poolTxs = fromIntegral poolTxs
     }
@@ -299,14 +299,14 @@ chunks n xs = let (a, b) = splitAt n xs in a : chunks n b
 -- | Write a database with the rules of a layout: a chain, a mempool on top
 -- of it, and blocks that confirm part of that mempool. Only the time that
 -- the store takes is counted, not the time to make the history.
-make :: Ctx -> Layout -> Bool -> FilePath -> Int -> Int -> Int -> IO ()
-make ctx layout bloom dir chainTxs poolTxs confirmed =
-  open ctx layout bloom dir $ \db -> do
+make :: Layout -> Bool -> FilePath -> Int -> Int -> Int -> IO ()
+make layout bloom dir chainTxs poolTxs confirmed =
+  open layout bloom dir $ \db -> do
     clock <- newIORef 0
     let write :: (Writer -> IO a) -> IO a
         write action = do
           t0 <- getMonotonicTimeNSec
-          x <- runWriter net ctx db quiet action
+          x <- runWriter net db quiet action
           t1 <- getMonotonicTimeNSec
           modifyIORef' clock (+ (t1 - t0))
           return x
@@ -314,7 +314,7 @@ make ctx layout bloom dir chainTxs poolTxs confirmed =
           let (b, node, coin) = block (height + 1) parent txs
           void (write (\w -> importBlock w b node))
           return (hist {coins = hist.coins |> coin}, height + 1, b.header)
-        p = places ctx chainTxs poolTxs
+        p = places chainTxs poolTxs
     write initBest
     Just best <- Q.getBestBlock db
     Just genesis <- Q.getBlock db best
@@ -370,10 +370,10 @@ report clock what count = do
 -- | Ask a database of today's layout and one of the layered layout the same
 -- questions, check that they answer the same, and print how long each
 -- takes.
-time :: Ctx -> Bool -> FilePath -> FilePath -> IO ()
-time ctx bloom dirOld dirNew =
-  open ctx Mixed bloom dirOld $ \old ->
-    open ctx Layered bloom dirNew $ \new -> do
+time :: Bool -> FilePath -> FilePath -> IO ()
+time bloom dirOld dirNew =
+  open Mixed bloom dirOld $ \old ->
+    open Layered bloom dirNew $ \new -> do
       let chain = [("tx", txCF), ("addr-tx", addrTxCF), ("balance", balanceCF), ("mempool", mempoolCF)]
       filters "today's" old chain
       filters "the layered" new (chain <> [("mempool-addr", mempoolAddrCF)])
@@ -383,7 +383,7 @@ time ctx bloom dirOld dirNew =
       Just tip <- Q.getBlock old best
       middle <- Q.getBlocksAtHeight old (tip.height `div` 2) >>= mapM (Q.getBlock old)
       let confirmedTxs = concat [drop 1 b.txs | Just b <- middle]
-          address = either error id . scriptToAddressBS net ctx
+          address = either error id . scriptToAddressBS net
           busiest = address hot
           entries :: M.AddressMempool -> Int
           entries m = length m.txs + HashMap.size m.spent + length m.created
@@ -396,10 +396,10 @@ time ctx bloom dirOld dirNew =
           stirred = take 1000 [a | (a, n) <- counted, n >= 1, n <= 4]
           never = [address (plain k) | k <- [200000 .. 200999]]
           wallets =
-            [ ("cold wallet", coldWallet ctx),
-              ("quiet wallet", quietWallet ctx),
-              ("busy wallet", busyWallet ctx),
-              ("small wallet", smallWallet ctx)
+            [ ("cold wallet", coldWallet),
+              ("quiet wallet", quietWallet),
+              ("busy wallet", busyWallet),
+              ("small wallet", smallWallet)
             ]
       Just hotBalance <- Q.getBalance old busiest
       hotEntries <- touched busiest
@@ -535,10 +535,10 @@ text = id
 -- | Time the first step of a scan by address, for 2,000 addresses that have
 -- nothing, in the index that the queries of a layout scan: before and after
 -- mempool transactions are confirmed by a block, or deleted.
-seeks :: Ctx -> Layout -> Bool -> FilePath -> Int -> Bool -> IO ()
-seeks ctx layout bloom dir count deleting =
-  open ctx layout bloom dir $ \db -> do
-    let address = either error id . scriptToAddressBS net ctx
+seeks :: Layout -> Bool -> FilePath -> Int -> Bool -> IO ()
+seeks layout bloom dir count deleting =
+  open layout bloom dir $ \db -> do
+    let address = either error id . scriptToAddressBS net
         never = [address (plain k) | k <- [200000 .. 201999]]
         (cf, key) = case layout of
           Mixed -> (addrTxCF db.db, encode . AddrTxKeyA)
@@ -549,7 +549,7 @@ seeks ctx layout bloom dir count deleting =
           _ <- iterValid it
           t1 <- getMonotonicTimeNSec
           return (t1 - t0)
-            -- the balance of each of the same addresses, as the queries of the
+        -- the balance of each of the same addresses, as the queries of the
         -- layout read it
         balance a = case layout of
           Mixed -> void (Q.getBalance db a)
@@ -580,7 +580,7 @@ seeks ctx layout bloom dir count deleting =
     if deleting
       then do
         let newest = map snd (take count pool)
-        runWriter net ctx db quiet (\w -> mapM_ (deleteUnconfirmedTx w False) newest)
+        runWriter net db quiet (\w -> mapM_ (deleteUnconfirmedTx w False) newest)
         printf "%d of the %d mempool transactions deleted\n" (length newest) (length pool)
         say "after the deletions"
       else do
@@ -593,7 +593,7 @@ seeks ctx layout bloom dir count deleting =
         Just tip <- Q.getBlock db best
         let txs = map snd (sortTxs (map (.tx) bodies))
             (b, node, _) = block (tip.height + 1) tip.header txs
-        void (runWriter net ctx db quiet (\w -> importBlock w b node))
+        void (runWriter net db quiet (\w -> importBlock w b node))
         printf "%d of the %d mempool transactions confirmed by a block\n" (length txs) (length pool)
         say "after the block"
   where
@@ -641,14 +641,14 @@ best3 action = minimum <$> mapM (const mean) [1 :: Int .. 3]
       if ns < 3.3e8 && n < 4000000 then go (n * 4) else return (ns / fromIntegral n / 1000)
 
 main :: IO ()
-main = withContext $ \ctx -> do
+main = do
   hSetBuffering stdout LineBuffering
   getArgs >>= \case
     ["make", layout, dir, chainTxs, poolTxs, confirmed, bloom] ->
-      make ctx (layoutOf layout) (flag bloom) dir (read chainTxs) (read poolTxs) (read confirmed)
-    ["time", dirOld, dirNew, bloom] -> time ctx (flag bloom) dirOld dirNew
+      make (layoutOf layout) (flag bloom) dir (read chainTxs) (read poolTxs) (read confirmed)
+    ["time", dirOld, dirNew, bloom] -> time (flag bloom) dirOld dirNew
     ["seeks", layout, dir, bloom, count, what] ->
-      seeks ctx (layoutOf layout) (flag bloom) dir (read count) (what == "delete")
+      seeks (layoutOf layout) (flag bloom) dir (read count) (what == "delete")
     _ ->
       fail . unlines $
         [ "usage: make mixed|layered DIR CHAIN MEMPOOL CONFIRMED on|off",

@@ -1,0 +1,71 @@
+Output of `haskoin-store-bench merge 100000 20000 256 DIR +RTS -N4 -A64m`,
+2026-11-15. The three numbers are the defaults, and DIR is a directory on
+tmpfs.
+
+AMD Ryzen 9 3900X, RocksDB 11.1.1, the database on tmpfs, Bloom filters on.
+What it measures, and how the database is built, is at the top of
+bench/Merge.hs: reads of keys that have a whole value at the last level
+and none, one, three or six merge records over it, each in a table file of
+its own, and then the same reads once everything is compacted.
+
+With the default block cache of 256 MiB, which holds all of it:
+
+100000 balances and 100000 groups of spenders for each number of merge records
+table files above the last level: 6 of balances, 6 of spenders
+
+microseconds a read, median of 5 passes of 20000 reads at random keys, one thread
+block cache of 256 MiB
+
+the balance of an address (a point read)
+  merge records            in table files   after compaction
+  0                                  10.6                7.6
+  1                                  13.5                7.1
+  3                                  18.2                7.6
+  6                                  25.2                7.5
+
+the spender of an output (a point read of its group)
+  merge records            in table files   after compaction
+  0                                  11.7                8.8
+  1                                  14.8                8.9
+  3                                  19.7                9.2
+  6                                  27.2                9.1
+
+the spenders of a transaction (a scan of its groups)
+  merge records            in table files   after compaction
+  0                                  17.9               12.2
+  1                                  22.5               13.2
+  3                                  26.9               12.9
+  6                                  35.4               14.3
+
+`haskoin-store-bench merge 100000 20000 1 DIR +RTS -N4 -A64m`: with a block
+cache of 1 MiB, so that every block looked into is fetched from the file
+and decompressed again, as on a store whose cache is a fraction of its
+database. The files are in memory all the same: on a disk, each table file
+that has a merge record of the key is one more block to read from it.
+
+100000 balances and 100000 groups of spenders for each number of merge records
+table files above the last level: 6 of balances, 6 of spenders
+
+microseconds a read, median of 5 passes of 20000 reads at random keys, one thread
+block cache of 1 MiB
+
+the balance of an address (a point read)
+  merge records            in table files   after compaction
+  0                                  20.3               11.0
+  1                                  27.4               11.2
+  3                                  38.1               11.0
+  6                                  53.2               11.1
+
+the spender of an output (a point read of its group)
+  merge records            in table files   after compaction
+  0                                  21.8               13.9
+  1                                  26.3               14.2
+  3                                  39.7               13.5
+  6                                  56.7               13.7
+
+the spenders of a transaction (a scan of its groups)
+  merge records            in table files   after compaction
+  0                                  29.8               19.2
+  1                                  37.5               19.4
+  3                                  49.8               19.9
+  6                                  67.5               20.3

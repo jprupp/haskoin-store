@@ -2,18 +2,18 @@ module Haskoin.Store.Database.ViewsSpec (spec) where
 
 import Control.Monad (void)
 import Data.List (sort)
-import Haskoin (BlockHash, btcRegTest, prepareContext)
+import Haskoin (BlockHash, btcRegTest)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Views
 import Haskoin.Store.Histories
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Test.Hspec
-import UnliftIO (withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> describe "views of the database by block" $ do
+spec = describe "views of the database by block" $ do
   let withChain go =
         withSystemTempDirectory "haskoin-store-views-" $ \dir ->
-          open20 btcRegTest ctx dir $ \db -> do
+          open20 btcRegTest dir $ \db -> do
             void (start mixedRules db)
             views <- newViews db
             let best = Q.getBestBlock db >>= maybe (fail "no best block") return

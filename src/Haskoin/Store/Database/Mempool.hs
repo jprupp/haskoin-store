@@ -72,6 +72,7 @@ module Haskoin.Store.Database.Mempool
   ( -- * What a transaction contributes
     MemRecords (..),
     mempoolRecords,
+    mempoolRecordsOf,
     recordEntries,
     insertRecordOps,
     deleteRecordOps,
@@ -103,6 +104,7 @@ module Haskoin.Store.Database.Mempool
 where
 
 import Conduit (runConduit, sinkList, (.|))
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -132,7 +134,6 @@ import Database.RocksDB.Query
   )
 import Haskoin
   ( Address,
-    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -158,6 +159,7 @@ import Haskoin.Store.Data
   )
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
+    forgetMempoolCopy,
     mempoolAddrCF,
     mempoolCF,
   )
@@ -203,8 +205,14 @@ data MemRecords = MemRecords
 -- thing here that can depend on other transactions, because a transaction
 -- inherits it from unconfirmed ancestors, and it is corrected when one of
 -- them is confirmed.
-mempoolRecords :: Network -> Ctx -> UnixTime -> TxData -> MemRecords
-mempoolRecords net ctx time td =
+mempoolRecords :: Network -> UnixTime -> TxData -> MemRecords
+mempoolRecords net time td = mempoolRecordsOf (txHash td.tx) net time td
+
+-- | 'mempoolRecords' given the hash of the transaction, for a caller that
+-- has it: the import of a block, which would otherwise hash every
+-- transaction that leaves the mempool once more.
+mempoolRecordsOf :: TxHash -> Network -> UnixTime -> TxData -> MemRecords
+mempoolRecordsOf h net time td =
   MemRecords
     { txid = h,
       time,
@@ -223,9 +231,8 @@ mempoolRecords net ctx time td =
              ]
     }
   where
-    h = txHash td.tx
     spent = [(k, i.outpoint) | (k, i) <- zip [0 :: Word32 ..] td.tx.inputs, i.outpoint /= nullOutPoint]
-    address = eitherToMaybe . scriptToAddressBS net ctx
+    address = eitherToMaybe . scriptToAddressBS net
     touched =
       nub' $
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)
@@ -331,8 +338,13 @@ getMempoolSpenders r h = do
 --
 -- This is all that wiping the mempool takes in the layered layout, and what
 -- can be done if the mempool area is ever found to be wrong.
+--
+-- It writes to the area without a batch of the block store, so it tells
+-- the database that its copy of the area in memory is no longer right
+-- ('forgetMempoolCopy'), however it ends: the next batch loads the copy
+-- again, from an area that is then empty.
 wipeMempoolArea :: DatabaseReader -> IO Int
-wipeMempoolArea r = sum <$> mapM wipe [mempoolCF r.db, mempoolAddrCF r.db]
+wipeMempoolArea r = (sum <$> mapM wipe [mempoolCF r.db, mempoolAddrCF r.db]) `finally` forgetMempoolCopy r
   where
     wipe cf = go 0
       where
@@ -494,12 +506,15 @@ addressArea records = [(encode k, encode v) | (k, v) <- entries <> summaryEntrie
 -- | Work every summary out again from the entries, and say how many
 -- addresses have one. The migration does this once everything is moved, and
 -- it is what puts the summaries right if they are ever in doubt.
+--
+-- Like 'wipeMempoolArea', it writes to the area without a batch of the
+-- block store, and has the copy of the area loaded again afterwards.
 rebuildSummaries :: DatabaseReader -> IO Int
 rebuildSummaries r = do
   rows <- matchingAsListCF r.db cf MemAddrKeyS
   let old = [DelCF cf (encode k) | (k@MemAddrSumKey {}, _ :: MemAddrVal) <- rows]
       new = summaryEntries rows
-  writeBatch r.db (old <> [PutCF cf (encode k) (encode v) | (k, v) <- new])
+  writeBatch r.db (old <> [PutCF cf (encode k) (encode v) | (k, v) <- new]) `finally` forgetMempoolCopy r
   return (length new)
   where
     cf = mempoolAddrCF r.db

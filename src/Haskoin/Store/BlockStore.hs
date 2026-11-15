@@ -17,11 +17,15 @@
 --
 -- When the best header of the node is ahead of the best block in the database,
 -- the block store picks one online peer as its syncing peer and asks it for
--- blocks in batches of 'blockWindow'. Each block is imported as soon as it
--- arrives. If the best block of the database is no longer in the main chain of
--- headers, blocks are reverted until it is. A syncing peer that sends a block
--- that was not requested, cannot find a block, or stays silent for longer than
--- 'peerTimeout' is disconnected. The state of the download, and every rule
+-- blocks in batches of 'blockWindow'. Only a peer that has announced the next
+-- block is picked ('Known'): the peers that have are pinged, and the first to
+-- answer is the one, or a late one if none answers within 'blockPing'. Each
+-- block is imported as soon as it arrives. If the best block of the database is no longer in the main chain of
+-- headers, blocks are reverted until it is. A syncing peer that delivers
+-- nothing for 'blockStall' is passed over: another is found the same way and
+-- asked for the same blocks, and whichever delivers first is taken. A peer that sends a
+-- block that it was not asked for, cannot find a block, or still owes blocks
+-- after 'peerTimeout' is disconnected. The state of the download, and every rule
 -- about it, is the pure state machine of "Haskoin.Store.BlockStore.Sync";
 -- this module carries out what its transitions decide.
 --
@@ -78,6 +82,10 @@ module Haskoin.Store.BlockStore
     blockStoreBlockSTM,
     blockStoreNotFound,
     blockStoreNotFoundSTM,
+    blockStoreAnnounced,
+    blockStoreAnnouncedSTM,
+    blockStorePong,
+    blockStorePongSTM,
     blockStoreTx,
     blockStoreTxSTM,
     blockStoreTxHash,
@@ -88,8 +96,23 @@ module Haskoin.Store.BlockStore
   )
 where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (link, withAsync)
+import Control.Concurrent.STM
+  ( STM,
+    TVar,
+    atomically,
+    modifyTVar,
+    modifyTVar',
+    newTVarIO,
+    readTVar,
+    readTVarIO,
+    stateTVar,
+  )
+import Control.Exception (Exception, catch, throwIO, try)
 import Control.Monad
-  ( forM,
+  ( filterM,
+    forM,
     forM_,
     unless,
     void,
@@ -98,6 +121,7 @@ import Control.Monad
   )
 import Data.Bool (bool)
 import Data.ByteString qualified as B
+import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
@@ -124,22 +148,24 @@ import Data.Time.Format
   ( defaultTimeLocale,
     formatTime,
   )
+import Data.Word (Word64)
 import Haskoin
   ( Block (..),
     BlockHash (..),
     BlockHeader (..),
     BlockHeight,
     BlockNode (..),
-    Ctx,
     GetData (..),
     InvType (..),
     InvVector (..),
     Message (..),
     Network (..),
     OutPoint (..),
+    Ping (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
+    Version (..),
     blockHashToHex,
     headerHash,
     txHash,
@@ -158,6 +184,7 @@ import Haskoin.Node
     chainGetBest,
     chainGetBlock,
     chainGetParents,
+    getOnlinePeer,
     getPeers,
     killPeer,
     logAt,
@@ -170,7 +197,7 @@ import Haskoin.Store.BlockStore.Pending (Pending, PendingTx (..))
 import Haskoin.Store.BlockStore.Pending qualified as Pending
 import Haskoin.Store.BlockStore.Sync
   ( Accept (..),
-    Sync (..),
+    Sync,
     needsMoreBlocks,
   )
 import Haskoin.Store.BlockStore.Sync qualified as Sync
@@ -181,7 +208,13 @@ import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Database.Writer (MempoolChanges (..), Writer, runWriterMempool)
+import Haskoin.Store.Database.Writer
+  ( BatchReport (..),
+    BlockTimes (..),
+    MempoolChanges (..),
+    Writer,
+    runWriterReport,
+  )
 import Haskoin.Store.Database.Writer qualified as W
 import Haskoin.Store.Logic (ImportException (..))
 import Haskoin.Store.Logic.Layered
@@ -205,25 +238,7 @@ import NQE
     sendSTM,
   )
 import System.Metrics.StatsD
-import System.Random (randomRIO)
-import UnliftIO
-  ( Exception,
-    STM,
-    TVar,
-    atomically,
-    catch,
-    link,
-    modifyTVar,
-    modifyTVar',
-    newTVarIO,
-    readTVar,
-    readTVarIO,
-    stateTVar,
-    throwIO,
-    try,
-    withAsync,
-  )
-import UnliftIO.Concurrent (threadDelay)
+import System.Random (randomIO, randomRIO)
 
 -- | Messages handled by the block store process.
 data BlockStoreMessage
@@ -237,6 +252,11 @@ data BlockStoreMessage
     BlockReceived !Peer !Block
   | -- | a peer could not find blocks
     BlockNotFound !Peer ![BlockHash]
+  | -- | a peer announced blocks: the last header of those it sent, or the
+    -- blocks of an inventory
+    BlockAnnounced !Peer ![BlockHash]
+  | -- | a peer answered a ping with a nonce
+    BlockPong !Peer !Word64
   | -- | a peer sent a transaction
     TxRefReceived !Peer !Tx
   | -- | a peer announced transactions
@@ -273,6 +293,9 @@ data BlockStore = BlockStore
     metrics :: !(Maybe StoreMetrics),
     -- | labels of the peers whose mempool was already requested
     syncedMempool :: !(TVar (HashSet Text)),
+    -- | what each peer said that it has, by its label: a peer is asked
+    -- only for blocks that it announced
+    knows :: !(TVar (HashMap Text Known)),
     -- | who reserves the syncing peer, so that no one else releases it
     owner :: !Owner,
     -- | transactions that left the mempool unconfirmed since the store
@@ -280,6 +303,20 @@ data BlockStore = BlockStore
     -- them, and peers go on announcing them: without this the store would
     -- fetch each one again, only to refuse it again.
     forgotten :: !(TVar (HashSet TxHash))
+  }
+
+-- | The blocks that a peer said it has. A peer is asked for a block only
+-- if it has announced it, or a block that comes after it: one that is
+-- asked for a block that it does not have yet answers nothing, or that it
+-- cannot find it, and the block arrives a stall later from another.
+data Known = Known
+  { -- | the height that it gave when it connected: it is taken to have
+    -- the blocks of the main chain up to there
+    height :: !BlockHeight,
+    -- | the block with the most work of those it announced since, with
+    -- the headers that it sent or in an inventory: it has that block and
+    -- those before it
+    tip :: !(Maybe BlockNode)
   }
 
 -- | How many deleted transactions the store remembers not to fetch again.
@@ -301,7 +338,30 @@ data StoreMetrics = StoreMetrics
     -- | transactions in the mempool (@store.mempool@)
     mempool :: !StatGauge,
     -- | milliseconds to import a block (@store.block@)
-    block :: !StatTiming
+    block :: !StatTiming,
+    -- | milliseconds of each stage of the import of a block
+    -- ('Haskoin.Store.Logic.Layered.importBlock'): working out what it
+    -- needs of the block (@store.block_prepare@)
+    blockPrepare :: !StatTiming,
+    -- | reading ahead what the rules will read (@store.block_prefetch@)
+    blockPrefetch :: !StatTiming,
+    -- | of the read ahead, each kind of key
+    -- ('Haskoin.Store.Database.Writer.ReadTimes'): the unspent outputs
+    -- that the block spends (@store.block_read_unspents@)
+    blockReadUnspents :: !StatTiming,
+    -- | the groups of spenders of those outputs
+    -- (@store.block_read_spenders@): zero, as a block reads none
+    blockReadSpenders :: !StatTiming,
+    -- | the balances of the addresses of the block
+    -- (@store.block_read_balances@): zero, as a block reads none
+    blockReadBalances :: !StatTiming,
+    -- | what is read ahead of the mempool area, from its copy in memory:
+    -- bodies and summaries of addresses (@store.block_read_mempool@)
+    blockReadMempool :: !StatTiming,
+    -- | the rules, in memory (@store.block_apply@)
+    blockApply :: !StatTiming,
+    -- | writing the batch to RocksDB (@store.block_write@)
+    blockWrite :: !StatTiming
   }
 
 -- | Register the block store metrics, if StatsD is configured, with their current values.
@@ -320,11 +380,22 @@ newStoreMetrics cfg =
     queuedTxs <- g s "queued_txs" 0
     peers <- g s "peers" (length p)
     mempool <- g s "mempool" (length m)
-    block <- t s "block" 0
+    block <- t s "block"
+    blockPrepare <- t s "block_prepare"
+    blockPrefetch <- t s "block_prefetch"
+    blockReadUnspents <- t s "block_read_unspents"
+    blockReadSpenders <- t s "block_read_spenders"
+    blockReadBalances <- t s "block_read_balances"
+    blockReadMempool <- t s "block_read_mempool"
+    blockApply <- t s "block_apply"
+    blockWrite <- t s "block_write"
     return StoreMetrics {..}
   where
     g s x = newStatGauge s ("store." <> x)
-    t s x = newStatTiming s ("store." <> x)
+    -- every sample is sent: there is one a block. The timing of a block
+    -- was made with a rate of 0 until version 1.15.1, which sends none,
+    -- so it never reached the StatsD server
+    t s x = newStatTiming s ("store." <> x) 1
 
 -- | Update the gauge of the best block height.
 setStoreHeight :: BlockStore -> IO ()
@@ -369,9 +440,7 @@ withBlockTiming self go = do
 
 -- | Configuration for a block store.
 data BlockStoreConfig = BlockStoreConfig
-  { -- | secp256k1 context
-    ctx :: !Ctx,
-    -- | peer manager from running node
+  { -- | peer manager from running node
     peerMgr :: !PeerMgr,
     -- | chain from a running node
     chain :: !Chain,
@@ -398,6 +467,12 @@ data BlockStoreConfig = BlockStoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
+    -- | ask another peer for the blocks that the syncing peer has not
+    -- delivered for this long ("Haskoin.Store.BlockStore.Sync")
+    blockStall :: !NominalDiffTime,
+    -- | a peer is asked for blocks if it answers a ping within this long,
+    -- or if none does ("Haskoin.Store.BlockStore.Sync")
+    blockPing :: !NominalDiffTime,
     -- | StatsD client, if metrics are enabled
     stats :: !(Maybe Stats),
     -- | log messages here
@@ -412,35 +487,55 @@ logWarn self = logAt LevelWarn self.config.logger
 logError self = logAt LevelError self.config.logger
 
 -- | Run an import against the database, returning the import error if it fails.
-runImport :: BlockStore -> Network -> Ctx -> (Writer -> IO a) -> IO (Either ImportException a)
-runImport self net ctx f = fmap fst <$> runImportMempool self net ctx f
+runImport :: BlockStore -> Network -> (Writer -> IO a) -> IO (Either ImportException a)
+runImport self net f = fmap fst <$> runImportMempool self net f
 
 -- | Like 'runImport', but also return how the import changed the mempool.
 -- The mempool gauge is kept up to date from those changes instead of
 -- counting the whole mempool on every clock tick.
-runImportMempool :: BlockStore -> Network -> Ctx -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
-runImportMempool self net ctx f = do
-  r <- try $ runWriterMempool net ctx self.config.db self.config.logger f
-  forM_ r $ \(_, c) ->
+runImportMempool :: BlockStore -> Network -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
+runImportMempool self net f = do
+  r <- try $ runWriterReport net self.config.db self.config.logger f
+  forM_ r $ \(_, report) ->
     forM_
       self.metrics
       ( \m -> do
-          incrementGauge m.mempool (length c.added)
-          decrementGauge m.mempool (length c.removed)
+          incrementGauge m.mempool (length report.mempool.added)
+          decrementGauge m.mempool (length report.mempool.removed)
+          -- only a batch that imported a block has these
+          forM_ report.block $ \t -> do
+            addTiming m.blockPrepare (milliseconds t.prepare)
+            addTiming m.blockPrefetch (milliseconds t.prefetch)
+            addTiming m.blockReadUnspents (milliseconds t.reads.unspentReads)
+            addTiming m.blockReadSpenders (milliseconds t.reads.spenderReads)
+            addTiming m.blockReadBalances (milliseconds t.reads.balanceReads)
+            addTiming m.blockReadMempool (milliseconds t.reads.mempoolReads)
+            addTiming m.blockApply (milliseconds t.apply)
+            addTiming m.blockWrite (milliseconds t.write)
       )
-  return r
+  return (fmap (.mempool) <$> r)
+  where
+    milliseconds :: Double -> Int
+    milliseconds = round . (* 1000)
 
 -- | Run an import and publish the transactions that it added to the
 -- mempool or removed from it, then the new best block if there is one.
 -- Transactions of the block are not published.
-runImportNotify :: BlockStore -> Maybe Block -> (Writer -> IO a) -> IO (Either ImportException a)
+--
+-- An import of a block comes with the hash of the block and with how to
+-- get the hashes of its transactions from what the import returns. The
+-- import has worked them out; hashing every transaction of the block
+-- again here took 25 ms of each block at the tip of the chain.
+runImportNotify ::
+  BlockStore -> Maybe (BlockHash, a -> [TxHash]) -> (Writer -> IO a) -> IO (Either ImportException a)
 runImportNotify self block f = do
   net <- getNetwork self
-  ctx <- getCtx self
-  runImportMempool self net ctx f >>= \case
+  runImportMempool self net f >>= \case
     Left e -> return (Left e)
     Right (x, c) -> do
       let l = self.config.pub
+          inBlock = maybe HashSet.empty (\(_, hashes) -> HashSet.fromList (hashes x)) block
+          notInBlock = not . (`HashSet.member` inBlock)
       let deleted = filter notInBlock c.removed
       atomically . modifyTVar' self.forgotten $ \seen ->
         let more = foldr HashSet.insert seen deleted
@@ -451,15 +546,12 @@ runImportNotify self block f = do
         publish (StoreMempoolDelete h) l
       forM_ (filter notInBlock c.added) $ \h ->
         publish (StoreMempoolNew h) l
-      forM_ block $ \b -> do
+      forM_ block $ \(h, _) -> do
         -- before the event, so that whoever hears of the block finds what
         -- was done for it
-        self.config.onBest (headerHash b.header)
-        publish (StoreBestBlock (headerHash b.header)) l
+        self.config.onBest h
+        publish (StoreBestBlock h) l
       return (Right x)
-  where
-    inBlock = maybe HashSet.empty (HashSet.fromList . map txHash . (.txs)) block
-    notInBlock = not . (`HashSet.member` inBlock)
 
 -- | Run a database query from the block store.
 -- | Best block in the database.
@@ -483,23 +575,20 @@ getUnspent self p = L.withView self.config.db (`L.getUnspent` p)
 getNetwork :: BlockStore -> IO Network
 getNetwork self = return self.config.net
 
--- | Secp256k1 context of the block store.
-getCtx :: BlockStore -> IO Ctx
-getCtx self = return self.config.ctx
-
 -- | Run block store process.
 withBlockStore ::
   BlockStoreConfig ->
   (BlockStore -> IO a) ->
   IO a
 withBlockStore cfg action = do
-  pb <- newTVarIO Idle
+  pb <- newTVarIO . Sync.idle =<< getCurrentTime
   ts <- newTVarIO Pending.empty
   sy <- newTVarIO HashSet.empty
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
   forgotten <- newTVarIO HashSet.empty
+  knows <- newTVarIO HashMap.empty
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -508,6 +597,7 @@ withBlockStore cfg action = do
             pending = ts,
             metrics = metrics,
             syncedMempool = sy,
+            knows = knows,
             owner = owner,
             forgotten = forgotten
           }
@@ -521,7 +611,9 @@ withBlockStore cfg action = do
       run
       where
         -- the mempool is an area of its own, so wiping it is deleting the
-        -- keys of that area: nothing of the chain has to be put right
+        -- keys of that area: nothing of the chain has to be put right. The
+        -- wipe also has the copy of the area in memory loaded again, by
+        -- the next batch that needs it
         wipe = when cfg.wipeMempool $ do
           keys <- wipeMempoolArea cfg.db
           forM_ self.metrics $ \m -> setGauge m.mempool 0
@@ -529,8 +621,7 @@ withBlockStore cfg action = do
             "Wiped the mempool: " <> cs (show keys) <> " keys deleted"
         ini = do
           net <- getNetwork self
-          ctx <- getCtx self
-          runImport self net ctx initBest >>= \case
+          runImport self net initBest >>= \case
             Left e -> do
               logError self $
                 "Could not initialize: " <> cs (show e)
@@ -588,9 +679,11 @@ syncMempool self p =
 -- the block is unknown to the node, or if the block cannot be imported.
 processBlock :: BlockStore -> Peer -> Block -> IO ()
 processBlock self peer block =
-  Sync.accept peer blockhash <$> readTVarIO self.sync >>= \case
+  transition self (Sync.accept peer blockhash) >>= \case
     NotSyncingPeer -> refuse "Non-syncing peer"
     NotRequested -> refuse "Syncing peer"
+    -- a peer that was passed over for being slow, and another was faster
+    Late -> logDebug self $ "Block " <> hexhash <> " from peer " <> peer.label <> " came after another's"
     Requested ->
       getBlockNode self blockhash >>= \case
         Nothing -> do
@@ -606,7 +699,9 @@ processBlock self peer block =
               <> blockText node Nothing
               <> " from peer "
               <> peer.label
-          ret <- withBlockTiming self $ runImportNotify self (Just block) (\wr -> importBlock wr block node)
+          ret <-
+            withBlockTiming self $
+              runImportNotify self (Just (blockhash, (.txs) . fst)) (\wr -> importBlock wr block node)
           case ret of
             Left e -> failure e
             Right _ -> success node
@@ -874,15 +969,156 @@ processTxs self p hs = guardMempool self . guardSync self $ do
           msg = MGetData (GetData vec)
       msg `sendMessage` p
 
--- | Disconnect the syncing peer if it has been silent for too long.
+-- | Deal with peers that do not deliver: disconnect the syncing peer if it
+-- has been silent for the timeout, else look for another peer to ask for its
+-- blocks if it has been silent for the stall; and disconnect the peers passed
+-- over before that still owe their blocks after the timeout. If peers were
+-- pinged and none answered in time, ask one of them all the same.
 checkTime :: BlockStore -> IO ()
 checkTime self = do
   now <- getCurrentTime
-  Sync.timedOut self.config.peerTimeout now <$> readTVarIO self.sync >>= \case
-    Nothing -> return ()
+  st <- readTVarIO self.sync
+  let timeout = self.config.peerTimeout
+  case Sync.timedOut timeout now st of
     Just p -> do
       logWarn self $ "Syncing peer timeout: " <> p.label
       killPeer p
+    Nothing -> forM_ (Sync.stalled self.config.blockStall timeout now st) $ \slow ->
+      search self (slow : Sync.passedPeers st)
+  forM_ (Sync.expired timeout now st) $ \p -> do
+    logWarn self $ "Peer did not deliver its blocks: " <> p.label
+    killPeer p
+  late <- Sync.overdue self.config.blockPing now <$> readTVarIO self.sync
+  unless (null late) $ do
+    logWarn self $
+      "No peer answered a ping within "
+        <> cs (show self.config.blockPing)
+        <> ": asking one all the same"
+    void (firstM (choose self now) late)
+    transition self $ \s -> ((), Sync.settle s)
+  where
+    firstM _ [] = return Nothing
+    firstM f (x : xs) = f x >>= \ok -> if ok then return (Just x) else firstM f xs
+
+-- | Look for a peer to ask for blocks: ping those that have the block that
+-- is needed, leaving out the ones given, fastest first. The first to
+-- answer is asked ('processPong'). Peers that were pinged already in this
+-- search are not pinged again, so this may be called at every tick, and
+-- reaches the peers that announce the block while the search goes on.
+search :: BlockStore -> [Peer] -> IO ()
+search self asked =
+  needed self >>= \case
+    Nothing -> return ()
+    Just node -> do
+      -- the peers that still owe blocks from before come last
+      slow <- Sync.passedPeers <$> readTVarIO self.sync
+      peers <- filter (`notElem` asked) . map (.mailbox) <$> getPeers self.config.peerMgr
+      able <- filterM (peerHas self node) (filter (`notElem` slow) peers <> filter (`elem` slow) peers)
+      now <- getCurrentTime
+      fresh <- randomIO
+      transition self (Sync.ping now fresh able) >>= \case
+        Nothing -> return ()
+        Just (nonce, ps) -> forM_ ps $ \p -> do
+          logDebug self $ "Pinging peer before asking it for blocks: " <> p.label
+          MPing (Ping nonce) `sendMessage` p
+
+-- | The block that a peer must have to be asked: the last one that the
+-- syncing peer was asked for and has not delivered, since its blocks are
+-- what the next peer is asked for; or, with nothing asked, the block after
+-- the best one. A peer that has a block has those before it. Nothing if
+-- there is no block to ask for.
+needed :: BlockStore -> IO (Maybe BlockNode)
+needed self =
+  Sync.lastRequested <$> readTVarIO self.sync >>= \case
+    Just h -> getBlockNode self h
+    Nothing -> do
+      bb <- getBest self
+      bh <- chainGetBest self.config.chain
+      if bb.height < bh.height
+        then Just <$> findAncestor self (bb.height + 1) bh
+        else return Nothing
+
+-- | Whether a peer said that it has a block: it gave a height at least
+-- that of the block when it connected, or it announced the block or one
+-- that comes after it.
+peerHas :: BlockStore -> BlockNode -> Peer -> IO Bool
+peerHas self node p =
+  HashMap.lookup p.label <$> readTVarIO self.knows >>= \case
+    Nothing -> return False
+    Just k
+      | node.height <= k.height -> return True
+      | Just t <- k.tip,
+        node.height <= t.height ->
+          (== Just node) <$> chainGetAncestor self.config.chain node.height t
+      | otherwise -> return False
+
+-- | Note the blocks that a peer announced, and look for a peer to ask if
+-- blocks are needed: this one can now be asked for them. Blocks whose
+-- headers the node does not have are ignored: a peer that announces one in
+-- an inventory is asked for its header by the node, and announces it again
+-- with that.
+processAnnounced :: BlockStore -> Peer -> [BlockHash] -> IO ()
+processAnnounced self p hs = do
+  nodes <- catMaybes <$> mapM (getBlockNode self) hs
+  forM_ nodes $ \n ->
+    atomically . modifyTVar' self.knows $
+      HashMap.insertWith (\_ k -> raise n k) p.label (Known 0 (Just n))
+  unless (null nodes) (trySyncing self)
+  where
+    raise n k
+      | maybe True ((< n.work) . (.work)) k.tip = Known k.height (Just n)
+      | otherwise = k
+
+-- | A peer answered a ping: if it was pinged to be asked for blocks and
+-- answered in time, ask it.
+processPong :: BlockStore -> Peer -> Word64 -> IO ()
+processPong self p nonce = do
+  now <- getCurrentTime
+  chosen <- transition self (Sync.pong self.config.blockPing now p nonce)
+  when chosen (void (choose self now p))
+
+-- | Ask a peer that the search found for blocks: make it the syncing peer
+-- if there is none, or pass the syncing peer over for it if that one is
+-- still not delivering. Says whether the search is over; it is not if the
+-- peer is busy with something else and cannot be locked.
+choose :: BlockStore -> UTCTime -> Peer -> IO Bool
+choose self now p = do
+  st <- readTVarIO self.sync
+  case Sync.syncingPeer st of
+    Nothing ->
+      trySetPeer self p >>= \case
+        False -> return False
+        True -> syncMe self >> return True
+    Just _
+      | isJust (Sync.stalled self.config.blockStall self.config.peerTimeout now st) -> passOver self now p
+      -- the syncing peer delivered in the meantime
+      | otherwise -> True <$ transition self (\s -> ((), Sync.settle s))
+
+-- | Ask a peer for the blocks that the syncing peer is not delivering, and
+-- make it the syncing peer. The one passed over stays connected, and its
+-- blocks are still taken if they come first. Says whether it was done.
+passOver :: BlockStore -> UTCTime -> Peer -> IO Bool
+passOver self now p =
+  reservePeer self.owner p >>= \case
+    False -> return False
+    True ->
+      transition self (Sync.pass now p) >>= \case
+        Nothing -> False <$ releasePeer self.owner p
+        Just (old, blocks) -> do
+          logWarn self $
+            "Peer "
+              <> old.label
+              <> " is not delivering: asking "
+              <> p.label
+              <> " for "
+              <> cs (show (length blocks))
+              <> " blocks"
+          void (releasePeer self.owner old)
+          unless (null blocks) $ MGetData (GetData (map inv blocks)) `sendMessage` p
+          return True
+  where
+    inv = InvVector kind . (.get)
+    kind = if self.config.net.segWit then InvWitnessBlock else InvBlock
 
 -- | Revert blocks until the best block in the database is in the main chain of headers.
 revertToMainChain :: BlockStore -> IO ()
@@ -890,13 +1126,12 @@ revertToMainChain self = do
   h <- headerHash . (.header) <$> getBest self
   let ch = self.config.chain
   net <- getNetwork self
-  ctx <- getCtx self
   (chainBlockMain ch h) >>= \x -> unless x $ do
     logWarn self $
       "Reverting best block: "
         <> blockHashToHex h
     now <- floor . utcTimeToPOSIXSeconds <$> getCurrentTime
-    runImport self net ctx (\wr -> revertBlock wr now h) >>= \case
+    runImport self net (\wr -> revertBlock wr now h) >>= \case
       Left e -> do
         logError self $
           "Could not revert block "
@@ -969,15 +1204,38 @@ syncMe self = do
       bb <- getSyncBest self
       bh <- chainGetBest self.config.chain
       when (bb /= bh) $ do
-        bns <- sel bb bh
-        logDebug self $
-          "Requesting "
-            <> fromString (show (length bns))
-            <> " blocks from peer: "
-            <> p.label
-        transition self $ \st -> ((), Sync.request (map (headerHash . (.header)) bns) st)
-        MGetData (GetData (map inv bns)) `sendMessage` p
+        bns <- sel bb bh >>= reach p
+        idle <- null . Sync.outstanding <$> readTVarIO self.sync
+        if null bns
+          then when idle $ do
+            -- it has delivered what it had, and has not announced what
+            -- comes next: let it go, for a peer that has to be found
+            logDebug self $ "Syncing peer has not announced the next block: " <> p.label
+            released <- transition self (Sync.release p)
+            when released (void (releasePeer self.owner p))
+          else request p bns
   where
+    request p bns = do
+      logDebug self $
+        "Requesting "
+          <> fromString (show (length bns))
+          <> " blocks from peer: "
+          <> p.label
+      transition self $ \st -> ((), Sync.request (map (headerHash . (.header)) bns) st)
+      MGetData (GetData (map inv bns)) `sendMessage` p
+    -- the blocks that the peer has announced: all of them if it has the
+    -- last, since they are a chain, or else those up to the first that
+    -- it has not
+    reach _ [] = return []
+    reach p bns =
+      peerHas self (last bns) p >>= \case
+        True -> return bns
+        False -> takeWhileM (\n -> peerHas self n p) bns
+    takeWhileM _ [] = return []
+    takeWhileM f (x : xs) =
+      f x >>= \case
+        True -> (x :) <$> takeWhileM f xs
+        False -> return []
     inv = InvVector kind . (.get) . headerHash . (.header)
     kind = if self.config.net.segWit then InvWitnessBlock else InvBlock
     -- The blocks right after the last requested one, up to one window or
@@ -1029,7 +1287,7 @@ trySetPeer self p =
             else void (releasePeer self.owner p)
           return started
 
--- | If not in sync and there is no syncing peer, pick the first free peer and start syncing.
+-- | If not in sync and there is no syncing peer, look for one ('search').
 trySyncing :: BlockStore -> IO ()
 trySyncing self =
   isInSync self >>= \case
@@ -1037,27 +1295,24 @@ trySyncing self =
     False ->
       isJust . Sync.syncingPeer <$> readTVarIO self.sync >>= \case
         True -> return ()
-        False -> getPeers self.config.peerMgr >>= recurse . map (.mailbox)
-  where
-    recurse [] = return ()
-    recurse (p : ps) =
-      trySetPeer self p >>= \case
-        False -> recurse ps
-        True -> syncMe self
+        False -> revertToMainChain self >> search self []
 
--- | Start syncing against a newly connected peer if needed, or request its mempool if in sync.
+-- | Note the height that a newly connected peer gave, then start syncing if
+-- needed, or request its mempool if in sync.
 trySyncingPeer :: BlockStore -> Peer -> IO ()
-trySyncingPeer self p =
+trySyncingPeer self p = do
+  online <- getOnlinePeer self.config.peerMgr p
+  let height = maybe 0 (fromIntegral . max 0 . (.startHeight)) (online >>= (.version))
+  atomically . modifyTVar' self.knows $
+    HashMap.insertWith (\_ k -> Known (max height k.height) k.tip) p.label (Known height Nothing)
   isInSync self >>= \case
     True -> syncMempool self p
-    False ->
-      trySetPeer self p >>= \case
-        False -> return ()
-        True -> syncMe self
+    False -> trySyncing self
 
 -- | Release the syncing peer, if any.
 clearSyncingState :: BlockStore -> IO ()
-clearSyncingState self =
+clearSyncingState self = do
+  transition self $ \s -> ((), Sync.settle s)
   Sync.syncingPeer <$> readTVarIO self.sync >>= mapM_ (finishPeer self)
 
 -- | Handle a message sent to the block store.
@@ -1076,6 +1331,7 @@ processBlockStoreMessage self (BlockPeerConnect p) = do
 processBlockStoreMessage self (BlockPeerDisconnect p) = do
   logDebug self $
     "Peer disconnected: " <> p.label
+  atomically $ modifyTVar' self.knows $ HashMap.delete p.label
   finishPeer self p
 processBlockStoreMessage self (BlockReceived p b) = do
   logDebug self $
@@ -1089,6 +1345,8 @@ processBlockStoreMessage self (BlockNotFound p bs) = do
       <> ": "
       <> T.unwords (map blockHashToHex bs)
   processNoBlocks self p bs
+processBlockStoreMessage self (BlockAnnounced p bs) = processAnnounced self p bs
+processBlockStoreMessage self (BlockPong p n) = processPong self p n
 processBlockStoreMessage self (TxRefReceived p tx) = do
   logDebug self $
     "Transaction received from peer "
@@ -1152,6 +1410,22 @@ blockStoreNotFound ::
   Peer -> [BlockHash] -> BlockStore -> IO ()
 blockStoreNotFound peer blocks store =
   BlockNotFound peer blocks `send` store.mailbox
+
+-- | Tell the block store that a peer announced blocks.
+blockStoreAnnounced :: Peer -> [BlockHash] -> BlockStore -> IO ()
+blockStoreAnnounced peer blocks store = BlockAnnounced peer blocks `send` store.mailbox
+
+-- | Tell the block store that a peer answered a ping.
+blockStorePong :: Peer -> Word64 -> BlockStore -> IO ()
+blockStorePong peer nonce store = BlockPong peer nonce `send` store.mailbox
+
+-- | 'blockStoreAnnounced' in 'STM'.
+blockStoreAnnouncedSTM :: Peer -> [BlockHash] -> BlockStore -> STM ()
+blockStoreAnnouncedSTM peer blocks store = BlockAnnounced peer blocks `sendSTM` store.mailbox
+
+-- | 'blockStorePong' in 'STM'.
+blockStorePongSTM :: Peer -> Word64 -> BlockStore -> STM ()
+blockStorePongSTM peer nonce store = BlockPong peer nonce `sendSTM` store.mailbox
 
 -- | Give the block store a transaction received from a peer.
 blockStoreTx ::

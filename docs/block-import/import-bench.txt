@@ -1,0 +1,605 @@
+Output of `haskoin-store-bench import +RTS -N4 -A64m`, 2026-11-15.
+
+AMD Ryzen 9 3900X, four cores given to the program, RocksDB 11.1.1, the
+databases on tmpfs, a block cache of 32 MiB. "Sequential" is
+importBlockSequential without the read cache; "in stages" is importBlock.
+
+There are six sets of runs here, for the six tables of
+docs/block-import.md. Every stage was faster in the later sets, made
+later the same day, than in the first: compare within a set. The fifth
+and the sixth set have four kinds of block, where the others have two.
+
+========================================================================
+1. Before the batch of a block was packed: the first table
+========================================================================
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 23.6 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6642862 bytes
+                                           sequential  in stages
+  prepare                                         0.0       36.1
+  read ahead                                      0.0       75.1
+  apply the rules (sequential: reads too)       844.5       63.2
+  write the batch                               229.9      208.1
+  whole block                                  1074.4      382.4
+  faster by                                                 2.8x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 9785875 bytes
+                                           sequential  in stages
+  prepare                                         0.0       28.3
+  read ahead                                      0.0      195.7
+  apply the rules (sequential: reads too)      1514.6      239.8
+  write the batch                               400.0      377.0
+  whole block                                  1914.7      840.7
+  faster by                                                 2.3x
+
+The same benchmark on the code as it was before the hash tables of a batch
+and the serialising of its changes were made faster, which is what version
+1.15.1 ran (the sequential import, same machine, same day):
+
+mempool empty, as when syncing or catching up
+  apply the rules, with their reads            1045.5
+  write the batch                               335.1
+  whole block                                  1380.6
+
+every transaction in the mempool first, as at the tip
+  apply the rules, with their reads            1739.4
+  write the batch                               581.7
+  whole block                                  2321.1
+
+========================================================================
+2. The batch handed to RocksDB key by key, and packed: the second table
+========================================================================
+
+The benchmark was run on the code before the batch was packed and on the
+code after it, in turn, six times each: four pairs with the old code
+first, then two pairs with the new code first, since whichever ran first
+of a pair tended to be a few milliseconds slower in the stages that this
+does not touch. The import in stages, milliseconds a block, each run and
+the median:
+
+mempool empty, as when syncing or catching up
+  write the batch
+    key by key   132.7  138.1  133.6  139.8  129.6  134.4    median 134.0
+    packed        84.7   85.0   93.3   87.5   85.9   86.9    median  86.4
+  whole block
+    key by key   242.6  255.6  258.5  272.8  243.9  244.9    median 250.2
+    packed       187.8  186.2  211.9  196.9  199.6  205.5    median 198.2
+
+every transaction in the mempool first, as at the tip
+  write the batch
+    key by key   253.5  257.8  275.3  268.0  253.1  256.2    median 257.0
+    packed       173.5  178.3  187.8  177.5  187.9  197.9    median 183.1
+  whole block
+    key by key   520.3  521.8  563.9  556.2  517.5  521.6    median 521.7
+    packed       430.9  433.8  458.2  436.7  467.9  485.5    median 447.4
+
+The other stages, medians, key by key and packed: prepare 18.0 and 15.4,
+read ahead 63.9 and 58.7, apply 34.1 and 37.2 for the first kind of block;
+13.1 and 13.1, 131.1 and 129.3, 122.6 and 122.6 for the second.
+
+The fourth run of the code with the packed batch, which is near those
+medians:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 14.0 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6642862 bytes
+                                           sequential  in stages
+  prepare                                         0.0       15.3
+  read ahead                                      0.0       57.8
+    unspent outputs                               0.0       17.4
+    groups of spenders                            0.0       13.3
+    balances                                      0.0       25.3
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       640.5       36.4
+  write the batch                               101.1       87.5
+  whole block                                   741.5      196.9
+  faster by                                                 3.8x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 9785875 bytes
+                                           sequential  in stages
+  prepare                                         0.0       12.5
+  read ahead                                      0.0      126.3
+    unspent outputs                               0.0       16.1
+    groups of spenders                            0.0       12.0
+    balances                                      0.0       23.4
+    mempool                                       0.0       73.6
+  apply the rules (sequential: reads too)      1027.7      120.4
+  write the batch                               205.6      177.5
+  whole block                                  1233.4      436.7
+  faster by                                                 2.8x
+
+The second run of the code that handed the batch over key by key:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 16.8 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6642862 bytes
+                                           sequential  in stages
+  prepare                                         0.0       18.0
+  read ahead                                      0.0       64.4
+    unspent outputs                               0.0       19.0
+    groups of spenders                            0.0       16.7
+    balances                                      0.0       26.8
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       648.1       35.1
+  write the batch                               143.0      138.1
+  whole block                                   791.1      255.6
+  faster by                                                 3.1x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 9785875 bytes
+                                           sequential  in stages
+  prepare                                         0.0       13.2
+  read ahead                                      0.0      130.5
+    unspent outputs                               0.0       17.4
+    groups of spenders                            0.0       11.3
+    balances                                      0.0       25.2
+    mempool                                       0.0       75.4
+  apply the rules (sequential: reads too)      1011.4      120.2
+  write the batch                               301.3      257.8
+  whole block                                  1312.6      521.8
+  faster by                                                 2.5x
+
+The write of a block of the first kind, timed from inside, in one more run
+of each (the import in stages, median of its five blocks, milliseconds):
+
+                                              key by key     packed
+  list the changes of the batch                     1.6        1.6
+  serialise them, on all cores                     24.5       24.1
+  hand them to RocksDB, and RocksDB's write       102.1       58.8
+  count the keys and bytes, for the metrics         4.4        0.0
+
+========================================================================
+3. Balances and spenders read and written whole, and merged: the third table
+========================================================================
+
+The benchmark was run on the code of database version 22 (commit
+d0a8b9ce), in which the import of a block reads the balances of its
+addresses and the groups of spenders of the outputs that it spends, and on
+the code of version 23, in which it writes merge records and reads
+neither: in turn, six times each, the order swapped from one pair to the
+next, as `haskoin-store-bench import 1000000 3500 5 32 DIR +RTS -N4 -A64m`,
+which is the defaults and a directory on tmpfs. The import in stages,
+milliseconds a block, each run and the median:
+
+mempool empty, as when syncing or catching up
+                                        version 22                                    version 23
+  prepare                13.9  14.1  14.7  14.5  14.7  14.9   14.6     11.4  11.5  11.3  11.1  11.8  11.1   11.4
+  read ahead             56.4  56.2  56.1  56.5  55.5  55.9   56.2     20.0  20.5  20.6  20.2  20.6  20.6   20.6
+    unspent outputs      17.0  17.0  16.4  17.2  16.5  17.0   17.0     16.5  16.9  17.0  16.7  17.0  17.0   16.9
+    groups of spenders   12.9  13.3  13.1  13.2  13.0  13.2   13.1      2.1   2.2   2.2   2.0   2.0   2.2    2.2
+    balances             24.6  24.0  24.7  24.3  24.2  23.8   24.2      0.0   0.0   0.0   0.0   0.0   0.0    0.0
+  apply the rules        33.0  31.9  33.1  32.5  32.6  32.4   32.5     29.5  28.7  30.2  30.9  31.5  28.8   29.9
+  write the batch        85.7  82.5  85.7  87.8  86.5  85.1   85.7     86.3  85.6  86.0  87.5  89.3  87.7   86.9
+  whole block           189.0 184.8 189.7 191.4 189.3 188.3  189.2    147.2 146.3 148.2 149.7 153.2 148.2  148.2
+  one batch a block: 65410 keys and 6642862 bytes, and 65410 keys and 6270870 bytes
+
+every transaction in the mempool first, as at the tip
+                                        version 22                                    version 23
+  prepare                12.3  12.6  12.5  12.2  12.5  12.2   12.4     12.7  12.3  12.5  12.6  12.4  12.8   12.6
+  read ahead            125.7 126.5 124.4 125.1 126.2 125.2  125.5     92.4  92.9  91.0  91.0  91.7  92.0   91.8
+    unspent outputs      15.9  15.9  15.8  15.8  16.0  15.9   15.9     13.9  13.7  13.6  13.4  13.5  14.1   13.6
+    groups of spenders   12.0  12.3  11.8  11.9  12.1  12.3   12.1      0.0   0.0   0.0   0.0   0.0   0.0    0.0
+    balances             23.6  24.3  23.1  24.6  23.8  23.1   23.7      0.0   0.0   0.0   0.0   0.0   0.0    0.0
+    mempool              73.0  72.9  72.5  71.6  73.1  72.6   72.8     77.3  78.0  76.3  76.4  77.1  76.7   76.9
+  apply the rules       124.9 120.2 120.7 119.8 120.7 119.7  120.5    115.9 115.7 114.9 112.7 115.1 114.3  115.0
+  write the batch       180.4 175.2 172.7 174.6 177.9 172.2  174.9    179.5 177.8 178.6 179.4 179.2 178.5  178.9
+  whole block           443.2 434.4 430.3 431.7 437.2 429.2  433.0    400.4 398.7 397.0 395.7 398.5 397.5  398.0
+  one batch a block: 124514 keys and 9785875 bytes, and 124514 keys and 8981491 bytes
+
+The sixth run of the code of version 23:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 13.7 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6270870 bytes
+                                           sequential  in stages
+  prepare                                         0.0       11.1
+  read ahead                                      0.0       20.6
+    unspent outputs                               0.0       17.0
+    groups of spenders                            0.0        2.2
+    balances                                      0.0        0.0
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       643.7       28.8
+  write the batch                               100.3       87.7
+  whole block                                   744.0      148.2
+  faster by                                                 5.0x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 8981491 bytes
+                                           sequential  in stages
+  prepare                                         0.0       12.8
+  read ahead                                      0.0       92.0
+    unspent outputs                               0.0       14.1
+    groups of spenders                            0.0        0.0
+    balances                                      0.0        0.0
+    mempool                                       0.0       76.7
+  apply the rules (sequential: reads too)      1035.9      114.3
+  write the batch                               201.7      178.5
+  whole block                                  1237.6      397.5
+  faster by                                                 3.1x
+
+In that output the sequential import, which reads and writes whole values,
+reads balances and spenders that the building of the database left as
+merge records, since the database is built by the import in stages: its
+column is not that of version 22. Its whole block took 729.1 and 1213.6 ms in
+the runs of version 22, medians of the six, and 745.0 and 1239.3 in those of
+version 23. The sixth run of the code of version 22:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 13.7 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6642862 bytes
+                                           sequential  in stages
+  prepare                                         0.0       14.9
+  read ahead                                      0.0       55.9
+    unspent outputs                               0.0       17.0
+    groups of spenders                            0.0       13.2
+    balances                                      0.0       23.8
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       628.5       32.4
+  write the batch                                99.5       85.1
+  whole block                                   727.9      188.3
+  faster by                                                 3.9x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 9785875 bytes
+                                           sequential  in stages
+  prepare                                         0.0       12.2
+  read ahead                                      0.0      125.2
+    unspent outputs                               0.0       15.9
+    groups of spenders                            0.0       12.3
+    balances                                      0.0       23.1
+    mempool                                       0.0       72.6
+  apply the rules (sequential: reads too)       992.6      119.7
+  write the batch                               198.8      172.2
+  whole block                                  1191.4      429.2
+  faster by                                                 2.8x
+
+========================================================================
+4. The mempool area read from RocksDB, and from a copy in memory: the fourth table
+========================================================================
+
+The benchmark was run on the code before the block store kept a copy of
+the mempool area in memory (commit 9be69e06) and on the code with it, in
+turn, six times each, the order swapped from one pair to the next, as
+`haskoin-store-bench import +RTS -N4 -A64m`. The import in stages,
+milliseconds a block, each run and the median:
+
+mempool empty, as when syncing or catching up
+                                    before (9be69e06)                              with the copy
+  prepare                 9.0   8.8   8.9   9.1   9.0   9.4    9.0     8.9   9.3   8.8   9.2   8.8   9.0    8.9
+  read ahead             20.1  19.8  19.7  19.6  19.9  20.6   19.9    19.2  20.2  18.9  20.8  19.3  19.2   19.2
+    unspent outputs      16.6  16.3  16.5  16.2  16.5  17.1   16.5    16.5  17.2  16.2  17.8  16.4  16.6   16.6
+    groups of spenders    2.0   2.1   1.9   1.9   2.0   2.0    2.0     1.9   2.0   1.9   2.2   1.9   1.9    1.9
+    balances              0.0   0.0   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0   0.0   0.0    0.0
+    mempool               0.0   0.0   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0   0.0   0.0    0.0
+  apply the rules        29.3  32.7  30.3  29.2  28.9  29.6   29.5    31.7  32.1  30.4  30.5  30.4  31.5   31.0
+  write the batch        75.8  82.2  76.5  78.8  79.9  78.7   78.8    79.1  80.3  77.9  81.6  79.3  79.9   79.6
+  whole block           134.0 143.5 135.4 136.6 137.6 138.4  137.1   138.9 141.9 136.0 142.1 137.8 139.6  139.2
+  one batch a block: 65410 keys and 6270870 bytes, and 65410 keys and 6270870 bytes
+  the sequential import, whole block, medians: 670.5 and 678.8
+
+every transaction in the mempool first, as at the tip
+                                    before (9be69e06)                              with the copy
+  prepare                 9.3   9.2   9.5   9.5   9.6   9.5    9.5     9.8  10.0  10.0  10.4   9.9  10.2   10.0
+  read ahead             87.4  88.0  88.1  87.7  90.5  89.7   88.0    34.3  34.8  34.7  36.0  35.2  35.5   35.0
+    unspent outputs      14.0  13.9  13.9  13.7  15.0  14.3   13.9    17.0  17.1  17.0  17.3  17.5  17.6   17.2
+    groups of spenders    0.0   0.0   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0   0.0   0.0    0.0
+    balances              0.0   0.0   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0   0.0   0.0    0.0
+    mempool              72.3  73.0  73.1  72.9  74.3  74.2   73.0    17.3  17.7  17.7  18.7  17.7  17.9   17.7
+  apply the rules       107.1 109.9 107.9 112.1 114.9 113.8  111.0   113.2 121.9 117.0 121.7 119.7 121.7  120.7
+  write the batch       160.4 162.7 158.3 163.1 165.1 163.2  162.9   172.0 172.3 166.0 170.9 169.7 176.5  171.4
+  whole block           364.1 369.8 363.8 372.4 380.1 376.3  371.1   329.3 339.0 327.8 339.0 334.5 343.9  336.8
+  one batch a block: 124514 keys and 8981491 bytes, and 124514 keys and 8981491 bytes
+  the sequential import, whole block, medians: 1096.2 and 1086.2
+
+The fifth run of the code with the copy, which is near those medians:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 13.3 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6270870 bytes
+                                           sequential  in stages
+  prepare                                         0.0        8.8
+  read ahead                                      0.0       19.3
+    unspent outputs                               0.0       16.4
+    groups of spenders                            0.0        1.9
+    balances                                      0.0        0.0
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       601.7       30.4
+  write the batch                                83.1       79.3
+  whole block                                   684.8      137.8
+  faster by                                                 5.0x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 8981491 bytes
+                                           sequential  in stages
+  prepare                                         0.0        9.9
+  read ahead                                      0.0       35.2
+    unspent outputs                               0.0       17.5
+    groups of spenders                            0.0        0.0
+    balances                                      0.0        0.0
+    mempool                                       0.0       17.7
+  apply the rules (sequential: reads too)       913.2      119.7
+  write the batch                               172.1      169.7
+  whole block                                  1085.3      334.5
+  faster by                                                 3.2x
+
+the copy in memory of the mempool area, with 3500 transactions in the mempool
+  59104 keys, 5.6 MiB of keys and values
+  loaded from the database in 97 ms
+  heap: run with +RTS -T to have it measured
+
+The second run of the code before it:
+
+cores used: 4
+building a database with 1000000 unspent outputs at 500000 addresses
+built in 13.3 s
+blocks of 3501 transactions, 7001 inputs and 7001 outputs
+
+mempool empty, as when syncing or catching up (milliseconds a block, mean of 5)
+  one batch a block: 65410 keys set or deleted, 6270870 bytes
+                                           sequential  in stages
+  prepare                                         0.0        8.8
+  read ahead                                      0.0       19.8
+    unspent outputs                               0.0       16.3
+    groups of spenders                            0.0        2.1
+    balances                                      0.0        0.0
+    mempool                                       0.0        0.0
+  apply the rules (sequential: reads too)       611.8       32.7
+  write the batch                                79.2       82.2
+  whole block                                   691.0      143.5
+  faster by                                                 4.8x
+
+every transaction in the mempool first, as at the tip (milliseconds a block, mean of 5)
+  one batch a block: 124514 keys set or deleted, 8981491 bytes
+                                           sequential  in stages
+  prepare                                         0.0        9.2
+  read ahead                                      0.0       88.0
+    unspent outputs                               0.0       13.9
+    groups of spenders                            0.0        0.0
+    balances                                      0.0        0.0
+    mempool                                       0.0       73.0
+  apply the rules (sequential: reads too)       899.3      109.9
+  write the batch                               171.5      162.7
+  whole block                                  1070.8      369.8
+  faster by                                                 2.9x
+
+What the copy costs with 25,000 transactions in the mempool, the end of
+the output of `haskoin-store-bench import 1000000 25000 1 +RTS -N4 -A64m -T`
+(a second run loaded it in 280 ms):
+
+the copy in memory of the mempool area, with 25000 transactions in the mempool
+  401125 keys, 38.5 MiB of keys and values
+  loaded from the database in 264 ms
+  heap: 84.6 MiB, 3549 bytes a transaction
+  a full collection: 27 ms with the copy, 16 ms without
+
+What is taken from the copy ahead of the rules. One program, told by an
+environment variable what to read ahead, in turn; the import in stages
+of a block at the tip, milliseconds, medians of three runs but for
+"nothing", which is one run:
+
+                                              read ahead   of it: mempool   the rules   together
+  everything that was read ahead before             48.7             32.0       104.7      153.4
+  nothing                                           15.4              0.0       146.2      161.6
+  the bodies                                        20.8              4.0       137.9      159.0
+  the bodies and the spenders of spent outputs      26.0              9.2       133.2      159.2
+  the bodies and the summaries of the addresses     34.5             17.6       114.2      148.9
+
+When the copy is changed. One program, told by an environment variable,
+in turn with the code before the copy; the write of the batch of a block
+at the tip, milliseconds, medians of three runs:
+
+  without a copy (9be69e06)                         168.6
+  after the write, in the same thread               210.4
+  during the write, a thread on the same core       202.3
+  during the write, a thread on another core        170.0
+
+The reads by themselves, in a program of their own, on a map of 48,000
+keys and of 360,000, nanoseconds each:
+
+                                                   48,000    360,000
+  serialise the key of a mempool spender              152        102
+  the same with encode                                611        988
+  look it up in the ordered map                       213        318
+  look it up in a hash map                             71        169
+  decode the spender                                  143        131
+  all three, with the ordered map                     418        521
+  delete a key from the ordered map                   323        713
+  add a key to the ordered map                        533        994
+  delete a key from a hash map                        198        773
+  add a key to a hash map                             255        564
+  serialise the key of the summary of an address      414
+
+========================================================================
+5. A mined block validated, and not: the fifth table
+========================================================================
+
+The benchmark with its four kinds of block was run on the code that
+still checked a block (commit f82516ea, with the benchmark of this
+change) and on the code that does not, in turn, four times each, the
+order turned from one round to the next, as
+`haskoin-store-bench import +RTS -N4 -A64m`. A block of chains has 3,501
+transactions and 7,001 inputs, of which 5,180 spend an output of the
+block; the other blocks have 350 such inputs. The mempool of the fourth
+kind has 3,500 transactions. The import in stages, milliseconds a block,
+each run and the median:
+
+mempool empty, as when syncing or catching up
+                             before (f82516ea)                  not validated
+  prepare                8.9   8.8   8.7   8.9    8.9     9.6   9.3   9.8   9.4    9.5
+  read ahead            19.7  19.3  19.2  19.5   19.4    17.2  16.3  17.1  17.2   17.1
+    unspent outputs     17.0  16.6  16.5  16.9   16.8    17.2  16.2  17.1  17.2   17.1
+    groups of spenders   1.8   1.9   1.9   1.8    1.9     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool              0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+  apply the rules       30.0  29.4  28.7  27.1   29.0    36.9  31.4  30.9  31.2   31.3
+  write the batch       78.4  79.3  78.7  76.4   78.6    81.7  77.2  75.6  78.5   77.8
+  whole block          137.0 136.8 135.4 132.0  136.1   145.5 134.2 133.4 136.4  135.3
+  one batch a block: 65410 keys and 6270870 bytes, and 65410 keys and 6270870 bytes
+  the sequential import, whole block, medians: 684.1 and 670.2
+
+mempool empty, a block of chains: three inputs in four spend an output of the block
+                             before (f82516ea)                  not validated
+  prepare               10.2  10.5  10.2  10.7   10.3    10.4  10.3  10.3  10.5   10.4
+  read ahead            13.9  13.6  13.8  14.2   13.9     5.9   5.8   6.0   6.3    6.0
+    unspent outputs      8.0   7.8   8.0   8.3    8.0     5.9   5.8   6.0   6.3    6.0
+    groups of spenders   4.9   4.8   4.8   4.9    4.8     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool              0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+  apply the rules       25.6  28.1  26.5  27.7   27.1    27.4  27.4  26.5  28.8   27.4
+  write the batch       63.0  64.4  62.6  66.1   63.7    62.3  63.2  63.0  65.2   63.1
+  whole block          112.7 116.6 113.1 118.8  114.8   105.9 106.7 105.8 110.8  106.3
+  one batch a block: 49240 keys and 4984172 bytes, and 49240 keys and 4984172 bytes
+  the sequential import, whole block, medians: 508.4 and 503.8
+
+every transaction in the mempool first, as at the tip
+                             before (f82516ea)                  not validated
+  prepare               10.4  10.1  10.3  10.2   10.2     9.5   9.0   8.6   9.7    9.2
+  read ahead            43.7  43.9  45.3  44.9   44.4    39.3  36.4  36.5  41.0   37.9
+    unspent outputs     15.8  16.2  16.3  15.7   16.0    20.3  19.6  19.6  20.9   20.0
+    groups of spenders   9.8   9.5   9.8  10.2    9.8     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool             18.0  18.1  19.2  19.0   18.6    19.0  16.9  16.9  20.1   17.9
+  apply the rules      119.2 120.4 120.8 120.5  120.5   116.0 109.2 110.9 127.5  113.5
+  write the batch      176.6 181.2 172.2 175.5  176.1   181.3 175.4 176.6 199.5  178.9
+  whole block          349.9 355.6 348.6 351.1  350.5   346.2 330.1 332.7 377.8  339.4
+  one batch a block: 124515 keys and 8981542 bytes, and 124515 keys and 8981542 bytes
+  the sequential import, whole block, medians: 1109.7 and 1109.9
+
+a mempool of other transactions, and a block of chains that it has not seen
+                             before (f82516ea)                  not validated
+  prepare                9.5   9.6   9.8   9.8    9.7    10.8  10.4  10.6  11.6   10.7
+  read ahead            35.6  36.5  36.1  37.0   36.3    16.4  15.6  15.8  17.6   16.1
+    unspent outputs     13.0  13.2  13.2  13.7   13.2     5.2   5.0   5.0   5.5    5.1
+    groups of spenders  11.4  12.0  11.8  11.8   11.8     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool             11.2  11.3  11.1  11.5   11.2    11.2  10.7  10.8  12.1   11.0
+  apply the rules       34.6  35.8  34.6  35.1   34.9    31.2  31.3  32.8  35.7   32.0
+  write the batch       82.9  79.8  78.4  79.0   79.4    78.8  79.3  79.3  87.3   79.3
+  whole block          162.6 161.6 158.9 160.9  161.2   137.2 136.7 138.5 152.2  137.8
+  one batch a block: 49239 keys and 4984759 bytes, and 49239 keys and 4984759 bytes
+  the sequential import, whole block, medians: 561.5 and 559.5
+
+A third program ran in turn with those two: the code that does not check
+a block, without the second look at each output as it is spent, which is
+a look in the changes of the batch. Medians of four runs, the rules, with
+the look and without: 31.3 and 30.4, 27.4 and 28.4, 113.5 and 110.0, 32.0
+and 33.2. The whole block: 135.3 and 134.6, 106.3 and 107.8, 339.4 and
+336.0, 137.8 and 144.0. No difference that the runs can tell from each
+other, so the look stays.
+
+========================================================================
+6. The outputs that mempool transactions spend, read again and remembered:
+   the sixth table
+========================================================================
+
+The benchmark was run on the code that read from RocksDB every output
+that a block spends (commit ec4774ec) and on the code that remembers
+those that mempool transactions spend, in turn, four times each, the
+order turned from one round to the next, as
+`haskoin-store-bench import +RTS -N4 -A64m`. The import in stages,
+milliseconds a block, each run and the median:
+
+mempool empty, as when syncing or catching up
+                           read again (ec4774ec)                  remembered
+  prepare                9.4   9.2   9.4   9.0    9.3     9.1   9.6   9.7   9.0    9.3
+  read ahead            17.5  17.4  17.5  16.6   17.4    16.6  17.4  17.2  17.1   17.1
+    unspent outputs     17.5  17.3  17.5  16.6   17.4    16.6  17.3  17.2  17.1   17.1
+    groups of spenders   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool              0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+  apply the rules       32.5  32.7  33.4  32.0   32.6    28.6  30.2  34.2  32.8   31.5
+  write the batch       81.3  78.6  75.6  79.2   78.9    74.4  76.1  80.0  76.8   76.4
+  whole block          140.6 137.9 135.9 136.8  137.4   128.7 133.3 141.1 135.7  134.5
+  one batch a block: 65410 keys and 6270870 bytes, and 65410 keys and 6270870 bytes
+  the sequential import, whole block, medians: 653.2 and 674.2
+
+mempool empty, a block of chains: three inputs in four spend an output of the block
+                           read again (ec4774ec)                  remembered
+  prepare                9.9  10.1  10.7  10.5   10.3    10.1  10.2  10.2  10.1   10.1
+  read ahead             6.1   6.1   6.0   5.8    6.0     5.5   6.0   6.6   5.9    6.0
+    unspent outputs      6.1   6.1   6.0   5.8    6.0     5.5   6.0   6.6   5.9    6.0
+    groups of spenders   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool              0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+  apply the rules       27.4  27.0  27.2  28.5   27.3    26.7  27.4  26.8  28.4   27.1
+  write the batch       62.2  62.7  62.6  61.9   62.4    62.6  61.8  62.6  63.2   62.6
+  whole block          105.6 105.9 106.5 106.6  106.2   104.9 105.2 106.2 107.6  105.7
+  one batch a block: 49240 keys and 4984172 bytes, and 49240 keys and 4984172 bytes
+  the sequential import, whole block, medians: 507.1 and 498.9
+
+every transaction in the mempool first, as at the tip
+                           read again (ec4774ec)                  remembered
+  prepare                8.7   8.9   9.2   9.0    8.9     9.0   8.8   8.6   8.9    8.9
+  read ahead            36.1  36.5  37.1  36.6   36.5    25.7  26.5  25.6  26.2   25.9
+    unspent outputs     18.8  19.6  20.0  19.0   19.3     6.1   6.2   6.0   6.3    6.2
+    groups of spenders   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool             17.3  16.9  17.0  17.5   17.1    19.6  20.3  19.6  19.9   19.8
+  apply the rules      108.2 105.0 105.8 106.2  106.0   114.4 111.1 108.9 110.5  110.8
+  write the batch      184.1 181.2 170.8 175.2  178.2   173.1 175.6 182.3 177.1  176.3
+  whole block          337.0 331.6 322.9 327.0  329.3   322.2 322.0 325.4 322.6  322.4
+  one batch a block: 124515 keys and 8981542 bytes, and 124515 keys and 8981542 bytes
+  the sequential import, whole block, medians: 1104.1 and 1085.8
+
+a mempool of other transactions, and a block of chains that it has not seen
+                           read again (ec4774ec)                  remembered
+  prepare               10.4  10.2  10.5  11.0   10.4    10.3  10.6  10.2  10.5   10.4
+  read ahead            15.5  15.5  15.5  16.1   15.5    16.0  16.0  15.9  15.9   15.9
+    unspent outputs      4.9   4.8   4.9   5.0    4.9     4.9   5.2   5.0   5.0    5.0
+    groups of spenders   0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    balances             0.0   0.0   0.0   0.0    0.0     0.0   0.0   0.0   0.0    0.0
+    mempool             10.7  10.6  10.6  11.1   10.6    11.1  10.9  10.9  10.9   10.9
+  apply the rules       32.5  32.1  31.7  31.2   31.9    31.7  32.2  31.3  31.8   31.8
+  write the batch       80.8  79.4  79.2  82.9   80.1    78.9  81.9  80.5  79.2   79.8
+  whole block          139.3 137.1 136.8 141.2  138.2   136.8 140.6 137.8 137.4  137.6
+  one batch a block: 49239 keys and 4984759 bytes, and 49239 keys and 4984759 bytes
+  the sequential import, whole block, medians: 552.5 and 559.6
+
+What is remembered, and its heap, with the copy of the mempool area: the
+end of the output of `haskoin-store-bench import +RTS -N4 -A64m -T`, and
+of `haskoin-store-bench import 1000000 25000 1 +RTS -N4 -A64m -T`. The
+heap of the outputs is that of the copy which the batches made, with the
+outputs, less that of the copy loaded again, without them.
+
+the copy in memory of the mempool area, with 3500 transactions in the mempool
+  59103 keys, 5.6 MiB of keys and values
+  loaded from the database in 91 ms
+  6650 outputs that those transactions spend are remembered
+  heap: 12.4 MiB, 3721 bytes a transaction
+  a full collection: 8 ms with the copy, 6 ms without
+  heap of the outputs remembered: 1.4 MiB, 225 bytes an output
+
+the copy in memory of the mempool area, with 25000 transactions in the mempool
+  401125 keys, 38.5 MiB of keys and values
+  loaded from the database in 285 ms
+  47500 outputs that those transactions spend are remembered
+  heap: 84.7 MiB, 3550 bytes a transaction
+  a full collection: 25 ms with the copy, 17 ms without
+  heap of the outputs remembered: 7.4 MiB, 162 bytes an output

@@ -14,11 +14,11 @@ module Haskoin.Store.Integration.Valkey
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Database.Redis qualified as Redis
+import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Integration.Image (valkeyBin)
 import Haskoin.Store.Integration.Podman (ContainerSpec (..))
-import UnliftIO (bracket, tryAny)
-import UnliftIO.Concurrent (threadDelay)
 
 -- | Valkey, the Redis-compatible server of Ubuntu, from the test image, listening on every interface of the container
 -- (only its published port is reachable, on 127.0.0.1), with nothing saved

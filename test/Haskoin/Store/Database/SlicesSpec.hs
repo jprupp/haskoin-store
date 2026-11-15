@@ -22,22 +22,22 @@ import Test.QuickCheck
 
 spec :: Spec
 spec = do
-  ctx <- runIO createContext
   modifyMaxSuccess (const 500) $ describe "stored values read in part" $ do
     it "read a block as the full decoder does" $
-      forAll arbitraryBlockData $ \b -> blockData (encode b) `shouldBe` Right b
+      forAll arbitraryBlockData $
+        \b -> blockData (encode b) `shouldBe` Right b
     it "refuse a block that has fewer bytes than its count of transactions" $
       forAll arbitraryBlockData $ \b ->
         let bytes = encode b
             cut = B.take (B.length bytes - 25) bytes
          in not (null b.txs) ==> either (const True) (const False) (blockData cut)
     it "find the transaction of a stored one, and whether it is deleted" $
-      forAll (arbitraryTxData ctx) $ \td ->
+      forAll arbitraryTxData $ \td ->
         txBytes (encode td) `shouldBe` Right (runPutS (serialize td.tx), td.deleted)
     it "give the bytes that building and serializing the transaction gave" $
-      forAll (arbitraryTxData ctx) $ \td ->
+      forAll arbitraryTxData $ \td ->
         fmap fst (txBytes (encode td))
-          `shouldBe` Right (runPutS (serialize (transactionData (toTransaction btc ctx td))))
+          `shouldBe` Right (runPutS (serialize (transactionData (toTransaction btc td))))
 
 arbitraryBlockData :: Gen BlockData
 arbitraryBlockData =
@@ -53,11 +53,11 @@ arbitraryBlockData =
     <*> arbitrary
     <*> arbitrary
 
-arbitraryTxData :: Ctx -> Gen TxData
-arbitraryTxData ctx =
+arbitraryTxData :: Gen TxData
+arbitraryTxData =
   TxData
     <$> oneof [MemRef <$> arbitrary, BlockRef <$> arbitrary <*> arbitrary]
-    <*> oneof [arbitraryTx btc ctx, arbitraryWitnessTx btc ctx, arbitraryLegacyTx btc ctx]
+    <*> oneof [arbitraryTx btc, arbitraryWitnessTx btc, arbitraryLegacyTx btc]
     <*> (IntMap.fromList <$> listOf ((,) <$> choose (0, 1000) <*> (Prev <$> arbitraryBS <*> arbitrary)))
     <*> arbitrary
     <*> arbitrary

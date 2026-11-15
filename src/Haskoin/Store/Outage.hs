@@ -32,12 +32,13 @@ module Haskoin.Store.Outage
   )
 where
 
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, swapTVar)
 import Control.Monad (when)
 import Data.Maybe (isJust)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Haskoin.Node (LogLevel (..))
-import UnliftIO (TVar, atomically, newTVarIO, swapTVar, tryAny)
+import Haskoin.Store.Exception (tryAny)
 
 -- | Whether the last attempt at something failed.
 newtype Outage = Outage (TVar Bool)

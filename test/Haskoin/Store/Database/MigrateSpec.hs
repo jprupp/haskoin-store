@@ -2,22 +2,22 @@
 
 module Haskoin.Store.Database.MigrateSpec (spec) where
 
+import Control.Exception (Exception (..), throwIO, try)
 import Control.Monad (foldM, forM_, void, when)
 import Data.ByteString qualified as B
 import Data.Either (isRight, rights)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (sort)
+import Data.List (isInfixOf, sort)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Serialize (decode, encode)
 import Data.Text qualified as T
 import Data.Word (Word16, Word32, Word64)
-import Database.RocksDB (BatchOp (..))
+import Database.RocksDB (BatchOp (..), columnFamilies, compactRange)
 import Database.RocksDB.Query (insert, insertOp, retrieve, writeBatch)
 import Haskoin
   ( BlockHeader (..),
-    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -26,7 +26,6 @@ import Haskoin
     TxOut (..),
     btcRegTest,
     headerHash,
-    prepareContext,
     scriptToAddressBS,
     sha256,
     txHash,
@@ -46,23 +45,24 @@ import Haskoin.Store.Database.Reader
   )
 import Haskoin.Store.Database.Types (MigrationKey (..), SpenderKey (..), SpenderVal (..), VersionKey (..))
 import Haskoin.Store.Histories
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.TestBlocks (script)
+import System.IO.Error (ioeGetErrorString)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
 import Test.QuickCheck (forAll, ioProperty, property, tabulate, vectorOf)
-import UnliftIO (Exception, throwIO, try, withSystemTempDirectory)
 
 spec :: Spec
-spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
+spec = describe "migration to the layered layout" $ do
   it "takes the mempool out of the chain's indices, keeping every answer" $
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
       -- A coin of a block; a payment from it in the mempool, with change;
       -- and a transaction that spends that change, also in the mempool.
-      (hist, old) <- mixedDatabase ctx dir $ \db hist0 -> do
+      (hist, old) <- mixedDatabase dir $ \db hist0 -> do
         let payment = Tx 2 [TxIn (coinOf hist0) "" maxBound] [TxOut 3000 (p2pkh 1), TxOut 2000 script] [] 0
             child = Tx 2 [TxIn (OutPoint (txHash payment) 1) "" maxBound] [TxOut 1500 (p2pkh 2)] [] 0
         foldM (addTx db) hist0 [payment, child]
-      (miner, one, two) <- case rights (map (scriptToAddressBS net ctx) [script, p2pkh 1, p2pkh 2]) of
+      (miner, one, two) <- case rights (map (scriptToAddressBS net) [script, p2pkh 1, p2pkh 2]) of
         [a, b, c] -> return (a, b, c)
         _ -> fail "a script has no address"
       let numbers bs a = fmap (\b -> (b.confirmed, b.unconfirmed, b.utxo, b.txs, b.received)) (lookup a bs)
@@ -70,7 +70,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
       numbers old.balances miner `shouldBe` Just (0, 0, 0, 3, 5000002000)
       numbers old.balances one `shouldBe` Just (0, 3000, 1, 1, 3000)
       numbers old.balances two `shouldBe` Just (0, 1500, 1, 1, 1500)
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         migrateLayered db `shouldReturn` Migration {moved = 2, batches = 1, checked = 2, rewritten = 0}
         retrieve db.db VersionKey `shouldReturn` Just layeredVersion
         (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
@@ -91,14 +91,14 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
       property . forAll ((,) <$> vectorOf 45 anyNumber <*> vectorOf 12 anyNumber) $ \(seeds, last') -> ioProperty $ do
         withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
           -- anything at first, then payments, so that the mempool has something
-          (hist, old) <- mixedDatabase ctx dir $ \db hist0 -> foldM (step db) hist0 (seeds <> onlyPayments last')
+          (hist, old) <- mixedDatabase dir $ \db hist0 -> foldM (step db) hist0 (seeds <> onlyPayments last')
           withSystemTempDirectory "haskoin-store-chain-" $ \dir' ->
-            open20 net ctx dir' $ \fresh -> do
+            open20 net dir' $ \fresh -> do
               -- the same blocks, in a database that never saw the mempool
               void (run fresh mixedRules.initBest) :: IO ()
               forM_ (reverse hist.chain) $ \(block, node) ->
                 run fresh (\w -> mixedRules.importBlock w block node) >>= either (fail . show) (\_ -> return ())
-              openLayered net ctx dir $ \db -> do
+              openLayered net dir $ \db -> do
                 done <- migrateLayeredWith defaultMigrationOptions {chunk = 3} db
                 done.checked `shouldBe` length old.mempool
                 done.moved `shouldBe` length old.mempool
@@ -115,7 +115,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 -- the mempool area is the keys of its transactions, each worked
                 -- out from that transaction alone: no more and no less
                 moved <- catMaybes <$> mapM (M.getMempoolTx db . snd) old.mempool
-                let records = [M.mempoolRecords net ctx time td | td <- moved, MemRef time <- [td.block]]
+                let records = [M.mempoolRecords net time td | td <- moved, MemRef time <- [td.block]]
                 length records `shouldBe` length old.mempool
                 dump db (mempoolCF db.db) `shouldReturn` sort (concatMap (fst . M.recordEntries) records)
                 dump db (mempoolAddrCF db.db) `shouldReturn` sort (M.addressArea records)
@@ -142,17 +142,17 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
   it "carries on after being interrupted, between any two writes" $
     forM_ [1 .. 6] $ \stopAt ->
       withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
-        (hist, old) <- mixedDatabase ctx dir $ \db hist0 -> foldM (addTx db) hist0 (payments (coinOf hist0))
+        (hist, old) <- mixedDatabase dir $ \db hist0 -> foldM (addTx db) hist0 (payments (coinOf hist0))
         length old.mempool `shouldBe` 8
         -- one transaction in each write, and the plug pulled after a few
         let pull n = when (n == stopAt) (throwIO Interrupted)
             interrupted = defaultMigrationOptions {chunk = 1, afterBatch = pull}
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           try (migrateLayeredWith interrupted db) `shouldReturn` Left Interrupted
           -- a store of version 20 would refuse the database from here on
           retrieve db.db VersionKey `shouldReturn` Just layeredVersion
           (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Just 20
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           done <- migrateLayered db
           done.moved `shouldBe` length old.mempool - stopAt
           done.checked `shouldBe` length old.mempool
@@ -163,18 +163,18 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
 
   it "refuses a database that it cannot handle, and leaves it untouched" $ do
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         migrateLayered db `shouldThrow` (== UnknownVersion Nothing)
         insert db.db VersionKey (19 :: Word32)
         migrateLayered db `shouldThrow` (== UnknownVersion (Just 19))
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
       -- the mempool lists a transaction that has no body
       let lost = TxHash (sha256 ("lost" :: B.ByteString))
-      _ <- mixedDatabase ctx dir $ \db hist0 -> do
+      _ <- mixedDatabase dir $ \db hist0 -> do
         hist1 <- foldM (addTx db) hist0 (take 5 (payments (coinOf hist0)))
         writeBatch db.db (mempoolInsertOps db.db lost 7)
         return hist1
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         migrateLayered db `shouldThrow` \case
           Inconsistent _ -> True
           _ -> False
@@ -187,16 +187,16 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
   it "brings a database of any version that the store knows to the layout it runs on" $ do
     -- a new database
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         upgradeDatabase (\_ -> return ()) db
           `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
         retrieve db.db VersionKey `shouldReturn` Just currentVersion
     -- one of version 20 with a mempool, and then the same one again
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
-      (hist, old) <- mixedDatabase ctx dir $ \db hist0 ->
+      (hist, old) <- mixedDatabase dir $ \db hist0 ->
         foldM (addTx db) hist0 (take 5 (payments (coinOf hist0)))
       forM_ [5, 0] $ \moved ->
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           done <- upgradeDatabase (\_ -> return ()) db
           done.moved `shouldBe` moved
           retrieve db.db VersionKey `shouldReturn` Just currentVersion
@@ -205,9 +205,9 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           M.wrongSummaries db `shouldReturn` []
     -- one of version 19, which had no index of the mempool by time
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir -> do
-      (hist, old) <- mixedDatabase ctx dir $ \db hist0 ->
+      (hist, old) <- mixedDatabase dir $ \db hist0 ->
         foldM (addTx db) hist0 (take 3 (payments (coinOf hist0)))
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         index <- dump db (mempoolCF db.db)
         writeBatch db.db $
           insertOp VersionKey (19 :: Word32)
@@ -217,14 +217,107 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         layered db (ask hist) `shouldReturn` old
     -- and one of a version that it does not know
     withSystemTempDirectory "haskoin-store-migrate-" $ \dir ->
-      openLayered net ctx dir $ \db -> do
+      openLayered net dir $ \db -> do
         insert db.db VersionKey (17 :: Word32)
         upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just 17))
+
+  describe "version 23, in which blocks write merge records" $ do
+    it "takes a database of version 22 with one write, and then imports blocks as a new database does" $
+      withSystemTempDirectory "haskoin-store-merges-" $ \dir ->
+        withSystemTempDirectory "haskoin-store-fresh-" $ \dirFresh ->
+          withShadow net $ \shadow -> do
+            -- a history, cut in two: what a store of version 22 saw, and
+            -- what came after it was upgraded
+            let seeds = onlyPayments [1 .. 6] <> [8, 9, 24, 40] <> onlyPayments [7 .. 12] <> [25, 41, 30, 56]
+                choose' hist seed =
+                  plan shadow hist seed >>= \case
+                    (hist', Nothing) -> return (hist', Nothing)
+                    (hist', Just op) -> do
+                      out <- apply mixedRules shadow op
+                      return (record shadow hist' op out, Just op)
+                collect hist [] = return (hist, [])
+                collect hist (seed : more) = do
+                  (hist', op) <- choose' hist seed
+                  fmap (maybe id (:) op) <$> collect hist' more
+            hist0 <- openOlder net dir $ \db -> start sequentialRules db
+            (hist, ops) <- collect hist0 seeds
+            let (seen, rest) = splitAt (length ops `div` 2) ops
+            length [() | Mine _ _ <- seen] `shouldSatisfy` (> 0)
+            length [() | Mine _ _ <- rest] `shouldSatisfy` (> 0)
+            -- as version 22 wrote it: whole values, no merge operators, and
+            -- without the column family that came with version 23
+            openOlder net dir $ \db -> do
+              forM_ seen (apply sequentialRules db)
+              insert db.db VersionKey recordsVersion
+              length (columnFamilies db.db) `shouldBe` 10
+            upgraded <- openLayered net dir $ \db -> do
+              said <- newIORef []
+              upgradeDatabase (\line -> modifyIORef' said (line :)) db
+                `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
+              retrieve db.db VersionKey `shouldReturn` Just currentVersion
+              (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
+              readIORef said >>= (`shouldSatisfy` any ("merge records" `T.isInfixOf`))
+              length (columnFamilies db.db) `shouldBe` 11
+              -- a second run finds nothing to do, and says nothing
+              upgradeDatabase (\_ -> fail "nothing to say") db
+                `shouldReturn` Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
+              forM_ rest (apply layeredRules db)
+              contents db hist
+            fresh <- openLayered net dirFresh $ \db -> do
+              void (upgradeDatabase (\_ -> return ()) db)
+              void (start layeredRules db)
+              forM_ ops (apply layeredRules db)
+              contents db hist
+            fst upgraded `shouldBe` fst fresh
+            snd upgraded `shouldBe` snd fresh
+            -- and the same once it is closed, opened and compacted
+            again <- openLayered net dir $ \db -> do
+              forM_ (columnFamilies db.db) $ \cf -> compactRange db.db (Just cf) Nothing Nothing
+              contents db hist
+            again `shouldBe` fresh
+
+    it "refuses the database of a newer store, and one whose version does not fit its marker, untouched" $
+      withSystemTempDirectory "haskoin-store-merges-" $ \dir ->
+        openLayered net dir $ \db -> do
+          void (upgradeDatabase (\_ -> return ()) db)
+          retrieve db.db VersionKey `shouldReturn` Just (23 :: Word32)
+          insert db.db VersionKey (24 :: Word32)
+          upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just 24))
+          retrieve db.db VersionKey `shouldReturn` Just (24 :: Word32)
+          displayException (UnknownVersion (Just 24)) `shouldSatisfy` ("newer haskoin-store" `isInfixOf`)
+          -- no migration leaves a marker with the current version
+          writeBatch db.db [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
+          upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just currentVersion))
+          migrateRecords (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just currentVersion))
+          retrieve db.db VersionKey `shouldReturn` Just currentVersion
+
+    it "cannot be opened by a store that does not know the merge operators, which leaves its merge records be" $
+      withSystemTempDirectory "haskoin-store-merges-" $ \dir -> withShadow net $ \shadow -> do
+        let seeds = onlyPayments [1 .. 6] <> [8, 9, 24]
+            go db hist seed =
+              plan shadow hist seed >>= \case
+                (hist', Nothing) -> return hist'
+                (hist', Just op) -> do
+                  void (apply mixedRules shadow op)
+                  record db hist' op <$> apply layeredRules db op
+        -- blocks with merge records, which are in the write-ahead log and
+        -- in no table file when the database is closed
+        (hist, written) <- openLayered net dir $ \db -> do
+          void (upgradeDatabase (\_ -> return ()) db)
+          hist <- start layeredRules db >>= \h -> foldM (go db) h seeds
+          (hist,) <$> contents db hist
+        length [() | cf <- fst written, not (null cf)] `shouldSatisfy` (> 5)
+        -- RocksDB would open the database without the merge operators,
+        -- and drop those merge records: it does not get that far, for
+        -- want of the column family that such a store does not know
+        openOlder net dir (\_ -> return ()) `shouldThrow` \e ->
+          "merge-operators" `isInfixOf` ioeGetErrorString e
+        openLayered net dir (\db -> contents db hist) `shouldReturn` written
 
   describe "the time of a confirmed transaction" $ do
     it "is the time of its block, not of when the store first saw it" $
       withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           hist <- start layeredRules db
           let tx = Tx 2 [TxIn (coinOf hist) "" maxBound] [TxOut 4000 (p2pkh 1)] [] 0
               stored = do
@@ -252,7 +345,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- that are reverted and replaced
         property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
           withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+            openLayered net dir $ \db -> withShadow net $ \shadow -> do
               hist0 <- start layeredRules db
               void (foldM (walk shadow db) hist0 seeds)
               late <- wrongTimes db
@@ -266,7 +359,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- migration must give back the database as it was, byte for byte.
         property . forAll (vectorOf 40 anyNumber) $ \seeds -> ioProperty $
           withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+            openLayered net dir $ \db -> withShadow net $ \shadow -> do
               hist0 <- start layeredRules db
               void (foldM (walk shadow db) hist0 seeds)
               original <- dump db (txCF db.db)
@@ -294,7 +387,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- record has spenders in it.
         property . forAll (vectorOf 60 anyNumber) $ \seeds -> ioProperty $
           withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+            openLayered net dir $ \db -> withShadow net $ \shadow -> do
               hist0 <- start layeredRules db
               let records = do
                     rows <- dump db (txCF db.db)
@@ -310,7 +403,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
                 `shouldBe` []
     it "has the spenders of its outputs under a key for each sixteen of them" $
       withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           hist <- start layeredRules db
           -- forty outputs, of which three are spent, in three groups
           let wide = Tx 2 [TxIn (coinOf hist) "" maxBound] (replicate 40 (TxOut 1000 (p2pkh 1))) [] 0
@@ -362,7 +455,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
         -- migration must give back the records and the keys as they were.
         property . forAll (vectorOf 40 anyNumber) $ \seeds -> ioProperty $
           withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-            openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+            openLayered net dir $ \db -> withShadow net $ \shadow -> do
               hist0 <- start layeredRules db
               void (foldM (walk shadow db) hist0 seeds)
               records <- dump db (txCF db.db)
@@ -388,7 +481,7 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
               dump db (spenderCF db.db) `shouldReturn` keys
     it "is set by a migration that carries on after it was interrupted" $
       withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-        openLayered net ctx dir $ \db -> withShadow net ctx $ \shadow -> do
+        openLayered net dir $ \db -> withShadow net $ \shadow -> do
           hist0 <- start layeredRules db
           -- payments, and then blocks, which confirm some of them
           void (foldM (walk shadow db) hist0 (onlyPayments [1 .. 6] <> [8 .. 11]))
@@ -396,8 +489,10 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           let confirmed = [(k, td :: TxData) | (k, v) <- original, Right td <- [decode v], inChain td]
           length confirmed `shouldSatisfy` (> 0)
           -- as a migration leaves it that stopped before its first change
+          -- by a store of version 22, or by this one: the version is that
+          -- of the records, with the marker of the migration to it
           writeBatch db.db $
-            [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
+            [insertOp VersionKey recordsVersion, insertOp MigrationKey layeredVersion]
               <> [PutCF (txCF db.db) k (encode ((td :: TxData) {timestamp = 7})) | (k, td) <- confirmed]
           said <- newIORef []
           done <- upgradeDatabase (\line -> modifyIORef' said (line :)) db
@@ -405,9 +500,11 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           dump db (txCF db.db) `shouldReturn` original
           (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
           readIORef said >>= (`shouldSatisfy` any ("Carrying on" `T.isPrefixOf`))
+          -- and goes on to the version that the store runs on
+          retrieve db.db VersionKey `shouldReturn` Just currentVersion
     it "is not guessed for a transaction whose block the database does not have" $
       withSystemTempDirectory "haskoin-store-times-" $ \dir ->
-        openLayered net ctx dir $ \db -> do
+        openLayered net dir $ \db -> do
           _ <- start layeredRules db
           rows <- dump db (txCF db.db)
           let confirmed = [(k, td :: TxData) | (k, v) <- rows, Right td <- [decode v], inChain td]
@@ -420,6 +517,11 @@ spec = prepareContext $ \ctx -> describe "migration to the layered layout" $ do
           upgradeDatabase (\_ -> return ()) db `shouldThrow` \case
             Inconsistent _ -> True
             _ -> False
+
+-- | Every key and value of every column family of a database but the
+-- default one, and what its queries answer about a history.
+contents :: DatabaseReader -> History -> IO ([[(B.ByteString, B.ByteString)]], Answers)
+contents db hist = (,) <$> mapM (dump db) (take 10 (columnFamilies db.db)) <*> layered db (ask hist)
 
 net :: Network
 net = btcRegTest
@@ -440,7 +542,8 @@ walk shadow db hist seed =
 later :: TxData -> TxData
 later td = (td :: TxData) {timestamp = td.timestamp + 12345, rbf = True}
 
--- | Bring a database of version 21 to the version that the store runs on.
+-- | Bring a database of version 21 to the records of version 22, which
+-- are those of the version that the store runs on.
 settle :: DatabaseReader -> IO ()
 settle db = void (migrateRecords (\_ -> return ()) db)
 
@@ -474,12 +577,11 @@ data Interrupted = Interrupted
 -- with a coin, and whatever the function does next. Gives the history, and
 -- the answers of the database to every query about it.
 mixedDatabase ::
-  Ctx ->
   FilePath ->
   (DatabaseReader -> History -> IO History) ->
   IO (History, Answers)
-mixedDatabase ctx dir go =
-  open20 net ctx dir $ \db -> do
+mixedDatabase dir go =
+  open20 net dir $ \db -> do
     hist <- start mixedRules db >>= go db
     answers <- mixed db (ask hist)
     return (hist, answers)

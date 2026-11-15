@@ -33,6 +33,9 @@
 -- limit. Set @HASKOIN_TEST_LOG@ to see the log of the store.
 module Haskoin.Store.IntegrationSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, cancel, link, withAsync)
+import Control.Exception (throwIO, try)
 import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (forM_, forever, replicateM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
@@ -63,7 +66,6 @@ import Database.Redis qualified as Redis
 import Haskoin
   ( Address (..),
     BloomFlags (..),
-    Ctx,
     Network (..),
     OutPoint (..),
     Tx (..),
@@ -84,7 +86,6 @@ import Haskoin
     hexToTxHash,
     makeXPrvKey,
     marshalJSON,
-    prepareContext,
     prvSubKey,
     pubSubKey,
     sha256,
@@ -126,12 +127,12 @@ import Haskoin.Store.Common (StoreEvent (..))
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
+    BlockHealth (..),
     BlockRef (..),
     Event (..),
     EventCommand (..),
     Except (..),
     HealthCheck (..),
-    BlockHealth (..),
     RawResult (..),
     SerialList (..),
     Spender (..),
@@ -141,10 +142,12 @@ import Haskoin.Store.Data
   )
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Fleet.Member (memberTip)
 import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
+import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Integration.Valkey
 import Haskoin.Store.WebClient qualified as Client
 import Haskoin.Store.WebCommon (ApiResource, NoCache (..), NoTx (..))
@@ -158,8 +161,6 @@ import System.Exit (ExitCode (..))
 import System.Log.FastLogger (toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
-import UnliftIO (async, bracket, cancel, link, throwIO, try, tryAny, withAsync, withSystemTempDirectory)
-import UnliftIO.Concurrent (threadDelay)
 
 spec :: Spec
 spec = do
@@ -168,17 +169,17 @@ spec = do
     Left why ->
       it "check the store against Bitcoin Core and Bitcoin Cash Node" $
         pendingWith why
-    Right () -> prepareContext $ \ctx -> do
+    Right () -> do
       forM_ [BitcoinCore, BitcoinCashNode] $ \kind ->
-        aroundAll (withEnvOf False kind ctx) $
+        aroundAll (withEnvOf False kind) $
           describe (name kind <> " that does not whitelist the store") $
             it "publishes what it verified, and keeps its node when sent what it cannot verify" strangerTest
-      aroundAll (withEnvAt True (Just (30 * 24 * 3600)) BitcoinCore ctx) $
+      aroundAll (withEnvAt True (Just (30 * 24 * 3600)) BitcoinCore) $
         describe "Bitcoin Core with blocks of a month ago" $
           it "keeps what a reorganisation of an old block put back in the mempool" oldBlockTest
-      aroundAll (withEnv BitcoinCore ctx) $
+      aroundAll (withEnv BitcoinCore) $
         describe "Bitcoin Core" (chainSpec BitcoinCore)
-      aroundAll (withEnv BitcoinCashNode ctx) $
+      aroundAll (withEnv BitcoinCashNode) $
         describe "Bitcoin Cash Node" (chainSpec BitcoinCashNode)
 
 -- | The name of a node, as people write it.
@@ -233,7 +234,6 @@ data Env = Env
   { kind :: !NodeKind,
     node :: !Node,
     net :: !Network,
-    ctx :: !Ctx,
     store :: !Store,
     -- | base URL of the web server with the cache
     cached :: !String,
@@ -257,20 +257,20 @@ initGap, gap :: Word32
 initGap = 20
 gap = 32
 
-withEnv :: NodeKind -> Ctx -> (Env -> IO ()) -> IO ()
+withEnv :: NodeKind -> (Env -> IO ()) -> IO ()
 withEnv = withEnvOf True
 
 -- | The same with a node that whitelists the store, as an operator's own
 -- node should, or with one that does not. The second announces
 -- transactions seconds later, so the web servers wait longer for one they
 -- published, and it does not give its mempool when asked.
-withEnvOf :: Bool -> NodeKind -> Ctx -> (Env -> IO ()) -> IO ()
+withEnvOf :: Bool -> NodeKind -> (Env -> IO ()) -> IO ()
 withEnvOf whitelisted = withEnvAt whitelisted Nothing
 
 -- | The same, with the first blocks made a number of seconds in the past:
 -- the node's clock is set back for them with @setmocktime@, and left so.
-withEnvAt :: Bool -> Maybe Int -> NodeKind -> Ctx -> (Env -> IO ()) -> IO ()
-withEnvAt whitelisted ago kind ctx go = do
+withEnvAt :: Bool -> Maybe Int -> NodeKind -> (Env -> IO ()) -> IO ()
+withEnvAt whitelisted ago kind go = do
   image <- testImage
   withContainer (redisContainer image) $ \redis -> do
     redisPort <- hostPort redis 6379
@@ -299,7 +299,7 @@ withEnvAt whitelisted ago kind ctx go = do
       void $ generateTo node 150 miner
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
-            cfg = (storeConfig net ctx logger dir redisURL p2pPort False) {syncMempool = whitelisted}
+            cfg = (storeConfig net logger dir redisURL p2pPort False) {syncMempool = whitelisted}
         withStore cfg $ \store -> do
           listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
             let web s = runWebSocket (webConfig logger s)
@@ -314,15 +314,14 @@ withEnvAt whitelisted ago kind ctx go = do
                         { kind = kind,
                           node = node,
                           net = net,
-                          ctx = ctx,
                           store = store,
                           cached = "http://127.0.0.1:" <> show cachedPort,
                           plain = "http://127.0.0.1:" <> show plainPort,
                           miner = miner,
                           redisCache = cache,
                           redis = conn,
-                          configIn = \d -> storeConfig net ctx logger d redisURL p2pPort False,
-                          memberIn = \d -> storeConfig net ctx logger d redisURL p2pPort True
+                          configIn = \d -> storeConfig net logger d redisURL p2pPort False,
+                          memberIn = \d -> storeConfig net logger d redisURL p2pPort True
                         }
                 waitSynced env
                 go env
@@ -346,8 +345,8 @@ withTestLogger f =
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
 -- buffers and caches, as a member of a fleet or not.
-storeConfig :: Network -> Ctx -> Logger -> FilePath -> String -> Int -> Bool -> StoreConfig
-storeConfig net ctx logger dir redisURL p2pPort fleet =
+storeConfig :: Network -> Logger -> FilePath -> String -> Int -> Bool -> StoreConfig
+storeConfig net logger dir redisURL p2pPort fleet =
   StoreConfig
     { maxPeers = 1,
       initPeers = ["127.0.0.1:" <> show p2pPort],
@@ -355,7 +354,6 @@ storeConfig net ctx logger dir redisURL p2pPort fleet =
       db = dir,
       net = net,
       redis = Just redisURL,
-      ctx = ctx,
       initGap = initGap,
       gap = gap,
       redisMinAddrs = 1,
@@ -368,6 +366,8 @@ storeConfig net ctx logger dir redisURL p2pPort fleet =
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 120,
+      blockStall = 10,
+      blockPing = 5,
       maxPeerLife = 48 * 3600,
       connect = withConnection,
       stats = Nothing,
@@ -375,6 +375,7 @@ storeConfig net ctx logger dir redisURL p2pPort fleet =
       maxOpenFiles = Just 256,
       writeBufferSize = Just (16 * 1024 * 1024),
       maxWalSize = Just (64 * 1024 * 1024),
+      backgroundJobs = Nothing,
       blockCache = Just (16 * 1024 * 1024),
       logger = logger
     }
@@ -549,44 +550,44 @@ newXPub env seed deriv =
   XPub
     { prv = prv,
       spec = xspec,
-      text = cs (xPubExport env.net env.ctx pub),
+      text = cs (xPubExport env.net pub),
       scripts =
         Map.fromList
-          [ (scriptHex env (addrOf env x [m, i]), [m, i])
+          [ (scriptHex (addrOf x [m, i]), [m, i])
           | m <- [0, 1],
             i <- [0 .. 120]
           ]
     }
   where
     prv = makeXPrvKey (C8.pack ("haskoin-store integration " <> show env.kind <> " " <> seed))
-    pub = deriveXPubKey env.ctx prv
+    pub = deriveXPubKey prv
     xspec = XPubSpec {key = pub, deriv = deriv}
     x = XPub {prv = prv, spec = xspec, text = "", scripts = Map.empty}
 
 -- | Address at a derivation path, computed with haskoin-core, not the store.
-addrOf :: Env -> XPub -> [Word32] -> Address
-addrOf env x [m, i] = f (pubSubKey env.ctx (pubSubKey env.ctx x.spec.key m) i)
+addrOf :: XPub -> [Word32] -> Address
+addrOf x [m, i] = f (pubSubKey (pubSubKey x.spec.key m) i)
   where
     f = case x.spec.deriv of
-      DeriveNormal -> xPubAddr env.ctx
-      DeriveP2SH -> xPubCompatWitnessAddr env.ctx
-      DeriveP2WPKH -> xPubWitnessAddr env.ctx
-addrOf _ _ p = error ("Bad path: " <> show p)
+      DeriveNormal -> xPubAddr
+      DeriveP2SH -> xPubCompatWitnessAddr
+      DeriveP2WPKH -> xPubWitnessAddr
+addrOf _ p = error ("Bad path: " <> show p)
 
 addrText :: Env -> Address -> Text
 addrText env a = fromMaybe (error "Cannot encode address") (addrToText env.net a)
 
 -- | Address at a path of an xpub, as text.
 at :: Env -> XPub -> [Word32] -> Text
-at env x = addrText env . addrOf env x
+at env x = addrText env . addrOf x
 
-scriptHex :: Env -> Address -> Text
-scriptHex env a =
-  encodeHex (fromMaybe (error "No script for address") (addressToScriptBS env.ctx a))
+scriptHex :: Address -> Text
+scriptHex a =
+  encodeHex (fromMaybe (error "No script for address") (addressToScriptBS a))
 
 -- | Private key of the address at a path, as WIF.
 wifOf :: Env -> XPub -> [Word32] -> Text
-wifOf env x [m, i] = xPrvWif env.net (prvSubKey env.ctx (prvSubKey env.ctx x.prv m) i)
+wifOf env x [m, i] = xPrvWif env.net (prvSubKey (prvSubKey x.prv m) i)
 wifOf _ _ p = error ("Bad path: " <> show p)
 
 -- | Parameter that selects the derivation of an xpub.
@@ -875,7 +876,7 @@ spend env x ref cs' outs = do
         [ object
             [ "txid" .= c.txid,
               "vout" .= c.vout,
-              "scriptPubKey" .= scriptHex env (addrOf env x c.path),
+              "scriptPubKey" .= scriptHex (addrOf x c.path),
               "amount" .= btc c.value
             ]
         | c <- cs'
@@ -1362,7 +1363,7 @@ youngCoinbase env k = do
           [ object
               [ "txid" .= cbTxid,
                 "vout" .= (0 :: Int),
-                "scriptPubKey" .= scriptHex env (addrOf env k [0, 0]),
+                "scriptPubKey" .= scriptHex (addrOf k [0, 0]),
                 "amount" .= btc cbValue
               ]
           ]
@@ -1558,7 +1559,7 @@ incrementalTest env = do
   -- touch, as if a change had been missed
   Just blob <- redisRun env (Redis.get (xpubKey env x "bal"))
   bals <- either fail return (decode blob :: Either String [XPubBal])
-  let target = addrOf env x [0, 0]
+  let target = addrOf x [0, 0]
       wrong :: XPubBal -> XPubBal
       wrong b
         | b.balance.address == target =
@@ -1693,7 +1694,7 @@ evictTest env = do
   isCached env xb `shouldReturn` False
   left <- redisRun env $ Redis.keys (xpubKey env xb "*")
   left `shouldBe` []
-  addrs <- redisRun env $ Redis.smembers (cachePrefix env.net <> "a:" <> encode (addrOf env xb [0, 0]))
+  addrs <- redisRun env $ Redis.smembers (cachePrefix env.net <> "a:" <> encode (addrOf xb [0, 0]))
   addrs `shouldBe` []
   eb <- expect <$> readIORef rb
   forM_ eb.txids $ \t -> do
@@ -1777,7 +1778,7 @@ clientTest env = do
       -- api.haskoin.com has it, and the server of the tests has none
       conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain}
       call :: (ApiResource a b) => a -> IO b
-      call r = Client.apiCall env.ctx conf r >>= either (fail . show) return
+      call r = Client.apiCall conf r >>= either (fail . show) return
   heard <- newIORef []
   listener <- async . Client.apiEvents conf $ \e -> modifyIORef' heard (e :) >> return True
   -- the client is listening once it hears of a block
@@ -1796,14 +1797,14 @@ clientTest env = do
   tx.txid `shouldBe` txid
   raw <- call (Client.GetTxRaw txid)
   txHash raw.get `shouldBe` txid
-  balances <- call (Client.GetAddrsBalance [addrOf env x [0, 0]])
+  balances <- call (Client.GetAddrsBalance [addrOf x [0, 0]])
   map (.confirmed) balances.get `shouldBe` [100000]
   keys <- call (Client.GetXPubBalances x.spec.key DeriveNormal (NoCache False))
   sum (map (.balance.confirmed) keys.get) `shouldBe` 100000
   health <- call Client.GetHealth
   health.blocks.blocks `shouldSatisfy` (> 0)
   -- an error comes back as the error that it is
-  unknown <- Client.apiCall env.ctx conf (Client.GetTx (TxHash (sha256 ("nothing" :: C8.ByteString))))
+  unknown <- Client.apiCall conf (Client.GetTx (TxHash (sha256 ("nothing" :: C8.ByteString))))
   either Just (const Nothing) unknown `shouldBe` Just ThingNotFound
   hash <- maybe (fail "Not a hash") return (hexToBlockHash mined)
   waitFor "the client to hear of the block" ((EventBlock hash `elem`) <$> readIORef heard)
@@ -2077,7 +2078,9 @@ legacySpend env = do
   let amount = case c ! "amount" of
         Number n -> Number (n - 0.0001)
         other -> other
-  rpc env.node "createrawtransaction"
+  rpc
+    env.node
+    "createrawtransaction"
     [toJSON [object ["txid" .= (c ! "txid"), "vout" .= (c ! "vout")]], object [Key.fromText to .= amount]]
     >>= signed env Nothing
 
@@ -2151,19 +2154,19 @@ askTest env = withTestLogger $ \logger -> listening $ \(sock, port) -> listening
 -- is, and the output that holds it.
 payScript :: Env -> H.ScriptOutput -> IO (OutPoint, TxOut)
 payScript env so = do
-  address <- maybe (fail "No address for the script") return (H.outputAddress env.net env.ctx so)
+  address <- maybe (fail "No address for the script") return (H.outputAddress env.net so)
   txid <- sendMany env.node [(addrText env address, 300000)]
   waitSynced env
   funding <- getRawTx env.node txid
   vout <- case [ numV n
                | o <- arr (funding ! "vout"),
                  Just n <- [field "n" o],
-                 (textField "hex" =<< field "scriptPubKey" o) == Just (scriptHex env address)
+                 (textField "hex" =<< field "scriptPubKey" o) == Just (scriptHex address)
                ] of
     v : _ -> return v
     [] -> fail "No output to the script"
   spent <- maybe (fail "Not a transaction id") return (hexToTxHash txid)
-  return (OutPoint spent (fromIntegral vout), TxOut 300000 (H.marshal env.ctx so))
+  return (OutPoint spent (fromIntegral vout), TxOut 300000 (H.encodeSerial so))
 
 -- | A transaction that spends a coin of 300,000 to the wallet of the
 -- node, with nothing in its input yet.
@@ -2184,18 +2187,18 @@ spendingTo env coin = do
 -- | A Schnorr signature of Bitcoin Cash, made the plain way: this is a
 -- test, and the nonce is no secret worth keeping. haskoin-core verifies
 -- these and does not make them.
-cashSchnorr :: Ctx -> H.SecKey -> H.Hash256 -> C8.ByteString
-cashSchnorr ctx k h = case [sig | Just sig <- map attempt [1 ..]] of
+cashSchnorr :: H.SecKey -> H.Hash256 -> C8.ByteString
+cashSchnorr k h = case [sig | Just sig <- map attempt [1 ..]] of
   sig : _ -> sig
   [] -> error "No nonce"
   where
     n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141 :: Integer
     p = 2 ^ (256 :: Int) - 2 ^ (32 :: Int) - 977 :: Integer
     word256 i = let b = H.integerToBS i in C8.replicate (32 - C8.length b) '\0' <> b
-    public = H.exportPubKey ctx True (H.derivePubKey ctx k)
+    public = H.exportPubKey True (H.derivePubKey k)
     attempt nonce = do
-      r <- H.derivePubKey ctx <$> H.secKey (word256 nonce)
-      let (x, y) = C8.splitAt 32 (C8.drop 1 (H.exportPubKey ctx False r))
+      r <- H.derivePubKey <$> H.secKey (word256 nonce)
+      let (x, y) = C8.splitAt 32 (C8.drop 1 (H.exportPubKey False r))
           square = powMod (H.bsToInteger y) ((p - 1) `div` 2) == 1
           e = H.bsToInteger (encode (H.sha256 (x <> public <> encode h))) `mod` n
       if square then Just (x <> word256 ((nonce + e * H.bsToInteger k.get) `mod` n)) else Nothing
@@ -2217,10 +2220,9 @@ cashSchnorr ctx k h = case [sig | Just sig <- map attempt [1 ..]] of
 -- are not of, is refused.
 multisigTest :: Env -> IO ()
 multisigTest env = do
-  let ctx = env.ctx
-      secret n = fromMaybe (error "Not a secret key") (H.secKey (C8.replicate 31 '\0' <> C8.singleton n))
+  let secret n = fromMaybe (error "Not a secret key") (H.secKey (C8.replicate 31 '\0' <> C8.singleton n))
       secrets = map secret "\x0b\x0c\x0d"
-      points = map (H.derivePubKey ctx) secrets
+      points = map H.derivePubKey secrets
       twoOfThree = H.PayMulSig (map (H.wrapPubKey True) points) 2
       right = either (fail . ("Could not make the transaction: " <>)) return
       published tx = do
@@ -2239,25 +2241,25 @@ multisigTest env = do
                   sighash = hashType,
                   redeem = Just twoOfThree
                 }
-        right (H.signTx env.net ctx unsigned [input] (take 2 secrets)) >>= published
+        right (H.signTx env.net unsigned [input] (take 2 secrets)) >>= published
   case env.kind of
     BitcoinCore -> do
-      inWitness <- right (H.payToWitnessScriptAddress ctx twoOfThree)
+      inWitness <- right (H.payToWitnessScriptAddress twoOfThree)
       old (fromMaybe (error "No script") (H.addressToOutput inWitness)) H.sigHashAll
       -- Taproot: signed by the first and the third key
-      let xOnly = C8.drop 1 . H.exportPubKey ctx True
+      let xOnly = C8.drop 1 . H.exportPubKey True
           leaf =
             H.Script $
               [H.opPushData (xOnly (head points)), H.OP_CHECKSIG]
                 <> concat [[H.opPushData (xOnly k), H.OP_CHECKSIGADD] | k <- drop 1 points]
                 <> [H.OP_2, H.OP_NUMEQUAL]
-          internal = H.derivePubKey ctx (secret '\x0e')
+          internal = H.derivePubKey (secret '\x0e')
           tree = H.TaprootOutput {internalKey = internal, mast = Just (H.MASTLeaf H.tapscriptLeafVersion leaf)}
-      (coin, out) <- payScript env (H.taprootScriptOutput ctx tree)
+      (coin, out) <- payScript env (H.taprootScriptOutput tree)
       unsigned <- spendingTo env coin
       let leafOf = Just (H.leafHash H.tapscriptLeafVersion leaf, 0xffffffff)
       digest <- right (H.taprootSigHash unsigned [out] 0 H.sigHashDefault Nothing leafOf)
-      let sign k = (H.signSchnorr ctx k (H.hashToMsg digest)).get
+      let sign k = (H.signSchnorr k (H.hashToMsg digest)).get
           spend =
             H.ScriptPathSpend
               H.ScriptPathData
@@ -2265,25 +2267,25 @@ multisigTest env = do
                   -- an item for each key, that of the last key first
                   stack = [sign (secrets !! 2), "", sign (head secrets)],
                   script = leaf,
-                  extIsOdd = odd (H.keyParity ctx (H.taprootOutputKey ctx tree)),
+                  extIsOdd = odd (H.keyParity (H.taprootOutputKey tree)),
                   leafVersion = H.tapscriptLeafVersion,
                   internalKey = internal,
                   control = [],
                   opaqueScript = Nothing
                 }
-      witness <- right (H.encodeTaprootWitness ctx spend)
+      witness <- right (H.encodeTaprootWitness spend)
       published (unsigned {witness = [witness]} :: Tx)
     BitcoinCashNode -> do
-      inScript <- right (H.payToScriptAddress ctx twoOfThree)
+      inScript <- right (H.payToScriptAddress twoOfThree)
       let locked = fromMaybe (error "No script") (H.addressToOutput inScript)
       old locked (H.setForkIdFlag H.sigHashAll)
       -- Schnorr signatures of the first and the third key: bits 0 and 2
       (coin, out) <- payScript env locked
       unsigned <- spendingTo env coin
-      code <- right (H.encodeOutput ctx twoOfThree)
+      code <- right (H.encodeOutput twoOfThree)
       digest <- right (H.txSigHashForkId env.net unsigned code out.value 0 (H.setForkIdFlag H.sigHashAll))
-      let sign k = cashSchnorr ctx k digest <> "\x41"
-          pushed = [sign (head secrets), sign (secrets !! 2), H.marshal ctx twoOfThree]
+      let sign k = cashSchnorr k digest <> "\x41"
+          pushed = [sign (head secrets), sign (secrets !! 2), H.encodeSerial twoOfThree]
           items = [H.OP_5] <> map H.opPushData pushed
       published (unsigned {inputs = [i {script = encode (H.Script items)} | i <- unsigned.inputs]} :: Tx)
 
@@ -2339,7 +2341,7 @@ eventsTest env = do
       y = newXPub env "events-other" DeriveNormal
       port = read (reverse (takeWhile (/= ':') (reverse env.plain))) :: Int
       client path = WS.runClient "127.0.0.1" port path
-      json = BL.toStrict . marshalJSON (env.net, env.ctx)
+      json = BL.toStrict . marshalJSON env.net
       -- every event that a client hears after saying something, in order
       hearing path say heard = client path $ \c -> do
         mapM_ (WS.sendTextData c) (say :: [C8.ByteString])
@@ -2353,14 +2355,14 @@ eventsTest env = do
       element = \case
         PubKeyAddress h -> runPutS (serialize h)
         _ -> error "Not the hash of a key"
-      bloom = bloomInsert (bloomCreate 10 0.0000001 0 BloomUpdateNone) (element (addrOf env y [0, 1]))
+      bloom = bloomInsert (bloomCreate 10 0.0000001 0 BloomUpdateNone) (element (addrOf y [0, 1]))
   [all', key, address, filtered, quiet, keyFirst, addressFirst] <- mapM (const (newIORef [])) [1 .. 7 :: Int]
   listeners <-
     mapM
       async
       [ hearing "/events" [] all',
         hearing "/events" [json (EventWatchXPub x.spec)] key,
-        hearing "/events" [json (EventWatch [addrOf env y [0, 0]])] address,
+        hearing "/events" [json (EventWatch [addrOf y [0, 0]])] address,
         hearing "/events" [json (EventFilterLoad bloom)] filtered,
         -- chosen in the URL, before the first event: blocks alone, a key
         -- under a type of address, an address

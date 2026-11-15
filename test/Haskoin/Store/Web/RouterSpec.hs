@@ -33,7 +33,7 @@ spec = describe "router" $ do
   it "answers inside the scope of a request, and makes one for each route that it tries" $ do
     events <- newIORef []
     let note e = modifyIORef' events (<> [e])
-        scoped answer = note "open" >> answer routes <* note "close"
+        scoped _ answer = note "open" >> answer routes <* note "close"
         req = defaultRequest {requestMethod = methodGet, pathInfo = ["block", "best"]}
     _ <- routerScoped routes scoped (\_ _ -> fail "no route") req $ \_ ->
       note "respond" >> return ResponseReceived

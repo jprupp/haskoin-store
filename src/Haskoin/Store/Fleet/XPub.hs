@@ -129,7 +129,6 @@ import Database.Redis (Connection, Redis, Reply)
 import Database.Redis qualified as R
 import Haskoin
   ( Address (..),
-    Ctx,
     Network,
     OutPoint (..),
     Tx (..),
@@ -514,12 +513,12 @@ instance Semigroup AddressChange where
 -- address that they touch. An output that one of them pays and a later one
 -- spends is in both lists of its address: 'cacheAdvance' takes out what
 -- was spent after it puts in what was paid.
-blockChanges :: Network -> Ctx -> [TxData] -> HashMap Address AddressChange
-blockChanges net ctx tds = HashMap.fromListWith (flip (<>)) (concatMap one tds)
+blockChanges :: Network -> [TxData] -> HashMap Address AddressChange
+blockChanges net tds = HashMap.fromListWith (flip (<>)) (concatMap one tds)
   where
     one td =
       let h = txHash td.tx
-          address = either (const Nothing) Just . scriptToAddressBS net ctx
+          address = either (const Nothing) Just . scriptToAddressBS net
           ins =
             [ (a, AddressChange {txs = [], paid = [], spent = [i.outpoint]})
             | (n, i) <- zip [0 ..] td.tx.inputs,

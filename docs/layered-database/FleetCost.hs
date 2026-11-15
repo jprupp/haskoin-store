@@ -25,6 +25,7 @@
 module Main (main) where
 
 import Conduit (concatMapC, runConduit, sinkList, takeC, (.|))
+import Control.Concurrent.STM (readTVarIO)
 import Control.DeepSeq (NFData, rnf)
 import Control.Exception (evaluate)
 import Control.Monad (forM_, unless, when)
@@ -52,18 +53,17 @@ import Haskoin.Store.Fleet.XPub (cacheBuild)
 import System.Environment (getArgs)
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import Text.Printf (printf)
-import UnliftIO (readTVarIO)
 
 main :: IO ()
-main = withContext $ \ctx -> do
+main = do
   hSetBuffering stdout LineBuffering
   [dir, url] <- getArgs
   conn <- R.checkedConnect (either error id (R.parseConnectInfo url))
   old <- R.runRedis conn (R.keys "cost:*") >>= either (fail . show) return
   forM_ (nonEmpty old) $ \ks -> R.runRedis conn (R.del ks) >>= either (fail . show) (\_ -> return ())
   let mib = 1024 * 1024
-      open = withLayeredReader btcRegTest ctx 20 32 dir False (Just 2000) (Just (256 * mib))
-  open (Just (1024 * mib)) (Just (1024 * mib)) Nothing $ \db -> do
+      open = withLayeredReader btcRegTest 20 32 dir False (Just 2000) (Just (256 * mib))
+  open (Just (1024 * mib)) Nothing (Just (1024 * mib)) Nothing $ \db -> do
     let config =
           MemberConfig
             { prefix = "cost:",
@@ -74,8 +74,8 @@ main = withContext $ \ctx -> do
               cacheMax = 100,
               cacheMinAddrs = 0,
               cacheMinTxs = 0,
-                          stats = Nothing,
-                          note = \_ _ -> return ()
+              stats = Nothing,
+              note = \_ _ -> return ()
             }
     m <- newMember config conn db
     Just best <- Q.getBestBlock db
@@ -145,10 +145,10 @@ main = withContext $ \ctx -> do
     -- key costs a store alone, one of a fleet, and one of a fleet through
     -- the cache
     let wallets =
-          [ ("cold wallet", wallet ctx "the cold wallet of the measurements of haskoin-store"),
-            ("quiet wallet", wallet ctx "the quiet wallet of the measurements of haskoin-store"),
-            ("busy wallet", wallet ctx "the busy wallet of the measurements of haskoin-store"),
-            ("small wallet", wallet ctx "the small wallet of the measurements of haskoin-store")
+          [ ("cold wallet", wallet "the cold wallet of the measurements of haskoin-store"),
+            ("quiet wallet", wallet "the quiet wallet of the measurements of haskoin-store"),
+            ("busy wallet", wallet "the busy wallet of the measurements of haskoin-store"),
+            ("small wallet", wallet "the small wallet of the measurements of haskoin-store")
           ]
         -- as 'shared', with the fleet's cache of extended public keys in
         -- front
@@ -201,8 +201,8 @@ main = withContext $ \ctx -> do
       _ -> Nothing
 
 -- | A wallet of the history that QueryCost.hs writes.
-wallet :: Ctx -> ByteString -> XPubSpec
-wallet ctx seed = XPubSpec {key = deriveXPubKey ctx (makeXPrvKey seed), deriv = DeriveNormal}
+wallet :: ByteString -> XPubSpec
+wallet seed = XPubSpec {key = deriveXPubKey (makeXPrvKey seed), deriv = DeriveNormal}
 
 -- | The mean time of an action in microseconds, over so many runs after
 -- one that does not count.
