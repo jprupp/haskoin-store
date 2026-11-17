@@ -344,10 +344,10 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
 | `--max-requests` | `MAX_REQUESTS` | 16 a core | Most long requests (lists, whole blocks, xpubs) answered at once, the ceiling of a limit that adapts; see [Overload](#overload) (0 = no limit) |
-| `--min-requests` | `MIN_REQUESTS` | 1 a core | Fewest long requests answered at once, where the limit starts |
+| `--min-requests` | `MIN_REQUESTS` | 2 a core | Fewest long requests answered at once, where the limit starts |
 | `--target-delay` | `TARGET_DELAY` | `25` | Milliseconds that a thread ready to run may wait for a core before the limit comes down |
-| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 503 |
-| `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 503 |
+| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 429 |
+| `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
 | `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after Redis loses its data; without it, or when it does not answer, transactions go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
@@ -932,18 +932,24 @@ design.
 - **The limit adapts.** A probe on each core notes how late a woken
   thread runs, less the pauses of GHC's collector. Every half second, if
   the slowest tenth of those delays was over `--target-delay` (25 ms),
-  the limit comes down by a quarter; if it was under, and every slot was
-  in use, it goes up by one. It stays between `--min-requests` (one a
-  core) and `--max-requests` (sixteen a core). Requests that wait for the
-  disk give their cores back, so the limit grows for them; requests that
-  compute hold it near one a core.
+  the limit comes down by a quarter, at most once in the time a request
+  holds its slot. If it was under, every slot was in use and the cores
+  were used under 90%, the limit grows as TCP CUBIC's window does: fast
+  back toward the level of the last cut, then past it. It stays between
+  `--min-requests` (two a core) and `--max-requests` (sixteen a core).
+  Requests that wait for the disk give their cores back, so the limit
+  grows for them; busy cores stop it growing.
+- **A request for an xpub that is not cached** gives its slot back while
+  it waits for the indexer, which bounds that work itself.
 - **The line** in front of the slots holds up to `--request-queue` (64)
   requests for up to `--request-wait` (1 second). It is managed by CoDel:
   when even the shortest wait in 100 ms was over 5 ms, the line is
   overloaded, and a request that finds no slot free is refused at once.
-- **A refused request** gets 503, `{"error": "server-busy"}` and
-  `Retry-After: 1`. Have the load balancer try another server on a 503
-  (with nginx, `proxy_next_upstream error timeout http_503`).
+- **A refused request** gets 429, `{"error": "server-busy"}` and
+  `Retry-After: 1`, as nginx's `limit_conn_status 429` does: clients and
+  proxies take it to mean "come back later", where some retry a 503 at
+  once. Have the load balancer try another server on a 429 (with nginx,
+  `proxy_next_upstream error timeout http_429`).
 - **Xpubs:** reading an xpub into the cache is the work of the indexer,
   in threads of its own, not of a request. A request that would wait for
   the indexer too long gets 429, with when to come back
@@ -1059,6 +1065,8 @@ The metrics of admission control ([Overload](#overload)):
 | `web.cap.limit` | gauge | The limit on long requests, every half second |
 | `web.cap.delay_us` | gauge | 90th percentile of the scheduler's delay in the last half second, without the collector's pauses, in microseconds |
 | `web.cap.lateness_us` | gauge | The same with the collector's pauses |
+| `web.cap.used` | gauge | Use of the cores that the controller sees, smoothed over two seconds, in hundredths of the capabilities |
+| `web.cap.round_trip_us` | gauge | Time that a long request holds its slot, smoothed, in microseconds: the controller cuts at most once in it |
 | `web.cap.overloaded` | gauge | 1 while CoDel finds the line overloaded |
 | `web.cap.sojourn` | timing | Milliseconds that an admitted long request waited for its slot |
 | `web.cap.refused_full` | counter | Requests refused because the line was full |

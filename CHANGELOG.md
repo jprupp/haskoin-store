@@ -17,21 +17,31 @@ answered from the fleet's cache.
   still answers its quick requests at once.
   - **The limit follows the cores.** A probe on each capability waits on an
     eventfd that a system thread rings every 10 ms, and measures how late a
-    woken thread runs, less GHC's collector pauses. Every half second an AIMD
+    woken thread runs, less GHC's collector pauses. Every half second the
     controller cuts the limit by a quarter when that delay is over
-    `--target-delay` (25 ms), and adds one when it is under and every slot was
-    used. The limit stays between `--min-requests` (one a core) and
-    `--max-requests` (sixteen a core; 0 turns it all off).
+    `--target-delay` (25 ms), at most once a round trip (the smoothed time a
+    request holds its slot). It grows along TCP CUBIC's curve, back toward
+    the level of the last cut and then past it, while the delay is under the
+    target, every slot was used and the cores, smoothed over two seconds,
+    are used under 90%. The limit stays between `--min-requests` (two a
+    core) and `--max-requests` (sixteen a core; 0 turns it all off).
   - **The line in front is managed by CoDel** (100 ms interval, 5 ms target;
     while overloaded, a request that waited past 10 ms is refused). It holds
     up to `--request-queue` (64) requests for up to `--request-wait` (1 s).
-    A refused request gets 503 `server-busy` with `Retry-After: 1`. A request
-    in line sets no GHC timer: a sweep enforces the waits.
+    A refused request gets 429 `server-busy` with `Retry-After: 1`, which
+    clients and nginx take as "come back later"; a load generator retried
+    503s at once. A request in line sets no GHC timer: a sweep enforces the
+    waits.
+  - **A request for an xpub gives its slot back while it waits for the
+    indexer** (`Admission.admittedAside`, `aside`), and takes one again
+    without the line. The indexer bounds that work; holding the slot left
+    plain requests waiting a second behind cold xpubs.
   - **Options:** `--max-requests` (`MAX_REQUESTS`), `--min-requests`
     (`MIN_REQUESTS`), `--target-delay` (`TARGET_DELAY`), `--request-queue`
     (`REQUEST_QUEUE`) and `--request-wait` (`REQUEST_WAIT`).
   - **Metrics:** `web.cap.limit`, `web.cap.delay_us`, `web.cap.lateness_us`,
-    `web.cap.overloaded`, `web.cap.sojourn`, `web.cap.refused_full`,
+    `web.cap.overloaded`, `web.cap.used`, `web.cap.round_trip_us`,
+    `web.cap.sojourn`, `web.cap.refused_full`,
     `web.cap.refused_waited`, `web.cap.refused_codel`, `web.requests_waiting`,
     and for each long route `web.cap.<route>.running`, `.waited`, `.held` and
     `.refused`.

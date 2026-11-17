@@ -10,7 +10,8 @@
 -- on each capability ('withProbes', 'delays'), and the controller that
 -- follows it ('control'): a limit on how many long requests run at once
 -- ("Haskoin.Store.Web.Admission"), cut by a quarter when the cores do not
--- keep up and raised while they do, as TCP does with its window.
+-- keep up and raised while they have room, as TCP CUBIC does with its
+-- window.
 -- @docs/congestion-control.md@ explains the signal and the controller for a
 -- reader new to congestion control.
 --
@@ -59,34 +60,46 @@
 -- slower request says nothing about the server: it may just be a bigger
 -- one.
 --
--- = The control: additive increase, multiplicative decrease
+-- = The control: cut once a round trip, grow as TCP CUBIC does
 --
 -- Every half second the controller takes the 90th percentile of the
--- probes' lateness ('lateness') and moves the limit ('control'), as TCP and
--- LEDBAT move their window against a target delay:
+-- probes' lateness without the collector's pauses, and the use of the
+-- cores, smoothed over about two seconds ('cpuTime'), and moves the limit
+-- ('control'):
 --
--- * __Over the target__ (25 ms by default): the limit is cut by a quarter.
---   A cut takes effect as requests end, so there is no second cut while
---   more requests run than the limit allows: one congestion is answered
---   once, as TCP cuts its window once a round trip.
+-- * __Over the target__ (25 ms by default): the limit is cut by a quarter,
+--   at most once a round trip, the time that a request holds its slot,
+--   smoothed. A cut takes effect as requests end, and a second cut before
+--   it has would answer one congestion twice, as TCP cuts its window once
+--   a round trip.
 --
--- * __Under the target, and every slot used__: one more slot. The limit
---   grows only while it is what holds the requests back: a server that
---   has spare slots learns nothing from more of them, and an idle one must
---   not drift to the ceiling, to be found there by the next burst (TCP's
---   congestion window validation, RFC 7661).
+-- * __Under the target, every slot used, and the cores used under 90%__:
+--   the limit grows along the cubic curve of TCP CUBIC, concave back
+--   toward the level that it was last cut from, flat near it, and convex
+--   past it. It finds again at once the level that worked, and searches
+--   carefully around it. The time on the curve runs only while the limit
+--   may grow, so a limit held back for a while does not leap when it may
+--   grow again.
 --
--- The limit stays between a floor, the number of cores by default, and a
--- ceiling. A floor equal to the ceiling is a fixed cap.
+-- The limit stays between a floor, two a core by default, and a ceiling.
+-- A floor equal to the ceiling is a fixed cap.
+--
+-- The use of the cores is what keeps the limit from costing throughput, and
+-- from growing when it is no use. An earlier controller added one slot a
+-- step while the probes were under the target, and cut whenever they were
+-- over it and the last cut had taken effect. On two cores of a production
+-- store it answered a third fewer requests than no limit to sixteen
+-- clients that asked one after the other: each cut left cores idle, and
+-- one slot a step took seconds to fill them again. A server whose cores
+-- are used at 90% gains nothing from more slots, and one whose cores have
+-- room loses requests it could have answered while the limit climbs back.
 --
 -- The target cannot be much lower than GHC's timeslice: a thread that
 -- wakes behind one other that computes waits up to 20 ms, which is normal
 -- scheduling and not congestion. Measured with requests that compute, on
 -- four cores (@bench/Admission.hs@), a target of 10 ms held the limit at
--- the floor, where the probes still read 17 ms, and answered 343 requests
--- a second; 25 ms held it at about six and answered 378; 50 ms held it at
--- about ten and answered 368, with a light request at 83 ms at the 99th
--- percentile, where 25 ms had it at 53.
+-- the floor, where the probes still read 17 ms; 50 ms let a light request
+-- wait 83 ms at the 99th percentile, where 25 ms had it at 53.
 --
 -- = Not done here
 --
@@ -103,7 +116,10 @@ module Haskoin.Store.Web.Congestion
   ( -- * The controller
     Control (..),
     Observation (..),
+    Window (..),
+    window,
     control,
+    cpuTime,
 
     -- * The probes
     Probe,
@@ -133,6 +149,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Conc (closeFdWith)
 import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Haskoin.Store.Exception (bracket)
+import System.CPUTime (getCPUTime)
 import System.Posix.Types (Fd (..))
 
 -- | The settings of the controller.
@@ -148,26 +165,93 @@ data Control = Control
 
 -- | What the controller saw in a step.
 data Observation = Observation
-  { -- | the 90th percentile of the probes' lateness, in microseconds
+  { -- | the 90th percentile of the probes' lateness, without the pauses of
+    -- the collector, in microseconds
     delay :: !Int,
+    -- | the use of the cores, smoothed, in hundredths of all of them
+    used :: !Int,
     -- | whether every slot was taken at some point, or a request waited
     -- or was refused
     saturated :: !Bool,
-    -- | whether more requests run than the limit allows, which happens
-    -- after a cut until enough of them end
-    draining :: !Bool
+    -- | microseconds that a request holds its slot, smoothed: the round
+    -- trip, once a cut has taken effect
+    roundTrip :: !Int,
+    -- | microseconds since the step before
+    elapsed :: !Int
   }
   deriving stock (Eq, Show)
 
--- | The limit after a step, from the limit before it. It is always between
--- the floor and the ceiling, the floor giving way to a ceiling below it.
-control :: Control -> Observation -> Int -> Int
-control c o n
-  | o.delay > c.target && not o.draining = within (n * 3 `div` 4)
-  | o.delay < c.target && o.saturated = within (n + 1)
-  | otherwise = within n
+-- | The state of the controller between steps.
+data Window = Window
+  { -- | the limit: the level, rounded down, between the floor and the
+    -- ceiling
+    limit :: !Int,
+    -- | the number of slots before rounding
+    level :: !Double,
+    -- | the level that the limit was last cut from, where the curve is
+    -- flat
+    peak :: !Double,
+    -- | seconds on the curve, which run only while the limit may grow
+    climbed :: !Double,
+    -- | seconds from the start of the curve to its flat point
+    knee :: !Double,
+    -- | microseconds since the last cut
+    sinceCut :: !Int
+  }
+  deriving stock (Eq, Show)
+
+-- | The window at the start: at the floor, on the convex part of the curve.
+window :: Control -> Window
+window c = Window {limit = n, level = x, peak = x, climbed = 0, knee = 0, sinceCut = maxBound `div` 2}
   where
-    within = max (min c.floor c.ceiling) . min c.ceiling
+    n = lowest c
+    x = fromIntegral n
+
+-- | The floor, giving way to a ceiling below it.
+lowest :: Control -> Int
+lowest c = max 1 (min c.floor c.ceiling)
+
+-- | What is kept of the level at a cut: three quarters.
+backoff :: Double
+backoff = 0.75
+
+-- | How fast the curve rises away from its flat point, in slots a cubed
+-- second, as in TCP CUBIC: back to the level of a cut from 16 slots in two
+-- seconds, from 64 in three and a half.
+cubic :: Double
+cubic = 0.4
+
+-- | Hundredths of the cores in use above which the limit does not grow.
+busyCores :: Int
+busyCores = 90
+
+-- | The window after a step. Its limit is always between the floor and the
+-- ceiling, the floor giving way to a ceiling below it.
+control :: Control -> Observation -> Window -> Window
+control c o w
+  | o.delay > c.target && since >= o.roundTrip && w.limit > lowest c = cut
+  | o.delay < c.target && o.saturated && o.used < busyCores = grow
+  | otherwise = w {sinceCut = since}
+  where
+    since = min (maxBound `div` 2) (w.sinceCut + max 0 o.elapsed)
+    -- a cut below the peak of the last one is a sign that the room is
+    -- shrinking: the new peak is set lower still, as CUBIC does, so that
+    -- the limit leaves room sooner
+    cut =
+      let top = if w.level < w.peak then w.level * (1 + backoff) / 2 else w.level
+          low = max (fromIntegral (lowest c)) (w.level * backoff)
+       in settle w {level = low, peak = top, climbed = 0, knee = cbrt ((top - low) / cubic), sinceCut = 0}
+    grow =
+      let t = w.climbed + fromIntegral (max 0 o.elapsed) / 1e6
+          curve = cubic * (t - w.knee) ^ (3 :: Int) + w.peak
+       in settle w {level = max w.level (min (fromIntegral c.ceiling) curve), climbed = t, sinceCut = since}
+    settle x = x {limit = max (lowest c) (min c.ceiling (floor x.level))}
+    cbrt x = if x <= 0 then 0 else x ** (1 / 3)
+
+-- | Nanoseconds of the cores that the program has used so far, in all of
+-- its threads, those of the foreign calls included.
+cpuTime :: IO Int
+cpuTime = (`div` 1000) . fromIntegral <$> getCPUTime
 
 -- | The probe of a capability ('withProbes').
 data Probe = Probe

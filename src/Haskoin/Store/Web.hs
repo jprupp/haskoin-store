@@ -44,7 +44,7 @@
 -- * __Long requests take turns.__ Only so many long requests, lists,
 --   whole blocks and xpubs, are answered at once, as many as the cores keep
 --   up with ("Haskoin.Store.Web.Admission", "Haskoin.Store.Web.Congestion");
---   the next ones wait in a short line, and are refused with 503 when it
+--   the next ones wait in a short line, and are refused with 429 when it
 --   stops moving. A store with more to do than its cores can do still
 --   answers the simple requests at once.
 --
@@ -254,11 +254,13 @@ import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
 import Haskoin.Store.Web.Admission
   ( Admission,
+    Aside (..),
     Load (..),
     Refusal (..),
     Report (..),
     Settings (..),
-    admitted,
+    admittedAside,
+    aside,
     load,
     newAdmission,
     regulate,
@@ -496,6 +498,9 @@ data WebState = WebState
     query :: !StoreRead,
     -- | the same queries without the cache, on the same view
     direct :: !StoreRead,
+    -- | how the request steps aside from its slot while it waits for the
+    -- indexer of xpubs ("Haskoin.Store.Web.Admission")
+    aside :: !Aside,
     -- | whether Redis answered the last time it was asked
     cacheUp :: !(TVar Bool),
     -- | the events that the clients of @\/events@ read ('feedEvents')
@@ -580,6 +585,10 @@ data WebMetrics = WebMetrics
     capLimit :: !StatGauge,
     capDelay :: !StatGauge,
     capLateness :: !StatGauge,
+    -- | the use of the cores that the controller sees, in hundredths
+    capUsed :: !StatGauge,
+    -- | the round trip that the controller sees, in microseconds
+    capRoundTrip :: !StatGauge,
     capOverloaded :: !StatGauge,
     capSojourn :: !StatTiming,
     refusedFull :: !StatCounter,
@@ -661,6 +670,8 @@ createMetrics s = do
   capLimit <- g "cap.limit"
   capDelay <- g "cap.delay_us"
   capLateness <- g "cap.lateness_us"
+  capUsed <- g "cap.used"
+  capRoundTrip <- g "cap.round_trip_us"
   capOverloaded <- g "cap.overloaded"
   capSojourn <- newStatTiming s "web.cap.sojourn" 1
   refusedFull <- newStatCounter s "web.cap.refused_full" 1
@@ -776,25 +787,26 @@ serveWeb config serve = do
       -- the door to the fleet's cache of xpubs; a store without Redis has
       -- none, and answers about no xpub
       xpubDoor = (.door) <$> config.store.fleet
-      stateOf sess q =
+      stateOf out sess q =
         WebState
-          { query = xpubQuery xpubDoor sess q,
+          { query = xpubQuery xpubDoor out sess q,
             direct = q,
             reading = sess,
+            aside = out,
             ..
           }
       routesOf s = map (guarded s . settled s) (concatMap withPost (handlePaths s config))
       -- outside of a request, each query has a view of its own; a request
       -- has one view for all that it reads, which is let go when its
       -- response is sent
-      st = stateOf unpinned (chainRead db)
+      st = stateOf (Aside id) unpinned (chainRead db)
       -- every store is a member of a fleet: without Redis, or without a
       -- view of the fleet tip, it is unhealthy and answers 503
-      scoped answer = case config.store.fleet of
+      scoped out answer = case config.store.fleet of
         Nothing -> behind answer
         Just member ->
           readTVarIO cacheUp >>= \case
-            True -> shared member (3 :: Int) False answer
+            True -> shared member out (3 :: Int) False answer
             False -> behind answer
       -- as a member of a fleet: from the view at the fleet tip, with the
       -- pool that the fleet shares on top. The tip is taken to be the one
@@ -804,7 +816,7 @@ serveWeb config serve = do
       -- unless a request saw it in Redis a moment ago ('answeringAt'). If
       -- it is not the tip any more, the request is answered again, from the
       -- tip that Redis has.
-      shared member tries fresh answer = do
+      shared member out tries fresh answer = do
         known <- if fresh then return Nothing else fmap encode <$> readTVarIO member.tip
         asked <- case known of
           Just tip -> return (Just (Just tip))
@@ -819,21 +831,21 @@ serveWeb config serve = do
                 -- extended public keys through the fleet's cache of
                 -- them, unless a request asks for the database
                 inFleet plain sess confirm =
-                  answer (map (marked confirm) (routesOf (stateOf sess plain)))
+                  answer (map (marked confirm) (routesOf (stateOf out sess plain)))
             try (try (answeringCached member tip inFleet)) >>= \case
               -- an entry of the cache changed or was evicted while the
               -- request read it: answered again, from the start
               Left EntryMoved
                 | tries > 0 -> do
                     forM_ metrics (\x -> incrementCounter x.reruns 1)
-                    shared member (tries - 1) False answer
+                    shared member out (tries - 1) False answer
                 | otherwise -> answer [r {handler = \_ -> unindexedResponse st JobBroke} :: Route | r <- routes]
               Right r -> case r of
                 Right (Just sent) -> return sent
                 Right Nothing
                   -- a tip from the member's last turn of which there is no
                   -- view may not be the tip any more
-                  | not fresh && tries > 0 -> shared member (tries - 1) True answer
+                  | not fresh && tries > 0 -> shared member out (tries - 1) True answer
                   | otherwise -> behind answer
                 Left TipMoved ->
                   -- the tip moved while the handler was reading: answer
@@ -841,7 +853,7 @@ serveWeb config serve = do
                   readIORef handled >>= \case
                     True -> throwIO TipMoved
                     False
-                      | tries > 0 -> shared member (tries - 1) True answer
+                      | tries > 0 -> shared member out (tries - 1) True answer
                       | otherwise -> behind answer
       behind answer = answer [r {handler = behindResponse st} :: Route | r <- routes]
       routes = routesOf st
@@ -858,7 +870,7 @@ serveWeb config serve = do
       -- answered in a slot, or told that the server is full.
       capped r answer = case r.cost of
         Light -> answer routes
-        Short -> scoped answer
+        Short -> scoped (Aside id) answer
         Long -> case (metrics, HashMap.lookup (routeName r) capStats) of
           (Just w, Just m) -> do
             asked <- millis
@@ -866,16 +878,16 @@ serveWeb config serve = do
                   incrementCounter m.refused 1
                   incrementCounter (refusedBy w why) 1
                   answer full
-            admitted admission refused $ do
+            admittedAside admission refused $ \out -> do
               entered <- millis
               addTiming m.waited (entered - asked)
               addTiming w.capSojourn (entered - asked)
               bracket_
                 (atomicModifyIORef' m.inSlot (\n -> (n + 1, ())))
                 (atomicModifyIORef' m.inSlot (\n -> (n - 1, ())))
-                (scoped answer)
+                (scoped out answer)
                 `finally` (millis >>= \left -> addTiming m.held (left - entered))
-          _ -> admitted admission (const (answer full)) (scoped answer)
+          _ -> admittedAside admission (const (answer full)) (`scoped` answer)
       refusedBy w = \case
         LineFull -> w.refusedFull
         WaitedTooLong -> w.refusedWaited
@@ -1090,16 +1102,20 @@ notFoundTx st txid = st.query.getReplaced txid >>= maybe (raise st ThingNotFound
 behindResponse :: WebState -> Req -> IO Response
 behindResponse st _ = errorResponse st BehindFleet
 
--- | What a server that is full answers ("Haskoin.Store.Web.Admission"): 503
+-- | What a server that is full answers ("Haskoin.Store.Web.Admission"): 429
 -- with @{"error": "server-busy"}@, and a header that says to try again in a
--- second. It is not counted as an error of the server: nothing is wrong with
--- it, and the refusals have a metric of their own.
+-- second: as an xpub that the indexer cannot have soon, and as nginx's
+-- @limit_conn_status 429@. Clients and proxies take a 429 with
+-- @Retry-After@ to mean "come back later"; a load generator seen on a
+-- production store retried a 503 at once, and the refusals became a storm.
+-- It is not counted as an error of the server: nothing is wrong with it,
+-- and the refusals have a metric of their own.
 busyResponse :: WebState -> Req -> IO Response
 busyResponse st _ = do
   forM_ st.metrics $ \m -> incrementCounter m.refused 1
   return $
     responseLBS
-      status503
+      status429
       [(hContentType, "application/json"), ("Retry-After", "1")]
       "{\"error\":\"server-busy\"}"
 
@@ -1125,6 +1141,8 @@ reportControl (Just m) r = do
   setGauge m.capLimit r.limit
   setGauge m.capDelay r.delay
   setGauge m.capLateness r.lateness
+  setGauge m.capUsed r.used
+  setGauge m.capRoundTrip r.roundTrip
   setGauge m.capOverloaded (if r.overloaded then 1 else 0)
 
 -- | A route whose handler, once it has its response and before the response
@@ -2770,7 +2788,7 @@ getXBals ::
   HashSet XPubSpec ->
   IO (HashMap XPubSpec [XPubBal])
 getXBals st xspecs = do
-  found <- askXPubs ((.door) <$> st.config.store.fleet) st.reading.reads (HashSet.toList xspecs)
+  found <- askXPubs ((.door) <$> st.config.store.fleet) st.aside st.reading.reads (HashSet.toList xspecs)
   bals <- forM found $ \(x, cached) -> (x,) <$> maybe (st.query.xPubBals x) return cached
   return (HashMap.fromList [(x, filter (not . nullBalance . (.balance)) b) | (x, b) <- bals])
 
@@ -3395,7 +3413,7 @@ handleShortBal st req =
     cashaddr <- getCashAddr req
     let net = st.config.store.net
     abals <- catMaybes <$> mapM (getabal net cashaddr) (HashSet.toList addrs)
-    found <- askXPubs ((.door) <$> st.config.store.fleet) st.reading.reads (HashSet.toList xspecs)
+    found <- askXPubs ((.door) <$> st.config.store.fleet) st.aside st.reading.reads (HashSet.toList xspecs)
     xbals <- mapM (getxbal net) found
     let res = HashMap.fromList (abals <> xbals)
     streamEncoding $ toEncoding res
@@ -4099,8 +4117,8 @@ instance Exception Unindexed
 -- 2026-11-17): every answer is of one version of an entry. There is no
 -- setting that turns the cache off. A store without Redis has no door
 -- ('Nothing'), and answers 503 to every query about an xpub.
-xpubQuery :: Maybe XPubs -> Door.Session -> StoreRead -> StoreRead
-xpubQuery gate sess base =
+xpubQuery :: Maybe XPubs -> Aside -> Door.Session -> StoreRead -> StoreRead
+xpubQuery gate out sess base =
   (base :: StoreRead)
     { getTxData = fmap listToMaybe' . txData . pure,
       getManyTxData = txData,
@@ -4119,7 +4137,7 @@ xpubQuery gate sess base =
     asked x tries = case gate of
       Nothing -> throwIO JobBroke
       Just xs -> do
-        a <- xpubAsk xs x
+        a <- aside out (xpubAsk xs x)
         unindexed [a]
         r.balances x >>= \case
           Just bals -> return bals
@@ -4156,14 +4174,14 @@ unindexed answers
 -- its queries. If the indexer refused any, this throws, with the latest
 -- @Retry-After@ of them ('unindexed'); a store without Redis throws that
 -- the job failed (503).
-askXPubs :: Maybe XPubs -> XPubReads -> [XPubSpec] -> IO [(XPubSpec, Maybe [XPubBal])]
-askXPubs gate r specs = do
+askXPubs :: Maybe XPubs -> Aside -> XPubReads -> [XPubSpec] -> IO [(XPubSpec, Maybe [XPubBal])]
+askXPubs gate out r specs = do
   found <- forM specs $ \x -> (x,) <$> r.balances x
   let misses = [x | (x, Nothing) <- found]
   answers <- case (misses, gate) of
     ([], _) -> return []
     (_, Nothing) -> throwIO JobBroke
-    (_, Just xs) -> mapConcurrently (xpubAsk xs) misses
+    (_, Just xs) -> aside out (mapConcurrently (xpubAsk xs) misses)
   unindexed answers
   -- the misses that were indexed, read at one version, as every read of
   -- the request
@@ -4191,7 +4209,7 @@ watching st x = go (3 :: Int)
               Right Nothing | n > 1 -> go (n - 1)
               Left TipMoved | n > 1 -> go (n - 1)
               _ -> throwIO JobBroke
-    balances m q sess _ = (xpubQuery (Just m.door) sess q).xPubBals x <* sess.settle
+    balances m q sess _ = (xpubQuery (Just m.door) (Aside id) sess q).xPubBals x <* sess.settle
 
 -- | The answer to a request about xpubs that cannot be answered yet: 429
 -- with @{"error":"server-busy"}@ and @Retry-After@ in whole seconds, the

@@ -10,9 +10,10 @@ How a store decides how many long requests to answer at once. The code is in
   for everyone at once, the quick requests included. Letting in only so many
   long requests at a time fixes that. The question is how many.
 - **The answer.** The store measures how long a thread that is ready to run
-  waits for a core. While that wait is short and every slot is in use, it
-  lets in one more long request. When the wait grows too long, it lets in a
-  quarter fewer. This is how TCP has shared links since 1988.
+  waits for a core, and how much of its cores it uses. While that wait is
+  short, the cores have room and every slot is in use, it lets in more long
+  requests. When the wait grows too long, it lets in a quarter fewer, at
+  most once a round trip. This is how TCP shares links (CUBIC).
 - **The line** in front of the slots is managed the way Linux manages the
   queues of its network links (CoDel): it absorbs bursts, and refuses
   requests at once when it stops emptying.
@@ -59,19 +60,41 @@ factor of a thousand in cost, so a slow request may just be a big one.
 
 ## The controller
 
-Additive increase, multiplicative decrease, as in TCP and LEDBAT:
+Every half second the controller looks at the delay and at the use of the
+cores: the CPU time of the store, all its threads included, over that of
+its capabilities, smoothed over about two seconds.
 
-- **Over the target** (25 ms): the limit is cut by a quarter. There is no
-  second cut while more requests run than the limit allows, so one
-  congestion is answered once.
-- **Under the target, with every slot used:** one more slot. An idle store
-  does not drift up to the ceiling.
+- **Over the target** (25 ms): the limit is cut by a quarter, at most once
+  a round trip. The round trip is how long a request holds its slot,
+  smoothed. A cut takes effect as requests end; a second one before that
+  would answer one congestion twice.
+- **Under the target, every slot used, and the cores under 90%:** the limit
+  grows along the curve of TCP CUBIC. It climbs fast back toward the level
+  it was last cut from, slows down near it, then speeds up past it. The
+  clock of the curve runs only while growth is allowed.
+- **Otherwise** it stays. An idle store does not drift up to the ceiling,
+  and a store whose cores are busy gains nothing from more slots.
 
-The limit stays between a floor (one a core) and a ceiling (sixteen a
+The limit stays between a floor (two a core) and a ceiling (sixteen a
 core). A floor equal to the ceiling is a fixed cap.
+
+The first controller added one slot a step and cut whenever the delay was
+over the target. On two cores of a production store it answered a fifth to
+a third fewer requests than no limit to sixteen clients that asked one
+after the other: each cut left the cores idle, and one slot a step took
+seconds to fill them again.
 
 The target cannot be much lower than GHC's time slice of 20 ms: a thread
 behind one other that computes waits that long, which is normal scheduling.
+
+## Requests that wait for the xpub indexer
+
+A request for an xpub that is not in the cache waits for the indexer, up to
+`--xpub-wait`. It gives its slot back while it waits, and takes one again
+when the xpub is in the cache, past the limit if need be, without the line.
+The indexer's own threads bound that work. Holding the slot would leave a
+core idle, and a few such waits of seconds would fill every slot: on a
+production store, plain requests then waited about a second in the line.
 
 ## The line, and CoDel
 
@@ -85,9 +108,13 @@ refused at once, and one that has waited over 10 ms is refused.
 Otherwise a request waits until it gets a slot, for at most
 `--request-wait`, and a line of `--request-queue` takes no more.
 
-A refused request gets 503 with `{"error":"server-busy"}` and
+A refused request gets 429 with `{"error":"server-busy"}` and
 `Retry-After: 1`. It costs the store almost nothing, and a load balancer
-learns at once that this store is full.
+learns at once that this store is full. It is 429, as for an xpub that is
+not ready and as nginx's `limit_conn_status 429`, because clients and
+proxies take a 429 with `Retry-After` to mean "come back later". A load
+generator on a production store retried each 503 at once, and the refusals
+became a storm of six thousand a second.
 
 A request in line sets no timer. GHC's timer manager was seen blocked for
 seconds under load, so the waits are enforced by a sweep ten times a second.
@@ -98,13 +125,13 @@ A slot that comes free goes straight to the first in line.
 | Option | Variable | Default | Meaning |
 | --- | --- | --- | --- |
 | `--max-requests` | `MAX_REQUESTS` | 16 a core | Ceiling of the limit; 0 turns the control off |
-| `--min-requests` | `MIN_REQUESTS` | 1 a core | Floor of the limit, where it starts |
+| `--min-requests` | `MIN_REQUESTS` | 2 a core | Floor of the limit, where it starts |
 | `--target-delay` | `TARGET_DELAY` | 25 ms | Delay of the scheduler that counts as congestion |
 | `--request-queue` | `REQUEST_QUEUE` | 64 | Most requests that may wait |
 | `--request-wait` | `REQUEST_WAIT` | 1 s | Longest wait while the line moves |
 
-The step of the controller (half a second, one up, a quarter down) and
-CoDel's figures (5 ms over 100 ms) are fixed in the code. They are the usual
+The step of the controller (half a second, a quarter down, CUBIC's curve
+up, 90% of the cores) and CoDel's figures (5 ms over 100 ms) are fixed in the code. They are the usual
 values of these algorithms, and none depends on the machine.
 
 ## What to watch
@@ -114,6 +141,8 @@ StatsD gauges and counters under `web.cap.`:
 - `limit`: a sawtooth under load, the floor when idle;
 - `delay_us` and `lateness_us`: the signal, without and with the
   collector's pauses;
+- `used` and `round_trip_us`: the use of the cores and the round trip
+  that the controller sees;
 - `overloaded`: 1 while CoDel refuses;
 - `sojourn`: how long admitted requests waited;
 - `refused_full`, `refused_waited`, `refused_codel`: refusals by reason;
@@ -140,6 +169,19 @@ four busy cores, under overload, a light request took 53 ms at the 99th
 percentile against 940 ms with no limit, for a fifth fewer long requests
 that compute. With requests that wait for a disk, the limit grew and
 answered within 2% of no limit.
+
+The tuned controller, against no limit, on a store of the benchmark
+(`haskoin-store-bench`, four capabilities, three alternated pairs):
+
+| Load | Control on | Control off |
+| --- | --- | --- |
+| Overload, 64 heavy connections: simple p50 / p99 | 18–21 / 57–83 ms | 104 / 157–160 ms |
+| Overload: heavy answered | 55/s, plus 44–48 refusals (429) a second | 52/s |
+| Closed loop, 32 connections, mixed | 123–124/s | 109–110/s |
+| Moderate, 4 heavy connections: simple p50 / p99 | 4 / 15–16 ms | 4 / 14–15 ms |
+
+The heavy load waited `Retry-After` on each 429. Under overload the cores
+were used at 99%, so the limit held where it was, under the target.
 
 ## Further reading
 

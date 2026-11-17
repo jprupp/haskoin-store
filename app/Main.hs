@@ -271,15 +271,17 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
-      -- the limit on long requests moves between one a core, for requests
-      -- that compute, and sixteen a core, for requests that wait for the
-      -- disk: 64 on four cores, twice the 32 reads in flight at which the
-      -- disk of a production store gave its most (README, Overload)
+      -- the limit on long requests moves between two a core and sixteen a
+      -- core, for requests that wait for the disk: 64 on four cores, twice
+      -- the 32 reads in flight at which the disk of a production store gave
+      -- its most (README, Overload). Two a core, not one: a request spends
+      -- part of its time in RocksDB and Redis, off its core, and a slot
+      -- handed to a thread that has yet to run is idle until it does.
       cores <- getNumCapabilities
       maxRequests <-
         env "MAX_REQUESTS" (fromIntegral (16 * cores)) readMaybe
       minRequests <-
-        env "MIN_REQUESTS" (fromIntegral cores) readMaybe
+        env "MIN_REQUESTS" (fromIntegral (2 * cores)) readMaybe
       targetDelay <-
         env "TARGET_DELAY" d.targetDelay readMaybe
       requestQueue <-
@@ -473,7 +475,7 @@ config c = do
           <> long "min-requests"
           <> helpEnv
             "MIN_REQUESTS"
-            "Fewest long requests answered at once, where the limit starts; the default is one a core"
+            "Fewest long requests answered at once, where the limit starts; the default is two a core"
           <> showDefault
           <> value c.webLimits.minRequests
     targetDelay <-

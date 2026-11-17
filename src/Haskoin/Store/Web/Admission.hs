@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE RankNTypes #-}
 
 -- |
 -- Module      : Haskoin.Store.Web.Admission
@@ -144,6 +145,9 @@ module Haskoin.Store.Web.Admission
     Settings (..),
     newAdmission,
     admitted,
+    admittedAside,
+    Aside (..),
+    aside,
     Refusal (..),
 
     -- * The controller
@@ -164,6 +168,7 @@ module Haskoin.Store.Web.Admission
   )
 where
 
+import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.STM
   ( STM,
     TVar,
@@ -176,7 +181,8 @@ import Control.Concurrent.STM
     writeTVar,
   )
 import Control.Exception (finally, mask, onException)
-import Control.Monad (forever, replicateM_, unless, when)
+import Control.Monad (replicateM_, unless, when)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Sequence (Seq, ViewL (..), (|>))
 import Data.Sequence qualified as Seq
 import GHC.Clock (getMonotonicTimeNSec)
@@ -184,9 +190,12 @@ import Haskoin.Store.Web.Congestion
   ( Control (..),
     Delays (..),
     Observation (..),
+    Window (..),
     control,
+    cpuTime,
     delays,
     snooze,
+    window,
     withProbes,
   )
 
@@ -226,7 +235,10 @@ data Admission = Admission
     -- since the last step of the controller
     saturated :: !(TVar Bool),
     codel :: !(TVar Codel),
-    refusals :: !(TVar Refusals)
+    refusals :: !(TVar Refusals),
+    -- | nanoseconds that the slots given back since the last step of the
+    -- controller were held, in all, and how many
+    held :: !(TVar (Int, Int))
   }
 
 -- | A request in line: when it came, and where it is told what became of
@@ -303,6 +315,7 @@ newAdmissionWith clock given = do
     <*> newTVarIO False
     <*> newTVarIO Codel {ends = t + interval, least = maxBound, overloaded = False}
     <*> newTVarIO (Refusals 0 0 0)
+    <*> newTVarIO (0, 0)
   where
     s =
       given
@@ -320,18 +333,49 @@ data Entry = Enter | Refuse !Refusal | Wait !Waiter
 -- however it ends, and a request that is stopped while it waits leaves the
 -- line.
 admitted :: Admission -> (Refusal -> IO a) -> IO a -> IO a
-admitted a refused action
-  | a.settings.ceiling <= 0 = action
+admitted a refused = admittedAside a refused . const
+
+-- | 'admitted', with an action that may step 'aside' from its slot.
+admittedAside :: Admission -> (Refusal -> IO a) -> (Aside -> IO a) -> IO a
+admittedAside a refused action
+  | a.settings.ceiling <= 0 = action (Aside id)
   | otherwise = mask $ \restore -> do
-      let answer = restore action `finally` (a.clock >>= atomically . release a)
+      let answer t = do
+            since <- newIORef t
+            let out = do
+                  t' <- a.clock
+                  s <- readIORef since
+                  atomically (hold a (t' - s) >> release a t')
+                back = do
+                  a.clock >>= writeIORef since
+                  atomically (modifyTVar' a.running (+ 1))
+                step = Aside $ \act -> mask $ \inner -> out >> (inner act `finally` back)
+            restore (action step) `finally` out
       t <- a.clock
       atomically (entry a t) >>= \case
-        Enter -> answer
+        Enter -> answer t
         Refuse why -> restore (refused why)
         Wait w ->
           restore (await w) `onException` (a.clock >>= atomically . abandon a w) >>= \case
-            Nothing -> answer
+            Nothing -> a.clock >>= answer
             Just why -> restore (refused why)
+
+-- | How a request in a slot steps aside from it ('aside').
+newtype Aside = Aside (forall b. IO b -> IO b)
+
+-- | Give the slot back while the action runs, and take one again when it
+-- ends, past the limit if need be, without waiting in line. For a wait
+-- that uses no core and that something else bounds: a request for an xpub
+-- that is not in the cache waits for the indexer of xpubs, whose threads
+-- bound that work. Holding the slot meanwhile would leave a core idle, and
+-- a few such waits of seconds would hold every slot, the requests in line
+-- waiting behind them for nothing.
+aside :: Aside -> IO b -> IO b
+aside (Aside f) = f
+
+-- | A slot was held so many nanoseconds.
+hold :: Admission -> Int -> STM ()
+hold a ns = modifyTVar' a.held (\(total, n) -> (total + max 0 ns, n + 1))
 
 -- | Ask for a slot at the given time.
 entry :: Admission -> Int -> STM Entry
@@ -492,6 +536,11 @@ data Report = Report
     delay :: !Int,
     -- | the same with the collector's pauses, in microseconds
     lateness :: !Int,
+    -- | the use of the cores, smoothed over about two seconds, in
+    -- hundredths of the capabilities
+    used :: !Int,
+    -- | microseconds that a request held its slot, smoothed
+    roundTrip :: !Int,
     -- | whether the line is overloaded
     overloaded :: !Bool
   }
@@ -501,27 +550,72 @@ data Report = Report
 -- as it runs, giving each t'Report' to the function, and 'sweep' every
 -- interval of CoDel in between. It returns at once when admission control
 -- is off, and starts no probe.
+--
+-- The use of the cores is the time of the cores that the program used, all
+-- of its threads included, over that of its capabilities, smoothed with a
+-- time constant of two seconds: long enough to see through the bursts of a
+-- few requests, short enough to follow a change of load. The round trip
+-- is the time that a slot is held, smoothed with a gain of a quarter, as
+-- TCP smooths its round trip.
 regulate :: Admission -> (Report -> IO ()) -> IO ()
 regulate a report
   | a.settings.ceiling <= 0 = return ()
-  | otherwise = withProbes $ \probes -> forever $ do
-      replicateM_ (stepIntervals - 1) (snooze (interval `div` 1000) >> sweep a)
-      snooze (interval `div` 1000)
-      d <- delays probes
-      t <- a.clock
-      atomically (step d t) >>= report
+  | otherwise = withProbes $ \probes -> do
+      caps <- getNumCapabilities
+      t0 <- a.clock
+      c0 <- cpuTime
+      let go w used rtt before cpuBefore = do
+            replicateM_ (stepIntervals - 1) (snooze (interval `div` 1000) >> sweep a)
+            snooze (interval `div` 1000)
+            d <- delays probes
+            t <- a.clock
+            cpu <- cpuTime
+            let dt = max 1 (t - before)
+                now = fromIntegral (cpu - cpuBefore) / fromIntegral (dt * caps) :: Double
+                used' = used + (1 - exp (negate (fromIntegral dt / 2e9))) * (now - used)
+            (w', rtt', r) <- atomically (step d t dt used' rtt w)
+            report r
+            go w' used' rtt' t cpu
+      go (window settings) 0 0 t0 c0
   where
     settings = Control {floor = a.settings.floor, ceiling = a.settings.ceiling, target = a.settings.target}
-    step d t = do
+    step d t dt used rtt w = do
       n <- readTVar a.limit
       busy <- readTVar a.running
       full <- readTVar a.saturated
       writeTVar a.saturated False
-      let seenNow = Observation {delay = d.scheduling, saturated = full || busy >= n, draining = busy > n}
-          n' = control settings seenNow n
-      resize a n' t
+      (total, ended) <- readTVar a.held
+      writeTVar a.held (0, 0)
+      let rtt'
+            | ended > 0 = rtt + (fromIntegral (total `div` ended) / 1000 - rtt) / 4 :: Double
+            | otherwise = rtt
+          seenNow =
+            Observation
+              { delay = d.scheduling,
+                used = round (100 * used),
+                saturated = full || busy >= n,
+                roundTrip = round rtt',
+                elapsed = dt `div` 1000
+              }
+          -- from the limit set by hand since the step before, if it was
+          from
+            | n == w.limit = w
+            | otherwise = (window settings) {limit = n, level = fromIntegral n}
+          w' = control settings seenNow from
+      resize a w'.limit t
       c <- readTVar a.codel
-      return Report {limit = n', delay = d.scheduling, lateness = d.raw, overloaded = c.overloaded}
+      return
+        ( w',
+          rtt',
+          Report
+            { limit = w'.limit,
+              delay = d.scheduling,
+              lateness = d.raw,
+              used = round (100 * used),
+              roundTrip = round rtt',
+              overloaded = c.overloaded
+            }
+        )
 
 -- | How full the server is.
 data Load = Load

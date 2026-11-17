@@ -132,9 +132,9 @@ info:
     | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
     | 410 | `replaced` | A transaction asked for by its id was replaced by one that a block confirmed; `replaced-by` and `height` say which and where. |
     | 429 | `server-busy` | A wallet asked for is not in the cache yet, and the server cannot have it there soon. Try again after the seconds of its `Retry-After` header. Any endpoint of wallets may answer it; `/events` only for an `xpub` to watch. |
+    | 429 | `server-busy` | The server has more long requests (lists, whole blocks, wallets) than it can answer now. Try again after a second, or ask another server. |
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
     | 503 | `server-error` | Reading a wallet into the cache failed; ask again after a second. |
-    | 503 | `server-busy` | The server has more long requests (lists, whole blocks, wallets) than it can answer now. Try again after a second, or ask another server. |
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
 
@@ -300,14 +300,14 @@ info:
     - **`Vary: Accept-Encoding`** is on every answer, so that a cache keeps
       compressed and plain answers apart.
     - **`Retry-After`** is on a 503: one second from a server that is behind
-      its fleet or failed to read a wallet into its cache, five from a health
-      check that fails, and one from a server that is too busy. It is on a
-      429 too: for a wallet that is not in the cache yet, it is when the
-      server expects to have it there, from the wallets ahead of it and how
-      long a wallet takes to read; from a server that another one is reading
-      it for, when that one expects to be done.
+      its fleet or failed to read a wallet into its cache, and five from a
+      health check that fails. It is on a 429 too: one second from a server
+      that is too busy; for a wallet that is not in the cache yet, it is when
+      the server expects to have it there, from the wallets ahead of it and
+      how long a wallet takes to read; from a server that another one is
+      reading it for, when that one expects to be done.
     - **A busy server makes long requests wait** for a moment, and refuses
-      with 503 those that it cannot start soon. A request that it started
+      with 429 those that it cannot start soon. A request that it started
       is answered in full.
     - **The reference itself** is at the root of every server: `/` is this
       page, for the version that the server runs, and `/swagger.yaml` the file

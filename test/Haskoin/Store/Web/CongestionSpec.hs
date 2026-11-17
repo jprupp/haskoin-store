@@ -21,39 +21,50 @@ spec :: Spec
 spec = do
   describe "the controller of the limit" $ do
     prop "keeps the limit between the floor and the ceiling" $
-      forAll settings $ \c -> forAll (start c) $ \n ->
+      forAll settings $ \c -> forAll (start c) $ \w ->
         forAll (listOf (observation c)) $ \os ->
-          all (\m -> c.floor <= m && m <= c.ceiling) (steps c n os)
+          all (\x -> c.floor <= x.limit && x.limit <= c.ceiling) (steps c w os)
 
     prop "comes down to the floor while the delay stays over the target" $
-      forAll settings $ \c -> forAll (start c) $ \n ->
-        forAll (vectorOf c.ceiling (congested c)) $ \os ->
-          let ms = steps c n os
+      forAll settings $ \c -> forAll (start c) $ \w ->
+        forAll (vectorOf 64 (congested c)) $ \os ->
+          let ms = map (.limit) (steps c w os)
            in last ms == c.floor && and (zipWith (>=) ms (drop 1 ms))
 
-    prop "grows by one a step up to the ceiling while under the target and saturated" $
-      forAll settings $ \c -> forAll (start c) $ \n ->
-        forAll (listOf (calm c)) $ \os ->
-          steps c n os == take (length os + 1) [min c.ceiling m | m <- [n ..]]
+    prop "cuts at most once a round trip" $
+      forAll settings $ \c -> forAll (start c) $ \w -> forAll (chooseInt (0, 5000000)) $ \rtt ->
+        forAll (listOf (congested c)) $ \os ->
+          let os' = [o {roundTrip = rtt} | o <- os]
+              ws = drop 1 (steps c w os')
+              -- microseconds since the last cut, before each step
+              since = scanl (\t (o, x) -> if x.sinceCut == 0 then 0 else t + o.elapsed) w.sinceCut (zip os' ws)
+           in and [t + o.elapsed >= rtt | (t, o, x) <- zip3 since os' ws, x.sinceCut == 0]
 
-    prop "never grows while it is not saturated" $
-      forAll settings $ \c -> forAll (start c) $ \n ->
-        forAll (listOf (observation c)) $ \os ->
-          let os' = [o {saturated = False} | o <- os]
-              ms = steps c n os'
-           in and (zipWith (>=) ms (drop 1 ms))
+    prop "never grows while it is not saturated, or while the cores are busy" $
+      forAll settings $ \c -> forAll (start c) $ \w ->
+        forAll (listOf (observation c)) $ \os -> forAll (chooseInt (90, 200)) $ \busy ->
+          let idle = map (.limit) (steps c w [o {saturated = False} | o <- os])
+              full = map (.limit) (steps c w [o {used = busy} | o <- os])
+           in and (zipWith (>=) idle (drop 1 idle)) && and (zipWith (>=) full (drop 1 full))
 
-    prop "never comes down while a cut is still draining" $
-      forAll settings $ \c -> forAll (start c) $ \n ->
-        forAll (listOf (observation c)) $ \os ->
-          let os' = [o {draining = True} | o <- os]
-              ms = steps c n os'
-           in and (zipWith (<=) ms (drop 1 ms))
+    prop "grows back to the level of the last cut, then past it to the ceiling" $
+      forAll settings $ \c -> forAll (chooseInt (c.floor, c.ceiling)) $ \n ->
+        let w = (window c) {limit = n, level = fromIntegral n, peak = fromIntegral n}
+            cut = control c (Observation (c.target + 1) 50 True 0 500000) w
+            climb = steps c cut (replicate 400 (calm c))
+            -- seconds on the curve at each step
+            times = [0.5 * fromIntegral i :: Double | i <- [0 :: Int ..]]
+            early = [x.limit | (x, t) <- zip climb times, t < cut.knee]
+            past = [x.limit | (x, t) <- zip climb times, t >= cut.knee + 0.5]
+         in all (<= n) early
+              && all (>= n) (take 1 past)
+              && last (map (.limit) climb) == c.ceiling
+              && and (zipWith (<=) (map (.limit) climb) (drop 1 (map (.limit) climb)))
 
     prop "never moves a fixed limit" $
       forAll settings $ \c0 -> forAll (listOf (observation c0)) $ \os ->
         let c = c0 {ceiling = c0.floor}
-         in all (== c.floor) (steps c c.floor os)
+         in all ((== c.floor) . (.limit)) (steps c (window c) os)
 
   describe "the percentile" $ do
     it "is the value at its rank" $ do
@@ -137,18 +148,31 @@ settings = do
   target <- chooseInt (1, 100000)
   return Control {floor = lo, ceiling = hi, target = target}
 
--- | A limit between the floor and the ceiling.
-start :: Control -> Gen Int
-start c = chooseInt (c.floor, c.ceiling)
+-- | A window that some steps led to from the start.
+start :: Control -> Gen Window
+start c = foldl (flip (control c)) (window c) <$> listOf (observation c)
 
 -- | Anything that a step may see.
 observation :: Control -> Gen Observation
-observation c = Observation <$> chooseInt (0, 2 * c.target) <*> arbitrary <*> arbitrary
+observation c =
+  Observation
+    <$> chooseInt (0, 2 * c.target)
+    <*> chooseInt (0, 150)
+    <*> arbitrary
+    <*> chooseInt (0, 2000000)
+    <*> chooseInt (0, 1000000)
 
--- | A step with a delay over the target, after the last cut took effect.
+-- | A step with a delay over the target, a round trip after the last cut.
 congested :: Control -> Gen Observation
-congested c = Observation <$> chooseInt (c.target + 1, 4 * c.target) <*> arbitrary <*> pure False
+congested c =
+  Observation
+    <$> chooseInt (c.target + 1, 4 * c.target)
+    <*> chooseInt (0, 150)
+    <*> arbitrary
+    <*> pure 0
+    <*> chooseInt (1, 1000000)
 
--- | A step with a delay under the target, and every slot taken.
-calm :: Control -> Gen Observation
-calm c = Observation <$> chooseInt (0, c.target - 1) <*> pure True <*> arbitrary
+-- | A step of half a second with a delay under the target, every slot
+-- taken, and cores with room.
+calm :: Control -> Observation
+calm c = Observation (c.target - 1) 50 True 0 500000

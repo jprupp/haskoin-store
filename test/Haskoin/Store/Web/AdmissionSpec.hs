@@ -226,6 +226,30 @@ spec = describe "the limit on the requests answered at once" $ do
       mapM_ (\(g, t) -> move 4 >> putMVar g () >> wait t) (zip gates ts)
       (.refused) <$> load a `shouldReturn` Refusals 0 0 0
 
+  it "lets a request step aside from its slot, and takes it back without the line" $ do
+    (clock, _) <- handClock
+    a <- newAdmissionWith clock (fixed 1 10)
+    outside <- newEmptyMVar
+    back <- newEmptyMVar
+    gate <- newEmptyMVar
+    stepping <- async $ admittedAside a (const (return False)) $ \out -> do
+      aside out (putMVar outside () >> takeMVar back)
+      takeMVar gate
+      return True
+    takeMVar outside
+    -- its slot is free while it is aside
+    settle a 0 0
+    other <- async (admitted a (const (return False)) (True <$ takeMVar gate))
+    settle a 1 0
+    -- back in, past the limit
+    putMVar back ()
+    settle a 2 0
+    putMVar gate ()
+    putMVar gate ()
+    mapM wait [stepping, other] `shouldReturn` [True, True]
+    l <- load a
+    (l.busy, l.waiting, l.refused) `shouldBe` (0, 0, Refusals 0 0 0)
+
 -- | A fixed limit of so many slots, with room for so many in line, who may
 -- wait ten seconds.
 fixed :: Int -> Int -> Settings
