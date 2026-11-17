@@ -98,6 +98,7 @@ import Haskoin.Store.Fleet.Member
     memberForget,
     memberLoop,
     memberReceived,
+    memberSeen,
     newMember,
     noteBest,
   )
@@ -381,6 +382,7 @@ blockStoreCfg cfg node pub db member =
       net = cfg.net,
       onBest = maybe (\_ -> return ()) noteBest member,
       onTx = maybe (\_ _ -> return ()) memberReceived member,
+      seen = maybe (\_ -> return mempty) memberSeen member,
       blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,

@@ -32,7 +32,10 @@
 -- = Transactions
 --
 -- Once the database is in sync, the block store requests every transaction
--- that peers announce. It asks peers for their whole mempools only to fill
+-- that peers announce and that no store of the fleet has seen ('toFetch'):
+-- what the fleet saw is a set in Redis, the same for every store and kept
+-- across restarts, so a transaction is fetched about once for the fleet.
+-- It asks peers for their whole mempools only to fill
 -- the pool again after Redis lost it ('blockStoreRefill'): the pool outlives
 -- the store, so a store that starts has nothing to ask for. A transaction
 -- that arrives goes to 'onTx': the member of the fleet offers it to the
@@ -87,6 +90,7 @@ module Haskoin.Store.BlockStore
     blockStorePendingTxsSTM,
     needsMoreBlocks,
     blockStoreRefill,
+    toFetch,
   )
 where
 
@@ -286,12 +290,7 @@ data BlockStore = BlockStore
     -- only for blocks that it announced
     knows :: !(TVar (HashMap Text Known)),
     -- | who reserves the syncing peer, so that no one else releases it
-    owner :: !Owner,
-    -- | transactions that peers sent since the store started, as many as
-    -- 'mostForgotten'. The database keeps nothing of the mempool, and every
-    -- peer announces each of them: without this the store would fetch each
-    -- one again from every peer.
-    forgotten :: !(TVar (HashSet TxHash))
+    owner :: !Owner
   }
 
 -- | The blocks that a peer said it has. A peer is asked for a block only
@@ -307,12 +306,6 @@ data Known = Known
     -- those before it
     tip :: !(Maybe BlockNode)
   }
-
--- | How many transactions the store remembers not to fetch again.
--- Past that many it forgets them all and starts over, which costs a few
--- fetches that come to nothing.
-mostForgotten :: Int
-mostForgotten = 100000
 
 -- | StatsD metrics of the block store.
 data StoreMetrics = StoreMetrics
@@ -440,6 +433,13 @@ data BlockStoreConfig = BlockStoreConfig
     -- fleet offers it to the pool, the mempool, which is in Redis alone
     -- ('Haskoin.Store.Fleet.Member.memberReceived')
     onTx :: !(UnixTime -> Tx -> IO ()),
+    -- | of these transactions, those that the fleet has seen, which the
+    -- store does not fetch when a peer announces them: one that a store
+    -- received, or that left the pool unconfirmed. The database keeps
+    -- nothing of the mempool, so without this every store would fetch each
+    -- transaction from every peer that announces it
+    -- ('Haskoin.Store.Fleet.Member.memberSeen')
+    seen :: !([TxHash] -> IO (HashSet TxHash)),
     -- | blocks to request from the syncing peer in one batch
     blockWindow :: !Int,
     -- | delete transactions older than this number of days from mempool
@@ -538,7 +538,6 @@ withBlockStore cfg action = do
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
-  forgotten <- newTVarIO HashSet.empty
   knows <- newTVarIO HashMap.empty
   let r =
         BlockStore
@@ -550,8 +549,7 @@ withBlockStore cfg action = do
             syncedMempool = sy,
             refilling = refilling,
             knows = knows,
-            owner = owner,
-            forgotten = forgotten
+            owner = owner
           }
   withAsync ((go r inbox)) $ \a -> do
     link a
@@ -614,13 +612,13 @@ syncMempool self p =
       MMempool `sendMessage` p
 
 -- | Ask every peer for its mempool again, and fetch every transaction that
--- it announces, as if none had been heard before: for when Redis lost its
--- data, and the pool with it ('Haskoin.Store.Fleet.Member.noteEpoch').
+-- it announces and the fleet has not seen: for when Redis lost its data,
+-- the pool with it, and what the fleet had seen
+-- ('Haskoin.Store.Fleet.Member.noteEpoch').
 -- The transactions go to 'onTx', which offers them to the pool again.
 blockStoreRefill :: BlockStore -> IO ()
 blockStoreRefill self = do
   atomically $ do
-    writeTVar self.forgotten HashSet.empty
     writeTVar self.syncedMempool HashSet.empty
     writeTVar self.refilling True
   getPeers self.config.peerMgr >>= mapM_ (syncMempool self . (.mailbox))
@@ -723,9 +721,6 @@ processTx self p tx = do
       <> txHashToHex (txHash tx)
       <> " by peer: "
       <> p.label
-  -- not fetched again when another peer announces it
-  atomically . modifyTVar' self.forgotten $ \seen ->
-    if HashSet.size seen >= mostForgotten then HashSet.singleton (txHash tx) else HashSet.insert (txHash tx) seen
   changePending self (Pending.answered (txHash tx))
   self.config.onTx (fromIntegral (floor (utcTimeToPOSIXSeconds t) :: Integer)) tx
 
@@ -760,65 +755,33 @@ updateOrphans self = do
         Just TxData {deleted = True} -> return False
         Just TxData {deleted = False} -> return True
 
--- | Whether the store has a transaction, or heard it not long ago: in
--- both cases there is nothing to fetch.
-known :: BlockStore -> TxHash -> IO (Maybe ())
-known self h =
-  HashSet.member h <$> readTVarIO self.forgotten >>= \case
-    True -> return (Just ())
-    False -> (() <$) <$> getTxData self h
+-- | Of the transactions that a peer announced, those to fetch: given
+-- whether one is queued or was requested lately, which of them the fleet
+-- has seen ('seen' of t'BlockStoreConfig'), and whether one is in the
+-- database. The fleet is asked once for all of them, since an inventory can
+-- name thousands, and only for those that are not queued.
+toFetch :: (TxHash -> IO Bool) -> ([TxHash] -> IO (HashSet TxHash)) -> (TxHash -> IO Bool) -> [TxHash] -> IO [TxHash]
+toFetch pending seen stored hs = do
+  fresh <- filterM (fmap not . pending) hs
+  have <- if null fresh then return HashSet.empty else seen fresh
+  filterM (fmap not . stored) (filter (not . (`HashSet.member` have)) fresh)
 
 -- | Request from a peer the announced transactions that are neither queued,
--- recently requested nor in the database. Only while in sync.
+-- recently requested, seen by the fleet nor in the database ('toFetch').
+-- Only while in sync.
 processTxs :: BlockStore -> Peer -> [TxHash] -> IO ()
 processTxs self p hs = guardSync self $ do
+  xs <- toFetch (isPending self) self.config.seen stored hs
   logDebug self $
-    "Received inventory with "
+    "Requesting "
+      <> cs (show (length xs))
+      <> " of "
       <> cs (show (length hs))
-      <> " transactions from peer: "
+      <> " transactions announced by peer: "
       <> p.label
-  xs <- catMaybes <$> zip_counter process_tx
   unless (null xs) $ go xs
   where
-    len = length hs
-    zip_counter = forM (zip [(1 :: Int) ..] hs) . uncurry
-    process_tx i h =
-      isPending self h >>= \case
-        True -> do
-          logDebug self $
-            "Tx "
-              <> cs (show i)
-              <> "/"
-              <> cs (show len)
-              <> " "
-              <> txHashToHex h
-              <> ": "
-              <> "Already Pending"
-          return Nothing
-        False ->
-          known self h >>= \case
-            Just _ -> do
-              logDebug self $
-                "Tx "
-                  <> cs (show i)
-                  <> "/"
-                  <> cs (show len)
-                  <> " "
-                  <> txHashToHex h
-                  <> ": "
-                  <> "Already Imported"
-              return Nothing
-            Nothing -> do
-              logDebug self $
-                "Tx "
-                  <> cs (show i)
-                  <> "/"
-                  <> cs (show len)
-                  <> " "
-                  <> txHashToHex h
-                  <> ": "
-                  <> "Requesting"
-              return (Just h)
+    stored h = isJust <$> getTxData self h
     go xs = do
       now <- getCurrentTime
       changePending self (Pending.requested now xs)

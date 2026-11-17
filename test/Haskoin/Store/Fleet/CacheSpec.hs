@@ -32,18 +32,21 @@ import Haskoin
     BlockHeader (..),
     BlockNode (..),
     Tx (..),
+    TxHash (..),
     TxIn (..),
     TxOut (..),
     addressToScriptBS,
     btcRegTest,
     buildMerkleRoot,
     deriveXPubKey,
+    doubleSHA256,
     isValidPOW,
     makeXPrvKey,
     nullOutPoint,
     scriptToAddressBS,
     txHash,
   )
+import Haskoin.Store.BlockStore (toFetch)
 import Haskoin.Store.Common (StoreRead (..), sortTxs)
 import Haskoin.Store.Data
   ( BlockData (..),
@@ -103,6 +106,7 @@ spec = do
       it "never answers an entry that a move of the tip is writing" (`withBed` markedTest)
       it "keeps the cache across a reorganisation, as the chain and the pool give it" (`withBed` reorgTest)
       it "fills the pool again after Redis lost its data" (`withBed` refillTest)
+      it "fetches no transaction that another member received" (`withBed` seenTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
           property $ \steps -> ioProperty (withBed r (\bed -> modelTest bed (take 12 steps)) >> return True)
@@ -224,6 +228,19 @@ reorgTest bed = do
   (entries, _) <- cacheSize bed.conn bed.a.keys
   entries `shouldSatisfy` (> 0)
   forM_ [bed.a, bed.b] $ \m -> sameAsChain bed m x
+
+-- | What one store received from a peer, another does not fetch when its
+-- own peer announces it: both ask the same set in Redis.
+seenTest :: Bed -> IO ()
+seenTest bed = do
+  coin : _ <- coins bed
+  let tx = spend [coin] [(script, 100000)]
+      other = TxHash (doubleSHA256 ("never sent" :: ByteString))
+      fetch m = toFetch (\_ -> return False) (memberSeen m) (\_ -> return False)
+  fetch bed.b [txHash tx, other] `shouldReturn` [txHash tx, other]
+  offer bed tx
+  fetch bed.b [txHash tx, other] `shouldReturn` [other]
+  fetch bed.a [txHash tx, other] `shouldReturn` [other]
 
 refillTest :: Bed -> IO ()
 refillTest bed = do

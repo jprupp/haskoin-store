@@ -86,6 +86,24 @@ spec = do
         fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) [] `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
+      it "keeps the newest transactions seen, and those that left the pool unconfirmed" $ \(conn, fresh) -> do
+        keys <- fresh
+        -- a bound of 20 is trimmed past 21
+        forM_ [100 .. 129] $ \i -> fleetSaw conn keys 4 20 [block i] >>= (`shouldSatisfy` (<= 21))
+        kept <- fleetSeen conn keys (map block [100 .. 129])
+        length (filter id kept) `shouldSatisfy` (\n -> n >= 20 && n <= 21)
+        drop 10 kept `shouldBe` replicate 20 True
+        fleetSeen conn keys [] `shouldReturn` []
+        -- what a block confirms is not seen; what leaves unconfirmed is
+        fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
+        fleetMove conn keys Nothing Nothing `shouldReturn` MovedTo (block 1)
+        poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
+        poolOffer conn keys 4 (Just (block 1)) (txOf 8 [out 0 1]) [True] [] `shouldReturn` Taken
+        poolWithdraw conn keys 4 [block 8] `shouldReturn` [block 8]
+        fleetReport conn keys Nothing 60000 "a" [block 2, block 1] [block 1] `shouldReturn` True
+        let confirms = nothing {confirmed = [block 7], spent = [out 0 0 <> block 7 <> encode (2 :: Word32)]}
+        fleetAdvance conn keys 4 Nothing (Just (block 1)) (block 2) (Just confirms) [] `shouldReturn` MovedTo (block 2)
+        fleetSeen conn keys [block 7, block 8] `shouldReturn` [False, True]
       it "tells what happens to the pool and to the tip, in the order in which it happens" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True

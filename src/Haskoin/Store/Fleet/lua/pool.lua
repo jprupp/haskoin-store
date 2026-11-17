@@ -24,6 +24,9 @@
 --
 -- 'withdraw': the transactions. Returns those that left.
 --
+-- 'saw': the transactions that a store received from a peer, and how many
+-- of the transactions seen to keep. Returns how many are kept.
+--
 -- 'advance': the tip that the store saw or '', the block to move to, the
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
 -- bytes, '1' to empty the pool instead of changing it or '0', the height of
@@ -120,6 +123,7 @@ local key = {
   lostval = prefix .. 'pool:lost',
   lostby = prefix .. 'pool:lostby:',
   lostat = prefix .. 'pool:lostat',
+  seen = prefix .. 'fleet:seen',
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:',
   xtip = prefix .. 'fx:tip',
@@ -143,6 +147,21 @@ end
 -- keeps about the last ten thousand.
 local function emit(kind, what)
   redis.call('XADD', key.events, 'MAXLEN', '~', '10000', '*', 'k', kind, 'h', what)
+end
+
+-- The transactions that the stores of the fleet saw, by the time in
+-- milliseconds at which they were first seen: each that a store received
+-- from a peer ('saw'), and each that left the pool unconfirmed. No store
+-- fetches one of them when a peer announces it. Not under 'pool:', so that
+-- it outlives a pool that is started again, as the transactions do: peers
+-- do not announce them again. 'saw' keeps the newest of them.
+local seenAt
+local function seen(t)
+  if not seenAt then
+    local time = redis.call('TIME')
+    seenAt = time[1] * 1000 + math.floor(time[2] / 1000)
+  end
+  redis.call('ZADD', key.seen, 'NX', seenAt, t)
 end
 
 local function member(t)
@@ -319,6 +338,7 @@ local function remove(t, quiet)
   end
   if not quiet then
     emit('d', t)
+    seen(t)
   end
   local kept = cmsgpack.unpack(redis.call('HGET', key.entries, t))
   account(t, kept[1], kept[2], -1)
@@ -368,6 +388,20 @@ end
 
 if what == 'withdraw' then
   return withdraw(split(ARGV[4], tsize))
+end
+
+-- trimmed only when the set has grown a hundredth past its bound, so that
+-- most calls cost a ZADD and a ZCARD
+if what == 'saw' then
+  for _, t in ipairs(split(ARGV[4], tsize)) do
+    seen(t)
+  end
+  local most, n = tonumber(ARGV[5]), redis.call('ZCARD', key.seen)
+  if n > most + math.max(1, math.floor(most / 100)) then
+    redis.call('ZREMRANGEBYRANK', key.seen, 0, n - most - 1)
+    n = most
+  end
+  return n
 end
 
 -- forget that these transactions were replaced

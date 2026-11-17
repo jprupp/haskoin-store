@@ -32,7 +32,9 @@
 --
 -- * __It offers its mempool to the shared pool__ ('offerMempool'), each
 --   transaction with whether its inputs are unspent in the store's view at
---   the fleet tip, so that the pool only takes what is valid there.
+--   the fleet tip, so that the pool only takes what is valid there. What
+--   it receives it notes in Redis as seen by the fleet, and no store
+--   fetches that again when a peer announces it ('memberSeen').
 --
 -- * __It answers from the view at the fleet tip with the pool on top__
 --   ('answering', 'redisPool'), or says that it is behind when it has no
@@ -95,6 +97,8 @@ module Haskoin.Store.Fleet.Member
     changeBetween,
     offerMempool,
     memberReceived,
+    memberSeen,
+    mostSeen,
     memberPoolBody,
     memberNewest,
     expirePool,
@@ -914,10 +918,36 @@ offerMempool m =
 -- | A transaction that the store heard from a peer, to offer to the pool at
 -- the next turn, with the time at which it was heard. There is no mempool
 -- of the store's own: the pool in Redis is the mempool.
+--
+-- It is also noted in Redis as seen by the fleet ('fleetSaw'), so that no
+-- store fetches it again when a peer announces it ('memberSeen'). That
+-- waits at most a second for Redis, and gives up quietly: a store without
+-- Redis is unhealthy anyway, and at worst a store fetches it again.
 memberReceived :: Member -> UnixTime -> Tx -> IO ()
-memberReceived m time tx = atomically $ do
-  have <- HashSet.member (txHash tx) <$> readTVar m.offered
-  unless have $ modifyTVar' m.waiting (HashMap.insertWith (\_ old -> old) (txHash tx) (time, tx))
+memberReceived m time tx = do
+  handleAny (\_ -> return ()) . void . timeout 1000000 $
+    fleetSaw m.redis m.keys 32 mostSeen [encode (txHash tx)]
+  atomically $ do
+    have <- HashSet.member (txHash tx) <$> readTVar m.offered
+    unless have $ modifyTVar' m.waiting (HashMap.insertWith (\_ old -> old) (txHash tx) (time, tx))
+
+-- | Of these transactions, those that the fleet has seen ('fleetSaw'), in
+-- one round trip to Redis: the block store fetches none of them when a peer
+-- announces them. None if Redis does not answer within a second; the store
+-- then fetches what is announced, and finds out later what the pool has.
+memberSeen :: Member -> [TxHash] -> IO (HashSet TxHash)
+memberSeen m hs =
+  handleAny (\_ -> return HashSet.empty) $
+    timeout 1000000 (fleetSeen m.redis m.keys (map encode hs)) <&> \case
+      Just flags -> HashSet.fromList [h | (h, True) <- zip hs flags]
+      Nothing -> HashSet.empty
+
+-- | How many transactions the fleet remembers having seen, the newest
+-- ('fleetSaw'). A peer announces a transaction within seconds of having
+-- it, so a hundred thousand covers far more than the time in which the
+-- peers of the fleet announce one, at any rate that Bitcoin carries.
+mostSeen :: Int
+mostSeen = 100000
 
 -- | The body of a transaction of the pool, for the filters of @/events@.
 memberPoolBody :: Member -> TxHash -> IO (Maybe TxData)

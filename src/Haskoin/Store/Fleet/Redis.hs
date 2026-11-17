@@ -82,6 +82,10 @@ module Haskoin.Store.Fleet.Redis
     poolBody,
     poolRead,
 
+    -- * What the fleet has seen
+    fleetSaw,
+    fleetSeen,
+
     -- * Scripts
     Script,
     script,
@@ -95,7 +99,7 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word32, Word64)
 import Database.Redis (Connection, Redis, RedisResult, Reply (..))
 import Database.Redis qualified as R
@@ -272,6 +276,33 @@ poolOffer conn keys tsize seen tx unspents replaced =
 poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString]
 poolWithdraw conn keys tsize ts =
   run conn (evalScript poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
+
+-- | Note that a store received these transactions from a peer, given the
+-- size of a transaction id and how many of the transactions seen to keep,
+-- the newest. Gives how many are kept.
+--
+-- The fleet keeps, in one sorted set, each transaction that a store
+-- received and each that left the pool unconfirmed, by the time at which
+-- it was first seen, so that no store fetches it when a peer announces it
+-- ('fleetSeen'). In Redis, the set is the same for every store and outlives
+-- a store that restarts; in the memory of each store, as it was before,
+-- every store fetched each transaction once, and again after a restart. A
+-- transaction is seen at most once by the set, with @ZADD NX@. The set is
+-- trimmed to the newest when it has grown a hundredth past its bound, and
+-- not on every call.
+fleetSaw :: Connection -> FleetKeys -> Int -> Int -> [ByteString] -> IO Integer
+fleetSaw conn keys tsize most ts =
+  run conn (evalScript poolScript [] ["saw", keys.prefix, num tsize, B.concat ts, num most])
+
+-- | Of these transactions, which the fleet has seen ('fleetSaw'), in one
+-- round trip.
+fleetSeen :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
+fleetSeen _ _ [] = return []
+fleetSeen conn keys ts =
+  map isJust <$> run conn scores
+  where
+    scores :: Redis (Either Reply [Maybe ByteString])
+    scores = R.sendRequest ("ZMSCORE" : keys.prefix <> "fleet:seen" : ts)
 
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the

@@ -31,6 +31,15 @@ knows nothing of the mempool, and is unhealthy.
   times the pool was started again.
 - **A stream of events**: what entered, what left, which blocks the tip
   went through.
+- **What the fleet saw** (`fleet:seen`): the newest 100,000 transactions
+  that a server received from a peer or that left the pool unconfirmed,
+  by the time each was first seen. A server checks every announcement
+  against it in one call (`ZMSCORE`), and fetches none of them. It is the
+  same for every server and outlives a restart, so a transaction is
+  fetched about once for the fleet, and one that another server dropped is
+  not fetched and offered again. It is trimmed when it grows a hundredth
+  past its bound. Without an answer from Redis, a server fetches what is
+  announced.
 
 The pool and the tip are written only by `pool.lua`, so one script call
 changes them together or not at all.
@@ -247,6 +256,9 @@ then corrects itself when that block comes. This is the same rule a node
 uses, and cannot be better without knowing what miners will do.
 
 **7. Small ones.**
+- A server notes a transaction as seen when it receives it, before it
+  offers it. If it stops before the offer, no other server fetches that
+  transaction while it is in the set.
 - A replacement relayed by a peer replaces its rivals in the pool, on the
   word of that peer's node.
 - The pool's part of a tip move across many large blocks is one long
@@ -261,12 +273,14 @@ uses, and cannot be better without knowing what miners will do.
   property that the pool stays valid on top of the chain whatever is
   offered, mined and unwound (3,000 random histories).
 - `Haskoin.Store.Fleet.RedisSpec`: the scripts against a real Redis, step
-  by step against the model, plus the emptying rules and the events.
+  by step against the model, plus the emptying rules, the events, and
+  the set of what the fleet saw.
 - `Haskoin.Store.Fleet.CacheSpec`: two members on one chain and a real
   Redis: random histories of payments, blocks, reorganisations and builds,
   each cached entry held to the queries at the tip and the pool; a
   reorganisation that keeps the cache; the pool filling again after Redis
-  lost its data.
+  lost its data; a transaction that one member received not fetched by
+  the other.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 
