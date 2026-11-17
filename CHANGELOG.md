@@ -11,6 +11,8 @@ store is a member of a fleet, the mempool is only in Redis, and every xpub is
 answered from the fleet's cache.
 
 ### Added
+- **Gauges of the latest block's import times** (`store.last_block_ms` and one per stage), which
+  keep their value until the next block, so that charts show the right time at any zoom.
 - **Admission control that adapts** (`Haskoin.Store.Web.Admission`,
   `Haskoin.Store.Web.Congestion`, `docs/congestion-control.md`). Only so many
   long requests (lists, whole blocks, xpubs) run at once, so that a busy store

@@ -338,7 +338,18 @@ data StoreMetrics = StoreMetrics
     -- | the rules, in memory (@store.block_apply@)
     blockApply :: !StatTiming,
     -- | writing the batch to RocksDB (@store.block_write@)
-    blockWrite :: !StatTiming
+    blockWrite :: !StatTiming,
+    -- | the same times of the latest block, as gauges that keep their value
+    -- until the next block (@store.last_block_ms@, @store.last_block_prepare_ms@,
+    -- @store.last_block_prefetch_ms@, @store.last_block_apply_ms@ and
+    -- @store.last_block_write_ms@): a timing has a value only in the second of
+    -- its block, so a chart that averages seconds shows it smaller the more it
+    -- is zoomed out; a gauge shows the time of the latest block at any zoom
+    lastBlock :: !StatGauge,
+    lastPrepare :: !StatGauge,
+    lastPrefetch :: !StatGauge,
+    lastApply :: !StatGauge,
+    lastWrite :: !StatGauge
   }
 
 -- | Register the block store metrics, if StatsD is configured, with their current values.
@@ -363,6 +374,11 @@ newStoreMetrics cfg =
     blockReadBalances <- t s "block_read_balances"
     blockApply <- t s "block_apply"
     blockWrite <- t s "block_write"
+    lastBlock <- g s "last_block_ms" 0
+    lastPrepare <- g s "last_block_prepare_ms" 0
+    lastPrefetch <- g s "last_block_prefetch_ms" 0
+    lastApply <- g s "last_block_apply_ms" 0
+    lastWrite <- g s "last_block_write_ms" 0
     return StoreMetrics {..}
   where
     g s x = newStatGauge s ("store." <> x)
@@ -408,6 +424,7 @@ withBlockTiming self go = do
         Right x -> do
           end <- round . (* 1000) <$> getPOSIXTime
           addTiming m.block (end - start)
+          setGauge m.lastBlock (end - start)
           return (Right x)
         Left y -> return (Left y)
     Nothing -> go
@@ -483,6 +500,10 @@ runImport self net f = do
             addTiming m.blockReadBalances (milliseconds t.reads.balanceReads)
             addTiming m.blockApply (milliseconds t.apply)
             addTiming m.blockWrite (milliseconds t.write)
+            setGauge m.lastPrepare (milliseconds t.prepare)
+            setGauge m.lastPrefetch (milliseconds t.prefetch)
+            setGauge m.lastApply (milliseconds t.apply)
+            setGauge m.lastWrite (milliseconds t.write)
       )
   return (fst <$> r)
   where

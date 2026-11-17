@@ -992,6 +992,7 @@ The metrics of the block store:
 | `store.block_read_balances` | timing | Zero since database version 23: a block no longer reads balances |
 | `store.block_apply` | timing | The rules, in memory |
 | `store.block_write` | timing | Writing the batch to RocksDB |
+| `store.last_block_ms`, `store.last_block_prepare_ms`, `store.last_block_prefetch_ms`, `store.last_block_apply_ms`, `store.last_block_write_ms` | gauge | The same times of the latest block, kept until the next one, so that a chart averaging seconds shows them right at any zoom |
 
 - **The four stages add up to nearly all of `store.block`.** A slow
   `store.block_prefetch` is the disk or RocksDB's cache, and the four
