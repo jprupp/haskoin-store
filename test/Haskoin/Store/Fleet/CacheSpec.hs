@@ -229,8 +229,9 @@ reorgTest bed = do
   entries `shouldSatisfy` (> 0)
   forM_ [bed.a, bed.b] $ \m -> sameAsChain bed m x
 
--- | What one store received from a peer, another does not fetch when its
--- own peer announces it: both ask the same set in Redis.
+-- | What one store received from a peer, it does not fetch again; another
+-- fetches it until the first has offered it to the pool, and not after:
+-- both ask the same set in Redis, which has only what the pool decided on.
 seenTest :: Bed -> IO ()
 seenTest bed = do
   coin : _ <- coins bed
@@ -239,8 +240,12 @@ seenTest bed = do
       fetch m = toFetch (\_ -> return False) (memberSeen m) (\_ -> return False)
   fetch bed.b [txHash tx, other] `shouldReturn` [txHash tx, other]
   offer bed tx
-  fetch bed.b [txHash tx, other] `shouldReturn` [other]
   fetch bed.a [txHash tx, other] `shouldReturn` [other]
+  fetch bed.b [txHash tx, other] `shouldReturn` [txHash tx, other]
+  settle bed
+  inPool bed tx `shouldReturn` True
+  fetch bed.a [txHash tx, other] `shouldReturn` [other]
+  fetch bed.b [txHash tx, other] `shouldReturn` [other]
 
 refillTest :: Bed -> IO ()
 refillTest bed = do

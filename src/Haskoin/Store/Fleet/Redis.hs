@@ -83,7 +83,7 @@ module Haskoin.Store.Fleet.Redis
     poolRead,
 
     -- * What the fleet has seen
-    fleetSaw,
+    fleetTrimSeen,
     fleetSeen,
 
     -- * Scripts
@@ -277,24 +277,26 @@ poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString
 poolWithdraw conn keys tsize ts =
   run conn (evalScript poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
 
--- | Note that a store received these transactions from a peer, given the
--- size of a transaction id and how many of the transactions seen to keep,
--- the newest. Gives how many are kept.
+-- | Keep the newest of the transactions that the fleet has seen, so
+-- many. Gives how many are kept.
 --
--- The fleet keeps, in one sorted set, each transaction that a store
--- received and each that left the pool unconfirmed, by the time at which
--- it was first seen, so that no store fetches it when a peer announces it
--- ('fleetSeen'). In Redis, the set is the same for every store and outlives
--- a store that restarts; in the memory of each store, as it was before,
--- every store fetched each transaction once, and again after a restart. A
--- transaction is seen at most once by the set, with @ZADD NX@. The set is
--- trimmed to the newest when it has grown a hundredth past its bound, and
--- not on every call.
-fleetSaw :: Connection -> FleetKeys -> Int -> Int -> [ByteString] -> IO Integer
-fleetSaw conn keys tsize most ts =
-  run conn (evalScript poolScript [] ["saw", keys.prefix, num tsize, B.concat ts, num most])
+-- The fleet keeps, in one sorted set, each transaction that the pool has
+-- decided on: each that entered it, that an offer found in it or in
+-- conflict with it, and that left it unconfirmed, by the time at which it
+-- was first seen. No store fetches one of them when a peer announces it
+-- ('fleetSeen'). The pool's script adds them, with @ZADD NX@, in the step
+-- that decides, so a transaction that a store received and has not offered
+-- is not in the set: if the store stops first, another fetches it. In
+-- Redis, the set is the same for every store and outlives a store that
+-- restarts; in the memory of each store, as it was before, every store
+-- fetched each transaction once, and again after a restart. The set is
+-- trimmed here, when it has grown a hundredth past its bound, and not on
+-- every addition.
+fleetTrimSeen :: Connection -> FleetKeys -> Int -> IO Integer
+fleetTrimSeen conn keys most =
+  run conn (evalScript poolScript [] ["trim", keys.prefix, "0", num most])
 
--- | Of these transactions, which the fleet has seen ('fleetSaw'), in one
+-- | Of these transactions, which the fleet has seen ('fleetTrimSeen'), in one
 -- round trip.
 fleetSeen :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
 fleetSeen _ _ [] = return []

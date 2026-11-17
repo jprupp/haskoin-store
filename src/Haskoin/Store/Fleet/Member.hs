@@ -33,8 +33,8 @@
 -- * __It offers its mempool to the shared pool__ ('offerMempool'), each
 --   transaction with whether its inputs are unspent in the store's view at
 --   the fleet tip, so that the pool only takes what is valid there. What
---   it receives it notes in Redis as seen by the fleet, and no store
---   fetches that again when a peer announces it ('memberSeen').
+--   the pool decided on is seen by the fleet, in Redis, and no store
+--   fetches it again when a peer announces it ('memberSeen').
 --
 -- * __It answers from the view at the fleet tip with the pool on top__
 --   ('answering', 'redisPool'), or says that it is behind when it has no
@@ -134,7 +134,7 @@ import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (nub, sortOn)
+import Data.List (nub, partition, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Serialize (Serialize, decode, encode, get, getWord32be, putWord32be, runGet, runPut)
@@ -446,7 +446,8 @@ memberAlive m =
 
 -- | One round of what a member does: report, move the tip if the stores
 -- agree on another block, offer what the pool does not have of the store's
--- mempool, and let go of old views. Call it every second or two, and when
+-- mempool, let go of old views, and trim what the fleet has seen
+-- ('fleetTrimSeen'). Call it every second or two, and when
 -- the best block changes. A store whose own health checks fail must not
 -- call it: its lease then runs out, and the fleet goes on without it.
 memberTick :: Member -> IO ()
@@ -462,6 +463,7 @@ memberTick m = do
   cacheGauges m
   unless moved (expirePool m)
   offerMempool m
+  void (fleetTrimSeen m.redis m.keys mostSeen)
   where
     decoded = either (const Nothing) Just . decode
 
@@ -918,32 +920,35 @@ offerMempool m =
 -- | A transaction that the store heard from a peer, to offer to the pool at
 -- the next turn, with the time at which it was heard. There is no mempool
 -- of the store's own: the pool in Redis is the mempool.
---
--- It is also noted in Redis as seen by the fleet ('fleetSaw'), so that no
--- store fetches it again when a peer announces it ('memberSeen'). That
--- waits at most a second for Redis, and gives up quietly: a store without
--- Redis is unhealthy anyway, and at worst a store fetches it again.
 memberReceived :: Member -> UnixTime -> Tx -> IO ()
-memberReceived m time tx = do
-  handleAny (\_ -> return ()) . void . timeout 1000000 $
-    fleetSaw m.redis m.keys 32 mostSeen [encode (txHash tx)]
-  atomically $ do
-    have <- HashSet.member (txHash tx) <$> readTVar m.offered
-    unless have $ modifyTVar' m.waiting (HashMap.insertWith (\_ old -> old) (txHash tx) (time, tx))
+memberReceived m time tx = atomically $ do
+  have <- HashSet.member (txHash tx) <$> readTVar m.offered
+  unless have $ modifyTVar' m.waiting (HashMap.insertWith (\_ old -> old) (txHash tx) (time, tx))
 
--- | Of these transactions, those that the fleet has seen ('fleetSaw'), in
--- one round trip to Redis: the block store fetches none of them when a peer
--- announces them. None if Redis does not answer within a second; the store
--- then fetches what is announced, and finds out later what the pool has.
+-- | Of these transactions, those that the block store need not fetch when
+-- a peer announces them: those that this store holds to offer, and those
+-- that the fleet has seen ('fleetTrimSeen'), asked of Redis in one round
+-- trip. The fleet sees a transaction only once the pool has decided on it,
+-- so what this store received and has not offered yet is known here alone.
+-- Without an answer from Redis within a second, only what the store holds;
+-- the store then fetches the rest, and finds out at the offer what the pool
+-- has.
 memberSeen :: Member -> [TxHash] -> IO (HashSet TxHash)
-memberSeen m hs =
-  handleAny (\_ -> return HashSet.empty) $
-    timeout 1000000 (fleetSeen m.redis m.keys (map encode hs)) <&> \case
-      Just flags -> HashSet.fromList [h | (h, True) <- zip hs flags]
-      Nothing -> HashSet.empty
+memberSeen m hs = do
+  held <- readTVarIO m.waiting
+  let (mine, others) = partition (`HashMap.member` held) hs
+  fleet <-
+    if null others
+      then return HashSet.empty
+      else
+        handleAny (\_ -> return HashSet.empty) $
+          timeout 1000000 (fleetSeen m.redis m.keys (map encode others)) <&> \case
+            Just flags -> HashSet.fromList [h | (h, True) <- zip others flags]
+            Nothing -> HashSet.empty
+  return (HashSet.union (HashSet.fromList mine) fleet)
 
 -- | How many transactions the fleet remembers having seen, the newest
--- ('fleetSaw'). A peer announces a transaction within seconds of having
+-- ('fleetTrimSeen'), trimmed at each turn of a member. A peer announces a transaction within seconds of having
 -- it, so a hundred thousand covers far more than the time in which the
 -- peers of the fleet announce one, at any rate that Bitcoin carries.
 mostSeen :: Int

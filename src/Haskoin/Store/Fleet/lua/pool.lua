@@ -24,8 +24,8 @@
 --
 -- 'withdraw': the transactions. Returns those that left.
 --
--- 'saw': the transactions that a store received from a peer, and how many
--- of the transactions seen to keep. Returns how many are kept.
+-- 'trim': how many of the transactions seen to keep. Returns how many are
+-- kept.
 --
 -- 'advance': the tip that the store saw or '', the block to move to, the
 -- time in milliseconds or '' for the clock of Redis, the size of a block in
@@ -149,12 +149,15 @@ local function emit(kind, what)
   redis.call('XADD', key.events, 'MAXLEN', '~', '10000', '*', 'k', kind, 'h', what)
 end
 
--- The transactions that the stores of the fleet saw, by the time in
--- milliseconds at which they were first seen: each that a store received
--- from a peer ('saw'), and each that left the pool unconfirmed. No store
--- fetches one of them when a peer announces it. Not under 'pool:', so that
--- it outlives a pool that is started again, as the transactions do: peers
--- do not announce them again. 'saw' keeps the newest of them.
+-- The transactions that the fleet has seen, by the time in milliseconds at
+-- which they were first seen: each that entered the pool, that an offer
+-- found in the pool or in conflict with it, and that left the pool
+-- unconfirmed. No store fetches one of them when a peer announces it. Only
+-- what the pool has decided on is seen: a transaction that a store
+-- received and has not offered yet is not, so that if the store stops
+-- before the offer, another fetches it. Not under 'pool:', so that it
+-- outlives a pool that is started again, as the transactions do: peers do
+-- not announce them again. 'trim' keeps the newest of them.
 local seenAt
 local function seen(t)
   if not seenAt then
@@ -376,6 +379,7 @@ local function insert(tx)
   end
   replaceable(t)
   emit('t', t)
+  seen(t)
 end
 
 local function withdraw(from)
@@ -391,12 +395,9 @@ if what == 'withdraw' then
 end
 
 -- trimmed only when the set has grown a hundredth past its bound, so that
--- most calls cost a ZADD and a ZCARD
-if what == 'saw' then
-  for _, t in ipairs(split(ARGV[4], tsize)) do
-    seen(t)
-  end
-  local most, n = tonumber(ARGV[5]), redis.call('ZCARD', key.seen)
+-- most calls cost a ZCARD
+if what == 'trim' then
+  local most, n = tonumber(ARGV[4]), redis.call('ZCARD', key.seen)
   if n > most + math.max(1, math.floor(most / 100)) then
     redis.call('ZREMRANGEBYRANK', key.seen, 0, n - most - 1)
     n = most
@@ -438,6 +439,7 @@ if what == 'offer' then
   local tx = read(7)
   local t, inputs = tx.id, split(tx.inputs, osize)
   if member(t) then
+    seen(t)
     return {'known'}
   end
   -- what it replaces leaves first, but only if it is taken
@@ -451,6 +453,7 @@ if what == 'offer' then
     end
   end
   if #rivals > 0 then
+    seen(t)
     table.insert(rivals, 1, 'conflict')
     return rivals
   end

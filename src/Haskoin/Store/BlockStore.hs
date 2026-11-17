@@ -433,9 +433,10 @@ data BlockStoreConfig = BlockStoreConfig
     -- fleet offers it to the pool, the mempool, which is in Redis alone
     -- ('Haskoin.Store.Fleet.Member.memberReceived')
     onTx :: !(UnixTime -> Tx -> IO ()),
-    -- | of these transactions, those that the fleet has seen, which the
-    -- store does not fetch when a peer announces them: one that a store
-    -- received, or that left the pool unconfirmed. The database keeps
+    -- | of these transactions, those that the store does not fetch when a
+    -- peer announces them: those that it holds to offer to the pool, and
+    -- those that the pool has decided on, taken, refused as a conflict or
+    -- let go unconfirmed. The database keeps
     -- nothing of the mempool, so without this every store would fetch each
     -- transaction from every peer that announces it
     -- ('Haskoin.Store.Fleet.Member.memberSeen')

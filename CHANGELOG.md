@@ -111,9 +111,11 @@ answered from the fleet's cache.
 
 ### Changed
 - **The fleet remembers what it saw, in Redis** (`fleet:seen`): the last
-  100,000 transactions that any store received from a peer or that left the
-  pool unconfirmed. No store fetches them again when a peer announces them,
-  after a restart either. Each store kept its own set in memory before.
+  100,000 transactions that the pool decided on, taken, refused as a
+  conflict or let go unconfirmed, marked by the pool's script in the same
+  step. No store fetches them again when a peer announces them, after a
+  restart either; what a store holds unoffered it does not fetch again from
+  its own peers. Each store kept its own set in memory before.
 - **Indexes and filters stay in memory** with their open table files, outside
   the block cache, so data blocks can no longer evict them (about 0.34% of the
   database).
