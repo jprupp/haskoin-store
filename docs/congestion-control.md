@@ -12,8 +12,9 @@ How a store decides how many long requests to answer at once. The code is in
 - **The answer.** The store measures how long a thread that is ready to run
   waits for a core, and how much of its cores it uses. While that wait is
   short, the cores have room and every slot is in use, it lets in more long
-  requests. When the wait grows too long, it lets in a quarter fewer, at
-  most once a round trip. This is how TCP shares links (CUBIC).
+  requests. When the wait grows too long and the cores are busy, it lets in a
+  quarter fewer, at most once a round trip. This is how TCP shares links
+  (CUBIC).
 - **The line** in front of the slots is managed the way Linux manages the
   queues of its network links (CoDel): it absorbs bursts, and refuses
   requests at once when it stops emptying.
@@ -64,8 +65,8 @@ Every half second the controller looks at the delay and at the use of the
 cores: the CPU time of the store, all its threads included, over that of
 its capabilities, smoothed over about two seconds.
 
-- **Over the target** (25 ms): the limit is cut by a quarter, at most once
-  a round trip. The round trip is how long a request holds its slot,
+- **Over the target** (25 ms) **with the cores at 90%:** the limit is cut
+  by a quarter, at most once a round trip. The round trip is how long a request holds its slot,
   smoothed. A cut takes effect as requests end; a second one before that
   would answer one congestion twice.
 - **Under the target, every slot used, and the cores under 90%:** the limit
@@ -74,6 +75,12 @@ its capabilities, smoothed over about two seconds.
   clock of the curve runs only while growth is allowed.
 - **Otherwise** it stays. An idle store does not drift up to the ceiling,
   and a store whose cores are busy gains nothing from more slots.
+
+The delay alone does not cut. Requests that wait for the disk come back
+to the cores in bursts, and the probes read over the target for a moment
+while the cores are idle the rest of the time. Cutting on those bursts held
+the limit under the number of clients on a slow disk, and cost answers. A
+store that is really behind uses its cores to the full.
 
 The limit stays between a floor (two a core) and a ceiling (sixteen a
 core). A floor equal to the ceiling is a fixed cap.
@@ -104,6 +111,12 @@ the requests let in during an interval of 100 ms. If even that was over
 5 ms, the line stood all along, and it is *overloaded* until the end of the
 next interval. While it is overloaded, a request that finds no free slot is
 refused at once, and one that has waited over 10 ms is refused.
+
+CoDel holds its fire while the limit is free to rise: the cores under
+90% and the limit under its ceiling. A line that stands then waits for the
+limit to catch up with the load, as after a quiet spell; it does not mean
+that the store is behind. Refused, each client would wait a second for
+nothing.
 
 Otherwise a request waits until it gets a slot, for at most
 `--request-wait`, and a line of `--request-queue` takes no more.
@@ -170,18 +183,31 @@ percentile against 940 ms with no limit, for a fifth fewer long requests
 that compute. With requests that wait for a disk, the limit grew and
 answered within 2% of no limit.
 
-The tuned controller, against no limit, on a store of the benchmark
-(`haskoin-store-bench`, four capabilities, three alternated pairs):
+The controller against no limit, on a store of the benchmark
+(`haskoin-store-bench`, three alternated pairs). In memory, on four
+capabilities:
 
 | Load | Control on | Control off |
 | --- | --- | --- |
-| Overload, 64 heavy connections: simple p50 / p99 | 18–21 / 57–83 ms | 104 / 157–160 ms |
-| Overload: heavy answered | 55/s, plus 44–48 refusals (429) a second | 52/s |
-| Closed loop, 32 connections, mixed | 123–124/s | 109–110/s |
-| Moderate, 4 heavy connections: simple p50 / p99 | 4 / 15–16 ms | 4 / 14–15 ms |
+| Overload, 64 heavy connections: simple p50 / p99 | 18–19 / 53–69 ms | 105–109 / 159–164 ms |
+| Overload: heavy answered | 54/s, plus 42–43 refusals (429) a second | 50–52/s |
+| Closed loop, 16 connections, mixed | 108–111/s | 107–111/s |
+| Moderate, 4 heavy connections: simple p50 / p99 | 4 / 15–16 ms | 4 / 15–16 ms |
 
-The heavy load waited `Retry-After` on each 429. Under overload the cores
-were used at 99%, so the limit held where it was, under the target.
+Bound by the disk, on two capabilities: a block cache of 1 MB, the
+database dropped from the page cache every 50 ms, and 3,500 reads a second:
+
+| Load | Control on | Control off |
+| --- | --- | --- |
+| Closed loop, 16 connections, mixed | 38–43/s | 40–43/s |
+| Overload: simple p50 / p99 | 30–32 / 144–152 ms | 85–88 / 318–487 ms |
+| Overload: heavy answered | 24–26/s, plus 6–7 refusals a second | 26–27/s |
+
+The heavy load waited `Retry-After` on each 429. Before the delay needed
+busy cores to cut and CoDel waited for the limit to rise, the disk-bound
+closed loop answered 33–42/s, with the cores at 63%: the limit was under
+the number of clients a third of the time, and the line refused about two
+requests a second, each of which kept its client away for a second.
 
 ## Further reading
 

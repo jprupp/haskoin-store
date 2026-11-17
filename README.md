@@ -924,8 +924,8 @@ design.
   `/peers` and `/events`, are not limited.
 - **The limit adapts.** A probe on each core notes how late a woken
   thread runs, less the pauses of GHC's collector. Every half second, if
-  the slowest tenth of those delays was over `--target-delay` (25 ms),
-  the limit comes down by a quarter, at most once in the time a request
+  the slowest tenth of those delays was over `--target-delay` (25 ms)
+  and the cores were used at 90%, the limit comes down by a quarter, at most once in the time a request
   holds its slot. If it was under, every slot was in use and the cores
   were used under 90%, the limit grows as TCP CUBIC's window does: fast
   back toward the level of the last cut, then past it. It stays between
@@ -938,6 +938,8 @@ design.
   requests for up to `--request-wait` (1 second). It is managed by CoDel:
   when even the shortest wait in 100 ms was over 5 ms, the line is
   overloaded, and a request that finds no slot free is refused at once.
+  While the cores have room and the limit is under its ceiling, the line
+  waits for the limit to grow instead.
 - **A refused request** gets 429, `{"error": "server-busy"}` and
   `Retry-After: 1`, as nginx's `limit_conn_status 429` does: clients and
   proxies take it to mean "come back later", where some retry a 503 at

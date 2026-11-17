@@ -70,6 +70,15 @@
 -- the clients that it refuses learn so at once, rather than after waiting
 -- for nothing.
 --
+-- CoDel holds its fire while the controller is free to raise the limit,
+-- with the cores under 90% and the limit under its ceiling ('rising'). A
+-- line that stands then waits for the limit to catch up with the load, as
+-- it does after a quiet spell, and is not a sign that the store is behind.
+-- Refused, its clients would wait a second each (@Retry-After@): with the
+-- database on a slow disk, sixteen clients that asked one after the other
+-- were refused about twice a second, each time losing a second of a
+-- client, while the limit climbed.
+--
 -- While the line is not overloaded, a request waits until it is given a
 -- slot, or for at most a limit ('patience'), and a line already holding so
 -- many requests ('room') takes no more. Both are bounds for safety, which
@@ -154,6 +163,7 @@ module Haskoin.Store.Web.Admission
     regulate,
     Report (..),
     setLimit,
+    setClimbing,
 
     -- * How full the server is
     Load (..),
@@ -194,6 +204,7 @@ import Haskoin.Store.Web.Congestion
     control,
     cpuTime,
     delays,
+    rising,
     snooze,
     window,
     withProbes,
@@ -235,6 +246,9 @@ data Admission = Admission
     -- since the last step of the controller
     saturated :: !(TVar Bool),
     codel :: !(TVar Codel),
+    -- | whether the controller is free to raise the limit, as of its last
+    -- step; CoDel does not refuse while it is
+    climbing :: !(TVar Bool),
     refusals :: !(TVar Refusals),
     -- | nanoseconds that the slots given back since the last step of the
     -- controller were held, in all, and how many
@@ -314,6 +328,7 @@ newAdmissionWith clock given = do
     <*> newTVarIO Seq.empty
     <*> newTVarIO False
     <*> newTVarIO Codel {ends = t + interval, least = maxBound, overloaded = False}
+    <*> newTVarIO False
     <*> newTVarIO (Refusals 0 0 0)
     <*> newTVarIO (0, 0)
   where
@@ -472,7 +487,8 @@ tick a t = do
           readTVar a.line >>= \l -> return $ case Seq.viewl l of
             w :< _ -> max 0 (t - w.arrived)
             EmptyL -> 0
-    writeTVar a.codel Codel {ends = t + interval, least = maxBound, overloaded = shortest > sojournTarget}
+    up <- readTVar a.climbing
+    writeTVar a.codel Codel {ends = t + interval, least = maxBound, overloaded = shortest > sojournTarget && not up}
   readTVar a.codel >>= front . (.overloaded)
   where
     -- the line is in the order of arrival, so those who waited longest
@@ -510,6 +526,12 @@ refuse a why = modifyTVar' a.refusals $ \r -> case why of
 -- in line at once. The limit is kept between the floor and the ceiling.
 setLimit :: Admission -> Int -> IO ()
 setLimit a n = a.clock >>= atomically . resize a n
+
+-- | Say whether the limit is free to rise, as the controller does after
+-- each step. While it is, CoDel does not refuse: a line that stands is
+-- waiting for the limit to grow.
+setClimbing :: Admission -> Bool -> IO ()
+setClimbing a = atomically . writeTVar a.climbing
 
 -- | Set the limit at the given time.
 resize :: Admission -> Int -> Int -> STM ()
@@ -603,6 +625,7 @@ regulate a report
             | otherwise = (window settings) {limit = n, level = fromIntegral n}
           w' = control settings seenNow from
       resize a w'.limit t
+      writeTVar a.climbing (rising settings seenNow w')
       c <- readTVar a.codel
       return
         ( w',

@@ -213,6 +213,26 @@ spec = describe "the limit on the requests answered at once" $ do
       wait held `shouldReturn` Right ()
       mapM wait [waiting, behind] `shouldReturn` replicate 2 (Left Overloaded)
 
+    it "lets the line stand while the limit is free to rise" $ do
+      (clock, move) <- handClock
+      a <- newAdmissionWith clock (fixed 1 10)
+      setClimbing a True
+      gate <- newEmptyMVar
+      held <- async (admitted a (return . Left) (Right () <$ takeMVar gate))
+      settle a 1 0
+      waiting <- async (admitted a (return . Left) (return (Right ())))
+      settle a 1 1
+      -- two intervals in which nobody was let in: the line stood, but the
+      -- limit is about to grow, so the request waits for it
+      move 150
+      sweep a
+      move 110
+      sweep a
+      (.overloaded) <$> load a `shouldReturn` False
+      putMVar gate ()
+      mapM wait [held, waiting] `shouldReturn` replicate 2 (Right ())
+      (.refused) <$> load a `shouldReturn` Refusals 0 0 0
+
     it "absorbs a burst that the slots clear within an interval" $ do
       (clock, move) <- handClock
       a <- newAdmissionWith clock (fixed 1 100)

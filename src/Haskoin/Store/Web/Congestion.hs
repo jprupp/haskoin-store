@@ -67,11 +67,11 @@
 -- cores, smoothed over about two seconds ('cpuTime'), and moves the limit
 -- ('control'):
 --
--- * __Over the target__ (25 ms by default): the limit is cut by a quarter,
---   at most once a round trip, the time that a request holds its slot,
---   smoothed. A cut takes effect as requests end, and a second cut before
---   it has would answer one congestion twice, as TCP cuts its window once
---   a round trip.
+-- * __Over the target__ (25 ms by default) __with the cores used at 90%__:
+--   the limit is cut by a quarter, at most once a round trip, the time that
+--   a request holds its slot, smoothed. A cut takes effect as requests end,
+--   and a second cut before it has would answer one congestion twice, as
+--   TCP cuts its window once a round trip.
 --
 -- * __Under the target, every slot used, and the cores used under 90%__:
 --   the limit grows along the cubic curve of TCP CUBIC, concave back
@@ -93,6 +93,15 @@
 -- one slot a step took seconds to fill them again. A server whose cores
 -- are used at 90% gains nothing from more slots, and one whose cores have
 -- room loses requests it could have answered while the limit climbs back.
+--
+-- For the same reason the delay alone does not cut. Requests that wait for
+-- the disk come back to the cores in bursts, and the probes then read over
+-- the target for a moment while the cores are idle the rest of the time.
+-- With the database on a slow disk and two cores used at 63%, cutting on
+-- such bursts held the limit under the number of clients, and the line
+-- refused requests: sixteen clients that asked one after the other got up
+-- to a sixth fewer answers than with no limit. A store that is really behind uses its
+-- cores to the full, so the controller asks for both signals.
 --
 -- The target cannot be much lower than GHC's timeslice: a thread that
 -- wakes behind one other that computes waits up to 20 ms, which is normal
@@ -119,6 +128,7 @@ module Haskoin.Store.Web.Congestion
     Window (..),
     window,
     control,
+    rising,
     cpuTime,
 
     -- * The probes
@@ -221,7 +231,8 @@ backoff = 0.75
 cubic :: Double
 cubic = 0.4
 
--- | Hundredths of the cores in use above which the limit does not grow.
+-- | Hundredths of the cores in use from which the limit does not grow, and
+-- under which it is not cut.
 busyCores :: Int
 busyCores = 90
 
@@ -229,7 +240,7 @@ busyCores = 90
 -- ceiling, the floor giving way to a ceiling below it.
 control :: Control -> Observation -> Window -> Window
 control c o w
-  | o.delay > c.target && since >= o.roundTrip && w.limit > lowest c = cut
+  | o.delay > c.target && o.used >= busyCores && since >= o.roundTrip && w.limit > lowest c = cut
   | o.delay < c.target && o.saturated && o.used < busyCores = grow
   | otherwise = w {sinceCut = since}
   where
@@ -247,6 +258,14 @@ control c o w
        in settle w {level = max w.level (min (fromIntegral c.ceiling) curve), climbed = t, sinceCut = since}
     settle x = x {limit = max (lowest c) (min c.ceiling (floor x.level))}
     cbrt x = if x <= 0 then 0 else x ** (1 / 3)
+
+-- | Whether the limit is free to rise after a step: the cores have room and
+-- it is under the ceiling. A line that stands while it is shows that the
+-- limit lags behind the load, not that the store is behind: the limit
+-- will grow, and refusing the requests that wait for it would cost
+-- answers that the store could give ("Haskoin.Store.Web.Admission").
+rising :: Control -> Observation -> Window -> Bool
+rising c o w = o.used < busyCores && w.limit < c.ceiling
 
 -- | Nanoseconds of the cores that the program has used so far, in all of
 -- its threads, those of the foreign calls included.

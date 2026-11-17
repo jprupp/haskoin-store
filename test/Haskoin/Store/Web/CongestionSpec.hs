@@ -47,10 +47,20 @@ spec = do
               full = map (.limit) (steps c w [o {used = busy} | o <- os])
            in and (zipWith (>=) idle (drop 1 idle)) && and (zipWith (>=) full (drop 1 full))
 
+    prop "never cuts while the cores have room" $
+      forAll settings $ \c -> forAll (start c) $ \w ->
+        forAll (listOf (congested c)) $ \os -> forAll (chooseInt (0, 89)) $ \idle ->
+          let ms = map (.limit) (steps c w [o {used = idle} | o <- os])
+           in and (zipWith (<=) ms (drop 1 ms))
+
+    prop "is free to rise only while the cores have room, under the ceiling" $
+      forAll settings $ \c -> forAll (start c) $ \w -> forAll (observation c) $ \o ->
+        rising c o w == (o.used < 90 && w.limit < c.ceiling)
+
     prop "grows back to the level of the last cut, then past it to the ceiling" $
       forAll settings $ \c -> forAll (chooseInt (c.floor, c.ceiling)) $ \n ->
         let w = (window c) {limit = n, level = fromIntegral n, peak = fromIntegral n}
-            cut = control c (Observation (c.target + 1) 50 True 0 500000) w
+            cut = control c (Observation (c.target + 1) 95 True 0 500000) w
             climb = steps c cut (replicate 400 (calm c))
             -- seconds on the curve at each step
             times = [0.5 * fromIntegral i :: Double | i <- [0 :: Int ..]]
@@ -162,12 +172,13 @@ observation c =
     <*> chooseInt (0, 2000000)
     <*> chooseInt (0, 1000000)
 
--- | A step with a delay over the target, a round trip after the last cut.
+-- | A step with a delay over the target and the cores busy, a round trip
+-- after the last cut.
 congested :: Control -> Gen Observation
 congested c =
   Observation
     <$> chooseInt (c.target + 1, 4 * c.target)
-    <*> chooseInt (0, 150)
+    <*> chooseInt (90, 150)
     <*> arbitrary
     <*> pure 0
     <*> chooseInt (1, 1000000)

@@ -19,8 +19,10 @@ answered from the fleet's cache.
     eventfd that a system thread rings every 10 ms, and measures how late a
     woken thread runs, less GHC's collector pauses. Every half second the
     controller cuts the limit by a quarter when that delay is over
-    `--target-delay` (25 ms), at most once a round trip (the smoothed time a
-    request holds its slot). It grows along TCP CUBIC's curve, back toward
+    `--target-delay` (25 ms) and the cores are used at 90%, at most once a
+    round trip (the smoothed time a request holds its slot). The delay
+    alone does not cut: requests that wait for a slow disk make it jump
+    while the cores have room. It grows along TCP CUBIC's curve, back toward
     the level of the last cut and then past it, while the delay is under the
     target, every slot was used and the cores, smoothed over two seconds,
     are used under 90%. The limit stays between `--min-requests` (two a
@@ -28,7 +30,11 @@ answered from the fleet's cache.
   - **The line in front is managed by CoDel** (100 ms interval, 5 ms target;
     while overloaded, a request that waited past 10 ms is refused). It holds
     up to `--request-queue` (64) requests for up to `--request-wait` (1 s).
-    A refused request gets 429 `server-busy` with `Retry-After: 1`, which
+    It refuses nothing while the limit is free to rise (the cores under 90%,
+    the limit under its ceiling): such a line waits for the limit to catch
+    up, and refusing it cost clients that ask one after the other a second
+    of `Retry-After` each. A refused request gets 429 `server-busy`
+    with `Retry-After: 1`, which
     clients and nginx take as "come back later"; a load generator retried
     503s at once. A request in line sets no GHC timer: a sweep enforces the
     waits.
