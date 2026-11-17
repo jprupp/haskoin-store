@@ -38,65 +38,16 @@
 --
 -- The cache is there so that the reads of a batch can be done ahead of the
 -- rules that need them. Importing a block reads an unspent output for every
--- input, and what the mempool has of the block, thousands of keys, and the
--- rules ask for them one at a time from one thread. The functions under
--- "Reading ahead" read any number of keys with RocksDB's multi-get, split
--- over all cores, and put the answers in the cache, those that say "not
--- there" too. The rules then run as they are and find everything in
--- memory. A key that was not read ahead is read from the database when it
--- is asked for, and cached, so that reading ahead is never needed to be
--- right: it only moves the time of the reads.
---
--- The alternative was to hand the values read ahead to the rules as
--- arguments. That needs a second set of rules for blocks, which takes its
--- values from somewhere else than the rules for the mempool and for
--- reverting, and it must be told what to do when a value is missing. A
--- cache under the reads keeps one set of rules.
+-- input, thousands of keys, and the rules ask for them one at a time from
+-- one thread. The functions under "Reading ahead" read any number of keys
+-- with RocksDB's multi-get, split over all cores, and put the answers in
+-- the cache, those that say "not there" too. The rules then run as they are
+-- and find everything in memory. A key that was not read ahead is read from
+-- the database when it is asked for, and cached, so that reading ahead is
+-- never needed to be right: it only moves the time of the reads.
 --
 -- 'withoutReadCache' gives a writer that reads the database every time, as
--- every batch did until version 1.15.1: the tests compare the two.
---
--- = The mempool area, from a copy in memory
---
--- What a batch reads of the mempool area, the two column families of the
--- unconfirmed transactions, it does not read from RocksDB at all. The
--- database keeps a copy of the whole area in memory
--- ("Haskoin.Store.Database.Copy", 'mempoolCopy'), and every read of the
--- area through a batch is answered from it: 'getMempoolTx',
--- 'getMempoolSpender', 'getMempoolSpenders', 'inMempool', 'getMempoolAddr',
--- 'getMempool' and 'mempoolAreaEmpty'. The changes of the batch still come
--- first.
---
--- The copy is right because the block store is the only writer of the
--- area, one batch at a time: when a batch has been written, 'runWriterReport'
--- applies its changes to the copy too ('committing'). A block at the tip
--- read some fifty thousand keys of the area, at eight microseconds of
--- processor time each in RocksDB, though all of them were in memory.
---
--- Most of those reads are now made by the rules when they come to them, a
--- look in a tree for each. Two kinds are still made ahead, on all cores,
--- into the read cache: the bodies of the transactions, which have to be
--- decoded ('readAheadMempoolTxs'), and the summaries of the addresses
--- ('readAheadMempoolSummaries'). @docs\/block-import.md@ has what was
--- measured for each kind.
---
--- A writer of 'withoutReadCache' reads the area from RocksDB, and never
--- loads the copy: it is what the tests hold the copy to.
---
--- = The outputs that mempool transactions spend, remembered
---
--- A batch that puts a transaction in the mempool has read, from the chain,
--- the unspent outputs that the transaction spends. When it is written it
--- leaves them with the copy of the mempool area ('spentChanges',
--- t'Haskoin.Store.Database.Copy.SpentOutput'), and the batch of the block
--- that confirms the transaction takes them from there instead of reading
--- them from RocksDB a second time ('readAheadUnspents'): they were the
--- largest part of the read ahead of a block at the tip.
---
--- Only reading ahead looks there. A read of one output goes to the
--- database as before, and so does everything through 'withoutReadCache'.
--- "Haskoin.Store.Database.Copy" says what keeps an entry from ever being
--- other than what the chain has.
+-- every batch did until version 1.15.1: the benchmark compares the two.
 --
 -- = Merges: changes to values that the batch has not read
 --
@@ -128,27 +79,12 @@
 --   a key that nobody asks for.
 --
 -- Only the import of a block merges
--- ('Haskoin.Store.Logic.Layered.importBlock'). Reverting a block, and the
--- import of version 1.15.1 that is kept as the reference, read each value
--- and write it whole.
---
--- = Two layouts
---
--- The writes of the first groups below are to the column families that the
--- store uses today, where the chain and the mempool share their indices.
--- The last group is for the layered layout of @docs\/layered-database.md@,
--- in which the mempool has an area of its own: bodies, spenders, address
--- entries and deleted transactions of the mempool. A batch can write to
--- both areas, and is still one atomic write. Only
--- "Haskoin.Store.Logic.Layered" uses that group, on a database opened with
--- 'Haskoin.Store.Database.Reader.withLayeredReader'; a batch that does not
--- use it writes nothing there.
+-- ('Haskoin.Store.Logic.importBlock'). Reverting a block reads each value
+-- and writes it whole.
 module Haskoin.Store.Database.Writer
   ( -- * Batches
     Writer,
-    MempoolChanges (..),
     runWriter,
-    runWriterMempool,
     runWriterReport,
     BatchReport (..),
     writerNet,
@@ -160,11 +96,6 @@ module Haskoin.Store.Database.Writer
     readAheadUnspents,
     readAheadBalances,
     readAheadSpenders,
-    readAheadMempoolTxs,
-    readAheadMempoolSummaries,
-    mempoolAreaEmpty,
-    mempoolUntouched,
-    forgetSpentOutputs,
 
     -- * Timing the import of a block
     BlockTimes (..),
@@ -181,10 +112,8 @@ module Haskoin.Store.Database.Writer
     getBlocksAtHeight,
     getBlock,
     getTxData,
-    getSpender,
     getUnspent,
     getBalance,
-    getMempool,
 
     -- * Writes
     setBest,
@@ -196,9 +125,6 @@ module Haskoin.Store.Database.Writer
     deleteAddrTx,
     insertAddrUnspent,
     deleteAddrUnspent,
-    addToMempool,
-    deleteFromMempool,
-    inMempool,
     setBalance,
     mergeBalance,
     insertUnspent,
@@ -206,22 +132,12 @@ module Haskoin.Store.Database.Writer
     deleteTxData,
     deleteBalance,
 
-    -- * The mempool area of the layered layout
-    getMempoolTx,
-    getMempoolSpender,
-    getMempoolSpenders,
+    -- * Spenders of the chain
     getChainSpender,
     getChainSpenders,
     insertSpender,
     mergeSpender,
     deleteSpender,
-    insertMempoolTx,
-    deleteMempoolTx,
-    insertMempoolSpender,
-    deleteMempoolSpender,
-    insertMempoolAddr,
-    deleteMempoolAddr,
-    getMempoolAddr,
 
     -- * Transactions that blocks replaced
     insertReplaced,
@@ -230,24 +146,21 @@ module Haskoin.Store.Database.Writer
   )
 where
 
-import Control.Concurrent (getNumCapabilities, myThreadId, threadCapability)
+import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.Async (wait, withAsyncOn)
 import Control.DeepSeq (NFData, force)
-import Control.Exception (evaluate, mask_)
-import Control.Monad (filterM, forM, unless, when)
+import Control.Exception (evaluate)
+import Control.Monad (filterM, forM, when)
 import Data.ByteString qualified as B
 import Data.ByteString.Builder.Extra (Next (..), runBuilder)
 import Data.ByteString.Internal (ByteString (BS))
 import Data.Default (def)
-import Data.Either (partitionEithers)
 import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (sortOn)
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
-import Data.Ord (Down (..))
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Serialize (Put, Serialize, decode, encode, put, runPut)
 import Data.Serialize.Put (execPut, putByteString)
 import Data.Word (Word32, Word8)
@@ -289,24 +202,6 @@ import Haskoin
 import Haskoin.Node (Logger)
 import Haskoin.Store.Common (Replaced (..))
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Copy
-  ( Copy,
-    CopyChange (..),
-    Family (..),
-    SpentChange (..),
-    applyChanges,
-    applySpent,
-    firstKey,
-    forgetCopy,
-    prefixed,
-    setCopy,
-    shortKey,
-    spentOutput,
-    spentOutputs,
-    spentUnspent,
-    valueIn,
-  )
-import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Table (Table, TableKey)
@@ -380,17 +275,8 @@ type AddrTxTable = Table (Address, TxRef) (Maybe ())
 -- | Changed address unspent outputs: 'Nothing' for a deletion.
 type AddrOutTable = Table (Address, BlockRef, OutPoint) (Maybe OutVal)
 
--- | Mempool changes in this batch: 'Nothing' for a deletion.
-type MempoolTable = Table TxHash (Maybe UnixTime)
-
 -- | Changed groups of spenders of outputs in the chain.
 type SpenderTable = Table (TxHash, Word32) (IntMap Spender)
-
--- | Changed mempool spenders of outputs: 'Nothing' for a deletion.
-type MemSpenderTable = Table OutPoint (Maybe Spender)
-
--- | Changed entries of the mempool by address: 'Nothing' for a deletion.
-type MemAddrTable = Table MemAddrKey (Maybe MemAddrVal)
 
 -- | Changed records of transactions that blocks replaced: 'Nothing' for a
 -- deletion.
@@ -408,16 +294,7 @@ data ReadCache = ReadCache
     balances :: !BalanceTable,
     -- | groups of spenders of outputs of the chain, empty for one that the
     -- database does not have
-    spenders :: !SpenderTable,
-    -- | bodies of mempool transactions, decoded from the copy of the
-    -- mempool area
-    memTxs :: !TxTable,
-    -- | entries of the mempool by address, decoded from the copy of the
-    -- mempool area
-    memAddrs :: !MemAddrTable,
-    -- | whether the database has no transaction in its mempool area, once
-    -- 'mempoolAreaEmpty' has looked
-    areaEmpty :: !(IORef (Maybe Bool))
+    spenders :: !SpenderTable
   }
 
 -- | Changes made in a batch, not yet written to the database, and what the
@@ -444,14 +321,6 @@ data Memory = Memory
     addressTable :: !AddrTxTable,
     -- | address unspent outputs
     outputTable :: !AddrOutTable,
-    -- | mempool
-    mempoolTable :: !MempoolTable,
-    -- | bodies of mempool transactions, in the mempool area
-    memTxTable :: !TxTable,
-    -- | mempool spenders of outputs, in the mempool area
-    memSpenderTable :: !MemSpenderTable,
-    -- | entries of the mempool by address, in the mempool area
-    memAddrTable :: !MemAddrTable,
     -- | inputs of blocks that spend outputs, by group of outputs
     -- as t'SpenderKey' says, each group as the batch leaves it: empty for one
     -- that has no spent output left
@@ -463,8 +332,6 @@ data Memory = Memory
     replacedTable :: !ReplacedTable,
     -- | values read from the database
     cache :: !ReadCache,
-    -- | whether the batch reverted a block ('forgetSpentOutputs')
-    reverted :: !(IORef Bool),
     -- | how long the stages of the imports of blocks took, if any block was
     -- imported
     times :: !(IORef (Maybe BlockTimes))
@@ -508,14 +375,6 @@ insertAddrUnspent w a u =
 deleteAddrUnspent :: Writer -> Address -> Unspent -> IO ()
 deleteAddrUnspent w a u =
   T.insert w.memory.outputTable (a, u.block, u.outpoint) Nothing
-
--- | Add a transaction to the mempool with the time it arrived.
-addToMempool :: Writer -> TxHash -> UnixTime -> IO ()
-addToMempool w x t = T.insert w.memory.mempoolTable x (Just t)
-
--- | Remove a transaction from the mempool.
-deleteFromMempool :: Writer -> TxHash -> IO ()
-deleteFromMempool w x = T.insert w.memory.mempoolTable x Nothing
 
 -- | Set the balance of an address: the whole value, in place of whatever
 -- the batch had for it. Differences that the batch held for the address
@@ -570,39 +429,6 @@ deleteBalance w a = do
   T.insert w.memory.balanceTable a Nothing
   T.delete w.memory.balanceMerges a
 
--- | Add or replace the body of a mempool transaction in the mempool area.
-insertMempoolTx :: Writer -> TxData -> IO ()
-insertMempoolTx w t = T.insert w.memory.memTxTable (txHash t.tx) (Just t)
-
--- | Remove the body of a mempool transaction from the mempool area.
-deleteMempoolTx :: Writer -> TxHash -> IO ()
-deleteMempoolTx w h = T.insert w.memory.memTxTable h Nothing
-
--- | Record the mempool input that spends an output.
-insertMempoolSpender :: Writer -> OutPoint -> Spender -> IO ()
-insertMempoolSpender w p s = T.insert w.memory.memSpenderTable p (Just s)
-
--- | Forget the mempool input that spends an output.
-deleteMempoolSpender :: Writer -> OutPoint -> IO ()
-deleteMempoolSpender w p = T.insert w.memory.memSpenderTable p Nothing
-
--- | Add an entry of the mempool by address.
-insertMempoolAddr :: Writer -> MemAddrKey -> MemAddrVal -> IO ()
-insertMempoolAddr w k v = T.insert w.memory.memAddrTable k (Just v)
-
--- | Remove an entry of the mempool by address.
-deleteMempoolAddr :: Writer -> MemAddrKey -> IO ()
-deleteMempoolAddr w k = T.insert w.memory.memAddrTable k Nothing
-
--- | An entry of the mempool by address, with the changes of the batch
--- applied: from the changes, or from what the batch read before, or from
--- the copy of the mempool area, which is then remembered decoded.
-getMempoolAddr :: Writer -> MemAddrKey -> IO (Maybe MemAddrVal)
-getMempoolAddr w k =
-  T.lookup w.memory.memAddrTable k >>= \case
-    Just x -> return x
-    Nothing -> remembered w (.memAddrs) k (inArea w ByAddress k)
-
 -- | Read a value from the changes of the batch, or from the database if the
 -- batch did not change it. For what a batch reads once or twice: the best
 -- block, the blocks at a height.
@@ -642,51 +468,6 @@ remembered w cache k stored
           return x
   where
     table = cache w.memory.cache
-
--- | A read of the transactions of the mempool area in the database, given
--- what it finds when there are none. Once 'mempoolAreaEmpty' has found the
--- area empty nothing is read, and no key is serialised to look it up.
-areaRead :: Writer -> a -> IO a -> IO a
-areaRead w nothing stored
-  | not w.cached = stored
-  | otherwise =
-      readIORef w.memory.cache.areaEmpty >>= \case
-        Just True -> return nothing
-        _ -> stored
-
--- | What the mempool area of the database has for a key, whatever the
--- batch changed: from the copy of the area that the database keeps in
--- memory ('mempoolCopy'), which is loaded if it is not there, or from
--- RocksDB through 'withoutReadCache'.
-inArea :: (KeyValue k v, Serialize k, Serialize v) => Writer -> Family -> k -> IO (Maybe v)
-inArea w f k
-  | w.cached = fmap decoded . valueIn f (shortKey k) <$> mempoolCopy w.reader
-  | otherwise = retrieveCF db (familyCF db f) k
-  where
-    db = w.reader.db
-
--- | The column family of a part of the mempool area.
-familyCF :: DB -> Family -> ColumnFamily
-familyCF db General = mempoolCF db
-familyCF db ByAddress = mempoolAddrCF db
-
--- | What the mempool area of the database has for the mempool inputs that
--- spend the outputs of a transaction, by output: the keys that start with
--- the transaction, in the copy or, through 'withoutReadCache', in RocksDB.
-spendersInArea :: Writer -> TxHash -> IO (IntMap Spender)
-spendersInArea w h
-  | w.cached = spendersIn h <$> mempoolCopy w.reader
-  | otherwise = M.getMempoolSpenders w.reader h
-
--- | The mempool inputs that spend the outputs of a transaction, by output,
--- as a copy of the mempool area has them.
-spendersIn :: TxHash -> Copy -> IntMap Spender
-spendersIn h c =
-  IntMap.fromList
-    [ (fromIntegral p.index, decoded v)
-    | (k, v) <- prefixed General (shortKey (MemSpenderKeyS h)) c,
-      MemSpenderKey p <- [decoded k]
-    ]
 
 -------------------------------------------------------------------------------
 -- Reading ahead
@@ -732,31 +513,6 @@ readMany db cf key value items = concat <$> onAllCores readsPerCore smallestRead
     chunk xs = do
       found <- multiGetCF db cf (map (encode . key) xs)
       forM (zip xs found) $ \(x, bytes) -> (x,) <$> evaluate (force (value x bytes))
-
--- | Fewest keys worth a thread of their own when they are looked up in the
--- copy of the mempool area, which takes a fraction of a microsecond each.
-smallestLookup :: Int
-smallestLookup = 256
-
--- | Look many keys up in the copy of the mempool area, on all cores, and
--- work out something from each value in the thread that found it: what
--- 'readMany' does with RocksDB. The copy does not change under the
--- threads, and they share it without a lock
--- ("Haskoin.Store.Database.Copy").
---
--- The results are in no particular order.
-copyMany ::
-  (Serialize k, NFData v) =>
-  Writer ->
-  Family ->
-  (a -> k) ->
-  (a -> Maybe ByteString -> v) ->
-  [a] ->
-  IO [(a, v)]
-copyMany w f key value items = do
-  c <- mempoolCopy w.reader
-  let look x = (x,) <$> evaluate (force (value x (valueIn f (shortKey (key x)) c)))
-  concat <$> onAllCores 1 smallestLookup (mapM look) items
 
 -- | Split a list in pieces, as many for each core as the first number says
 -- and none shorter than the second unless it is the only one, and work on
@@ -878,43 +634,29 @@ data Encoded
 --
 -- = Small batches
 --
--- A batch of a few changes, such as that of a mempool transaction, is
+-- A batch of a few changes, such as that of the genesis block, is
 -- serialised with 'encode' and given to RocksDB one operation at a time, as
 -- before. A buffer of this size for each would be the waste that this is
 -- meant to remove, and what a few dozen foreign calls cost is not worth a
 -- second way to pack. It also keeps the old way in use, which the tests
 -- compare the new one against: the same changes must leave the same
 -- database whether they are written in one large batch or a few at a time.
-encodeChanges :: (ColumnFamily -> Maybe Family) -> [Change] -> IO (Encoded, [CopyChange])
-encodeChanges area changes
-  | null (drop 255 changes) =
-      let ops = map plain changes
-       in return (Plain ops, mapMaybe (areaChange area) ops)
+encodeChanges :: [Change] -> IO Encoded
+encodeChanges changes
+  | null (drop 255 changes) = return (Plain (map plain changes))
   | otherwise = do
       pieces <- onAllCores 2 512 inArenas changes
-      return
-        ( Packed
-            (concat [chunks | (chunks, _, _, _) <- pieces])
-            (sum [records | (_, records, _, _) <- pieces])
-            (sum [size | (_, _, size, _) <- pieces]),
-          concat [noted | (_, _, _, noted) <- pieces]
-        )
+      return $
+        Packed
+          (concat [chunks | (chunks, _, _) <- pieces])
+          (sum [records | (_, records, _) <- pieces])
+          (sum [size | (_, _, size) <- pieces])
   where
     inArenas piece = do
       arena <- newIORef =<< newArena
-      mapM_ (packChange area arena) piece
-      Arena buffer start used chunks records size noted <- readIORef arena
-      return (reverse (sealed buffer start used chunks), records, size, reverse noted)
-
--- | What an operation of a batch changes in the mempool area, if it is on
--- one of its two column families, given how to tell them
--- ('mempoolFamily'). The byte strings are those of the operation.
-areaChange :: (ColumnFamily -> Maybe Family) -> BatchOp -> Maybe CopyChange
-areaChange area = \case
-  PutCF cf k v -> area cf <&> \f -> CopySet f k v
-  DelCF cf k -> area cf <&> \f -> CopyDrop f k
-  MergeCF cf _ _ | isJust (area cf) -> error "A merge record for the mempool area, which has no merge operator"
-  _ -> Nothing
+      mapM_ (packChange arena) piece
+      Arena buffer start used chunks records size <- readIORef arena
+      return (reverse (sealed buffer start used chunks), records, size)
 
 -- | The operation of a change, with byte strings of its own.
 plain :: Change -> BatchOp
@@ -941,15 +683,11 @@ opBytes = \case
 -- another; where in it the records start that are in no chunk yet; where
 -- the next record goes; the chunks so far, the last one first; the
 -- number of records in the chunks and in the buffer, with the bytes of
--- their keys and values; and the changes among them to the mempool area,
--- the last one first, for the copy of the area
--- ("Haskoin.Store.Database.Copy").
+-- their keys and values.
 --
 -- A chunk is a slice of a buffer, so the buffer lives as long as its
--- chunks, and a buffer can give more than one: see 'packChange'. The keys
--- and values of the changes to the mempool area are slices of it too, and
--- are let go when the copy has copied them.
-data Arena = Arena !(ForeignPtr Word8) !Int !Int [ByteString] !Int !Int ![CopyChange]
+-- chunks, and a buffer can give more than one: see 'packChange'.
+data Arena = Arena !(ForeignPtr Word8) !Int !Int [ByteString] !Int !Int
 
 -- | Bytes of the buffer of an t'Arena': room for a few thousand keys and
 -- values, and for nearly any transaction. It is also the most that RocksDB
@@ -961,7 +699,7 @@ arenaSize = 256 * 1024
 newArena :: IO Arena
 newArena = do
   buffer <- mallocPlainForeignPtrBytes arenaSize
-  return (Arena buffer 0 0 [] 0 0 [])
+  return (Arena buffer 0 0 [] 0 0)
 
 -- | The chunks of an arena, the last one first, with the records of its
 -- buffer that are in no chunk yet as one more.
@@ -991,12 +729,8 @@ data Fit
 -- The order of the changes is the order of the records, so the records
 -- before it are made a chunk first, and those after it go on in the same
 -- buffer.
---
--- A change to the mempool area, which the first argument tells from the
--- others ('mempoolFamily'), is also noted with where its key and its value
--- are, for the copy of the area.
-packChange :: (ColumnFamily -> Maybe Family) -> IORef Arena -> Change -> IO ()
-packChange area ref change = case change of
+packChange :: IORef Arena -> Change -> IO ()
+packChange ref change = case change of
   Set cf k v -> record (Just cf) PackedPut k (Just v)
   Drop cf k -> record (Just cf) PackedDel k Nothing
   Join cf k v -> record (Just cf) PackedMerge k (Just v)
@@ -1008,7 +742,7 @@ packChange area ref change = case change of
   Ready (Merge k v) -> record Nothing PackedMerge (putByteString k) (Just (putByteString v))
   where
     record cf op k v = do
-      Arena buffer start used chunks records size noted <- readIORef ref
+      Arena buffer start used chunks records size <- readIORef ref
       let body = used + packedHeaderSize
           key = execPut k
           value = execPut <$> v
@@ -1035,24 +769,16 @@ packChange area ref change = case change of
       case fit of
         Fits klen vlen -> do
           let bytes = klen + vlen
-              slice from len = BS (buffer `plusForeignPtr` from) len
-              noted' = case cf >>= area of
-                Nothing -> noted
-                Just f -> case op of
-                  PackedPut -> CopySet f (slice body klen) (slice (body + klen) vlen) : noted
-                  PackedDel -> CopyDrop f (slice body klen) : noted
-                  PackedMerge -> error "A merge record for the mempool area, which has no merge operator"
-          writeIORef ref (Arena buffer start (body + bytes) chunks (records + 1) (size + bytes) noted')
+          writeIORef ref (Arena buffer start (body + bytes) chunks (records + 1) (size + bytes))
         NoRoom | used > 0 -> do
           fresh <- mallocPlainForeignPtrBytes arenaSize
-          writeIORef ref (Arena fresh 0 0 (sealed buffer start used chunks) records size noted)
+          writeIORef ref (Arena fresh 0 0 (sealed buffer start used chunks) records size)
           record cf op k v
         _ -> do
           let whole = plain change
               before = sealed buffer start used chunks
-              noted' = maybe noted (: noted) (areaChange area whole)
           writeIORef ref $
-            Arena buffer used used (packOps [whole] : before) (records + 1) (size + opBytes whole) noted'
+            Arena buffer used used (packOps [whole] : before) (records + 1) (size + opBytes whole)
 
 -- | Decode a value read from the database.
 decoded :: (Serialize v) => ByteString -> v
@@ -1083,34 +809,14 @@ readAhead w cache keys reading = when w.cached $ do
   new <- filterM fresh keys
   reading new >>= mapM_ (uncurry (T.insert table))
 
--- | Read unspent outputs ahead of the reads of the batch.
---
--- An output that a mempool transaction spends is not read from RocksDB if
--- the block store remembers it from the batch that put the transaction in
--- the mempool ('spentChanges'): it is taken from the table that is kept
--- with the copy of the mempool area, on all cores, as an entry is turned
--- back into an unspent output with its address. The others are read with
--- multi-gets as before. At the tip of the chain nearly every output that a
--- block spends is remembered, and they were the largest part of its read
--- ahead.
---
--- The table is only looked at if the database has a copy of its mempool
--- area already: with no copy there is nothing remembered.
+-- | Read unspent outputs ahead of the reads of the batch, with multi-gets.
 readAheadUnspents :: Writer -> [OutPoint] -> IO ()
 readAheadUnspents w ps = readAhead w (.unspents) ps $ \new -> do
-  table <- maybe HashMap.empty spentOutputs <$> knownMempoolCopy w.reader
-  (kept, rest) <-
-    if HashMap.null table
-      then return ([], new)
-      else partitionEithers . concat <$> onAllCores 1 smallestLookup (mapM (look table)) new
-  found <- readMany db (unspentCF db) UnspentKey (\p -> fmap (valToUnspent w.reader.net p . decoded)) rest
+  found <- readMany db (unspentCF db) UnspentKey (\p -> fmap (valToUnspent w.reader.net p . decoded)) new
   Q.count w.reader $ \s -> incrementCounter s.dataUnspentCount (length (filter (isJust . snd) found))
-  return (kept <> found)
+  return found
   where
     db = w.reader.db
-    look table p = case HashMap.lookup p table of
-      Nothing -> return (Right p)
-      Just s -> Left . (p,) . Just <$> evaluate (force (spentUnspent w.reader.net p s))
 
 -- | Read balances ahead of the reads of the batch. The import of a block
 -- does not need it any more, as it changes balances without reading them
@@ -1127,7 +833,7 @@ readAheadBalances w as = readAhead w (.balances) as $ \new -> do
 -- for each of them. The import of a block does not need it: it adds
 -- spenders without reading them ('mergeSpender'), and does not ask who
 -- spends an output in the chain, as a mined block is not validated
--- ('Haskoin.Store.Logic.Layered.importBlock'). It is for rules that read
+-- ('Haskoin.Store.Logic.importBlock'). It is for rules that read
 -- them.
 readAheadSpenders :: Writer -> [OutPoint] -> IO ()
 readAheadSpenders w ps =
@@ -1136,94 +842,6 @@ readAheadSpenders w ps =
   where
     db = w.reader.db
     group (SpenderVal m) = m
-
--- | Read ahead the bodies that the mempool area has for these
--- transactions: looked up in the copy of the area and decoded, on all
--- cores. A body is a transaction, and decoding it is the one read of the
--- area that costs more than a look in a table: a block at the tip decodes
--- all of its transactions here, where the rules would do it one by one.
-readAheadMempoolTxs :: Writer -> [TxHash] -> IO ()
-readAheadMempoolTxs w hs =
-  unlessEmpty w . readAhead w (.memTxs) hs $ copyMany w General TxKey (\_ -> fmap decoded)
-
--- | Read ahead the summaries of what the mempool does at these addresses:
--- looked up in the copy of the area and decoded, on all cores. The rules
--- ask for the summary of every address of every transaction that leaves
--- the mempool, and serialising the key of an address is most of what such
--- a read costs.
-readAheadMempoolSummaries :: Writer -> [Address] -> IO ()
-readAheadMempoolSummaries w as =
-  unlessEmpty w . readAhead w (.memAddrs) (map MemAddrSumKey as) $
-    copyMany w ByAddress id (\_ -> fmap decoded)
-
--- | Do something unless the mempool area of the database is known to be
--- empty.
-unlessEmpty :: Writer -> IO () -> IO ()
-unlessEmpty w action = readIORef w.memory.cache.areaEmpty >>= \e -> unless (e == Just True) action
-
--- | Whether the database has no transaction in its mempool area: no body,
--- no spender and no entry in the list of the mempool. It is 'False'
--- through 'withoutReadCache', whatever the database has.
---
--- Once this has found the area empty, the reads of the batch that ask it
--- for something ('getMempoolTx', 'getMempoolSpender', 'getMempoolSpenders',
--- 'inMempool') answer from the changes of the batch alone. A store that
--- syncs or catches up has an empty mempool, and its blocks would ask the
--- area about every transaction and every input all the same.
---
--- = Why look, and how
---
--- The alternatives were to count the transactions of the mempool somewhere,
--- which is one more thing to keep right through migrations and wipes, or
--- to take the list of the mempool for the whole area, which leans on the
--- rules having kept the two in step. The first key says what is there. The
--- transactions of the mempool have every key of the column family but one
--- kind: bodies of deleted transactions, which sort after all the others,
--- which version 21 wrote and which nothing reads. So the area is empty when
--- the column family has no key, or when its first key is one of those.
---
--- The first key is that of the copy of the area in memory
--- ('mempoolCopy'), which this loads if no batch has needed it before.
-mempoolAreaEmpty :: Writer -> IO Bool
-mempoolAreaEmpty w
-  | not w.cached = return False
-  | otherwise =
-      readIORef ref >>= \case
-        Just e -> return e
-        Nothing -> do
-          e <-
-            firstKey General <$> mempoolCopy w.reader <&> \case
-              Nothing -> True
-              Just k -> B.take 1 k >= encode MemDeletedKeyS
-          writeIORef ref (Just e)
-          return e
-  where
-    ref = w.memory.cache.areaEmpty
-
--- | Say that the batch reverts a block: when it is written, nothing is
--- remembered any more of the outputs that mempool transactions spend
--- ("Haskoin.Store.Database.Copy").
---
--- A revert takes the outputs of a block out of the chain while the
--- mempool transactions that spend them stay, and puts back the outputs
--- that the block spent. The changes that the batch makes to unspent
--- outputs are applied to what is remembered in any case ('spentChanges'),
--- so this is not needed to be right. It is there so that being right
--- after a reorganisation, which is rare and which the tests reach less
--- often than a block, rests on nothing at all: the table is empty.
-forgetSpentOutputs :: Writer -> IO ()
-forgetSpentOutputs w = writeIORef w.memory.reverted True
-
--- | Whether the batch has not changed the mempool so far.
-mempoolUntouched :: Writer -> IO Bool
-mempoolUntouched w =
-  and
-    <$> sequence
-      [ null <$> T.toList w.memory.mempoolTable,
-        null <$> T.toList w.memory.memTxTable,
-        null <$> T.toList w.memory.memSpenderTable,
-        null <$> T.toList w.memory.memAddrTable
-      ]
 
 -------------------------------------------------------------------------------
 -- Timing the import of a block
@@ -1247,17 +865,10 @@ data BlockTimes = BlockTimes
   deriving (Eq, Show)
 
 -- | How long the read ahead of a block took for each kind of key, in
--- seconds. The kinds are read one after another, each on all cores, with
--- multi-gets but for the mempool, so the four add up to nearly all of the
--- read ahead.
---
--- They are timed apart because they are not alike. An output that a block
--- spends was read when its transaction came into the mempool, and is
--- likely to be in RocksDB's cache still. The balances and the groups of
--- spenders of the chain were not read then, and are not read at all any
--- more: their two times are kept, as zero, for what reads them from a
--- report. Which kind a slow block waits for says what would make it
--- faster: @docs\/block-import-next.md@.
+-- seconds. Only the unspent outputs are read now, with multi-gets on all
+-- cores. The balances and the groups of spenders of the chain are not read
+-- at all any more: their two times are kept, as zero, for what reads them
+-- from a report.
 data ReadTimes = ReadTimes
   { -- | the outputs that the block spends, as unspent outputs of the chain
     unspentReads :: !Double,
@@ -1268,19 +879,13 @@ data ReadTimes = ReadTimes
     -- | the balances of the addresses that the block pays or spends from:
     -- nothing since database version 23, as the import of a block changes
     -- them without reading them
-    balanceReads :: !Double,
-    -- | what is read ahead of the mempool area, from its copy in memory:
-    -- the bodies of the transactions of the block that are in the mempool,
-    -- which are decoded, and the summaries of its addresses. Nothing when
-    -- the area is empty. The other reads of the area are made by the rules
-    -- as they go, and are part of the time of the rules
-    mempoolReads :: !Double
+    balanceReads :: !Double
   }
   deriving (Eq, Show)
 
 -- | No time spent reading: of an import that did not read ahead.
 noReads :: ReadTimes
-noReads = ReadTimes {unspentReads = 0, spenderReads = 0, balanceReads = 0, mempoolReads = 0}
+noReads = ReadTimes {unspentReads = 0, spenderReads = 0, balanceReads = 0}
 
 -- | Note how long the first three stages of the import of a block took,
 -- and each kind of key of the read ahead. 'runWriterReport' adds how long
@@ -1298,8 +903,7 @@ noteBlockTimes w prepare prefetch kinds apply =
               ReadTimes
                 { unspentReads = t.reads.unspentReads + kinds.unspentReads,
                   spenderReads = t.reads.spenderReads + kinds.spenderReads,
-                  balanceReads = t.reads.balanceReads + kinds.balanceReads,
-                  mempoolReads = t.reads.mempoolReads + kinds.mempoolReads
+                  balanceReads = t.reads.balanceReads + kinds.balanceReads
                 },
             apply = t.apply + apply
           }
@@ -1322,34 +926,11 @@ runWriter ::
   (Writer -> IO a) ->
   IO a
 runWriter net bdb logger f =
-  fst <$> runWriterMempool net bdb logger f
-
--- | Transactions that a batch added to the mempool or removed from it,
--- compared to what the database held before the batch was written.
-data MempoolChanges = MempoolChanges
-  { -- | transactions that entered the mempool
-    added :: ![TxHash],
-    -- | transactions that left the mempool
-    removed :: ![TxHash]
-  }
-  deriving (Eq, Show)
-
--- | Like 'runWriter', but also say how the batch changed the mempool, so
--- that callers do not have to read the whole mempool before and after.
-runWriterMempool ::
-  Network ->
-  DatabaseReader ->
-  Logger ->
-  (Writer -> IO a) ->
-  IO (a, MempoolChanges)
-runWriterMempool net bdb logger f =
-  fmap (.mempool) <$> runWriterReport net bdb logger f
+  fst <$> runWriterReport net bdb logger f
 
 -- | What a batch did, besides what its function returned.
 data BatchReport = BatchReport
-  { -- | how it changed the mempool
-    mempool :: !MempoolChanges,
-    -- | how long the stages of the import of a block took, if it imported
+  { -- | how long the stages of the import of a block took, if it imported
     -- one
     block :: !(Maybe BlockTimes),
     -- | keys that it set, deleted or wrote a merge record for
@@ -1361,7 +942,7 @@ data BatchReport = BatchReport
   }
   deriving (Eq, Show)
 
--- | Like 'runWriterMempool', but say everything about the batch, in a
+-- | Like 'runWriter', but say everything about the batch, in a
 -- t'BatchReport': for the metrics of the block store, and for the
 -- benchmark.
 --
@@ -1378,133 +959,20 @@ runWriterReport net bdb@DatabaseReader {db} logger f = do
   hm <- newMemory net
   let w = Writer {reader = bdb, memory = hm, logger, cached = True}
   x <- f w
-  ((changes, operations, bytes), took) <- stopwatch $ do
+  ((operations, bytes), took) <- stopwatch $ do
     ops <- hashMapOps db hm
-    (mops, changes) <- mempoolOps w
-    (encoded, area) <- encodeChanges (mempoolFamily db) (ops <> mops)
-    spent <- knownMempoolCopy bdb >>= maybe (return []) (spentChanges w)
-    committing bdb area spent $ case encoded of
+    encodeChanges ops >>= \case
       Plain batch -> do
         writeBatch db batch
-        return (changes, length batch, sum (map opBytes batch))
+        return (length batch, sum (map opBytes batch))
       Packed chunks records size -> do
         writePacked db chunks
-        return (changes, records, size)
+        return (records, size)
   times <- readIORef hm.times
   let block = (\t -> (t :: BlockTimes) {write = took}) <$> times
-  return (x, BatchReport {mempool = changes, block, operations, bytes})
+  return (x, BatchReport {block, operations, bytes})
 
--- | Write a batch to the database, and bring the copy of the mempool area
--- up to date with it, given the changes of the batch to the area and to
--- what is remembered of the outputs that mempool transactions spend
--- ('spentChanges'): when the write is done, the copy with those changes
--- takes the place of the copy that the database had, in one step.
---
--- = Never a copy that is not the database
---
--- What must not happen is a copy that stays in use and is not what the
--- database has. So the order is: say that the copy is not known
--- ('forgetCopy'), write, and only then set the new copy. Whatever goes
--- wrong in between, a write that throws, of which RocksDB may have kept a
--- part, or the thread being killed, leaves the database without a copy,
--- and the next batch that needs one loads it from the column families.
--- That costs a scan, a third of a second for a full mempool, and is right
--- whatever was written.
---
--- The three steps are also masked, so that an asynchronous exception that
--- arrives while RocksDB writes is not delivered between the write and the
--- new copy, and a batch that was written does not cost a scan for
--- nothing. Masking alone would not do: the write itself can throw.
---
--- A batch whose function threw never gets here, and one that changes
--- nothing in the area or in what is remembered leaves the copy alone. If
--- the database has no copy,
--- because no batch has needed one yet, none is made: it is loaded when it
--- is asked for.
---
--- = While RocksDB writes
---
--- The new copy is worked out by another thread while RocksDB writes the
--- batch, which it does in one thread of its own and outside the Haskell
--- runtime. A block at the tip deletes sixty thousand keys from the copy.
--- Done after the write, that added 40 ms to the 170 that the write of
--- such a block takes in the benchmark.
---
--- The thread is bound to another core of the runtime than the one that
--- this runs on. Left on the same one it gained next to nothing, 202 ms
--- against 210: the thread that comes back from RocksDB wants that core
--- again. On the next core the write takes the 170 ms that it took
--- without a copy.
-committing :: DatabaseReader -> [CopyChange] -> [SpentChange] -> IO a -> IO a
-committing r area spent write
-  | null area && null spent = write
-  | otherwise =
-      knownMempoolCopy r >>= \case
-        Nothing -> write
-        Just old -> mask_ $ do
-          forgetCopy r.copy
-          cores <- getNumCapabilities
-          (here, _) <- threadCapability =<< myThreadId
-          withAsyncOn ((here + 1) `mod` cores) (evaluate (applySpent spent (applyChanges area old))) $ \new -> do
-            x <- write
-            wait new >>= setCopy r.copy
-            return x
-
--- | What a batch does, when it is written, to what the block store
--- remembers of the outputs that mempool transactions spend, given the
--- copy of the mempool area that holds it: for each of those outputs, a
--- t'Haskoin.Store.Database.Copy.SpentOutput'.
---
--- * A batch that reverted a block empties the table ('forgetSpentOutputs').
---
--- * An output whose mempool spender the batch took away is forgotten.
---
--- * An output that the batch gave a mempool spender is remembered, if the
---   batch knows the unspent output of the chain: as the batch leaves it,
---   if the batch changed it, or else as the batch read it, which is what
---   the database has until the batch is written. A new mempool
---   transaction read every output that it spends ('getUnspent'), so they
---   are all there. An output that the chain does not have as unspent, as
---   one made by another mempool transaction, is not remembered. One that
---   the batch has not read keeps what was remembered of it.
---
--- * An unspent output of the chain that the batch changed, and whose
---   mempool spender it left alone, has its entry changed with it or
---   dropped, if it has one. Without this, an entry could outlive what it
---   says: a coinbase that is confirmed a second time moves its unspent
---   outputs to the later block, and a mempool transaction that spends one
---   stays where it is.
---
--- So an entry is always what the database has for its output, whatever
--- the rules did in the batch: only batches write unspent outputs, and
--- every unspent output that a batch writes is looked up here.
---
--- The list is not worked out when the table is empty and the batch gives
--- no output a mempool spender, as while a store syncs.
-spentChanges :: Writer -> Copy -> IO [SpentChange]
-spentChanges w old = do
-  reverted <- readIORef w.memory.reverted
-  spenders <- T.toList w.memory.memSpenderTable
-  case () of
-    _
-      | reverted -> return [ForgetAll | not empty]
-      | empty && null spenders -> return []
-      | otherwise -> do
-          unspents <- if empty then return [] else T.toList w.memory.unspentTable
-          changed <- concat <$> mapM (uncurry spender) spenders
-          return ([Correct p (u >>= spentOutput) | (p, u) <- unspents] <> changed)
-  where
-    empty = HashMap.null (spentOutputs old)
-    spender p Nothing = return [Forget p]
-    spender p (Just _) =
-      -- the unspent output of the chain as the batch leaves it, if the
-      -- batch changed it or read it
-      T.lookup w.memory.unspentTable p >>= maybe (T.lookup w.memory.cache.unspents p) (return . Just) <&> \case
-        Just (Just u) | Just kept <- spentOutput u -> [Remember p kept]
-        Just _ -> [Forget p]
-        Nothing -> []
-
--- | Database operations for all changes of a batch except the mempool.
+-- | Database operations for all changes of a batch.
 hashMapOps :: DB -> Memory -> IO [Change]
 hashMapOps db Memory {..} =
   mconcat
@@ -1518,9 +986,6 @@ hashMapOps db Memory {..} =
         addrTxOps db addressTable,
         addrOutOps db outputTable,
         unspentOps db unspentTable,
-        memTxOps db memTxTable,
-        memSpenderOps db memSpenderTable,
-        memAddrOps db memAddrTable,
         spenderOps db spenderTable,
         spenderMergeOps db spenderMerges,
         replacedOps db replacedTable
@@ -1604,52 +1069,6 @@ addrOutOps db t = map (uncurry f) <$> (T.toList t)
         (addrOutCF db)
         (AddrOutKey a b p)
 
--- | Operations for the mempool changes of a batch. Each changed entry is
--- compared to the database: its time is needed to update the index by
--- time, and the comparison says which transactions really entered or left
--- the mempool.
---
--- What the database has is taken from the copy of the mempool area if the
--- database has one, and read from RocksDB otherwise. The copy is not
--- loaded for it: a database whose batches all read RocksDB
--- ('withoutReadCache') stays without one.
-mempoolOps :: Writer -> IO ([Change], MempoolChanges)
-mempoolOps w = do
-  changes <- T.toList w.memory.mempoolTable
-  -- from the copy of the mempool area only if a batch has asked for it
-  -- before: the batch of 'withoutReadCache' reads the database here too
-  known <- knownMempoolCopy w.reader
-  let before h = case known of
-        Just c -> return (decoded <$> valueIn General (shortKey (MemTxKey h)) c)
-        Nothing -> retrieveCF db cf (MemTxKey h)
-  rows <- forM changes $ \(h, new) -> do
-    old <- before h
-    return (h, old, new)
-  return
-    ( concatMap ops rows,
-      MempoolChanges
-        { added = [h | (h, Nothing, Just _) <- rows],
-          removed = [h | (h, Just _, Nothing) <- rows]
-        }
-    )
-  where
-    db = w.reader.db
-    cf = mempoolCF db
-    ops (_, Nothing, Nothing) = []
-    ops (h, Nothing, Just n) = map Ready (mempoolInsertOps db h n)
-    ops (h, Just o, Nothing) =
-      [dropOpCF cf (MemTxKey h), dropOpCF cf (MemTimeKey o h)]
-    ops (h, Just o, Just n)
-      | o == n = []
-      | otherwise = dropOpCF cf (MemTimeKey o h) : map Ready (mempoolInsertOps db h n)
-
--- | Operations for changed bodies of mempool transactions.
-memTxOps :: DB -> TxTable -> IO [Change]
-memTxOps db t = map (uncurry f) <$> T.toList t
-  where
-    f h (Just td) = setOpCF (mempoolCF db) (TxKey h) td
-    f h Nothing = dropOpCF (mempoolCF db) (TxKey h)
-
 -- | Operations for the changed groups of spenders of the chain.
 spenderOps :: DB -> SpenderTable -> IO [Change]
 spenderOps db t = map (uncurry f) <$> T.toList t
@@ -1663,22 +1082,6 @@ spenderOps db t = map (uncurry f) <$> T.toList t
 spenderMergeOps :: DB -> SpenderTable -> IO [Change]
 spenderMergeOps db t =
   map (\((h, g), m) -> joinOpCF (spenderCF db) (SpenderKey h g) (SpenderVal m)) <$> T.toList t
-
--- | Operations for changed mempool spenders.
-memSpenderOps :: DB -> MemSpenderTable -> IO [Change]
-memSpenderOps db t = map (uncurry f) <$> T.toList t
-  where
-    f p (Just s) = setOpCF (mempoolCF db) (MemSpenderKey p) s
-    f p Nothing = dropOpCF (mempoolCF db) (MemSpenderKey p)
-
--- | Operations for changed entries of the mempool by address. Their column
--- family is only looked up if there are any, as a database of the layout in
--- use today does not have it.
-memAddrOps :: DB -> MemAddrTable -> IO [Change]
-memAddrOps db t = map (uncurry f) <$> T.toList t
-  where
-    f k (Just v) = setOpCF (mempoolAddrCF db) k v
-    f k Nothing = dropOpCF (mempoolAddrCF db) k
 
 -- | Operations for changed unspent outputs.
 unspentOps :: DB -> UnspentTable -> IO [Change]
@@ -1706,13 +1109,6 @@ getBlock w bh = getLayered w (getBlockH bh) (`Q.getBlock` bh)
 getTxData :: Writer -> TxHash -> IO (Maybe TxData)
 getTxData w th = getCached w (.txTable) (.txs) th (`Q.getTxRecord` th)
 
--- | Spender of an output, with the changes of the batch applied.
-getSpender :: Writer -> OutPoint -> IO (Maybe Spender)
-getSpender w op =
-  -- the rules of version 20 keep spenders in the record of the transaction
-  -- that made the output, and this is theirs
-  (>>= IntMap.lookup (fromIntegral op.index) . (.spenders)) <$> getTxData w op.hash
-
 -- | Balance of an address, with the changes of the batch applied: the
 -- whole value if the batch has one, and otherwise what the database has
 -- with the differences that the batch holds for the address added to it
@@ -1730,53 +1126,6 @@ getBalance w a =
 -- | Unspent output, with the changes of the batch applied.
 getUnspent :: Writer -> OutPoint -> IO (Maybe Unspent)
 getUnspent w op = getCached w (.unspentTable) (.unspents) op (`Q.getUnspent` op)
-
--- | Whether a transaction is in the mempool, with the changes of the batch
--- applied. It looks for the small key that lists the transaction, in the
--- copy of the mempool area, where 'getMempoolTx' decodes its whole body: a
--- rule that only needs to know asks this.
-inMempool :: Writer -> TxHash -> IO Bool
-inMempool w h =
-  T.lookup w.memory.mempoolTable h >>= \case
-    Just change -> return (isJust change)
-    Nothing -> isJust <$> storedMempoolTime w h
-
--- | The time at which the database has a transaction entering the mempool,
--- if it lists it, whatever the batch changed: as the copy of the mempool
--- area has it.
-storedMempoolTime :: Writer -> TxHash -> IO (Maybe UnixTime)
-storedMempoolTime w h = areaRead w Nothing (inArea w General (MemTxKey h))
-
--- | Body of a transaction in the mempool area, without its spenders, with
--- the changes of the batch applied: from the changes, or as the batch
--- decoded it before, or decoded from the copy of the mempool area and
--- remembered.
-getMempoolTx :: Writer -> TxHash -> IO (Maybe TxData)
-getMempoolTx w h =
-  T.lookup w.memory.memTxTable h >>= \case
-    Just x -> return x
-    Nothing -> areaRead w Nothing (remembered w (.memTxs) h (inArea w General (TxKey h)))
-
--- | Mempool input that spends an output, with the changes of the batch
--- applied: from the changes, or from the copy of the mempool area.
-getMempoolSpender :: Writer -> OutPoint -> IO (Maybe Spender)
-getMempoolSpender w p =
-  T.lookup w.memory.memSpenderTable p >>= \case
-    Just x -> return x
-    Nothing -> areaRead w Nothing (inArea w General (MemSpenderKey p))
-
--- | Mempool inputs that spend the outputs of a transaction, by output
--- index, with the changes of the batch applied. The second argument is the
--- number of outputs of the transaction: what the database has for it is
--- the keys of the copy of the mempool area that start with the
--- transaction, and the changes of the batch are looked up for each output.
-getMempoolSpenders :: Writer -> TxHash -> Int -> IO (IntMap Spender)
-getMempoolSpenders w h outputs = do
-  had <- areaRead w IntMap.empty (spendersInArea w h)
-  changed <- catMaybes <$> mapM change [0 .. outputs - 1]
-  return $ IntMap.mapMaybe id (IntMap.union (IntMap.fromList changed) (IntMap.map Just had))
-  where
-    change i = fmap (i,) <$> T.lookup w.memory.memSpenderTable (OutPoint h (fromIntegral i))
 
 -- | The spenders of a group of outputs of a transaction, with the changes
 -- of the batch applied: the whole group if the batch has one, and
@@ -1880,21 +1229,6 @@ getReplacedAt w height = do
       added = [h | (h, Just r) <- changes, r.height == height]
   return (kept <> added)
 
--- | The mempool in the database with the changes of this batch applied,
--- newest first: the index by time of the copy of the mempool area, and the
--- changes.
-getMempool :: Writer -> IO [(UnixTime, TxHash)]
-getMempool w = do
-  listed <- if w.cached then inCopy <$> mempoolCopy w.reader else Q.getMempool w.reader
-  changes <- T.toList w.memory.mempoolTable
-  let changed = HashMap.fromList changes
-      unchanged = filter (not . (`HashMap.member` changed) . snd) listed
-      added = [(t, h) | (h, Just t) <- changes]
-  return $ sortOn Down (unchanged <> added)
-  where
-    -- the index by time, as the copy of the mempool area has it
-    inCopy c = [(t, h) | (k, _) <- prefixed General (shortKey MemTimeKeyS) c, MemTimeKey t h <- [decoded k]]
-
 -- | Empty set of changes.
 newMemory ::
   Network ->
@@ -1909,15 +1243,10 @@ newMemory net = do
   balanceMerges <- T.new
   addressTable <- T.new
   outputTable <- T.new
-  mempoolTable <- T.new
-  memTxTable <- T.new
-  memSpenderTable <- T.new
-  memAddrTable <- T.new
   spenderTable <- T.new
   spenderMerges <- T.new
   replacedTable <- T.new
   cache <- newReadCache
-  reverted <- newIORef False
   times <- newIORef Nothing
   return Memory {..}
 
@@ -1928,9 +1257,6 @@ newReadCache = do
   unspents <- T.new
   balances <- T.new
   spenders <- T.new
-  memTxs <- T.new
-  memAddrs <- T.new
-  areaEmpty <- newIORef Nothing
   return ReadCache {..}
 
 -- | Read the best block from the changes of the batch: 'Nothing' if unchanged, @Just Nothing@ if deleted.

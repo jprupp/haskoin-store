@@ -159,14 +159,14 @@ instance Default Limits where
   def = defaultLimits
 
 -- | The queries that the web server answers with, as plain functions in
--- 'IO'. "Haskoin.Store.Database.Query" gives them for the database
--- ('Haskoin.Store.Database.Query.databaseRead'); the web server puts the
--- Redis cache in front of some of them.
+-- 'IO'. "Haskoin.Store.Database.Query.Pooled" gives them for the chain
+-- with the fleet's pool on top ('Haskoin.Store.Database.Query.Pooled.pooledRead');
+-- the web server puts the cache of xpubs in front of some of them.
 --
 -- A record of functions rather than a class: a class needs a monad to pick
 -- its instance, and the store has no monads of its own to pick it with, only
 -- 'IO'. The record makes the source of every answer an ordinary value that
--- can be passed around and replaced, as @nocache=true@ does.
+-- can be passed around and replaced, as the door to the cache of xpubs does.
 data StoreRead = StoreRead
   { -- | network the store indexes
     net :: !Network,

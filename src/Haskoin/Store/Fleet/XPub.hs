@@ -13,8 +13,8 @@
 -- answers as a member of a fleet ("Haskoin.Store.Fleet.Member") keeps in
 -- the Redis that the fleet shares, so that a request about a wallet is one
 -- or two reads of Redis instead of a read of the database for each of its
--- addresses. It is built on the shared pool, and described in "The cache
--- of extended public keys of a fleet" in @docs\/layered-database.md@.
+-- addresses. It is built on the shared pool, and described in
+-- @docs\/one-fleet.md@ and @docs\/xpub-indexing.md@.
 --
 -- = What an entry is
 --
@@ -49,32 +49,48 @@
 -- * __A read answers only where the cache is__, which is a move of the
 --   fleet tip and the block that it went to, and only while the tip is
 --   there. A block alone would not do: the tip can leave a block and come
---   back to it, as when a block is reverted and mined again, and on the
---   way the pool takes that block's transactions out of the entries and
---   puts them back as unconfirmed. When the tip moves, the store that moved it
---   brings the cache there, with what the blocks in between did to the
---   addresses that entries have ('cacheAdvance'). Until it has, every read
---   is a miss and the store answers from its database. If it never does, or
---   the chain was reorganised, or the pool was emptied, the cache is
---   emptied: the next move finds it at a block that it does not start from.
+--   back to it, as when a block is reverted and mined again.
+--
+-- * __The tip and the cache move in one commit.__ The store that moves the
+--   tip first writes what the blocks in between did at the addresses that
+--   entries have ('tipMoves'), in pieces that mark the entries they touch
+--   ('cachePieces'); readers wait for a marked entry. Then one script moves
+--   the pool, the fleet tip and the cache together, gives each marked entry
+--   a new version and clears the marks ('Haskoin.Store.Fleet.Redis.fleetCommit').
+--   No request finds the tip without its cache, or an entry half moved.
+--
+-- * __A reorganisation is undone address by address__ ('tipMoves'), from
+--   the views of the database at the old tip and the new one, and never
+--   empties the cache. Only a move that empties the pool, or one whose
+--   store cannot say what the abandoned blocks held, empties it too.
 --
 -- * __The addresses of a key depend on which are used__, and the pool
 --   counts. So every read of balances runs the scan again over what the
---   entry has ('window'), and is a miss unless the scan reads exactly the
---   addresses of the entry. The other reads say how many addresses the
---   caller found, and miss if the entry has another number.
---
--- The alternative that this replaces, "Haskoin.Store.Cache", keeps one
--- store's view of each key and repairs it from that store's events. It is
--- still what a store that is not in a fleet uses.
+--   entry has ('window'). An entry also has its lookahead, the next gap's
+--   worth of addresses, indexed at build time ('lookahead'), so that a
+--   payment that moves the gap is in the entry at once, through the pool,
+--   and the entry still answers. A read misses only when the scan needs an
+--   address that the entry lacks; when the lookahead runs low, the indexer
+--   is asked to extend it, and reads go on meanwhile. The other reads say
+--   how many addresses the entry has, and miss if it has another number.
 --
 -- = What it costs
 --
 -- An entry is built from the database by the store that missed, in the
 -- background, a few addresses at a time ('cacheBuild'); when a key gains
--- addresses only those are read. Each block costs one question to Redis
--- about the addresses that it touches, and a write for those that entries
--- have.
+-- addresses only those are read. Each move of the tip costs one question
+-- to Redis about the addresses that its blocks touch, and a write for those
+-- that entries have.
+--
+-- = Which entries stay
+--
+-- Every key that a request asks about is cached, and the cache evicts by
+-- GreedyDual ('Haskoin.Store.XPub.greedyLua'): each
+-- entry has what it cost to build, at the prices of the token design, a use
+-- gives it the level of the cache plus that cost, and the entry of the
+-- lowest priority goes first, the level rising to it ('cacheEvict'). A
+-- wallet of 40,000 addresses outlives an empty one used as recently, and
+-- either goes once nobody asks for it.
 module Haskoin.Store.Fleet.XPub
   ( -- * Reading
     Cached (..),
@@ -88,25 +104,31 @@ module Haskoin.Store.Fleet.XPub
     -- * Writing
     Built (..),
     cacheBuild,
+    lookahead,
     cacheDrop,
     cacheHave,
-    CacheMoved (..),
+    cacheEvict,
+    cacheSize,
+
+    -- * Moving the tip
     AddressChange (..),
     blockChanges,
     cacheTracked,
-    cacheAdvance,
-    cacheEvict,
-    cacheTip,
-    cacheSize,
+    Begun (..),
+    cacheBegin,
+    AddressMove (..),
+    tipMoves,
+    cachePieces,
+    cacheAbort,
 
     -- * Encoding
     xpubId,
     score,
     position,
-    nothingPool,
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Monad (forM)
 import Data.Bits (shift, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -142,7 +164,7 @@ import Haskoin
     sha256,
     txHash,
   )
-import Haskoin.Store.Common (Limits (..), StoreRead (..), scanXPubBals)
+import Haskoin.Store.Common (Limits (..), StoreRead (..), nub', scanXPubBals)
 import Haskoin.Store.Data
   ( Balance (..),
     BlockRef (..),
@@ -156,13 +178,12 @@ import Haskoin.Store.Data
     nullBalance,
     zeroBalance,
   )
-import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered (From (..))
-import Haskoin.Store.Database.Query.Pooled (PoolReads (..), pooledRead)
-import Haskoin.Store.Database.Reader (DatabaseReader (..))
+import Haskoin.Store.Database.Query.Pooled (From (..), PoolReads (..), applySummary, emptyPool, pooledRead)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), Derived (..), derivedAddrs)
 import Haskoin.Store.Database.Types (MemSummary (..))
-import Haskoin.Store.Fleet.Redis (FleetKeys (..))
+import Haskoin.Store.Fleet.Redis (FleetKeys (..), Script, evalScript, script)
+import Haskoin.Store.XPub (greedyLua, indexCost)
 
 -------------------------------------------------------------------------------
 -- Encoding
@@ -181,7 +202,7 @@ xpubId = encodeUtf8 . encodeHex . B.take 16 . encode . sha256 . encode
 -- their bytes, which for hashes and outputs is the order of the database
 -- ('Haskoin.Store.Common.txRefKey', 'Haskoin.Store.Common.unspentKey').
 --
--- It is the score of "Haskoin.Store.Cache", as a whole number: height and
+-- It is a whole number: height and
 -- position fit in the 53 bits that Redis keeps exactly.
 score :: BlockRef -> Int64
 score BlockRef {height = h, position = p} = 0x001fffffffffffff - (h' .|. p')
@@ -198,23 +219,6 @@ position s
   where
     m = 0x001fffffffffffff - s
 
--- | A pool that has nothing. The queries of
--- "Haskoin.Store.Database.Query.Pooled" with it answer from the chain
--- alone, which is how the chain's layer of an entry is read.
-nothingPool :: PoolReads
-nothingPool =
-  PoolReads
-    { summaries = return . map (const Nothing),
-      addressTxs = \_ _ _ -> return [],
-      addressOuts = \_ _ _ -> return [],
-      spentOutputs = \_ ps -> return (map (const False) ps),
-      bodies = return . map (const (Nothing, IntMap.empty)),
-      spenders = return . map (const Nothing),
-      page = \_ _ -> return [],
-      startingWith = \_ -> return [],
-      replaced = \_ -> return Nothing
-    }
-
 -------------------------------------------------------------------------------
 -- Reading
 -------------------------------------------------------------------------------
@@ -224,7 +228,7 @@ data Cached a
   = -- | the answer, which is the one that the database gives at the fleet
     -- tip with the pool on top
     Hit !a
-  | -- | the cache cannot answer: ask the database
+  | -- | the cache cannot answer: ask the indexer
     Miss
   | -- | the fleet tip is another block than the one that the request
     -- answers from: answer again from the new tip
@@ -239,19 +243,25 @@ data Entry = Entry
     sizes :: !(Int, Int),
     -- | where each address is in the key. It is worked out when it is
     -- asked for, which only a list of unspent outputs does.
-    paths :: HashMap Address [Word32]
+    paths :: HashMap Address [Word32],
+    -- | the version of the entry: every change of it stamps a new one
+    version :: !ByteString,
+    -- | whether the lookahead of the entry is less than half the gap in a
+    -- chain: payments used it up, and the indexer is to extend it
+    short :: !Bool
   }
   deriving (Eq, Show)
 
 -- | The balances of a key at the fleet tip, with the pool applied, if the
 -- cache has the key with exactly the addresses that a scan of it reads
 -- now. Arguments: the tip that the request answers from, the initial gap
--- and the gap of the store, and the time in milliseconds, by which the
--- cache knows which keys are in use.
-cachedEntry :: Connection -> FleetKeys -> ByteString -> Word32 -> Word32 -> Word64 -> XPubSpec -> IO (Cached Entry)
-cachedEntry conn keys tip igap gap now spec =
-  ask conn keys "bals" [tip, xpubId spec, num now] <&> \case
-    Hit rows -> maybe Miss Hit (entry (mapMaybe row (groups 3 rows)))
+-- and the gap of the store, and whether the read is a use of the key,
+-- which renews its priority in the cache (GreedyDual).
+cachedEntry :: Connection -> FleetKeys -> ByteString -> Word32 -> Word32 -> Bool -> XPubSpec -> IO (Cached Entry)
+cachedEntry conn keys tip igap gap used spec =
+  ask conn keys "bals" [tip, xpubId spec, if used then "1" else ""] <&> \case
+    Hit (ver : rows) -> maybe Miss Hit (entry ver (mapMaybe row (groups 3 rows)))
+    Hit [] -> Miss
     Miss -> Miss
     Moved -> Moved
   where
@@ -262,40 +272,51 @@ cachedEntry conn keys tip igap gap now spec =
       n <- either (const Nothing) Just (decode (B.drop 1 path)) :: Maybe Word32
       let stored = if B.null bal then Nothing else either (const Nothing) Just (decode bal)
           chain = fromMaybe (zeroBalance address) stored
-      return (fromIntegral m, n, maybe chain (M.applySummary chain) (summary sums))
+      return (fromIntegral m, n, maybe chain (applySummary chain) (summary sums))
     row _ = Nothing
     summary sums = case map number (C.words sums) of
       [txs, paid, paidCount, spent, spentCount, both, bothCount] -> Just MemSummary {..}
       _ -> Nothing
-    entry rows = do
+    entry version rows = do
       balances <- window igap gap rows
-      let count m = length [() | XPubBal {path = m' : _} <- balances, m' == m]
+      -- the numbers of the entry, its lookahead included, which the other
+      -- reads check
+      let held m = length [() | (m', _, _) <- rows, m' == m]
+          scanned m = length [() | XPubBal {path = m' : _} <- balances, m' == m]
+          ahead m = held m - scanned m
       return
         Entry
           { balances,
-            sizes = (count 0, count 1),
-            paths = HashMap.fromList [(b.balance.address, b.path) | b <- balances]
+            sizes = (held 0, held 1),
+            paths = HashMap.fromList [(b.balance.address, b.path) | b <- balances],
+            version,
+            short = any (\m -> ahead m < fromIntegral gap `div` 2) [0, 1]
           }
 
 -- | The balances of a key as a scan of it gives them, from the balances of
 -- the addresses that an entry has, each with the chain that it is in and
--- its number there: if the scan, run over them, reads exactly those
--- addresses. 'Nothing' if it would read one that the entry does not have,
--- or would stop before one that it has.
+-- its number there: if the scan, run over them, reads none that the entry
+-- lacks, and every address of the entry that it does not read is unused.
+-- 'Nothing' otherwise.
 --
 -- This is what makes an entry safe against the gap. The addresses of a key
 -- are those up to the last one that is used and so many more, and a
--- payment in the pool counts as use. An entry is built for the addresses
--- of one moment; after a payment to one of its unused addresses the key
--- has more, and after such a payment is dropped it has fewer. Either way
--- this gives 'Nothing', and the store answers from the database and
--- builds the entry again.
+-- payment in the pool counts as use. An entry is built with the addresses
+-- of one moment and its lookahead, the next gap's worth after them in each
+-- chain ('lookahead'), indexed as the others are, so that the pool puts a
+-- payment to one of them in the entry at once. After such a payment the
+-- key has more addresses, and the entry still has them; after a payment
+-- is dropped it has fewer, and the rest are unused. Only a key that needs
+-- more than the entry has, or an entry with a used address past what the
+-- scan reads, gives 'Nothing', and the entry is built again.
 window :: Word32 -> Word32 -> [(Word32, Word32, Balance)] -> Maybe [XPubBal]
 window igap gap rows
   | not (contiguous ext && contiguous chg) = Nothing
   | otherwise = do
       found <- scanXPubBals (traverse (`HashMap.lookup` known)) igap gap (ext <> [beyond]) (chg <> [beyond])
-      if length found == HashMap.size known then Just found else Nothing
+      let read' = HashMap.fromList [(b.balance.address, ()) | b <- found]
+          unread = [b | (_, _, b) <- rows, not (HashMap.member b.address read')]
+      if all ((== 0) . (.txs)) unread then Just found else Nothing
   where
     chain m = sortOn fst [(n, b.address) | (m', n, b) <- rows, m' == m]
     ext = chain 0
@@ -313,9 +334,21 @@ window igap gap rows
 -- | A page of the transactions of a cached key, newest first, from where
 -- the page starts, given the numbers of addresses that the caller has for
 -- the key ('sizes').
-cachedTxs :: Connection -> FleetKeys -> ByteString -> XPubSpec -> (Int, Int) -> From -> Limits -> IO (Cached [TxRef])
+cachedTxs ::
+  Connection ->
+  FleetKeys ->
+  ByteString ->
+  XPubSpec ->
+  (Int, Int) ->
+  From ->
+  Limits ->
+  IO (Cached (ByteString, [TxRef]))
 cachedTxs conn keys tip spec (n0, n1) from limits =
-  ask conn keys "txs" (who <> place from encode <> [num limits.offset, num limits.limit]) <&> fmap refs
+  ask conn keys "txs" (who <> place from encode <> [num limits.offset, num limits.limit]) <&> \case
+    Hit (v : rows) -> Hit (v, refs rows)
+    Hit [] -> Miss
+    Miss -> Miss
+    Moved -> Moved
   where
     who = [tip, xpubId spec, num n0, num n1]
     refs rows =
@@ -335,10 +368,11 @@ cachedUnspents ::
   Entry ->
   From ->
   Limits ->
-  IO (Cached [XPubUnspent])
+  IO (Cached (ByteString, [XPubUnspent]))
 cachedUnspents conn keys tip spec e from limits =
   ask conn keys "outs" (who <> place from first <> [num limits.offset, num limits.limit]) <&> \case
-    Hit rows -> maybe Miss Hit (mapM output (groups 3 rows))
+    Hit (v : rows) -> maybe Miss (Hit . (v,)) (mapM output (groups 3 rows))
+    Hit [] -> Miss
     Miss -> Miss
     Moved -> Moved
   where
@@ -363,10 +397,10 @@ cachedUnspents conn keys tip spec e from limits =
     output _ = Nothing
 
 -- | The number of transactions of a cached key.
-cachedCount :: Connection -> FleetKeys -> ByteString -> XPubSpec -> (Int, Int) -> IO (Cached Word32)
+cachedCount :: Connection -> FleetKeys -> ByteString -> XPubSpec -> (Int, Int) -> IO (Cached (ByteString, Word32))
 cachedCount conn keys tip spec (n0, n1) =
   ask conn keys "count" [tip, xpubId spec, num n0, num n1] <&> \case
-    Hit [n] -> Hit (number n)
+    Hit [v, n] -> Hit (v, number n)
     Hit _ -> Miss
     Miss -> Miss
     Moved -> Moved
@@ -381,13 +415,23 @@ place from bytes = case from of
   InChain ref -> ["score", num (score ref), ""]
 
 -- | Ask the script something that it answers with rows.
+--
+-- An entry that a move of the tip is writing ('cachePieces') is read when
+-- the move is done: the read waits a few milliseconds at a time, for two
+-- seconds at most, and then says that the tip moved, which has the request
+-- answered again.
 ask :: Connection -> FleetKeys -> ByteString -> [ByteString] -> IO (Cached [ByteString])
-ask conn keys what args =
-  run conn (R.eval xpubScript [] (what : keys.prefix : "32" : args)) >>= \case
-    "ok" : rows -> return (Hit rows)
-    ["miss"] -> return Miss
-    ["raced"] -> return Moved
-    other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 other))
+ask conn keys what args = go (400 :: Int)
+  where
+    go tries =
+      run conn (evalScript xpubScript [] (what : keys.prefix : "32" : args)) >>= \case
+        "ok" : rows -> return (Hit rows)
+        ["miss"] -> return Miss
+        ["raced"] -> return Moved
+        ["marked"]
+          | tries > 0 -> threadDelay 5000 >> go (tries - 1)
+          | otherwise -> return Moved
+        other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 other))
 
 -------------------------------------------------------------------------------
 -- Writing
@@ -401,25 +445,31 @@ data Built
   | -- | the fleet tip moved, the cache is not at the tip, or another store
     -- wrote the entry meanwhile: nothing more was written
     Abandoned
+  | -- | a move of the tip is under way: the build is to be tried again
+    -- when it is done
+    Busy
   deriving (Eq, Show)
 
 -- | The numbers of addresses that the cache has for a key in each of its
 -- two chains, both zero if it does not have the key.
 cacheHave :: Connection -> FleetKeys -> XPubSpec -> IO (Int, Int)
 cacheHave conn keys spec =
-  run conn (R.eval xpubScript [] ["have", keys.prefix, "32", xpubId spec]) >>= \case
+  run conn (evalScript xpubScript [] ["have", keys.prefix, "32", xpubId spec]) >>= \case
     [n0, n1] -> return (fromInteger n0, fromInteger n1)
     other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [Integer]))
 
 -- | Delete the entry of a key.
 cacheDrop :: Connection -> FleetKeys -> XPubSpec -> IO ()
 cacheDrop conn keys spec = do
-  _ <- run conn (R.eval xpubScript [] ["drop", keys.prefix, "32", xpubId spec]) :: IO [ByteString]
+  _ <- run conn (evalScript xpubScript [] ["drop", keys.prefix, "32", xpubId spec]) :: IO [ByteString]
   return ()
 
 -- | Build the entry of a key, or add to it the addresses that the key has
 -- gained: given the tip that the fleet is at, the database as it was at
--- that block, the pool, and the time in milliseconds.
+-- that block, and the pool. A build is for a request that missed, and is a
+-- use of the key: its priority in the cache becomes the level plus what the
+-- entry cost to read, its addresses, transactions and outputs at the
+-- prices of 'Haskoin.Store.XPub.indexCost', added up over its writes.
 --
 -- The addresses of the key are read as a request reads them, from the
 -- chain with the pool on top. An entry that has some of them keeps what it
@@ -431,9 +481,9 @@ cacheDrop conn keys spec = do
 --
 -- Each write is taken only while the fleet tip, the block of the cache
 -- and the addresses of the entry are what this store found.
-cacheBuild :: Connection -> FleetKeys -> ByteString -> DatabaseReader -> PoolReads -> Word64 -> XPubSpec -> IO Built
-cacheBuild conn keys tip r pool now spec = do
-  bals <- (pooledRead r pool).xPubBals spec
+cacheBuild :: Connection -> FleetKeys -> ByteString -> DatabaseReader -> PoolReads -> XPubSpec -> IO Built
+cacheBuild conn keys tip r pool spec = do
+  bals <- (pooledRead r pool).xPubBals spec >>= lookahead r pool spec
   let wanted m = [b | b@XPubBal {path = m' : _} <- bals, m' == m]
       (w0, w1) = (length (wanted 0), length (wanted 1))
   (h0, h1) <- cacheHave conn keys spec
@@ -444,7 +494,7 @@ cacheBuild conn keys tip r pool now spec = do
   let new = drop n0 (wanted 0) <> drop n1 (wanted 1)
   go (n0, n1) 0 =<< mapM chainOf new
   where
-    chain = pooledRead r nothingPool
+    chain = pooledRead r emptyPool
     chainOf b = do
       let a = b.balance.address
       bal <- Q.getBalance r a
@@ -460,12 +510,19 @@ cacheBuild conn keys tip r pool now spec = do
     go _ added [] = return (Built added)
     go (n0, n1) added todo = do
       let (now', later) = batch chunk todo
+          cost =
+            indexCost
+              (length now')
+              (sum [length txs | (_, _, txs, _) <- now'])
+              (sum [length outs | (_, _, _, outs) <- now'])
+              0
           args =
-            [tip, xpubId spec, num n0, num n1, num now, num (length now')]
+            [tip, xpubId spec, num n0, num n1, num cost, num (length now')]
               <> concatMap address now'
           count m = length [() | (XPubBal {path = m' : _}, _, _, _) <- now', m' == m]
-      run conn (R.eval xpubScript [] ("build" : keys.prefix : "32" : args)) >>= \case
+      run conn (evalScript xpubScript [] ("build" : keys.prefix : "32" : args)) >>= \case
         ["ok"] -> go (n0 + count 0, n1 + count 1) (added + length now') later
+        ["busy"] -> return Busy
         [why] | why `elem` ["raced", "behind", "changed"] -> return Abandoned
         other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 (other :: [ByteString])))
     address (b, bal, txs, outs) =
@@ -479,23 +536,28 @@ cacheBuild conn keys tip r pool now spec = do
       [m, n] -> runPut (putWord8 (fromIntegral m) >> putWord32be n)
       _ -> ""
 
+-- | The addresses of a key as a scan gives them, with its lookahead: in
+-- each chain, the next gap's worth of addresses after them, up to the first
+-- that is used. Those are indexed with the others, so that a payment in the
+-- pool to one of them is in the entry at once, and the entry still answers
+-- when the payment moves the gap ('window'). A used address past the gap
+-- is not one that the key has, and stops the lookahead.
+lookahead :: DatabaseReader -> PoolReads -> XPubSpec -> [XPubBal] -> IO [XPubBal]
+lookahead r pool spec bals = do
+  Derived ext chg <- derivedAddrs r spec
+  more <- forM [(0, ext), (1, chg)] $ \(m, derived) -> do
+    let have = length [() | XPubBal {path = m' : _} <- bals, m' == m]
+        next = take (fromIntegral r.maxGap) (drop have derived)
+    found <- (pooledRead r pool).getBalances (map snd next)
+    return
+      . takeWhile ((== 0) . (.balance.txs))
+      $ zipWith (\(n, _) b -> XPubBal {path = [m, n], balance = b}) next found
+  return (bals <> concat more)
+
 -- | About how many transactions and outputs one write of 'cacheBuild'
 -- carries.
 chunk :: Int
 chunk = 5000
-
--- | What became of an attempt to bring the cache to a block.
-data CacheMoved
-  = -- | the cache is at the block now, with what the blocks did
-    CacheMoved
-  | -- | it was there already
-    CacheStays
-  | -- | the fleet tip is not that block any more: whoever moves it next
-    -- sees to the cache
-    CacheRaced
-  | -- | the cache was emptied and starts again at the block
-    CacheEmptied
-  deriving (Eq, Show)
 
 -- | What blocks did at an address: the transactions that they added to
 -- it, the outputs that they paid to it, and its outputs that they spent.
@@ -511,8 +573,8 @@ instance Semigroup AddressChange where
 
 -- | What the transactions of some blocks, in their order, did at each
 -- address that they touch. An output that one of them pays and a later one
--- spends is in both lists of its address: 'cacheAdvance' takes out what
--- was spent after it puts in what was paid.
+-- spends is in both lists of its address ('tipMoves' looks each up at the
+-- new tip).
 blockChanges :: Network -> [TxData] -> HashMap Address AddressChange
 blockChanges net tds = HashMap.fromListWith (flip (<>)) (concatMap one tds)
   where
@@ -540,51 +602,133 @@ cacheTracked conn keys as = concat <$> forM (pieces as) asked
   where
     asked some =
       map (== '1') . C.unpack
-        <$> run conn (R.eval xpubScript [] ("tracked" : keys.prefix : "32" : map encode some))
+        <$> run conn (evalScript xpubScript [] ("tracked" : keys.prefix : "32" : map encode some))
     pieces [] = []
     pieces xs = let (now, later) = splitAt 4000 xs in now : pieces later
 
--- | Bring the cache from the block that it is taken to be at to the block
--- that the fleet tip has moved to: given what the blocks in between did at
--- the addresses that entries have, each with its balance in the chain at
--- the new block, or 'Nothing' to empty the cache instead, as a store does
--- that cannot say what they did.
+-- | What became of an attempt to begin a move of the cache.
+data Begun
+  = -- | the move is under way, under its token: builds wait for it
+    Begun
+  | -- | another store is moving the tip
+    Moving
+  | -- | the fleet tip is not the one that the store saw
+    BeginRaced
+  deriving (Eq, Show)
+
+-- | Begin a move of the tip with the cache, under a token, from the tip
+-- that the store saw: from here until the commit ('fleetCommit' in
+-- "Haskoin.Store.Fleet.Redis") or 'cacheAbort', builds wait, so that every
+-- entry is either one that the move brings along or one built after it. A
+-- move whose store wrote nothing for ten seconds is aborted by whoever
+-- comes across it.
+cacheBegin :: Connection -> FleetKeys -> ByteString -> ByteString -> IO Begun
+cacheBegin conn keys token seen =
+  run conn (evalScript xpubScript [] ["begin", keys.prefix, "32", token, seen]) >>= \case
+    ["ok"] -> return Begun
+    ["busy"] -> return Moving
+    ["raced"] -> return BeginRaced
+    other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [ByteString]))
+
+-- | End a move of the cache that will not be committed, dropping the
+-- entries that its pieces wrote, to be built again.
+cacheAbort :: Connection -> FleetKeys -> ByteString -> IO ()
+cacheAbort conn keys token = do
+  _ <- run conn (evalScript xpubScript [] ["abort", keys.prefix, "32", token]) :: IO [ByteString]
+  return ()
+
+-- | What a move of the tip does to the chain's layer of an address that
+-- entries have: its balance in the chain at the new tip, the transactions
+-- of the abandoned blocks that touch it, those of the new blocks with
+-- where they are, and, of the outputs that either touches, those that are
+-- not unspent in the chain at the new tip and those that are.
+data AddressMove = AddressMove
+  { address :: !Address,
+    balance :: !(Maybe Balance),
+    abandoned :: ![TxHash],
+    added :: ![(TxHash, BlockRef)],
+    gone :: ![OutPoint],
+    unspent :: ![Unspent]
+  }
+  deriving (Eq, Show)
+
+-- | What a move of the tip does at the addresses that entries have, worked
+-- out from the view of the database at the new tip, the transactions of
+-- the abandoned blocks as the view at the old tip had them, and those of
+-- the new blocks, both in the order of their blocks.
 --
--- The cache is also emptied when it is found at another block than the
--- one given: a store moved the tip and did not get to bring the cache
--- along, and what the blocks since did to it is not known here.
-cacheAdvance ::
-  Connection ->
-  FleetKeys ->
-  Maybe ByteString ->
-  ByteString ->
-  Maybe [(Address, Maybe Balance, AddressChange)] ->
-  IO CacheMoved
-cacheAdvance conn keys from to changes =
-  run conn (R.eval xpubScript [] ("advance" : keys.prefix : "32" : args)) >>= \case
-    ["moved"] -> return CacheMoved
-    ["stays"] -> return CacheStays
-    ["raced"] -> return CacheRaced
-    ["emptied"] -> return CacheEmptied
-    other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 (other :: [ByteString])))
+-- = Undone address by address
+--
+-- A reorganisation is undone at each address as it was done: the
+-- transactions of the abandoned blocks come out, the new ones go in, and
+-- every output that either touches is looked up at the new tip, so that
+-- what the abandoned blocks paid goes, what they spent comes back unless
+-- the new blocks spend it, and what the new blocks pay and do not spend
+-- comes in. The balance is read at the new tip. Nothing else of an entry
+-- changes, so no entry has to be emptied or built again.
+tipMoves :: Connection -> FleetKeys -> DatabaseReader -> [TxData] -> [TxData] -> IO [AddressMove]
+tipMoves conn keys r old new = do
+  let undone = blockChanges r.net old
+      done = blockChanges r.net new
+      touched = HashMap.keys (HashMap.union (() <$ undone) (() <$ done))
+  flags <- cacheTracked conn keys touched
+  forM [a | (a, True) <- zip touched flags] $ \a -> do
+    let none = AddressChange [] [] []
+        u = HashMap.lookupDefault none a undone
+        d = HashMap.lookupDefault none a done
+        outs = nub' ([p | (p, _, _, _) <- u.paid <> d.paid] <> u.spent <> d.spent)
+    bal <- Q.getBalance r a
+    found <- forM outs $ \p -> (p,) <$> Q.getUnspent r p
+    return
+      AddressMove
+        { address = a,
+          balance = bal,
+          abandoned = map fst u.txs,
+          added = d.txs,
+          gone = [p | (p, Nothing) <- found],
+          unspent = [x | (_, Just x) <- found]
+        }
+
+-- | Write the moves of the addresses into their entries, a few at a time,
+-- each piece marking the entries that it writes, which readers then wait
+-- for until the commit. 'False' if the move was taken over or the tip
+-- moved meanwhile: the caller aborts it.
+cachePieces :: Connection -> FleetKeys -> ByteString -> ByteString -> [AddressMove] -> IO Bool
+cachePieces conn keys token seen = go
   where
-    args =
-      [fromMaybe "" from, to, maybe "1" (const "0") changes, num (maybe 0 length changes)]
-        <> concatMap one (fromMaybe [] changes)
-    one (a, bal, c) =
-      [encode a, maybe "" encode (bal >>= real), num (length c.txs)]
-        <> concat [[encode h, num (score ref)] | (h, ref) <- c.txs]
-        <> [num (length c.paid)]
-        <> concat [[encode p, num (score ref), num v, s] | (p, ref, v, s) <- c.paid]
-        <> [num (length c.spent)]
-        <> map encode c.spent
+    go [] = return True
+    go moves = do
+      let (now', later) = batch chunk moves
+          args = ["piece", keys.prefix, "32", token, seen, num (length now')] <> concatMap one now'
+      run conn (evalScript xpubScript [] args) >>= \case
+        ["ok"] -> go later
+        ["raced"] -> return False
+        other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [ByteString]))
+    weight x = 1 + length x.abandoned + length x.added + length x.gone + length x.unspent
+    batch _ [] = ([], [])
+    batch room (x : xs)
+      | room <= 0 = ([], x : xs)
+      | otherwise = let (now', later) = batch (room - weight x) xs in (x : now', later)
+    one x =
+      [encode x.address, maybe "" encode (x.balance >>= real), num (length x.abandoned)]
+        <> map encode x.abandoned
+        <> [num (length x.added)]
+        <> concat [[encode h, num (score ref)] | (h, ref) <- x.added]
+        <> [num (length x.gone)]
+        <> map encode x.gone
+        <> [num (length x.unspent)]
+        <> concat [[encode o.outpoint, num (score o.block), num o.value, o.script] | o <- x.unspent]
     real b = if nullBalance b then Nothing else Just b
 
--- | Delete the least recently used entries past so many. Says how many it
--- deleted.
+-- | Delete entries past so many by GreedyDual, those of the lowest priority
+-- first, raising the level to each ('Haskoin.Store.XPub.greedyLua'). A use
+-- of an entry gave it the level plus its cost, so a large key outlives
+-- small ones used as recently, and any key goes once it is not used for
+-- long enough. Entries of a version that ordered them by last use are given
+-- the level first, so they go first. Says how many it deleted.
 cacheEvict :: Connection -> FleetKeys -> Int -> IO Int
 cacheEvict conn keys most =
-  fromInteger <$> run conn (R.eval xpubScript [] ["evict", keys.prefix, "32", num most])
+  fromInteger <$> run conn (evalScript xpubScript [] ["evict", keys.prefix, "32", num most])
 
 -- | How large the cache is: the number of its entries, one for each
 -- extended public key, and the number of addresses that they have between
@@ -592,16 +736,9 @@ cacheEvict conn keys most =
 -- transactions of those addresses.
 cacheSize :: Connection -> FleetKeys -> IO (Int, Int)
 cacheSize conn keys =
-  run conn (R.eval xpubScript [] ["size", keys.prefix, "32"]) >>= \case
+  run conn (evalScript xpubScript [] ["size", keys.prefix, "32"]) >>= \case
     [entries, addresses] -> return (fromInteger entries, fromInteger addresses)
     other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [Integer]))
-
--- | The block that the cache is at, if it is where the fleet tip is: at
--- the same block, by the same move of the tip.
-cacheTip :: Connection -> FleetKeys -> IO (Maybe ByteString)
-cacheTip conn keys =
-  run conn (R.eval xpubScript [] ["where", keys.prefix, "32"]) <&> \block ->
-    if B.null block then Nothing else Just block
 
 -------------------------------------------------------------------------------
 -- Helpers
@@ -638,5 +775,6 @@ run conn f =
     Left e -> fail ("Redis error: " <> show e)
 
 -- | The script of the cache; see its header for what it takes and gives.
-xpubScript :: ByteString
-xpubScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/xpub.lua" >>= embedFile)
+xpubScript :: Script
+xpubScript = script (greedyLua <> $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/xpub.lua" >>= embedFile))
+{-# NOINLINE xpubScript #-}

@@ -49,7 +49,6 @@ import Data.Hashable (Hashable (..))
 import Data.Word (Word32)
 import Haskoin (Address (..), BlockHash, OutPoint (..), TxHash)
 import Haskoin.Store.Data (BlockRef, TxRef (..))
-import Haskoin.Store.Database.Types (MemAddrKey (..))
 import Prelude hiding (lookup)
 
 -- | A mutable hash table, for one thread at a time.
@@ -106,17 +105,6 @@ instance TableKey (Address, TxRef) where
 -- | The address and the output, without the position of its transaction.
 instance TableKey (Address, BlockRef, OutPoint) where
   tableHash salt (a, _, p) = tableHash (tableHash salt a) p
-
--- | The address, and the transaction or the output of the entry, each
--- kind of entry with a salt of its own. The short keys, which only scans
--- use, are hashed as their type says.
-instance TableKey MemAddrKey where
-  tableHash salt = \case
-    MemAddrTxKey a _ h -> tableHash salt a `hashWithSalt` h
-    MemAddrSpentKey a p -> tableHash (tableHash (salt + 1) a) p
-    MemAddrOutKey a _ p -> tableHash (tableHash (salt + 2) a) p
-    MemAddrSumKey a -> tableHash (salt + 3) a
-    k -> hashWithSalt (salt + 4) k
 
 -- | An empty table.
 new :: IO (Table k v)

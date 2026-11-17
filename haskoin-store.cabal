@@ -27,18 +27,16 @@ tested-with:
     GHC == 9.12.4
 extra-source-files:
     cbits/haskoin_store_merge.h
-    src/Haskoin/Store/Cache/lua/bodies.lua
-    src/Haskoin/Store/Cache/lua/commit.lua
-    src/Haskoin/Store/Cache/lua/delete.lua
-    src/Haskoin/Store/Cache/lua/evict.lua
-    src/Haskoin/Store/Cache/lua/page.lua
-    src/Haskoin/Store/Cache/lua/spends.lua
-    src/Haskoin/Store/Cache/lua/unlock.lua
     src/Haskoin/Store/Fleet/lua/move.lua
     src/Haskoin/Store/Fleet/lua/pool.lua
     src/Haskoin/Store/Fleet/lua/read.lua
     src/Haskoin/Store/Fleet/lua/report.lua
     src/Haskoin/Store/Fleet/lua/xpub.lua
+    src/Haskoin/Store/XPub/lua/greedy.lua
+    src/Haskoin/Store/XPub/lua/peek.lua
+    src/Haskoin/Store/XPub/lua/release.lua
+    src/Haskoin/Store/XPub/lua/renew.lua
+    src/Haskoin/Store/XPub/lua/take.lua
     stress/wrk.lua
     swagger.yaml
 extra-doc-files:
@@ -55,15 +53,10 @@ library
       Haskoin.Store.BlockStore
       Haskoin.Store.BlockStore.Pending
       Haskoin.Store.BlockStore.Sync
-      Haskoin.Store.Cache
-      Haskoin.Store.Cache.Protocol
       Haskoin.Store.Common
-      Haskoin.Store.Database.Copy
-      Haskoin.Store.Database.Mempool
       Haskoin.Store.Database.Merge
       Haskoin.Store.Database.Migrate
       Haskoin.Store.Database.Query
-      Haskoin.Store.Database.Query.Layered
       Haskoin.Store.Database.Query.Pooled
       Haskoin.Store.Database.Reader
       Haskoin.Store.Database.Slices
@@ -78,17 +71,21 @@ library
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.XPub
       Haskoin.Store.Logic
-      Haskoin.Store.Logic.Layered
       Haskoin.Store.Manager
       Haskoin.Store.Outage
       Haskoin.Store.Runtime
       Haskoin.Store.Web
       Haskoin.Store.Web.Admission
+      Haskoin.Store.Web.Congestion
       Haskoin.Store.Web.Docs
       Haskoin.Store.Web.Events
       Haskoin.Store.Web.Pieces
       Haskoin.Store.Web.Publish
       Haskoin.Store.Web.Router
+      Haskoin.Store.XPub
+      Haskoin.Store.XPub.Indexer
+      Haskoin.Store.XPub.Lock
+      Haskoin.Store.XPub.Service
   other-modules:
       Paths_haskoin_store
   autogen-modules:
@@ -106,6 +103,7 @@ library
       cbits
   c-sources:
       cbits/haskoin_store_merge.c
+      cbits/haskoin_store_probe.c
   build-depends:
       aeson >=2.2.5.1 && <2.3
     , async >=2.2.6 && <2.3
@@ -140,6 +138,7 @@ library
     , string-conversions >=0.4.0.1 && <0.5
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4
@@ -209,6 +208,7 @@ library integration
     , temporary ==1.3.*
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4
@@ -273,6 +273,7 @@ executable haskoin-store
     , string-conversions >=0.4.0.1 && <0.5
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4
@@ -291,17 +292,14 @@ test-suite spec
   other-modules:
       Haskoin.Store.BlockStore.PendingSpec
       Haskoin.Store.BlockStore.SyncSpec
-      Haskoin.Store.Cache.ProtocolSpec
-      Haskoin.Store.CacheSpec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Database.MergeSpec
       Haskoin.Store.Database.MigrateSpec
-      Haskoin.Store.Database.Query.LayeredSpec
       Haskoin.Store.Database.SlicesSpec
       Haskoin.Store.Database.ViewsSpec
       Haskoin.Store.Database.WriterSpec
       Haskoin.Store.ExceptionSpec
-      Haskoin.Store.Fleet.MemberSpec
+      Haskoin.Store.Fleet.CacheSpec
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
       Haskoin.Store.Fleet.XPubSpec
@@ -309,17 +307,17 @@ test-suite spec
       Haskoin.Store.Histories
       Haskoin.Store.Integration.TempSpec
       Haskoin.Store.IntegrationSpec
-      Haskoin.Store.Logic.LayeredSpec
-      Haskoin.Store.Logic.StagedSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.Web.AdmissionSpec
+      Haskoin.Store.Web.CongestionSpec
       Haskoin.Store.Web.EventsSpec
       Haskoin.Store.Web.PiecesSpec
       Haskoin.Store.Web.PublishSpec
       Haskoin.Store.Web.RouterSpec
       Haskoin.Store.WebSpec
+      Haskoin.Store.XPub.IndexerSpec
       Haskoin.StoreSpec
       Paths_haskoin_store
   autogen-modules:
@@ -375,6 +373,7 @@ test-suite spec
     , string-conversions >=0.4.0.1 && <0.5
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4
@@ -392,6 +391,7 @@ benchmark haskoin-store-bench
   type: exitcode-stdio-1.0
   main-is: Main.hs
   other-modules:
+      Admission
       Import
       Merge
       Paths_haskoin_store
@@ -443,6 +443,7 @@ benchmark haskoin-store-bench
     , string-conversions >=0.4.0.1 && <0.5
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4
@@ -510,6 +511,7 @@ benchmark haskoin-store-stress
     , string-conversions >=0.4.0.1 && <0.5
     , text >=2.1.4 && <2.2
     , time ==1.14.*
+    , time-manager >=0.4.2 && <0.5
     , transformers >=0.6.3.0 && <0.7
     , unordered-containers >=0.2.21 && <0.3
     , vault >=0.3.2.0 && <0.4

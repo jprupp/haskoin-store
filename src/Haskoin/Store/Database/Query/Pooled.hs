@@ -6,32 +6,23 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- The queries of the store with a mempool that is not the store's own laid
--- over the chain: the shared pool of a fleet of stores, which
--- "Haskoin.Store.Fleet.Redis" keeps in Redis. See "A fleet that answers as
--- one" in @docs\/layered-database.md@.
+-- The queries of the store: the chain, as the database has it, with the
+-- mempool laid over it. The mempool is the pool that the stores of a fleet
+-- share, which "Haskoin.Store.Fleet.Redis" keeps in Redis; the database
+-- has no mempool of its own.
 --
--- = Why another set of queries
+-- = Why the pool comes as functions
 --
--- "Haskoin.Store.Database.Query.Layered" answers from the two areas of one
--- database, read through one snapshot. Stores that share a Redis are to
--- give the same answer to the same request, and their own mempools differ.
--- So each answers from the chain as it was at the block that the fleet
--- agreed on, which every store has the same, and from the one pool that
--- they share. The chain's part of an answer is read as the layered queries
--- read it, with the same code. The mempool's part comes through a
+-- Stores that share a Redis are to give the same answer to the same
+-- request. So each answers from the chain as it was at the block that the
+-- fleet agreed on, which every store has the same, read through a view of
+-- its database at that block ("Haskoin.Store.Database.Views"), and from the
+-- one pool that they share. The mempool's part comes through a
 -- t'PoolReads', a handful of functions that say what a pool has: its
 -- summaries, the entries of an address by the page, bodies, spenders and
--- its list.
---
--- The alternative was to give the layered queries the same handful of
--- functions for the store's own mempool area. They read that area through
--- iterators that are made once for a request and moved from address to
--- address, which is where their speed comes from, and which a function
--- that returns a page would hide. The two sets share what is the same, and
--- the tests hold this one to the answers of the other: 'localPool' is the
--- store's own mempool area as a t'PoolReads', and with it every query here
--- must answer as the layered one does.
+-- its list. A pool far away answers each in one round trip, and
+-- 'emptyPool' answers for no pool at all, which is how the chain alone is
+-- read ('chainRead').
 --
 -- = What a pool cannot say
 --
@@ -42,8 +33,13 @@
 module Haskoin.Store.Database.Query.Pooled
   ( PoolReads (..),
     pooledRead,
-    localPool,
+    emptyPool,
+    chainRead,
     pageStart,
+    From (..),
+    withSpenders,
+    summaryBalance,
+    applySummary,
   )
 where
 
@@ -51,6 +47,7 @@ import Conduit
   ( ConduitT,
     await,
     awaitForever,
+    concatMapC,
     lift,
     mapC,
     runConduit,
@@ -66,16 +63,17 @@ import Data.ByteString qualified as BS
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (serialize)
 import Data.Functor ((<&>))
+import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Serialize (encode)
 import Data.Word (Word16, Word32, Word64)
 import Database.RocksDB (Iterator)
-import Database.RocksDB.Query (matchingAsListCF, retrieveCF)
+import Database.RocksDB.Query (matchingAsListCF)
 import Haskoin
   ( Address,
     OutPoint (..),
@@ -108,29 +106,26 @@ import Haskoin.Store.Data
     Unspent (..),
     XPubBal (..),
     XPubUnspent (..),
+    zeroBalance,
   )
-import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered (From (..), chainTxsC, chainUnspentsC, withSpenders)
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     Derived (..),
     addrOutCF,
     addrTxCF,
     derivedAddrs,
-    mempoolAddrCF,
-    mempoolCF,
     txCF,
+    withSnapshotReader,
   )
 import Haskoin.Store.Database.Types
   ( AddrOutKey (..),
     AddrTxKey (..),
-    MemAddrKey (..),
-    MemAddrVal (..),
-    MemSpenderKey (..),
     MemSummary (..),
+    OutVal,
     TxKey (..),
     decodeTxKey,
+    toUnspent,
   )
 
 -- | What a mempool has, as much as the queries need of it. Each function
@@ -212,9 +207,71 @@ pooledRead r pool =
       [found] -> found
       _ -> Nothing
 
+-- | A pool that has nothing. The queries of this module with it answer
+-- from the chain alone.
+emptyPool :: PoolReads
+emptyPool =
+  PoolReads
+    { summaries = return . map (const Nothing),
+      addressTxs = \_ _ _ -> return [],
+      addressOuts = \_ _ _ -> return [],
+      spentOutputs = \_ ps -> return (map (const False) ps),
+      bodies = return . map (const (Nothing, IntMap.empty)),
+      spenders = return . map (const Nothing),
+      page = \_ _ -> return [],
+      startingWith = \_ -> return [],
+      replaced = \_ -> return Nothing
+    }
+
+-- | The queries of the chain alone, each on a snapshot of the database of
+-- its own, taken when it is asked: for code that asks one thing at a time,
+-- outside of a request, such as the block store and the web server before
+-- it has a view of the fleet tip. Queries asked one after the other may see
+-- different blocks.
+chainRead :: DatabaseReader -> StoreRead
+chainRead r =
+  StoreRead
+    { net = r.net,
+      getBestBlock = one (.getBestBlock),
+      getBlocksAtHeight = \h -> one (\q -> q.getBlocksAtHeight h),
+      getBlock = \h -> one (\q -> q.getBlock h),
+      getTxData = \h -> one (\q -> q.getTxData h),
+      getManyTxData = \hs -> one (\q -> q.getManyTxData hs),
+      getManyTxBytes = \hs -> one (\q -> q.getManyTxBytes hs),
+      getSpender = \p -> one (\q -> q.getSpender p),
+      getBalance = \a -> one (\q -> q.getBalance a),
+      getUnspent = \p -> one (\q -> q.getUnspent p),
+      getMempool = return [],
+      getMempoolPage = \_ -> return [],
+      getAddressesTxs = \as l -> one (\q -> q.getAddressesTxs as l),
+      getAddressesUnspents = \as l -> one (\q -> q.getAddressesUnspents as l),
+      initialGap = r.initGap,
+      maxGap = r.maxGap,
+      getNumTxData = \n -> one (\q -> q.getNumTxData n),
+      getBalances = \as -> one (\q -> q.getBalances as),
+      getAddressTxs = \a l -> one (\q -> q.getAddressTxs a l),
+      getAddressUnspents = \a l -> one (\q -> q.getAddressUnspents a l),
+      xPubBals = \x -> one (\q -> q.xPubBals x),
+      xPubUnspents = \x bs l -> one (\q -> q.xPubUnspents x bs l),
+      xPubTxs = \x bs l -> one (\q -> q.xPubTxs x bs l),
+      xPubTxCount = \x bs -> one (\q -> q.xPubTxCount x bs),
+      getAddressesTxCount = \as -> one (\q -> q.getAddressesTxCount as),
+      getReplaced = \_ -> return Nothing
+    }
+  where
+    one :: (StoreRead -> IO a) -> IO a
+    one f = withSnapshotReader r (\s -> f (pooledRead s emptyPool))
+
 -------------------------------------------------------------------------------
 -- Transactions
 -------------------------------------------------------------------------------
+
+-- | Add the spenders that the pool has for the outputs of a transaction
+-- to those in its body.
+withSpenders :: HashMap TxHash (IntMap.IntMap Spender) -> TxHash -> TxData -> TxData
+withSpenders spent h td = case HashMap.lookup h spent of
+  Nothing -> td
+  Just unconfirmed -> (td :: TxData) {spenders = IntMap.union td.spenders unconfirmed}
 
 -- | Data of many transactions, in the order of the hashes: those of the
 -- pool from it, the others from the chain, each with the spenders that
@@ -236,7 +293,7 @@ getManyTxBytes r pool hs = do
       rest = filter (`Map.notMember` unconfirmed) hs
   chain <-
     Map.fromList . catMaybes . zipWith (\h v -> (,) h <$> (v >>= Q.liveTxBytes)) rest
-      <$> Q.retrieveManyBytesCF r.db (txCF r.db) (map TxKey rest)
+      <$> Q.retrieveManyBytesCF r (txCF r.db) (map TxKey rest)
   return [Map.lookup h unconfirmed <|> Map.lookup h chain | h <- hs]
 
 -- | The data of transactions by hash: those that the pool has, and those
@@ -253,7 +310,7 @@ known r pool hs = do
   chain <- case rest of
     [] -> return Map.empty
     _ -> do
-      found <- catMaybes . zipWith (fmap . (,)) rest <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey rest)
+      found <- catMaybes . zipWith (fmap . (,)) rest <$> Q.retrieveManyCF r (txCF r.db) (map TxKey rest)
       -- with the spenders that blocks give to their outputs
       Map.fromList . zip (map fst found) <$> Q.withChainSpenders r found
   return (Map.mapWithKey (withSpenders spent) (unconfirmed <> Map.mapMaybe notDeleted' chain))
@@ -286,7 +343,7 @@ getSpender r pool p =
 
 -- | Balance of an address, with the pool applied.
 getBalance :: DatabaseReader -> PoolReads -> Address -> IO (Maybe Balance)
-getBalance r pool a = M.summaryBalance a <$> Q.getBalance r a <*> (only <$> pool.summaries [a])
+getBalance r pool a = summaryBalance a <$> Q.getBalance r a <*> (only <$> pool.summaries [a])
   where
     only = \case
       [s] -> s
@@ -297,7 +354,28 @@ getBalances :: DatabaseReader -> PoolReads -> [Address] -> IO [Balance]
 getBalances _ _ [] = return []
 getBalances r pool as = zipWith apply <$> Q.getBalances r as <*> pool.summaries as
   where
-    apply c = maybe c (M.applySummary c)
+    apply c = maybe c (applySummary c)
+
+-- | The balance that the chain has for an address with the summary of what
+-- the pool does at it applied.
+applySummary :: Balance -> MemSummary -> Balance
+applySummary c s =
+  Balance
+    { address = c.address,
+      confirmed = c.confirmed `minus` (s.spent `minus` s.both),
+      unconfirmed = c.unconfirmed + (s.paid `minus` s.both),
+      utxo = (c.utxo `minus` (s.spentCount `minus` s.bothCount)) + (s.paidCount `minus` s.bothCount),
+      txs = c.txs + s.txs,
+      received = c.received + s.paid
+    }
+  where
+    minus x y = if y > x then 0 else x - y
+
+-- | Balance of an address as the API gives it, from its balance in the
+-- chain and its summary in the pool, either of which it may not have.
+summaryBalance :: Address -> Maybe Balance -> Maybe MemSummary -> Maybe Balance
+summaryBalance _ chain Nothing = chain
+summaryBalance a chain (Just s) = Just (applySummary (fromMaybe (zeroBalance a) chain) s)
 
 -- | Unspent output, if it exists and neither a block nor the pool spends
 -- it.
@@ -324,6 +402,42 @@ getUnspent r pool p =
               address = eitherToMaybe (scriptToAddressBS r.net o.script)
             }
       [] -> Nothing
+
+-- | Where a page starts in a list that has the pool's part first and the
+-- chain's part after it.
+data From
+  = -- | at the newest item
+    Top
+  | -- | in the pool's part, at the transaction that entered the pool at
+    -- this time and has this hash, or where it would be
+    InMempool !UnixTime !TxHash
+  | -- | in the chain's part, at this position: nothing of the pool is in
+    -- the page
+    InChain !BlockRef
+
+-- | Transactions of an address in the chain, newest first, from where a
+-- page starts, streamed from the index of the address.
+chainTxsC :: From -> Address -> Iterator -> ConduitT i TxRef IO ()
+chainTxsC from a it = chain .| concatMapC ref
+  where
+    chain = case from of
+      InChain position -> Q.scanFrom it (AddrTxKeyA a) (AddrTxKeyB a position)
+      _ -> Q.scan it (AddrTxKeyA a)
+    ref :: (AddrTxKey, ()) -> Maybe TxRef
+    ref (AddrTxKey _ t, ()) = Just t
+    ref _ = Nothing
+
+-- | Unspent outputs of an address in the chain, newest first, from where a
+-- page starts, streamed from the index of the address. Those that the
+-- pool spends are among them.
+chainUnspentsC :: DatabaseReader -> From -> Address -> Iterator -> ConduitT i Unspent IO ()
+chainUnspentsC r from a it = chain .| concatMapC output
+  where
+    chain = case from of
+      InChain position -> Q.scanFrom it (AddrOutKeyA a) (AddrOutKeyB a position)
+      _ -> Q.scan it (AddrOutKeyA a)
+    output :: (AddrOutKey, OutVal) -> Maybe Unspent
+    output = uncurry (toUnspent r.net)
 
 -- | Where the page of a query starts, or 'Nothing' if it starts at a
 -- transaction that neither the pool nor the chain has.
@@ -496,50 +610,3 @@ getAddressesTxCount r pool as = do
       txs <- forM several $ \(a, _) -> runConduit (poolTxsC pool Top 256 a True .| mapC (.txid) .| sinkList)
       return (HashSet.size (HashSet.fromList (concat txs)))
   return (inBlocks + fromIntegral inPool)
-
--------------------------------------------------------------------------------
--- The store's own mempool area as a pool
--------------------------------------------------------------------------------
-
--- | The mempool area of a database, as a reader has it, as a pool. The
--- queries of this module with it must answer as those of
--- "Haskoin.Store.Database.Query.Layered" do, but for deleted transactions:
--- that is what the tests check, and what this is for.
-localPool :: DatabaseReader -> PoolReads
-localPool r =
-  PoolReads
-    { summaries = M.getSummaries r,
-      addressTxs = \a start n -> do
-        rows <- entries a
-        let listed = [(t, h) | (MemAddrTxKey _ t h, _) <- rows]
-            from (t, h) = dropWhile (\(t', h') -> t' > t || (t' == t && h' < h)) listed
-        return (take n (maybe listed from start)),
-      addressOuts = \a start n -> do
-        rows <- entries a
-        let spent = HashSet.fromList [p | (MemAddrSpentKey _ p, _) <- rows]
-            made t p v s = Unspent {block = MemRef t, outpoint = p, value = v, script = s, address = Just a}
-            listed = [(made t p v s, HashSet.member p spent) | (MemAddrOutKey _ t p, MemAddrOutVal v s) <- rows]
-            place (u, _) = case u.block of
-              MemRef t -> (t, encode u.outpoint)
-              BlockRef {} -> (0, encode u.outpoint)
-            from (t, p) = dropWhile (\x -> let (t', p') = place x in t' > t || (t' == t && p' < encode p)) listed
-        return (take n (maybe listed from start)),
-      spentOutputs = \a ps ->
-        forM ps $ \p ->
-          isJust <$> (retrieveCF r.db (mempoolAddrCF r.db) (MemAddrSpentKey a p) :: IO (Maybe MemAddrVal)),
-      bodies = \hs -> case hs of
-        [] -> return []
-        _ -> zip <$> Q.retrieveManyCF r.db (mempoolCF r.db) (map TxKey hs) <*> mapM (M.getMempoolSpenders r) hs,
-      spenders = \ps -> case ps of
-        [] -> return []
-        _ -> Q.retrieveManyCF r.db (mempoolCF r.db) (map MemSpenderKey ps),
-      page = \offset limit -> Q.getMempoolPage r Limits {limit = limit, offset = offset, start = Nothing},
-      startingWith = \prefix -> do
-        rows <- matchingAsListCF r.db (mempoolCF r.db) (TxKeyS prefix)
-        return [h | (TxKey h, _ :: TxData) <- rows],
-      -- what the blocks replaced, as the store's own database keeps it
-      replaced = Q.getReplaced r
-    }
-  where
-    entries :: Address -> IO [(MemAddrKey, MemAddrVal)]
-    entries a = matchingAsListCF r.db (mempoolAddrCF r.db) (MemAddrKeyA a)

@@ -9,7 +9,7 @@
 -- The database as it was at each of its recent blocks: a RocksDB snapshot
 -- for each, kept until it is no longer needed. Nothing in the store uses
 -- this yet. It is the first part of the store's side of "A fleet that
--- answers as one" in @docs\/layered-database.md@.
+-- answers as one" in @docs\/one-fleet.md@.
 --
 -- = Why
 --

@@ -81,6 +81,7 @@ module Haskoin.Store.Web.Pieces
     -- * Pieces
     Piece,
     piece,
+    pieceOf,
     pieced,
     listPieces,
     around,
@@ -103,19 +104,26 @@ import Haskoin.Util (hexBuilder)
 import Network.HTTP.Types (ResponseHeaders, status200)
 import Network.Wai (Response, responseStream)
 
--- | A piece of a response. Its outer action reads what the piece is made of
--- and encodes it to bytes, and may run at the same time as those of other
--- pieces. The action that it gives runs in order, right before the piece is
--- written, and gives the bytes to write. It should be cheap: it is there
--- for what depends on the pieces before, such as a comma.
-newtype Piece = Piece (IO (IO Builder))
+-- | A piece of a response, with how many items it holds, known before it is
+-- read. Its outer action reads what the piece is made of and encodes it to
+-- bytes, and may run at the same time as those of other pieces; it gives
+-- how many bytes it made. The action that it gives runs in order, right
+-- before the piece is written, and gives the bytes to write. It should be
+-- cheap: it is there for what depends on the pieces before, such as a
+-- comma.
+data Piece = Piece !Int (IO (Int, IO Builder))
 
--- | A piece from an action that reads its bytes. They are encoded in the
--- thread that reads them, so the action that it gives only hands them over.
+-- | A piece from an action that reads its bytes, with no items to pay for
+-- in advance. They are encoded in the thread that reads them, so the
+-- action that it gives only hands them over.
 piece :: IO Builder -> Piece
-piece act = Piece $ do
+piece = pieceOf 0
+
+-- | A piece of so many items from an action that reads their bytes.
+pieceOf :: Int -> IO Builder -> Piece
+pieceOf n act = Piece n $ do
   bytes <- rendered =<< act
-  return (return (lazyByteString bytes))
+  return (fromIntegral (L.length bytes), return (lazyByteString bytes))
 
 -- | The bytes of a builder, all of them made, so that the work of making
 -- them is done where this is run.
@@ -134,11 +142,11 @@ piecesResponse :: Int -> ResponseHeaders -> IO () -> [Piece] -> IO Response
 piecesResponse n headers done pieces = do
   (first, rest) <- case pieces of
     [] -> return (mempty, [])
-    Piece p : more -> do
-      bytes <- p >>= id
+    Piece _ p : more -> do
+      bytes <- p >>= snd
       return (bytes, more)
   return . responseStream status200 headers $ \write flush ->
-    let send (Piece p) = p
+    let send (Piece _ p) = snd <$> p
         out next = next >>= write >> flush
      in (write first >> flush >> ahead n (map send rest) out) `finally` done
 
@@ -166,9 +174,10 @@ ahead n acts consume = do
   (mapM_ start first >> go later) `finally` (readIORef running >>= mapM_ cancel)
 
 -- | Cut a list of keys into pieces of a size, each read with the action
--- given: the pieces of items that are read by key.
-pieced :: Int -> ([k] -> IO b) -> [k] -> [IO b]
-pieced size fetch = map fetch . cut
+-- given, with how many keys it has: the pieces of items that are read by
+-- key.
+pieced :: Int -> ([k] -> IO b) -> [k] -> [(Int, IO b)]
+pieced size fetch = map (\ks -> (length ks, fetch ks)) . cut
   where
     cut [] = []
     cut ks = let (part, more) = splitAt (max 1 size) ks in part : cut more
@@ -178,13 +187,13 @@ pieced size fetch = map fetch . cut
 -- The items of each piece are encoded where it is read; whether a comma
 -- comes before them, which depends on whether an item came in the pieces
 -- before, is settled in order, as 'piecesResponse' runs the pieces.
-listPieces :: (b -> Encoding) -> [IO [b]] -> IO [Piece]
+listPieces :: (b -> Encoding) -> [(Int, IO [b])] -> IO [Piece]
 listPieces enc pieces = do
   begun <- newIORef False
-  let encoded part = Piece $ do
+  let encoded (n, part) = Piece n $ do
         items <- part
         bytes <- rendered (mconcat (intersperse "," (map (fromEncoding . enc) items)))
-        return $ do
+        return . (fromIntegral (L.length bytes),) $ do
           was <- readIORef begun
           let has = not (null items)
           writeIORef begun (was || has)
@@ -202,7 +211,7 @@ around open close = \case
     ending [] = []
     ending [final] = [wrap mempty close final]
     ending (p : more) = p : ending more
-    wrap before after (Piece p) = Piece (fmap (fmap (\b -> before <> b <> after)) p)
+    wrap before after (Piece n p) = Piece n (fmap (fmap (fmap (\b -> before <> b <> after))) p)
 
 -- | The serialization of a value, in hexadecimal.
 hexOf :: (Serial a) => a -> Builder

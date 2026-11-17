@@ -33,8 +33,17 @@
 -- four bytes, big-endian, the transactions of the abandoned blocks that the
 -- store has as replaced, each followed in the same way, the number of
 -- transactions that come back, those transactions, and the blocks that the
--- tip moves through, oldest first, or ''. Returns {'moved'}, {'stays'} or
--- {'raced'}.
+-- tip moves through, oldest first, or '', the token of the move of the
+-- cache that the store began (xpub.lua) or ''. Returns {'moved'}, {'stays'} or {'raced'}, also when the token is
+-- not that of the move of the cache under way.
+--
+-- The advance is the commit of a move of the tip: the pool, the tip and the
+-- cache of extended public keys change in it together. The pieces of the
+-- move (xpub.lua) wrote the chain's layer of the entries and marked them;
+-- here the pool's layer changes with the pool, every marked entry gets a
+-- new version, the marks go, and the cache is put at the new place of the
+-- tip. The cache is emptied only when the pool is, when the store cannot
+-- say what the abandoned blocks held, or when it was not at the tip.
 --
 -- What the new blocks replaced is kept: each transaction of the pool that
 -- leaves because it, or an ancestor, spent an output that a transaction of
@@ -112,7 +121,10 @@ local key = {
   lostby = prefix .. 'pool:lostby:',
   lostat = prefix .. 'pool:lostat',
   of = prefix .. 'fx:of:',
-  entry = prefix .. 'fx:e:'
+  entry = prefix .. 'fx:e:',
+  xtip = prefix .. 'fx:tip',
+  moving = prefix .. 'fx:moving',
+  marked = prefix .. 'fx:marked'
 }
 
 local function split(s, n)
@@ -174,6 +186,15 @@ local function read(at)
   return tx, at
 end
 
+-- whether a member of a list of an entry is in the pool's layer, with a
+-- score below zero: what the pool puts in or takes out of an entry is never
+-- what the chain's layer has, which a move of the tip writes ahead of the
+-- pool (xpub.lua)
+local function pooled(z, m)
+  local s = redis.call('ZSCORE', z, m)
+  return s and tonumber(s) < 0
+end
+
 local function add(a, field, by)
   redis.call('HINCRBY', key.asum .. a, field, string.format('%.0f', by))
 end
@@ -198,8 +219,8 @@ local function account(t, time, entries, sign)
       end
       for _, id in ipairs(watching) do
         if sign > 0 then
-          redis.call('ZADD', key.entry .. id .. ':txs', -time, t)
-        else
+          redis.call('ZADD', key.entry .. id .. ':txs', 'NX', -time, t)
+        elseif pooled(key.entry .. id .. ':txs', t) then
           redis.call('ZREM', key.entry .. id .. ':txs', t)
         end
       end
@@ -226,9 +247,10 @@ local function account(t, time, entries, sign)
       end
       for _, id in ipairs(watching) do
         if sign > 0 then
-          redis.call('ZADD', key.entry .. id .. ':outs', -time, o)
-          redis.call('HSET', key.entry .. id .. ':oval', o, e[4] .. ' ' .. #a .. ' ' .. a .. e[5])
-        else
+          if redis.call('ZADD', key.entry .. id .. ':outs', 'NX', -time, o) == 1 then
+            redis.call('HSET', key.entry .. id .. ':oval', o, e[4] .. ' ' .. #a .. ' ' .. a .. e[5])
+          end
+        elseif pooled(key.entry .. id .. ':outs', o) then
           redis.call('ZREM', key.entry .. id .. ':outs', o)
           redis.call('HDEL', key.entry .. id .. ':oval', o)
         end
@@ -239,6 +261,15 @@ local function account(t, time, entries, sign)
         add(a, 'both', sign * v)
         add(a, 'bothCount', sign)
       end
+    end
+  end
+  -- every entry with an address that the transaction touches has a new
+  -- version, so that a request that read it before reads it again
+  local ver = nil
+  for a, _ in pairs(touched) do
+    for _, id in ipairs(redis.call('SMEMBERS', key.of .. a)) do
+      ver = ver or redis.call('INCR', prefix .. 'fleet:xver')
+      redis.call('HSET', key.entry .. id .. ':meta', 'ver', ver)
     end
   end
   -- an address that no transaction touches has no summary
@@ -459,6 +490,34 @@ if agreed ~= target then
   return {'raced'}
 end
 
+-- the cache: the place of the tip before this move and after it, as
+-- xpub.lua has them, and the move of the cache that the store began
+local moves = tonumber(redis.call('GET', key.moves) or '0')
+local before, after = moves .. '@' .. tip, (moves + 1) .. '@' .. target
+local function token(at)
+  return ARGV[at + 1] or ''
+end
+local function settle(wipe)
+  local at = redis.call('GET', key.xtip)
+  if wipe or (at and at ~= before) then
+    for _, k in ipairs(redis.call('KEYS', prefix .. 'fx:*')) do
+      redis.call('DEL', k)
+    end
+  else
+    local ids = redis.call('SMEMBERS', key.marked)
+    if #ids > 0 then
+      local ver = redis.call('INCR', prefix .. 'fleet:xver')
+      for _, id in ipairs(ids) do
+        if redis.call('EXISTS', key.entry .. id .. ':meta') == 1 then
+          redis.call('HSET', key.entry .. id .. ':meta', 'ver', ver)
+        end
+      end
+    end
+    redis.call('DEL', key.marked, key.moving)
+  end
+  redis.call('SET', key.xtip, after)
+end
+
 -- a store that does not know the way from the old tip starts the pool
 -- again: if it is alone, or if the way is too long for any store
 if ARGV[8] == '1' or ARGV[8] == '2' then
@@ -469,16 +528,31 @@ if ARGV[8] == '1' or ARGV[8] == '2' then
   for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do
     redis.call('DEL', k)
   end
+  -- the entries have the pool's layer of the pool that is gone
+  settle(true)
   redis.call('SET', key.tip, target)
   redis.call('INCR', key.moves)
   emit('b', target)
   return {'moved'}
 end
 
+-- the move of the cache must be the one that the store began, and nobody
+-- aborted it; with none begun, none may be under way
+local at = 15
+for _ = 1, tonumber(ARGV[14]) do
+  local _, next = read(at)
+  at = next
+end
+local mine = token(at)
+local current = redis.call('GET', key.moving)
+if (current and string.sub(current, 1, #mine + 1) ~= mine .. ' ') or (not current and mine ~= '') then
+  return {'raced'}
+end
+
 -- the abandoned blocks: what can come back does, and what spends the rest
 -- leaves. What a transaction that comes back replaced is not replaced any
 -- more.
-local at = 15
+at = 15
 for _ = 1, tonumber(ARGV[14]) do
   local tx
   tx, at = read(at)
@@ -551,6 +625,7 @@ if ARGV[9] ~= '' and tonumber(ARGV[9]) >= 2016 then
   end
 end
 
+settle(false)
 redis.call('SET', key.tip, target)
 redis.call('INCR', key.moves)
 -- the blocks that the tip moved through, oldest first, if the store that

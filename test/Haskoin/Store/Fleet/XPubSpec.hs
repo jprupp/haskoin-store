@@ -58,18 +58,24 @@ spec = describe "cache of extended public keys of a fleet" $ do
             final m = maximum [n | (m', n, _) <- rows found, m' == m]
             lacking m = [r | r@(m', n, _) <- rows found, m' /= m || n /= final m]
          in conjoin [window igap gap (lacking m) === Nothing | m <- [0, 1], any (\(m', _, _) -> m' == m) (rows found)]
-    it "gives nothing when the entry has an address more" $
-      property . forAll key $ \k@(igap, gap, ext, chg) ->
-        let found = scan k
-            next m = length [() | (m', _, _) <- rows found, m' == m]
-            more m used = rows found <> [(m, fromIntegral (next m), balance used m (fromIntegral (next m)))]
-            -- one more is another key, unless the scan read no change
-            -- addresses at all and the one more is the first of them
-            changeless = next 1 == 0
-         in conjoin
-              [ window igap gap (more 0 ext) === Nothing,
-                changeless .||. window igap gap (more 1 chg) === Nothing
-              ]
+    -- one more address, right after what the scan reads in a chain
+    let past k m used =
+          let found = scan k
+              next = fromIntegral (length [() | (m', _, _) <- rows found, m' == m])
+              b = zeroBalance (address m next)
+           in (found, rows found <> [(m, next, if used then b {txs = 1, received = 5} else b)])
+    it "gives the scan when the entry has an unused address more, its lookahead" $
+      property . forAll key $ \k@(igap, gap, _, _) ->
+        conjoin
+          [ let (found, more) = past k m False in window igap gap more === Just found
+          | m <- [0, 1]
+          ]
+    it "gives nothing when an address past what the scan reads is used" $
+      property . forAll key $ \k@(igap, gap, _, _) ->
+        conjoin
+          [ let (_, more) = past k m True in window igap gap more === Nothing
+          | m <- [0, 1]
+          ]
     it "gives nothing when a chain has a hole" $
       property . forAll key $ \k@(igap, gap, _, _) ->
         let found = scan k

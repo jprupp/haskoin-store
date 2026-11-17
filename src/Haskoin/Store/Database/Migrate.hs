@@ -9,10 +9,11 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Migration of a database of version 20 to the layered layout, version 21,
--- of @docs\/layered-database.md@: the column families of the chain are left
--- with nothing from the mempool, and the mempool gets an area of its own
--- ("Haskoin.Store.Database.Mempool").
+-- Migration of a database of version 20 to the layout that holds the chain
+-- alone, version 21 and after: the column families of the chain are left
+-- with nothing from the mempool. The mempool is the pool that the fleet
+-- shares in Redis (@docs\/one-fleet.md@), so the transactions are dropped:
+-- the pool hears of them again from peers.
 --
 -- The store runs it when it opens a database ('upgradeDatabase'). It is
 -- what makes the change of layout possible without syncing the chain again.
@@ -24,9 +25,10 @@
 -- outputs it spends as spent, with itself as their spender in the bodies of
 -- the transactions that created them, and all of it in the balances. The
 -- migration takes each mempool transaction out of those indices, exactly as
--- deleting it does in version 20, and writes it to the mempool area instead.
--- When it is done, the chain's column families hold what they would hold if
--- the mempool had been wiped, and the mempool area holds the mempool.
+-- deleting it does in version 20. When it is done, the chain's column
+-- families hold what they would hold if the mempool had been wiped. The
+-- list of the mempool, in its own column family, is read and left there:
+-- nothing reads it afterwards.
 --
 -- It reads and writes only what the mempool touches, so it takes a time in
 -- proportion to the mempool, not to the chain: about what wiping the
@@ -34,21 +36,19 @@
 --
 -- = Why its own rules
 --
--- Taking a transaction out of the indices of version 20 is what
--- "Haskoin.Store.Logic" does today when it deletes one. The migration does
--- not call that code: the rules of the store will change with the layout,
--- and a migration has to go on reading version 20 as it was. It carries the
--- few rules it needs, and the tests check them against "Haskoin.Store.Logic"
--- while both exist.
+-- Taking a transaction out of the indices of version 20 is what the rules
+-- of version 20 did when they deleted one. Those rules are gone, and a
+-- migration has to go on reading version 20 as it was, so it carries the
+-- few rules it needs.
 --
 -- = Safe to interrupt
 --
 -- A mempool can hold hundreds of thousands of transactions, too many for one
 -- write, so the migration works in batches. Each batch is one atomic write
--- that moves whole transactions, descendants before the transactions they
--- spend. After any batch the database is a valid mix: the transactions
--- already moved are in the mempool area, and the others are still in the
--- chain's indices, as a database of version 20 with a smaller mempool. The
+-- that takes out whole transactions, descendants before the transactions
+-- they spend. After any batch the database is a valid mix: the transactions
+-- already taken out are gone, and the others are still in the chain's
+-- indices, as a database of version 20 with a smaller mempool. The
 -- migration can stop there and carry on later.
 --
 -- The first write sets the new version and a marker, t'MigrationKey', so
@@ -75,7 +75,7 @@
 -- spenders of its outputs are under keys of their own
 -- as t'Haskoin.Store.Database.Types.SpenderKey' says, and its record is written
 -- when a block confirms it and deleted if that block is reverted, and
--- nothing else ('Haskoin.Store.Logic.Layered.importBlock').
+-- nothing else ('Haskoin.Store.Logic.importBlock').
 -- 'migrateRecords' brings the records that are there already to that: it
 -- gives each the time of its block, and moves its spenders to their keys.
 -- It reads every transaction, and writes nearly every one, since most
@@ -115,8 +115,9 @@ module Haskoin.Store.Database.Migrate
   )
 where
 
-import Control.Exception (Exception (..), finally, throwIO)
-import Control.Monad (forM_, unless, void, when)
+import Control.Exception (Exception (..), throwIO)
+import Control.Monad (forM_, unless, when)
+import Data.ByteString qualified as B
 import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -124,7 +125,7 @@ import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (isJust, isNothing, mapMaybe)
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -139,6 +140,7 @@ import Database.RocksDB
     iterNext,
     withIterConfig,
   )
+import Database.RocksDB qualified as RocksDB
 import Database.RocksDB.Query
   ( deleteOp,
     deleteOpCF,
@@ -174,15 +176,12 @@ import Haskoin.Store.Data
     UnixTime,
     confirmed,
   )
-import Haskoin.Store.Database.Mempool (insertRecordOps, mempoolRecords, rebuildSummaries)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     addrOutCF,
     addrTxCF,
     balanceCF,
-    forgetMempoolCopy,
-    initRocksDB,
     mempoolCF,
     spenderCF,
     txCF,
@@ -229,12 +228,12 @@ mixedVersion = 20
 
 -- | What a migration did.
 data Migration = Migration
-  { -- | mempool transactions moved to the mempool area by this run
+  { -- | mempool transactions taken out of the chain's indices by this run
     moved :: !Int,
-    -- | writes to the database that moved them
+    -- | writes to the database that took them out
     batches :: !Int,
-    -- | mempool transactions checked at the end, moved by this run or by
-    -- an earlier one that was interrupted
+    -- | mempool transactions checked at the end, taken out by this run or
+    -- by an earlier one that was interrupted
     checked :: !Int,
     -- | records of confirmed transactions that this run wrote again, with
     -- the time of their block and without the spenders of their outputs
@@ -278,10 +277,10 @@ instance Exception MigrationError where
 
 -- | How to run a migration.
 data MigrationOptions = MigrationOptions
-  { -- | mempool transactions to move in each write
+  { -- | mempool transactions to take out in each write
     chunk :: !Int,
-    -- | called after each write with the number of transactions moved so
-    -- far; the tests interrupt the migration from here
+    -- | called after each write with the number of transactions taken out
+    -- so far; the tests interrupt the migration from here
     afterBatch :: Int -> IO (),
     -- | where to say what is going on
     report :: Text -> IO ()
@@ -300,9 +299,9 @@ defaultMigrationOptions =
 -- | Bring a database opened with
 -- 'Haskoin.Store.Database.Reader.withLayeredReader' to the layout that the
 -- store runs on, whatever it was, telling a function what is being done:
--- a new database gets the current version, one of version 18 or 19 is
--- first brought to version 20 as it always was, one of version 20 is
--- migrated to the layered layout ('migrateLayered'), one of version 21
+-- a new database gets the current version, one of version 18, 19 or 20
+-- is migrated to the layout of the chain alone ('migrateLayered'), with
+-- its unconfirmed transactions taken out of the chain, one of version 21
 -- gets the time of its block for every confirmed transaction
 -- ('migrateRecords'), and one of version 22 gets the current version, each
 -- from the start or after an earlier run that was interrupted. Throws a
@@ -337,10 +336,6 @@ upgradeDatabase report r = do
       writeBatch r.db [insertOp VersionKey currentVersion]
       return nothing
     Just v
-      | v == 18 || v == 19 -> do
-          report $ "Upgrading the database from version " <> cs (show v) <> " to " <> cs (show mixedVersion)
-          initRocksDB r
-          layered >>= times >>= merges
       | v == currentVersion && marker == Nothing -> return nothing
       -- no migration leaves its marker with this version
       | v >= currentVersion -> throwIO (UnknownVersion version)
@@ -348,6 +343,12 @@ upgradeDatabase report r = do
       -- the times were being set when the store last stopped
       | v == recordsVersion && marker == Just layeredVersion -> times nothing >>= merges
       | v == recordsVersion -> throwIO (UnknownVersion version)
+      -- versions 18 and 19 have the chain of version 20, and a mempool that
+      -- the migration to the layered layout reads where it is
+      | v == 18 || v == 19 -> do
+          report $ "Upgrading the database from version " <> cs (show v)
+          writeBatch r.db [insertOp VersionKey mixedVersion]
+          layered >>= times >>= merges
     Just (_ :: Word32) -> layered >>= times >>= merges
   where
     nothing = Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
@@ -500,29 +501,35 @@ migrateLayeredWith opts r = do
     | version == Just mixedVersion -> do
         listed <- mempoolList
         mapM_ (preflight r) listed
-        opts.report $ "Moving " <> cs (show (length listed)) <> " mempool transactions to their own area"
+        opts.report $
+          "Taking "
+            <> cs (show (length listed))
+            <> " mempool transactions out of the chain: the mempool is the pool that the fleet shares"
         -- from here on a store of version 20 refuses the database
         writeBatch db [insertOp VersionKey layeredVersion, insertOp MigrationKey mixedVersion]
         run
     | otherwise -> throwIO (UnknownVersion version)
   where
     db = r.db
+    -- the keys of versions 19 and 20, one for each transaction, and the
+    -- list of version 18 under one key of its own (@MemKey@, 0x07), both
+    -- left where they are: read again after an interruption, they list the
+    -- same transactions, and those already taken out are skipped
     mempoolList = do
       rows <- matchingAsListCF db (mempoolCF db) MemTxKeyS
-      return [h | (MemTxKey h, _ :: UnixTime) <- rows]
+      legacy <- RocksDB.get db (B.singleton 0x07)
+      let listed = maybe [] (either (const []) id . decode) legacy :: [(UnixTime, TxHash)]
+      return (nub' ([h | (MemTxKey h, _ :: UnixTime) <- rows] <> map snd listed))
     run = do
       env <- newEnv opts r
       listed <- mempoolList
       mapM_ (moveTx env) listed
       flush env
       mapM_ (verify r) listed
-      -- the summaries are worked out from the entries, all at once: doing it
-      -- again after an interruption gives the same
-      void (rebuildSummaries r)
       writeBatch db [deleteOp MigrationKey]
       moved <- readIORef env.total
       batches <- readIORef env.written
-      opts.report $ "Moved " <> cs (show moved) <> " mempool transactions"
+      opts.report $ "Took " <> cs (show moved) <> " mempool transactions out of the chain"
       return Migration {moved, batches, checked = length listed, rewritten = 0}
 
 -------------------------------------------------------------------------------
@@ -543,15 +550,15 @@ data Env = Env
     -- | everything else that the batch writes, newest first: each of these
     -- keys is written without being read, and in this order
     ops :: !(IORef [BatchOp]),
-    -- | transactions that the batch moves
+    -- | transactions that the batch takes out
     moving :: !(IORef (HashSet TxHash)),
-    -- | transactions moved by this run
+    -- | transactions taken out by this run
     total :: !(IORef Int),
     -- | batches written by this run
     written :: !(IORef Int)
   }
 
--- | A migration that has moved nothing yet, with an empty batch.
+-- | A migration that has taken nothing out yet, with an empty batch.
 newEnv :: MigrationOptions -> DatabaseReader -> IO Env
 newEnv options reader = do
   bodies <- newIORef HashMap.empty
@@ -590,13 +597,6 @@ op :: Env -> BatchOp -> IO ()
 op env o = modifyIORef' env.ops (o :)
 
 -- | Write the batch, and start another.
---
--- The batch writes the keys of the transactions that it moves to the
--- mempool area, and it is not a batch of the block store: so the copy of
--- the area in memory is forgotten, however the write ends
--- ('forgetMempoolCopy'). A migration runs before the block store has
--- imported anything, when no copy is loaded yet, and this keeps it right
--- for a caller that runs one later.
 flush :: Env -> IO ()
 flush env = do
   count <- HashSet.size <$> readIORef env.moving
@@ -604,7 +604,7 @@ flush env = do
     others <- reverse <$> readIORef env.ops
     bodies <- HashMap.toList <$> readIORef env.bodies
     balances <- HashMap.toList <$> readIORef env.balances
-    (`finally` forgetMempoolCopy env.reader) . writeBatch db $
+    writeBatch db $
       others
         <> [maybe (deleteOpCF (txCF db) (TxKey h)) (insertOpCF (txCF db) (TxKey h)) b | (h, b) <- bodies]
         <> [balanceOp a b | (a, b) <- balances]
@@ -622,20 +622,19 @@ flush env = do
       | otherwise = insertOpCF (balanceCF db) (BalKey a) b
 
 -------------------------------------------------------------------------------
--- Moving a transaction
+-- Taking a transaction out
 -------------------------------------------------------------------------------
 
--- | Whether a transaction is already in the mempool area.
+-- | Whether a transaction is out of the chain's indices already: in this
+-- batch, or in an earlier write, which left it no body.
 isMoved :: Env -> TxHash -> IO Bool
 isMoved env h = do
   now <- HashSet.member h <$> readIORef env.moving
-  if now then return True else isJust <$> getCF db (mempoolCF db) (encode (TxKey h))
-  where
-    db = env.reader.db
+  if now then return True else isNothing <$> chainBody env h
 
--- | Move a mempool transaction, and first the mempool transactions that
--- spend its outputs: taking those out is what makes its outputs unspent
--- again, as they must be for its own turn.
+-- | Take a mempool transaction out of the chain's indices, and first the
+-- mempool transactions that spend its outputs: taking those out is what
+-- makes its outputs unspent again, as they must be for its own turn.
 moveTx :: Env -> TxHash -> IO ()
 moveTx env h = do
   done <- isMoved env h
@@ -645,17 +644,15 @@ moveTx env h = do
     -- read again: moving the spenders removed them from the body
     td' <- mempoolBody
     unless (IntMap.null td'.spenders) . stop $ "still has spenders after they were moved"
-    time <- case td'.block of
-      MemRef t -> return t
+    case td'.block of
+      MemRef _ -> return ()
       BlockRef {} -> stop "is confirmed"
     takeOut env td'
-    mapM_ (op env) (insertRecordOps db (mempoolRecords env.reader.net time td'))
     modifyIORef' env.moving (HashSet.insert h)
     modifyIORef' env.total (+ 1)
     count <- HashSet.size <$> readIORef env.moving
     when (count >= env.options.chunk) (flush env)
   where
-    db = env.reader.db
     stop :: Text -> IO a
     stop why = throwIO . Inconsistent $ "Mempool transaction " <> txHashToHex h <> " " <> why
     mempoolBody =
@@ -667,7 +664,7 @@ moveTx env h = do
 
 -- | Take a mempool transaction that nothing spends out of the indices of
 -- the chain, as deleting it does in version 20, except that its body is
--- removed and not kept as deleted: it is not deleted, it moves.
+-- removed and not kept as deleted.
 takeOut :: Env -> TxData -> IO ()
 takeOut env td = do
   -- the entries of its addresses, and their counts of transactions
@@ -739,26 +736,13 @@ preflight r h =
       throwIO . Inconsistent $
         "The mempool lists " <> txHashToHex h <> ", which is not an unconfirmed transaction"
 
--- | After everything is moved: a mempool transaction is in the mempool
--- area and has left nothing in the chain's column families, and every
--- output it spends is there to be spent, in the mempool or unspent in the
--- chain.
+-- | After everything is taken out: a mempool transaction has left no body
+-- in the chain's column families. Its outputs went with its body, in the
+-- same batch.
 verify :: DatabaseReader -> TxHash -> IO ()
 verify r h = do
-  td <-
-    retrieveCF db (mempoolCF db) (TxKey h) >>= \case
-      Just td -> return (td :: TxData)
-      Nothing -> stop "is not in the mempool area"
   inChain <- isJust <$> getCF db (txCF db) (encode (TxKey h))
   when inChain $ stop "still has a body in the chain"
-  forM_ (zip [0 ..] td.tx.outputs) $ \(i, _) -> do
-    left <- isJust <$> getCF db (unspentCF db) (encode (UnspentKey (OutPoint h i)))
-    when left $ stop "still has an unspent output in the chain"
-  forM_ [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint] $ \p -> do
-    inMempool <- isJust <$> getCF db (mempoolCF db) (encode (TxKey p.hash))
-    unspent <- isJust <$> getCF db (unspentCF db) (encode (UnspentKey p))
-    unless (inMempool || unspent) . void . stop $
-      "spends an output of " <> txHashToHex p.hash <> " that is neither in the mempool nor unspent"
   where
     db = r.db
     stop :: Text -> IO a

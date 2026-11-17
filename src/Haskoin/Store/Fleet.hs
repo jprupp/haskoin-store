@@ -8,7 +8,7 @@
 --
 -- How stores that share one Redis agree on the block that they all answer
 -- from, as pure decisions. "Haskoin.Store.Fleet.Redis" carries them out.
--- This is the first part of the design in @docs\/layered-database.md@, "A
+-- This is the first part of the design in @docs\/one-fleet.md@, "A
 -- fleet that answers as one", written down so that it can be tested before
 -- a store depends on it.
 --

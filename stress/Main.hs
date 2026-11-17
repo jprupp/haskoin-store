@@ -245,8 +245,6 @@ withServer o outDir dir redisURL p2p statsPort act =
             "--redis",
             "--redis-url",
             redisURL,
-            "--redis-min-addrs",
-            "10",
             "--xpub-gap",
             show gap,
             "--xpub-gap-init",

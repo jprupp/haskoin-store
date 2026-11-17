@@ -9,11 +9,9 @@
 -- Queries against the RocksDB database, as plain functions in 'IO' that take
 -- the 'DatabaseReader' as their first argument.
 --
--- These read one layer. On a database of version 20 that is everything,
--- the mempool included, and the tests use them so. On the layout that the
--- store runs on, they give what the chain has and nothing of the mempool,
--- but for its list: "Haskoin.Store.Database.Query.Layered" calls them for
--- the chain's part of its answers, and is what the store answers with.
+-- They read the chain, which is all that the database has: the mempool is
+-- the pool that the fleet shares in Redis. "Haskoin.Store.Database.Query.Pooled"
+-- puts the two together, and is what the store answers with.
 --
 -- = Why plain functions
 --
@@ -28,10 +26,7 @@
 -- Streams are still conduits, run in 'IO': they are a good fit for merging the
 -- sorted indices of many addresses and reading only as far as a page needs.
 module Haskoin.Store.Database.Query
-  ( -- * All of them
-    databaseRead,
-
-    -- * Blocks
+  ( -- * Blocks
     getBestBlock,
     getBlocksAtHeight,
     getBlock,
@@ -59,11 +54,6 @@ module Haskoin.Store.Database.Query
     getAddressUnspents,
     getAddressesUnspents,
 
-    -- * Mempool
-    getMempool,
-    getMempoolPage,
-    getMempoolBefore,
-
     -- * Extended public keys
     xPubBals,
     xPubUnspents,
@@ -73,13 +63,15 @@ module Haskoin.Store.Database.Query
 
     -- * Building blocks
 
-    -- | What the queries above are made of, for the queries of the layered
-    -- layout in "Haskoin.Store.Database.Query.Layered", which read the same
-    -- column families for the part of their answers that is in the chain.
+    -- | What the queries above are made of, for the queries of
+    -- "Haskoin.Store.Database.Query.Pooled", which read the same column
+    -- families for the part of their answers that is in the chain.
     count,
     withManyIters,
     retrieveManyCF,
     retrieveManyBytesCF,
+    scan,
+    scanFrom,
     joinConduits,
     usedAddresses,
   )
@@ -88,19 +80,17 @@ where
 import Conduit
   ( ConduitT,
     concatC,
-    concatMapC,
     dropWhileC,
     lift,
+    liftIO,
     mapC,
     runConduit,
     sinkList,
-    takeC,
-    takeWhileC,
     yield,
     (.|),
   )
 import Control.Exception (mask_)
-import Control.Monad (forM, when, (>=>))
+import Control.Monad (forM, forM_, when, (>=>))
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -116,25 +106,18 @@ import Data.Word (Word32, Word64)
 import Database.RocksDB
   ( ChunkConfig (..),
     ColumnFamily,
-    DB,
     IterConfig (..),
     Iterator,
     createIteratorConfig,
     getCF,
     iterChunk,
-    iterLast,
-    iterPrev,
     iterSeek,
-    iterValid,
     multiGetCF,
     prefixUpperBound,
-    withIterCF,
     withIterConfig,
   )
 import Database.RocksDB.Query
-  ( matching,
-    matchingAsListCF,
-    matchingSkip,
+  ( matchingAsListCF,
     retrieve,
     retrieveCF,
   )
@@ -150,12 +133,10 @@ import Haskoin.Store.Common
   ( Limits (..),
     Replaced,
     Start (..),
-    StoreRead (..),
     applyLimitsC,
     deOffset,
     joinDescStreams,
     mergeDescGroups,
-    notDeleted,
     scanXPubBals,
     txRefKey,
     unspentKey,
@@ -166,42 +147,6 @@ import Haskoin.Store.Database.Slices (blockData, txBytes)
 import Haskoin.Store.Database.Types
 import Haskoin.Store.Exception (bracket, bracket_)
 import System.Metrics.StatsD (decrementGauge, incrementCounter, incrementGauge)
-
--- | The queries of a database as a 'StoreRead', for code that takes its
--- queries as a value, such as the web server, which puts the Redis cache in
--- front of some of them. Transactions that were deleted are left out
--- ('notDeleted'); the functions of this module still return them, for the
--- code that imports transactions.
-databaseRead :: DatabaseReader -> StoreRead
-databaseRead r =
-  StoreRead
-    { net = r.net,
-      getBestBlock = getBestBlock r,
-      getBlocksAtHeight = getBlocksAtHeight r,
-      getBlock = getBlock r,
-      getTxData = fmap notDeleted . getTxData r,
-      getManyTxData = fmap (map notDeleted) . getManyTxData r,
-      getManyTxBytes = getManyTxBytes r,
-      getSpender = getSpender r,
-      getBalance = getBalance r,
-      getUnspent = getUnspent r,
-      getMempool = getMempool r,
-      getMempoolPage = getMempoolPage r,
-      getAddressesTxs = getAddressesTxs r,
-      getAddressesUnspents = getAddressesUnspents r,
-      initialGap = r.initGap,
-      maxGap = r.maxGap,
-      getNumTxData = fmap (filter (not . (.deleted))) . getNumTxData r,
-      getBalances = getBalances r,
-      getAddressTxs = getAddressTxs r,
-      getAddressUnspents = getAddressUnspents r,
-      xPubBals = xPubBals r,
-      xPubUnspents = \_ -> xPubUnspents r,
-      xPubTxs = \_ -> xPubTxs r,
-      xPubTxCount = \_ -> xPubTxCount r,
-      getAddressesTxCount = getAddressesTxCount r,
-      getReplaced = getReplaced r
-    }
 
 -- | Count something in the metrics, if they are enabled.
 count :: DatabaseReader -> (DataMetrics -> IO ()) -> IO ()
@@ -273,7 +218,7 @@ getTxRecord r th = retrieveCF r.db (txCF r.db) (TxKey th)
 -- multi-get, with the inputs of blocks that spend their outputs.
 getManyTxData :: DatabaseReader -> [TxHash] -> IO [Maybe TxData]
 getManyTxData r ths = do
-  found <- retrieveManyCF r.db (txCF r.db) (map TxKey ths)
+  found <- retrieveManyCF r (txCF r.db) (map TxKey ths)
   count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes found))
   spent <- withChainSpenders r [(h, td) | (h, Just td) <- zip ths found]
   return (fill found spent)
@@ -287,7 +232,7 @@ getManyTxData r ths = do
 -- without the spenders of their outputs.
 getManyTxBytes :: DatabaseReader -> [TxHash] -> IO [Maybe ByteString]
 getManyTxBytes r ths = do
-  found <- map (>>= liveTxBytes) <$> retrieveManyBytesCF r.db (txCF r.db) (map TxKey ths)
+  found <- map (>>= liveTxBytes) <$> retrieveManyBytesCF r (txCF r.db) (map TxKey ths)
   count r $ \s -> incrementCounter s.dataTxCount (length (catMaybes found))
   return found
 
@@ -338,7 +283,7 @@ withChainSpenders r tds = do
       asked = concatMap keys (filter narrow tds)
   found <- case asked of
     [] -> return []
-    _ -> retrieveManyCF r.db (spenderCF r.db) asked
+    _ -> retrieveManyCF r (spenderCF r.db) asked
   let byKey = Map.fromList [(k, m) | (k, Just (SpenderVal m)) <- zip asked found]
       keyed x = IntMap.unions [m | k <- keys x, Just m <- [Map.lookup k byKey]]
   forM tds $ \x@(h, td) -> do
@@ -393,7 +338,7 @@ getBalances :: DatabaseReader -> [Address] -> IO [Balance]
 getBalances _ [] = return []
 getBalances r as = do
   count r $ \s -> incrementCounter s.dataBalanceCount (length as)
-  vals <- retrieveManyCF r.db (balanceCF r.db) (map BalKey as)
+  vals <- retrieveManyCF r (balanceCF r.db) (map BalKey as)
   return (zipWith f as vals)
   where
     f a Nothing = zeroBalance a
@@ -461,20 +406,20 @@ addressConduit r a s it =
     f _ _ = undefined
     pipe = case s of
       Nothing ->
-        matching it (AddrTxKeyA a)
+        scan it (AddrTxKeyA a)
       Just (AtBlock bh) ->
-        matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a (BlockRef bh maxBound))
+        scanFrom it (AddrTxKeyA a) (AddrTxKeyB a (BlockRef bh maxBound))
       Just (AtTx txh) ->
         lift (getTxRecord r txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
-            matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a b)
+            scanFrom it (AddrTxKeyA a) (AddrTxKeyB a b)
           Just TxData {block = b@MemRef {}} ->
             -- Mempool transactions that arrived in the same second are
             -- keyed by hash, so seek to the time and drop those before it.
             let start = txRefKey (TxRef b txh)
                 before (AddrTxKey _ t, ()) = txRefKey t > start
                 before _ = undefined
-             in matchingSkip it (AddrTxKeyA a) (AddrTxKeyB a b)
+             in scanFrom it (AddrTxKeyA a) (AddrTxKeyB a b)
                   .| (dropWhileC before >> mapC id)
           Nothing -> return ()
 
@@ -491,84 +436,22 @@ unspentConduit r a s it =
   where
     x = case s of
       Nothing ->
-        matching it (AddrOutKeyA a)
+        scan it (AddrOutKeyA a)
       Just (AtBlock h) ->
-        matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a (BlockRef h maxBound))
+        scanFrom it (AddrOutKeyA a) (AddrOutKeyB a (BlockRef h maxBound))
       Just (AtTx txh) ->
         lift (getTxRecord r txh) >>= \case
           Just TxData {block = b@BlockRef {}} ->
-            matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
+            scanFrom it (AddrOutKeyA a) (AddrOutKeyB a b)
           Just TxData {block = b@MemRef {}} ->
             -- The outputs of the start transaction come first among those
             -- of the same second whose hashes are not smaller.
             let start = (b, Down (encode (OutPoint txh 0)))
                 before (AddrOutKey _ ref p, _) = (ref, Down (encode p)) > start
                 before _ = undefined
-             in matchingSkip it (AddrOutKeyA a) (AddrOutKeyB a b)
+             in scanFrom it (AddrOutKeyA a) (AddrOutKeyB a b)
                   .| (dropWhileC before >> mapC id)
           Nothing -> return ()
-
--------------------------------------------------------------------------------
--- Mempool
--------------------------------------------------------------------------------
-
--- | The whole mempool, newest first.
-getMempool :: DatabaseReader -> IO [(UnixTime, TxHash)]
-getMempool r = getMempoolPage r def
-
--- | Page of the mempool, newest first, from the offset and limit of the
--- 'Limits'; its start is ignored. Reads only the entries of the page from
--- the index by time.
-getMempoolPage :: DatabaseReader -> Limits -> IO [(UnixTime, TxHash)]
-getMempoolPage r limits = do
-  count r $ \s -> incrementCounter s.dataMempoolCount 1
-  withIterCF r.db (mempoolCF r.db) $ \it ->
-    runConduit $
-      mempoolNewestC it
-        .| applyLimitsC limits
-        .| sinkList
-
--- | Mempool transactions that entered it before the given time, oldest
--- first, at most as many as given. Reads only those entries of the index.
-getMempoolBefore :: DatabaseReader -> UnixTime -> Int -> IO [(UnixTime, TxHash)]
-getMempoolBefore r time n =
-  withIterCF r.db (mempoolCF r.db) $ \it ->
-    runConduit $
-      matching it MemTimeKeyS
-        .| concatMapC entry
-        .| takeWhileC ((< time) . fst)
-        .| takeC n
-        .| sinkList
-  where
-    entry (MemTimeKey t h, ()) = Just (t, h)
-    entry (MemTimeKeyS, ()) = Nothing
-
--- | Mempool from the index by time, newest first. The index sorts last in
--- the mempool column family, so seek past its prefix and walk backwards
--- until a key is no longer in it.
-mempoolNewestC :: Iterator -> ConduitT i (UnixTime, TxHash) IO ()
-mempoolNewestC it = do
-  lift $ do
-    -- 0x0c is the first prefix after the 0x0b of 'MemTimeKey'
-    iterSeek it (BS.singleton 0x0c)
-    iterValid it >>= \case
-      True -> iterPrev it
-      False -> iterLast it
-  go 16
-  where
-    -- A few entries first and then more at a time, for one foreign call
-    -- each: who reads this usually wants one page, and each call costs the
-    -- thread its core, which is what made a long list slow.
-    go n = do
-      (rows, more) <- lift (iterChunk it def {chunkEntries = n, chunkPrefix = timePrefix, chunkBackwards = True})
-      whole <- yieldAll rows
-      when (whole && more) (go (min 256 (n * 4)))
-    -- the prefix of 'MemTimeKey'
-    timePrefix = BS.singleton 0x0b
-    yieldAll [] = return True
-    yieldAll ((k, _) : rest) = case decode k of
-      Right (MemTimeKey t h) -> yield (t, h) >> yieldAll rest
-      _ -> return False
 
 -------------------------------------------------------------------------------
 -- Extended public keys
@@ -704,9 +587,8 @@ withIterCFStat r cf prefix f =
 -- A scan that stops by looking at the key that it has reached makes
 -- RocksDB find that key first, and if the keys after the prefix were
 -- deleted, it steps over the marker of every one of them to get there.
--- With an upper bound it stops at the bound. The summary of the mempool
--- area and the layout of the chain keep such runs of deleted keys short as
--- things are, so this is for the day that they do not: after a
+-- With an upper bound it stops at the bound. The layout of the chain keeps
+-- such runs of deleted keys short as things are, so this is for the day that they do not: after a
 -- reorganisation that reverts many blocks, or a change of layout.
 scanOf :: (Serialize k) => k -> IterConfig
 scanOf prefix = def {upperBound = prefixUpperBound (encode prefix)}
@@ -743,15 +625,43 @@ gauge r n = count r $ \s ->
 -- set up and a third of one for each key, as measured, so it is the slower
 -- way to read one key, and most requests about one transaction or one
 -- address ask for one.
-retrieveManyCF :: (Serialize key, Serialize value) => DB -> ColumnFamily -> [key] -> IO [Maybe value]
-retrieveManyCF db cf keys = map (fmap (either error id . decode)) <$> retrieveManyBytesCF db cf keys
+retrieveManyCF :: (Serialize key, Serialize value) => DatabaseReader -> ColumnFamily -> [key] -> IO [Maybe value]
+retrieveManyCF r cf keys = map (fmap (either error id . decode)) <$> retrieveManyBytesCF r cf keys
 
 -- | The bytes of the values of many keys, as 'retrieveManyCF' reads them,
 -- for values that are read in part ("Haskoin.Store.Database.Slices").
-retrieveManyBytesCF :: (Serialize key) => DB -> ColumnFamily -> [key] -> IO [Maybe ByteString]
+retrieveManyBytesCF :: (Serialize key) => DatabaseReader -> ColumnFamily -> [key] -> IO [Maybe ByteString]
 retrieveManyBytesCF _ _ [] = return []
-retrieveManyBytesCF db cf [key] = pure <$> getCF db cf (encode key)
-retrieveManyBytesCF db cf keys = multiGetCF db cf (map encode keys)
+retrieveManyBytesCF r cf [key] = pure <$> getCF r.db cf (encode key)
+retrieveManyBytesCF r cf keys = multiGetCF r.db cf (map encode keys)
+
+-- | The entries of the keys that start with a prefix, read in chunks as
+-- the consumer asks for them: what 'Database.RocksDB.Query.matching' does,
+-- with each chunk read in a safe call into RocksDB.
+-- The chunks start at 16 entries, so that a consumer that takes a few
+-- makes the database read few, and grow four times at each call up to
+-- 256, and to a mebibyte at most.
+scan :: (Serialize key, Serialize value) => Iterator -> key -> ConduitT i (key, value) IO ()
+scan it base = scanFrom it base base
+
+-- | Like 'scan', but from the second key, or after it if it has no entry:
+-- for the pages after the first, which seek straight to where they start.
+scanFrom ::
+  (Serialize key, Serialize value) =>
+  Iterator ->
+  key ->
+  key ->
+  ConduitT i (key, value) IO ()
+scanFrom it base start = do
+  liftIO (iterSeek it (encode start))
+  go 16
+  where
+    prefix = encode base
+    go n = do
+      let chunk = def {chunkPrefix = prefix, chunkEntries = n, chunkBytes = 1_048_576}
+      (entries, more) <- liftIO (iterChunk it chunk)
+      forM_ entries $ \(k, v) -> yield (either error id (decode k), either error id (decode v))
+      when more (go (min 256 (n * 4)))
 
 -- | Merge streams sorted newest first, drop duplicates, and apply the offset
 -- and limit.

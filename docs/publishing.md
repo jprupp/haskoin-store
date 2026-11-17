@@ -1,9 +1,8 @@
 # Publishing a transaction
 
-How `POST /transactions` gets a transaction to the network, why, and how
-it differs from what the store did before. Written on 2026-11-12, and
-rewritten on 2026-11-13 when the wait for the echo went. The code is
-`Haskoin.Store.Web.Publish`.
+How `POST /transactions` gets a transaction to the network, and why. The
+code is `Haskoin.Store.Web.Publish`. It describes the code; it is not part
+of the package.
 
 ## The short answer
 
@@ -11,8 +10,8 @@ The store checks the transaction, hands it to every peer it has, each on
 a connection made for that (the **courier**), and answers 202, "handed
 over", as soon as they took it. It does not wait to see what the network
 makes of it. A peer that takes it announces it on the connections that the
-store syncs from, as it does any transaction, and the store imports it
-then. Only that announcement, the **echo**, brings it into the mempool.
+store syncs from, as it does any transaction, and the store offers it to
+the pool then. Only that announcement, the **echo**, brings it into the mempool.
 
 ## The problem
 
@@ -34,11 +33,11 @@ script of any other kind is satisfied. So:
    transaction in hexadecimal, so twice those sizes, and 4,096 bytes for
    white space. A longer body is answered 413: by its length when the
    client gave it, and else as soon as that much was read.
-2. **Check.** The store answers from its own index what it can. Each of
-   these is an answer a node would give too, and does not depend on what
-   else is in a mempool:
+2. **Check.** The store answers what it can from its view of the chain at
+   the fleet tip and the pool in Redis. Each of these is an answer a node
+   would give too, and does not depend on what else is in a mempool:
    - a transaction it has in a block is answered 200 and nothing is sent;
-     one it has unconfirmed is checked and sent again, as below;
+     one that the pool has is checked and sent again, as below;
    - no coinbase, no input twice, and no longer than a block of the network
      can hold: 4,000,000 bytes with SegWit, 1,000,000 on Bitcoin Cash;
    - every input spends an output the store knows, that no confirmed
@@ -80,16 +79,16 @@ script of any other kind is satisfied. So:
    reason. Bitcoin Core refuses without a word.
 6. **It comes back.** The connections that the store syncs from never had
    the transaction. A node that took it announces it there, and the block
-   store asks for it and imports it as any other. In case none does, the
-   store also asks for it a few times over two minutes and a half, as if
-   a peer had announced it.
+   store asks for it and offers it to the pool as any other. In case none
+   does, the store also asks for it a few times over two minutes and a
+   half, as if a peer had announced it.
 
 Posting the same transaction again is always safe. Each time, it is
 checked and handed over again.
 
 ### A transaction the store has unconfirmed
 
-The store does not hold its mempool to its node's. It may list a
+The pool is not held to the nodes' mempools. It may list a
 transaction that the nodes forgot: after a reorganisation that left it
 out, or when a node lost its mempool. Posting it again hands it to the
 peers again, as any other, and gets it back to them. A node that has it
@@ -102,10 +101,8 @@ transaction that breaks a rule of the chain, unless it whitelists that
 peer. Bitcoin Core 32 drops none; Bitcoin Core 29 and older drop a peer
 for a transaction that breaks a rule of the chain, by their source.
 
-On 2026-11-13 each kind of transaction below was posted to a store whose
-node did not whitelist it, and the node's peer ids were compared before
-and after. These are the transactions that passed the store's checks of
-1.12.1:
+Each kind of transaction below was posted to a store whose node did not
+whitelist it, and the node's peer ids were compared before and after:
 
 | Transaction | Bitcoin Core 32.1 | Bitcoin Cash Node 29.2.0 |
 | --- | --- | --- |
@@ -116,8 +113,8 @@ and after. These are the transactions that passed the store's checks of
 | A signature pushed in a longer form than it needs | refused in silence | **every connection closed** |
 | More tokens out than in | | **every connection closed** |
 
-So the store refuses the last two itself now, and the versions, which no
-node relays anyway. A signature on Bitcoin Cash without the fork id
+So the store refuses the last two itself, and the versions, which no node
+relays anyway. A signature on Bitcoin Cash without the fork id
 cannot be verified (haskoin-core does not make its digest), and an input
 script with more than a signature and a key cannot be judged: neither is
 sent to a peer.
@@ -177,7 +174,7 @@ and refused where it has none.
 | --- | --- |
 | 202, the id and a message | Handed over: a node took it over RPC, or one peer or more took it |
 | 200 and the id | The store has it in a block: nothing was sent |
-| 400 | The store refused it at step 2, or could not verify it and has no RPC to send it over, or a node refused it over RPC, or every peer that answered refused it |
+| 400 | Refused at step 2; or not verifiable, with no RPC; or refused by the node over RPC, or by every peer |
 | 413 | The body is longer than a transaction can be |
 | 500 `server-error` | No peer to hand it to, or none could be reached |
 
@@ -219,14 +216,13 @@ once it relayed it to another peer; Bitcoin Core only once it announced
 something else to that peer. With no other peer and nothing else going
 on, that may not happen before a block. Hence the courier.
 
-From the measurements of 1.11.0, with a program that speaks the
-peer-to-peer protocol:
+With a program that speaks the peer-to-peer protocol:
 
 | | Core, not whitelisted | BCHN, not whitelisted | Either, whitelisted |
 | --- | --- | --- | --- |
 | `pong` after the transaction | under 1 ms | under 1 ms | under 1 ms |
 | Echo on another connection | 3 to 13 s | 0.05 to 1.2 s | under 1 ms |
-| Bad signature | nothing said, connection kept | `reject`, then every connection from the address closed | Core: nothing; BCHN: `reject` |
+| Bad signature | nothing said, connection kept | `reject`, every connection closed | Core: nothing; BCHN: `reject` |
 | Announced first (`inv`) | asked for after 2 s | asked for after 2 s | not measured |
 
 ## What it cannot do
@@ -251,24 +247,6 @@ peer-to-peer protocol:
 **Whitelist the store on the nodes you run it next to** (`-whitelist` in
 Bitcoin Core and Bitcoin Cash Node). The node then announces without
 delay, and never closes the store's connections over a transaction.
-
-## What the store did before
-
-| | Before 1.11.0 | 1.11.0 to 1.12.1 | Now |
-| --- | --- | --- | --- |
-| Where it is sent | Half the peers, on the connections the store syncs from | One node, on a connection of its own | Every peer, each on a connection of its own |
-| What the client is told | 200 at once, whatever happens | What came of it, after up to `--publish-timeout` | 202, handed over, at once |
-| How it comes back | The store asks the same peers once, five seconds later | A node announces it | A node announces it; the store asks too |
-| What the store checks | That the body is one transaction | The inputs, the amounts, the signatures | Also the input scripts, the version and the tokens |
-
-- **Before 1.11.0**, a forged transaction went to half the peers on the
-  connections the store syncs from, and Bitcoin Cash Node closed every
-  connection from the address: one request cut the store off from half
-  its peers. And the transaction often never came back, as above.
-- **From 1.11.0**, the request waited for the echo, up to 30 seconds. The
-  wait was arbitrary, and the answer said less than it seemed: Bitcoin Core
-  refuses in silence, so a timeout meant nothing for sure, and one node is
-  not the network.
 
 ## What was not chosen
 

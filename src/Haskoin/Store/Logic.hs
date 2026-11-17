@@ -10,88 +10,112 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Rules to import and revert blocks and transactions in the layout of
--- version 20 of the database, in which the mempool is written into the
--- indices of the chain. The store no longer imports with them: it runs on
--- the layered layout, with the rules of "Haskoin.Store.Logic.Layered".
--- These are kept as the reference: the tests give the same random histories
--- to both and compare every result and every answer, and that comparison is
--- the evidence that the new layout does what the old one did.
+-- Rules to import and revert blocks. The database holds the chain and
+-- nothing else: the mempool is the pool that the fleet shares in Redis
+-- ("Haskoin.Store.Fleet.Pool"), so these rules never meet an unconfirmed
+-- transaction. 'importBlock' and 'revertBlock' are the only functions that
+-- write to the column families of the chain, and what they write depends
+-- on the block and on those column families alone: the same bytes on every
+-- store that has the same blocks.
 --
--- These functions keep every index consistent: transactions, unspent outputs,
--- spenders, address transactions, address unspent outputs, balances and the
--- mempool. Each takes the 'Writer' of a batch as its first argument and runs
--- in 'IO'; the writer buffers all changes and 'runWriter' commits them in one
--- atomic batch, so a failure leaves the database untouched.
+-- A reverted block takes its transactions out of the chain. They are not
+-- kept anywhere in the database: the member that moves the fleet tip reads
+-- them from its view of the database at the old tip, and gives them back to
+-- the pool ("Haskoin.Store.Fleet.Member").
 --
--- When a block is imported, transactions already in the mempool are confirmed,
--- new ones are imported, and mempool transactions that conflict with the block
--- are deleted together with their descendants. When a block is reverted, its
--- transactions go back to the mempool and its coinbase is deleted.
+-- = Importing a block in stages
 --
--- On networks with replace-by-fee, a new mempool transaction may replace the
--- unconfirmed transactions it conflicts with. Elsewhere a conflicting mempool
--- transaction is rejected as a double spend.
--- = Why these rules
+-- 'importBlock' works in four stages, so that a full block takes a second
+-- or two and not eighteen, as it did on a store of mainnet whose disk and
+-- cores were mostly idle. What cost the time was thirty thousand reads of
+-- the database, one after another from one thread, many of them of a key
+-- that had been read already.
 --
--- The indices are only useful if they always agree with each other: a balance
--- must equal the sum of the unspent outputs of its address, a spent output must
--- name its spender, and a transaction must appear in the index of every address
--- it touches. Every function here changes all of them together, inside one
--- atomic batch, so the database moves from one consistent state to the next.
+-- 1. __Prepare__ ('prepareBlock'), on all cores, from the block alone: the
+--    hash of each transaction, the address of each output, the sizes. They
+--    are carried along from there.
 --
--- The store does not validate scripts or consensus rules. It follows the chain
--- with the most work, as reported by haskoin-node, and checks only what it needs
--- to keep the indices consistent: that inputs exist and are unspent, and that a
--- transaction does not spend more than it has. A block that fails these checks
--- is not imported, and the block store disconnects the peer that sent it.
+-- 2. __Read ahead__: the outputs that the block spends are read with
+--    multi-gets on all cores into the read cache of the batch
+--    ("Haskoin.Store.Database.Writer").
 --
--- The mempool is treated as provisional. A confirmed block always wins: mempool
--- transactions that conflict with it are deleted together with everything that
--- spends them. Between mempool transactions, replace-by-fee decides on networks
--- that support it; elsewhere the first one seen stays.
+-- 3. __Apply__: the rules, one transaction after another, without a read of
+--    the database between them.
 --
--- These rules write unconfirmed transactions into the same indices as the
--- chain. "Haskoin.Store.Logic.Layered" has the rules for a layout that keeps
--- them apart, with the same functions; the store will move to it when that
--- layout replaces this one.
+-- 4. __Write__: the batch.
+--
+-- Since database version 23 the balances of the addresses of a block and
+-- the spenders of the outputs that it spends are not read at all: the
+-- block writes how they change, as merge records, and RocksDB works out
+-- the values when they are read ('addChainTx',
+-- "Haskoin.Store.Database.Merge").
+--
+-- = A mined block is not validated
+--
+-- A block that gets here was mined: it passed proof of work, and the node
+-- that the store follows took it. The store takes it that its
+-- transactions are valid: every output that the block spends is unspent
+-- in the chain or made by a transaction of the block, and none is spent
+-- twice. Checking that is the work of the node, and each check here was a
+-- read of the database for every input of every block. So the import
+-- reads what it needs to write the block, and nothing to check it:
+--
+-- * __No spender of the chain is read.__ A block writes its spenders as
+--   merge records and never reads a group of them.
+--
+-- * __An output that the block makes is not read from the database.__ The
+--   rules find it in the changes of the batch, as each transaction is
+--   applied after those that it spends ('readAheadBlock').
+--
+-- * __Only a coinbase is looked up in the chain__, in case it is confirmed
+--   already. That happened to two coinbases of 2010, and it is data, not
+--   a check: the later one takes the place of the earlier. A transaction
+--   with an input cannot be confirmed twice, since its input is spent.
+--
+-- What stays is what the store's own data needs: the unspent outputs that
+-- the block spends, whose values, scripts and positions the balances and
+-- the indexes are made from, and the order in which transactions are taken
+-- ('sortTxs', needed on Bitcoin Cash, whose blocks are in the order of the
+-- hashes).
+--
+-- A block that breaks the assumption is promised one thing: it is written
+-- whole or not at all, since a batch that throws writes nothing
+-- ("Haskoin.Store.Database.Writer"). It is still refused when the one
+-- read that stays finds nothing: an output that does not exist, that the
+-- chain has as spent, or that an earlier transaction of the block spent,
+-- is not there to be read, and the block is an 'Orphan'. A transaction
+-- that spends one output twice stops the batch too, when it comes to
+-- spend what it just spent ('addChainTx'): a look in the changes of the
+-- batch, in memory.
 module Haskoin.Store.Logic
   ( ImportException (..),
     initBest,
     revertBlock,
-    revertBlockAt,
     importBlock,
-    newMempoolTx,
-    deleteUnconfirmedTx,
+
+    -- * What a block needs worked out once
+    PreparedBlock (..),
+    PreparedTx (..),
+    prepareBlock,
   )
 where
 
-import Control.Exception (Exception, throwIO)
-import Control.Monad
-  ( forM,
-    forM_,
-    guard,
-    unless,
-    void,
-    when,
-    zipWithM_,
-  )
+import Control.DeepSeq (NFData, force)
+import Control.Exception (Exception, evaluate, throwIO)
+import Control.Monad (forM, forM_, guard, unless, void, when, zipWithM_)
 import Data.ByteString qualified as B
+import Data.Default (def)
 import Data.Either (rights)
-import Data.HashMap.Strict qualified as M
+import Data.Functor ((<&>))
 import Data.HashSet qualified as H
 import Data.IntMap.Strict qualified as I
 import Data.List (nub)
-import Data.Maybe
-  ( catMaybes,
-    fromMaybe,
-    isJust,
-    isNothing,
-  )
+import Data.Maybe (catMaybes, fromMaybe, isNothing, mapMaybe)
 import Data.Serialize (encode)
-import Data.String.Conversions (cs)
+import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import GHC.Generics (Generic)
 import Haskoin
   ( Address,
     Block (..),
@@ -101,11 +125,13 @@ import Haskoin
     Network (..),
     OutPoint (..),
     Tx (..),
-    TxHash,
+    TxHash (..),
     TxIn (..),
     TxOut (..),
+    VarInt (..),
     blockHashToHex,
     computeSubsidy,
+    doubleSHA256,
     eitherToMaybe,
     genesisBlock,
     genesisNode,
@@ -117,29 +143,10 @@ import Haskoin
     txHashToHex,
   )
 import Haskoin.Node (LogLevel (..), logAt)
-import Haskoin.Store.Common (nub', sortTxs)
+import Haskoin.Store.Common (nub', replacedKept, sortTxs, sortTxsWith)
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Writer hiding (deleteSpender, insertSpender)
-
--- | Log a message with the logger of the writer.
-logDebug, logError :: Writer -> Text -> IO ()
-logDebug wr = logAt LevelDebug (writerLogger wr)
-logError wr = logAt LevelError (writerLogger wr)
-
--- | Network of the database being written.
-getNetwork :: Writer -> IO Network
-getNetwork wr = return (writerNet wr)
-
--- | Data of a transaction that is in the database and not deleted.
-getActiveTxData :: Writer -> TxHash -> IO (Maybe TxData)
-getActiveTxData wr th =
-  getTxData wr th >>= \case
-    Just td | not td.deleted -> return (Just td)
-    _ -> return Nothing
-
--- | Balance of an address, or a zero balance if it was never used.
-getDefaultBalance :: Writer -> Address -> IO Balance
-getDefaultBalance wr a = fromMaybe (zeroBalance a) <$> getBalance wr a
+import Haskoin.Store.Database.Types (BalVal (..))
+import Haskoin.Store.Database.Writer
 
 -- | Reasons why an import can fail.
 data ImportException
@@ -147,71 +154,56 @@ data ImportException
     PrevBlockNotBest
   | -- | the transaction spends an output that is unknown or already spent
     Orphan
-  | -- | a coinbase transaction cannot go into the mempool
-    UnexpectedCoinbase
   | -- | the database has no best block, or it cannot be read
     BestBlockNotFound
   | -- | only the best block can be reverted
     BlockNotBest
   | -- | a transaction that should be in the database is not
     TxNotFound
-  | -- | the transaction conflicts with another and the network does not have
-    -- replace-by-fee
-    DoubleSpend
-  | -- | a confirmed transaction cannot be deleted or replaced
-    TxConfirmed
-  | -- | the outputs of the transaction are worth more than its inputs
-    InsufficientFunds
-  | -- | the transaction spends the same output twice
-    DuplicatePrevOutput
-  | -- | a transaction cannot be deleted while another one spends it
+  | -- | a transaction cannot be taken out while another one spends it
     TxSpent
   deriving (Eq, Ord, Exception)
 
 instance Show ImportException where
   show PrevBlockNotBest = "Previous block not best"
   show Orphan = "Orphan"
-  show UnexpectedCoinbase = "Unexpected coinbase"
   show BestBlockNotFound = "Best block not found"
   show BlockNotBest = "Block not best"
   show TxNotFound = "Transaction not found"
-  show DoubleSpend = "Double spend"
-  show TxConfirmed = "Transaction confirmed"
-  show InsufficientFunds = "Insufficient funds"
-  show DuplicatePrevOutput = "Duplicate previous output"
   show TxSpent = "Transaction is spent"
 
--- | Import the genesis block if the database has no best block yet.
-initBest :: Writer -> IO ()
-initBest wr = do
-  logDebug wr "Initializing best block"
-  net <- getNetwork wr
-  m <- getBestBlock wr
-  when (isNothing m) . void $ do
-    logDebug wr "Importing Genesis block"
-    importBlock wr (genesisBlock net) (genesisNode net)
+-------------------------------------------------------------------------------
+-- Reading
+-------------------------------------------------------------------------------
 
--- | Import a transaction into the mempool with the time it arrived. Returns
--- 'False' if it is already known.
---
--- Conflicting unconfirmed transactions are deleted together with their
--- descendants if the network has replace-by-fee; otherwise the transaction is
--- rejected with 'DoubleSpend'. Throws an 'ImportException' if the transaction is
--- invalid, for example if it spends unknown outputs.
-newMempoolTx :: Writer -> Tx -> UnixTime -> IO Bool
-newMempoolTx wr tx w =
-  getActiveTxData wr (txHash tx) >>= \case
-    Just _ ->
-      return False
-    Nothing -> do
-      -- Check everything before writing, so that a rejected transaction
-      -- leaves the mempool as it was.
-      replaced <- getConflicts wr True True tx
-      checkNewTx wr (map txHash replaced) tx
-      mapM_ (deleteSingleTx wr . txHash) replaced
-      rbf <- isRBF wr (MemRef w) tx
-      _ <- importTx wr (MemRef w) w rbf tx
-      return True
+-- | Log a message with the logger of the writer.
+logDebug, logError :: Writer -> Text -> IO ()
+logDebug wr = logAt LevelDebug (writerLogger wr)
+logError wr = logAt LevelError (writerLogger wr)
+
+-- | Address of an output script, if it has one on the network.
+scriptAddress :: Writer -> B.ByteString -> Maybe Address
+scriptAddress wr = eitherToMaybe . scriptToAddressBS (writerNet wr)
+
+-- | Data of a confirmed transaction, with the spenders of its outputs that
+-- are in blocks. Version 20 kept the bodies of deleted transactions in the
+-- same place; they do not count.
+chainTx :: Writer -> TxHash -> IO (Maybe TxData)
+chainTx wr h =
+  getTxData wr h <&> \case
+    Just td | not td.deleted -> Just td
+    _ -> Nothing
+
+-- | An output as an unspent output, given the position of its transaction.
+unspentOutput :: Writer -> BlockRef -> OutPoint -> TxOut -> Unspent
+unspentOutput wr br p o =
+  Unspent
+    { block = br,
+      outpoint = p,
+      value = o.value,
+      script = o.script,
+      address = scriptAddress wr o.script
+    }
 
 -- | Data of the best block. Throws 'BestBlockNotFound' if there is none.
 bestBlockData :: Writer -> IO BlockData
@@ -228,48 +220,19 @@ bestBlockData wr = do
       throwIO BestBlockNotFound
     Just b -> return b
 
--- | Revert the best block: make its parent the best block, mark it as not in the
--- main chain, move its transactions back to the mempool, and delete its
--- coinbase. Throws 'BlockNotBest' if the block is not the best block.
-revertBlock :: Writer -> BlockHash -> IO ()
-revertBlock wr = revertWith wr id
+-------------------------------------------------------------------------------
+-- Blocks
+-------------------------------------------------------------------------------
 
--- | 'revertBlock', with the transactions put back at a time, the time of
--- the revert, as the layered layout puts them back
--- ("Haskoin.Store.Logic.Layered"): the tests compare the two.
-revertBlockAt :: Writer -> UnixTime -> BlockHash -> IO ()
-revertBlockAt wr now = revertWith wr (\td -> (td :: TxData) {timestamp = now})
-
--- | Revert the best block, changing each transaction that goes back to the
--- mempool first.
-revertWith :: Writer -> (TxData -> TxData) -> BlockHash -> IO ()
-revertWith wr restamp bh = do
-  bd <-
-    bestBlockData wr >>= \b ->
-      if headerHash b.header == bh
-        then return b
-        else do
-          logError wr $
-            "Cannot revert non-head block: " <> blockHashToHex bh
-          throwIO BlockNotBest
-  logDebug wr $
-    "Obtained block data for " <> blockHashToHex bh
-  tds <- mapM (getImportTxData wr) bd.txs
-  logDebug wr $
-    "Obtained import tx data for block " <> blockHashToHex bh
-  setBest wr bd.header.prev
-  logDebug wr $
-    "Set parent as best block "
-      <> blockHashToHex bd.header.prev
-  insertBlock wr bd {main = False}
-  logDebug wr $
-    "Updated as not in main chain: " <> blockHashToHex bh
-  forM_ (drop 1 tds) (unConfirmTx wr . restamp)
-  logDebug wr $
-    "Unconfirmed " <> cs (show (length tds)) <> " transactions"
-  deleteConfirmedTx wr (txHash (tds !! 0).tx)
-  logDebug wr $
-    "Deleted coinbase: " <> txHashToHex (txHash (tds !! 0).tx)
+-- | Import the genesis block if the database has no best block yet.
+initBest :: Writer -> IO ()
+initBest wr = do
+  logDebug wr "Initializing best block"
+  let net = writerNet wr
+  m <- getBestBlock wr
+  when (isNothing m) . void $ do
+    logDebug wr "Importing Genesis block"
+    importBlock wr (genesisBlock net) (genesisNode net)
 
 -- | Check that a block builds on the best block, or that it is the genesis block
 -- of an empty database.
@@ -279,144 +242,263 @@ checkNewBlock wr b n =
     Nothing
       | isGenesis n -> return ()
       | otherwise -> do
-          logError wr $
-            "Cannot import non-genesis block: "
-              <> blockHashToHex (headerHash b.header)
+          logError wr $ "Cannot import non-genesis block: " <> blockHashToHex (headerHash b.header)
           throwIO BestBlockNotFound
     Just h
       | b.header.prev == h -> return ()
       | otherwise -> do
-          logError wr $
-            "Block does not build on head: "
-              <> blockHashToHex (headerHash b.header)
+          logError wr $ "Block does not build on head: " <> blockHashToHex (headerHash b.header)
           throwIO PrevBlockNotBest
-
--- | Import the transactions of a block, in dependency order. Mempool transactions
--- that conflict with the block are deleted first. Transactions already in the
--- mempool are confirmed; others are imported.
-importOrConfirm :: Writer -> BlockNode -> [Tx] -> IO [TxData]
-importOrConfirm wr bn txns = do
-  logDebug wr "Freeing outputs..."
-  mapM_ (freeOutputs wr True False . snd) (reverse txs)
-  logDebug wr "Outputs freed"
-  mapM (uncurry action) txs
-  where
-    txs = sortTxs txns
-    br i = BlockRef {height = bn.height, position = i}
-    bn_time = fromIntegral $ bn.header.timestamp
-    action i tx =
-      testPresent wr tx >>= \case
-        False -> import_it i tx
-        True -> confirm_it i tx
-    confirm_it i tx =
-      getActiveTxData wr (txHash tx) >>= \case
-        Just t -> do
-          logDebug wr $
-            "Confirming tx: "
-              <> txHashToHex (txHash tx)
-          -- with the time of the block, as the layered rules give it: see
-          -- 'Haskoin.Store.Logic.Layered.importChainTx'. Version 20 kept
-          -- the time at which the store first saw the transaction; these
-          -- rules are what the tests hold the layered ones to, and have
-          -- to agree with them on it.
-          td <- confirmTx wr t (br i)
-          let timed = (td :: TxData) {timestamp = bn_time}
-          insertTx wr timed
-          return timed
-        Nothing -> do
-          logError wr $
-            "Cannot find tx to confirm: "
-              <> txHashToHex (txHash tx)
-          throwIO TxNotFound
-    import_it i tx = do
-      logDebug wr $
-        "Importing tx: " <> txHashToHex (txHash tx)
-      importTx wr (br i) bn_time False tx
 
 -- | Import a block that builds on the best block, and make it the best block.
 -- Returns its data and the data of its transactions.
+--
+-- It works in the stages that the head of this module describes, and notes
+-- how long each took ('noteBlockTimes').
 importBlock :: Writer -> Block -> BlockNode -> IO (BlockData, [TxData])
 importBlock wr b n = do
-  logDebug wr $
-    "Checking new block: "
-      <> blockHashToHex (headerHash n.header)
   checkNewBlock wr b n
-  logDebug wr "Passed check"
-  net <- getNetwork wr
-  let subsidy = computeSubsidy net n.height
+  (pb, preparing) <- stopwatch (prepareBlock (writerNet wr) b)
+  (kinds, reading) <- stopwatch (readAheadBlock wr pb)
+  (done, applying) <- stopwatch (applyBlock wr b n pb)
+  noteBlockTimes wr preparing reading kinds applying
+  return done
+
+-- | A transaction of a block with what its import needs of it, worked out
+-- once, from the transaction alone.
+data PreparedTx = PreparedTx
+  { tx :: !Tx,
+    -- | its hash
+    txid :: !TxHash,
+    -- | the outputs that it spends, in the order of its inputs: none for a
+    -- coinbase
+    spends :: ![OutPoint],
+    -- | the address of each of its outputs, for those that have one
+    paid :: ![Maybe Address],
+    -- | bytes that it takes in a block, with its witness
+    size :: !Int,
+    -- | the same without its witness
+    base :: !Int
+  }
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | A block with what its import needs of it, worked out once.
+data PreparedBlock = PreparedBlock
+  { -- | its transactions, in its order
+    txs :: ![PreparedTx],
+    -- | the same, each after those that it spends, with its position in
+    -- the block ('sortTxs')
+    ordered :: ![(Word32, PreparedTx)],
+    -- | bytes of the block
+    size :: !Int,
+    -- | weight of the block, as BIP 141 defines it
+    weight :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | Work out what the import of a block needs of it, on all cores.
+--
+-- Each transaction is serialised once without its witness: the hash is
+-- taken of those bytes, and their length is its part of the size of the
+-- block. One with a witness is serialised once more for its length. The
+-- size and the weight of the block are sums of those, with the header and
+-- the count of transactions, instead of two more serialisations of the
+-- whole block.
+prepareBlock :: Network -> Block -> IO PreparedBlock
+prepareBlock net b = do
+  txs <- concat <$> onAllCores 2 16 (evaluate . force . map (prepareTx net)) b.txs
+  let count = length txs
+      overhead = B.length (encode b.header) + B.length (encode (VarInt (fromIntegral count)))
+      base = overhead + sum (map (.base) txs)
+      full = overhead + sum (map (.size) txs)
+      ordered = sortTxsWith (.txid) (.tx) txs
+  -- the sort is part of this stage
+  _ <- evaluate (length ordered)
+  return PreparedBlock {txs, ordered, size = full, weight = 3 * base + full}
+
+-- | Work out what the import of a block needs of one of its transactions.
+prepareTx :: Network -> Tx -> PreparedTx
+prepareTx net tx =
+  PreparedTx
+    { tx,
+      txid = TxHash (doubleSHA256 stripped),
+      spends = prevOuts tx,
+      paid = map (eitherToMaybe . scriptToAddressBS net . (.script)) tx.outputs,
+      size = if null tx.witness then B.length stripped else B.length (encode tx),
+      base = B.length stripped
+    }
+  where
+    -- what 'txHash' hashes
+    stripped = encode (tx :: Tx) {witness = []}
+
+-- | Read ahead what the rules will read from the database for a block,
+-- into the read cache of the batch: the outputs that the block spends and
+-- does not make, as unspent outputs of the chain, with multi-gets on all
+-- cores. Their values, scripts and positions are what the balances and the
+-- indexes of the block are made from.
+--
+-- An output that a transaction of the block makes is not asked for. The
+-- database does not have it, and the rules find it in the changes of the
+-- batch, since each transaction is applied after those that it spends. On
+-- Bitcoin mainnet in November 2026 that was 3,000 to 6,500 of the inputs
+-- of a block.
+--
+-- A key that is missing here costs a read when the rules ask for it, and
+-- nothing else.
+--
+-- The balances of the addresses of the block, and the groups of spenders
+-- of the outputs that it spends, are not read: they are changed without
+-- being read ('addChainTx'). It says how long the read took, as
+-- t'ReadTimes'.
+readAheadBlock :: Writer -> PreparedBlock -> IO ReadTimes
+readAheadBlock wr pb
+  | not (readsAhead wr) = return noReads
+  | otherwise = do
+      (_, unspentReads) <- stopwatch (readAheadUnspents wr outside)
+      return ReadTimes {unspentReads, spenderReads = 0, balanceReads = 0}
+  where
+    made = H.fromList (map (.txid) pb.txs)
+    -- the outputs that the block spends and that no transaction of the
+    -- block makes
+    outside = filter (not . (`H.member` made) . (.hash)) (concatMap (.spends) pb.txs)
+
+-- | The rules of the import of a block, given what was worked out of it.
+applyBlock :: Writer -> Block -> BlockNode -> PreparedBlock -> IO (BlockData, [TxData])
+applyBlock wr b n pb = do
+  let net = writerNet wr
+      subsidy = computeSubsidy net n.height
   bs <- getBlocksAtHeight wr n.height
-  logDebug wr $
-    "Inserting block entries for: "
-      <> blockHashToHex (headerHash n.header)
-  setBlocksAtHeight
-    wr
-    (nub (headerHash n.header : bs))
-    n.height
+  setBlocksAtHeight wr (nub (headerHash n.header : bs)) n.height
   setBest wr (headerHash n.header)
-  tds <- importOrConfirm wr n b.txs
+  tds <- importTxs wr n pb.ordered
+  when (n.height >= replacedKept) $
+    getReplacedAt wr (n.height - replacedKept) >>= mapM_ (deleteReplaced wr)
   let bd =
         BlockData
           { height = n.height,
             main = True,
             work = n.work,
             header = n.header,
-            size = fromIntegral (B.length (encode b)),
-            txs = map txHash b.txs,
-            weight = if net.segWit then w else 0,
+            size = fromIntegral pb.size,
+            txs = map (.txid) pb.txs,
+            weight = if net.segWit then fromIntegral pb.weight else 0,
             subsidy = subsidy,
             fee = sum $ map txDataFee tds,
-            outputs = ts_out_val
+            outputs = sum $ map (sum . map (.value) . (.outputs)) (drop 1 b.txs)
           }
   insertBlock wr bd
-  logDebug wr $
-    "Finished importing block: "
-      <> blockHashToHex (headerHash n.header)
+  logDebug wr $ "Finished importing block: " <> blockHashToHex (headerHash n.header)
   return (bd, tds)
-  where
-    ts_out_val =
-      sum $ map (sum . map (.value) . (.outputs)) (drop 1 b.txs)
-    w =
-      let f t = (t :: Tx) {witness = []}
-          b' = (b :: Block) {txs = map f b.txs}
-          x = B.length (encode b)
-          s = B.length (encode b')
-       in fromIntegral $ s * 3 + x
 
--- | Check a transaction that will replace these ones. Outputs that they spend
--- count as unspent, and outputs that they create as missing.
-checkNewTx :: Writer -> [TxHash] -> Tx -> IO ()
-checkNewTx wr replaced tx = do
-  when (unique_inputs < length tx.inputs) $ do
-    logError wr $
-      "Transaction spends same output twice: "
-        <> txHashToHex (txHash tx)
-    throwIO DuplicatePrevOutput
-  prevs <- mapM prev_output (prevOuts tx)
-  when (any isNothing prevs) $ do
-    logError wr $
-      "Orphan: " <> txHashToHex (txHash tx)
-    throwIO Orphan
-  when (isCoinbaseTx tx) $ do
-    logError wr $
-      "Coinbase cannot be imported into mempool: "
-        <> txHashToHex (txHash tx)
-    throwIO UnexpectedCoinbase
-  when (outputs > sum (map (.value) (catMaybes prevs))) $ do
-    logError wr $
-      "Insufficient funds for tx: " <> txHashToHex (txHash tx)
-    throwIO InsufficientFunds
+-- | Import the transactions of a block, in dependency order.
+importTxs :: Writer -> BlockNode -> [(Word32, PreparedTx)] -> IO [TxData]
+importTxs wr bn = mapM (uncurry action)
   where
-    prev_output op
-      | op.hash `elem` replaced = return Nothing
-      | otherwise = do
-          parent <- getActiveTxData wr op.hash
-          return (parent >>= getTxOut op.index . (.tx))
-    outputs = sum (map (.value) tx.outputs)
-    unique_inputs = length (nub' (map (.outpoint) tx.inputs))
+    br i = BlockRef {height = bn.height, position = i}
+    blockTime = fromIntegral bn.header.timestamp
+    action i p
+      -- only a transaction without inputs can be in the chain already:
+      -- the inputs of any other would be spent
+      | null p.spends =
+          chainTx wr p.txid >>= \case
+            Just td -> moveChainTx wr td (br i) blockTime
+            Nothing -> importChainTx wr (br i) blockTime p
+      | otherwise = importChainTx wr (br i) blockTime p
 
--- | Unspent outputs spent by a transaction, or 'Nothing' for those that are missing.
-getUnspentOutputs :: Writer -> Tx -> IO [Maybe Unspent]
-getUnspentOutputs wr tx = mapM (getUnspent wr) (prevOuts tx)
+-- | Import a transaction of a block into the chain, with the time of the
+-- block. Throws 'Orphan' if an output that it spends is not unspent in the
+-- chain. That is not a check of the block: the output is read for what the
+-- transaction needs of it, and there is nothing to go on with when it is
+-- not there.
+--
+-- = Why the time of the block
+--
+-- What the chain's column families hold is to follow from the chain and
+-- from nothing else: the same bytes on every store that has the same
+-- blocks, whatever each of them saw before. The time of a transaction was
+-- the one thing in them that did not. A store kept the time at which it
+-- first saw a transaction in its mempool when a block confirmed it, so two
+-- stores had two times for it, a store that synced later had the time of
+-- the block, and the stores of a fleet gave different answers about the
+-- same confirmed transaction. The time of first sight is what a
+-- transaction has while it is in the pool.
+importChainTx :: Writer -> BlockRef -> Word64 -> PreparedTx -> IO TxData
+importChainTx wr br time p = do
+  us <- forM p.spends $ \o ->
+    getUnspent wr o >>= \case
+      Just u -> return u
+      Nothing -> do
+        logError wr $ "Attempted to import a tx missing UTXO: " <> txHashToHex p.txid
+        throwIO Orphan
+  let td = prepareTxData False br time p.tx us
+  addChainTx wr p td us
+  return td
+
+-- | Give a confirmed transaction a new position in the chain: a block has a
+-- transaction that is already confirmed. Only two coinbases of 2010 are, on
+-- Bitcoin; the later one takes the place of the earlier, with the outputs
+-- that are still unspent, as in the layout of version 20, and the time of
+-- the later block.
+moveChainTx :: Writer -> TxData -> BlockRef -> Word64 -> IO TxData
+moveChainTx wr t new time = do
+  forM_ (txDataAddresses wr t) $ \a -> do
+    deleteAddrTx wr a TxRef {block = t.block, txid = h}
+    insertAddrTx wr a TxRef {block = new, txid = h}
+  forM_ (zip [0 ..] t.tx.outputs) $ \(i, _) ->
+    getUnspent wr (OutPoint h i) >>= mapM_ move
+  let td = (t :: TxData) {block = new, timestamp = time}
+  insertTx wr td
+  return td
+  where
+    h = txHash t.tx
+    move u = do
+      let u' = (u :: Unspent) {block = new}
+      insertUnspent wr u'
+      forM_ u.address $ \a -> deleteAddrUnspent wr a u >> insertAddrUnspent wr a u'
+
+-- | Revert the best block: make its parent the best block, mark it as not in
+-- the main chain, and take its transactions out of the chain, each after
+-- the transactions of the block that spend it. Throws 'BlockNotBest' if the
+-- block is not the best block.
+--
+-- Nothing is kept of the transactions: the pool that the fleet shares gets
+-- them back from the member that moves the tip, which reads them from its
+-- view of the database at the old tip ("Haskoin.Store.Fleet.Member").
+revertBlock :: Writer -> BlockHash -> IO ()
+revertBlock wr bh = do
+  bd <-
+    bestBlockData wr >>= \b ->
+      if headerHash b.header == bh
+        then return b
+        else do
+          logError wr $ "Cannot revert non-head block: " <> blockHashToHex bh
+          throwIO BlockNotBest
+  tds <- mapM inChain bd.txs
+  setBest wr bd.header.prev
+  insertBlock wr bd {main = False}
+  -- what the block replaced is not replaced any more
+  getReplacedAt wr bd.height >>= mapM_ (deleteReplaced wr)
+  -- out of the chain, each after the transactions that spend it
+  forM_ (reverse (sortTxs (map (.tx) tds))) (leave . txHash . snd)
+  where
+    inChain h =
+      chainTx wr h >>= \case
+        Just td -> return td
+        Nothing -> do
+          logDebug wr $ "Tx not found: " <> txHashToHex h
+          throwIO TxNotFound
+    -- take a transaction that nothing in the chain spends out of the chain
+    leave h = do
+      td <- inChain h
+      spent <- getChainSpenders wr h (length td.tx.outputs)
+      unless (I.null spent) $ do
+        logError wr $ "Tried to revert spent tx: " <> txHashToHex h
+        throwIO TxSpent
+      removeChainTx wr td
+
+-- The chain's column families
+-------------------------------------------------------------------------------
 
 -- | Data of a new transaction, from its replace-by-fee flag, position, time and
 -- the outputs it spends.
@@ -435,429 +517,122 @@ prepareTxData rbf br tt tx us =
     mkprv Unspent {..} = Prev script value
     ps = I.fromList $ zip [0 ..] $ map mkprv us
 
--- | Import a transaction at a position in the chain or the mempool. Throws 'Orphan' if it spends a missing output.
-importTx ::
-  Writer ->
-  BlockRef ->
-  -- | unix time
-  Word64 ->
-  -- | RBF
-  Bool ->
-  Tx ->
-  IO TxData
-importTx wr br tt rbf tx = do
-  mus <- getUnspentOutputs wr tx
-  us <- forM mus $ \case
-    Nothing -> do
-      logError wr $
-        "Attempted to import a tx missing UTXO: "
-          <> txHashToHex (txHash tx)
-      throwIO Orphan
-    Just u -> return u
-  let td = prepareTxData rbf br tt tx us
-  commitAddTx wr td
-  return td
+-- | Change the balance of an address in the chain, by reading it and
+-- writing it whole. An address whose balance goes back to nothing, as when
+-- the only block that paid it is reverted, has none.
+--
+-- The import of a block does not go through here: it changes a balance
+-- without reading it ('addChainTx'). This is for taking a block out.
+modifyBalance :: Writer -> Address -> (Balance -> Balance) -> IO ()
+modifyBalance wr a f = do
+  b <- f . fromMaybe (zeroBalance a) <$> getBalance wr a
+  if nullBalance b then deleteBalance wr a else setBalance wr b
 
--- | Move a confirmed transaction back to the mempool.
-unConfirmTx :: Writer -> TxData -> IO TxData
-unConfirmTx wr t = confTx wr t Nothing
+-- | Subtract, or stop: no count or amount of the chain goes below zero.
+less :: String -> Word64 -> Word64 -> Word64
+less what x y
+  | y > x = error $ "The " <> what <> " of an address would go below zero"
+  | otherwise = x - y
 
--- | Confirm a mempool transaction at a position in a block.
-confirmTx :: Writer -> TxData -> BlockRef -> IO TxData
-confirmTx wr t br = confTx wr t (Just br)
-
--- | Move a transaction to a new position in the indices of all its addresses.
-replaceAddressTx :: Writer -> TxData -> BlockRef -> IO ()
-replaceAddressTx wr t new = do
-  net <- getNetwork wr
-  forM_ (txDataAddresses net t) $ \a -> do
-    deleteAddrTx
-      wr
-      a
-      TxRef
-        { block = t.block,
-          txid = txHash t.tx
-        }
-    insertAddrTx
-      wr
-      a
-      TxRef
-        { block = new,
-          txid = txHash t.tx
-        }
-
--- | Move an unspent output to a new position in the chain, updating the indices
--- and balance of its address.
-adjustAddressOutput ::
-  Writer ->
-  OutPoint ->
-  TxOut ->
-  BlockRef ->
-  BlockRef ->
-  IO ()
-adjustAddressOutput wr op o old new = do
-  let pk = o.script
-  getUnspent wr op >>= \case
-    Nothing -> return ()
-    Just u -> do
-      unless (u.block == old) $
-        error $
-          "Existing unspent block bad for output: " <> show op
-      replace_unspent pk
+-- | Add a confirmed transaction to every index of the chain, given what
+-- was worked out of it and the outputs that it spends, which must be
+-- unspent in the chain.
+--
+-- Its addresses are those worked out before: of its outputs, and of the
+-- outputs that it spends, which came with them. Each is taken once, by
+-- comparing them: hashing an address, as 'nub'' does, costs more than the
+-- few comparisons that a transaction needs. Each output is asked for
+-- again as it is spent, which the batch answers from memory: it is how a
+-- transaction that spends an output twice is stopped. A mined block is
+-- not validated, and this look is the one thing here that does nothing
+-- else. It stays because it costs nothing that could be measured: the
+-- benchmark took as long without it (@docs\/block-import.md@).
+--
+-- = Nothing is read to be changed
+--
+-- A balance is changed by its differences ('mergeBalance') and a spender
+-- is added to its group ('mergeSpender') without reading either: the batch
+-- writes them as merge records, and RocksDB works out the values when they
+-- are read ("Haskoin.Store.Database.Merge"). Reading the balances and the
+-- groups of spenders was most of the read ahead of a block on a store of
+-- mainnet, and the import only read them to write them back.
+--
+-- Two things follow. A count or an amount of a balance is not checked
+-- against going below zero here, as it is in 'removeChainTx', since that
+-- takes the value: an output that is spent was unspent in the chain, so
+-- its amount is in the balance. And a balance is never deleted here: the
+-- count of transactions of every address that the transaction touches
+-- goes up by one, so none of them comes to nothing. Taking a block out
+-- reads each value and writes it whole ('removeChainTx').
+addChainTx :: Writer -> PreparedTx -> TxData -> [Unspent] -> IO ()
+addChainTx wr p td us = do
+  forM_ (S.toList (S.fromList (mapMaybe (.address) us <> catMaybes p.paid))) $ \a -> do
+    insertAddrTx wr a TxRef {block = td.block, txid = h}
+    mergeBalance wr a (def :: BalVal) {txs = 1}
+  forM_ (zip3 [0 ..] td.tx.outputs p.paid) $ \(i, o, address) -> do
+    let u = Unspent {block = td.block, outpoint = OutPoint h i, value = o.value, script = o.script, address}
+    insertUnspent wr u
+    forM_ address $ \a -> do
+      insertAddrUnspent wr a u
+      mergeBalance wr a (def :: BalVal) {confirmed = o.value, utxo = 1, received = o.value}
+  zipWithM_ spend [0 ..] p.spends
+  insertTxOf wr h td
   where
-    replace_unspent pk = do
-      net <- getNetwork wr
-      let ma = eitherToMaybe (scriptToAddressBS net pk)
-      deleteUnspent wr op
-      insertUnspent
-        wr
-        Unspent
-          { block = new,
-            outpoint = op,
-            value = o.value,
-            script = pk,
-            address = ma
+    h = p.txid
+    spend ix o = do
+      u <-
+        getUnspent wr o >>= \case
+          Just u -> return u
+          Nothing -> error $ "Could not find UTXO to spend: " <> show o
+      deleteUnspent wr o
+      -- under the key of the output: the record of the transaction that
+      -- made it is written once, when it is confirmed, and is not read
+      -- here either
+      mergeSpender wr o (Spender h ix)
+      forM_ u.address $ \a -> do
+        deleteAddrUnspent wr a u
+        -- taken off by adding the two's complement
+        mergeBalance wr a (def :: BalVal) {confirmed = negate u.value, utxo = negate 1}
+
+-- | Take a confirmed transaction that nothing in the chain spends out of
+-- every index of the chain, and make the outputs that it spent unspent
+-- again.
+removeChainTx :: Writer -> TxData -> IO ()
+removeChainTx wr td = do
+  forM_ (txDataAddresses wr td) $ \a -> do
+    deleteAddrTx wr a TxRef {block = td.block, txid = h}
+    modifyBalance wr a $ \b -> (b :: Balance) {txs = less "count of transactions" b.txs 1}
+  forM_ (zip [0 ..] td.tx.outputs) $ \(i, o) -> do
+    let p = OutPoint h i
+        u = unspentOutput wr td.block p o
+    deleteUnspent wr p
+    forM_ u.address $ \a -> do
+      deleteAddrUnspent wr a u
+      modifyBalance wr a $ \b ->
+        (b :: Balance)
+          { confirmed = less "confirmed balance" b.confirmed o.value,
+            utxo = less "count of unspent outputs" b.utxo 1,
+            received = less "amount received" b.received o.value
           }
-      forM_ ma $ replace_addr_unspent pk
-    replace_addr_unspent pk a = do
-      deleteAddrUnspent
-        wr
-        a
-        Unspent
-          { block = old,
-            outpoint = op,
-            value = o.value,
-            script = pk,
-            address = Just a
-          }
-      insertAddrUnspent
-        wr
-        a
-        Unspent
-          { block = new,
-            outpoint = op,
-            value = o.value,
-            script = pk,
-            address = Just a
-          }
-      decreaseBalance wr (confirmed old) a o.value
-      increaseBalance wr (confirmed new) a o.value
-
--- | Confirm a transaction at a position in a block, or move it back to the mempool
--- if no position is given.
-confTx :: Writer -> TxData -> Maybe BlockRef -> IO TxData
-confTx wr t mbr = do
-  replaceAddressTx wr t new
-  forM_ (zip [0 ..] t.tx.outputs) $ \(n, o) -> do
-    let op = OutPoint (txHash t.tx) n
-    adjustAddressOutput wr op o old new
-  rbf <- isRBF wr new t.tx
-  let td = (t :: TxData) {block = new, rbf = rbf}
-  insertTx wr td
-  updateMempool wr td
-  updateSpendersRBF wr td
-  return td
+  forM_ (prevOuts td.tx) $ \p -> do
+    parent <-
+      chainTx wr p.hash >>= \case
+        Just t -> return t
+        Nothing -> error $ "Could not find tx data: " <> show p.hash
+    let o = fromMaybe (error ("Could not find output: " <> show p)) (getTxOut p.index parent.tx)
+        u = unspentOutput wr parent.block p o
+    deleteSpender wr p
+    insertUnspent wr u
+    forM_ u.address $ \a -> do
+      insertAddrUnspent wr a u
+      modifyBalance wr a $ \b -> (b :: Balance) {confirmed = b.confirmed + o.value, utxo = b.utxo + 1}
+  deleteTxData wr h
   where
-    new = fromMaybe (MemRef t.timestamp) mbr
-    old = t.block
+    h = txHash td.tx
 
--- | Spenders inherit BIP125 signalling from unconfirmed parents only, so their
--- flag can change when a parent is confirmed or unconfirmed.
-updateSpendersRBF :: Writer -> TxData -> IO ()
-updateSpendersRBF wr td =
-  forM_ (nub' (map (.txid) (I.elems td.spenders))) $ \h ->
-    getActiveTxData wr h >>= mapM_ update
-  where
-    update s = do
-      rbf <- isRBF wr s.block s.tx
-      when (rbf /= s.rbf) $ do
-        let s' = (s :: TxData) {rbf = rbf}
-        insertTx wr s'
-        updateSpendersRBF wr s'
-
--- | Delete the transactions that spend the same outputs as this one, with their
--- descendants. The first flag refuses to delete confirmed transactions, and the
--- second refuses any deletion on networks without replace-by-fee.
-freeOutputs :: Writer -> Bool -> Bool -> Tx -> IO ()
-freeOutputs wr memonly rbfcheck tx =
-  getConflicts wr memonly rbfcheck tx >>= mapM_ (deleteSingleTx wr . txHash)
-
--- | Transactions that spend the same outputs as this one, with their
--- descendants, in an order in which they can be deleted.
-getConflicts ::
-  Writer ->
-  -- | only delete transaction if unconfirmed
-  Bool ->
-  -- | only delete if network has RBF
-  Bool ->
-  Tx ->
-  IO [Tx]
-getConflicts wr memonly rbfcheck tx = do
-  logDebug wr $
-    "Getting conflicts for tx " <> txHashToHex (txHash tx) <> "..."
-  let prevs = prevOuts tx
-  unspents <- mapM (getUnspent wr) prevs
-  let spents = [p | (p, Nothing) <- zip prevs unspents]
-  spndrs <- catMaybes <$> mapM (getSpender wr) spents
-  let txids = H.fromList $ filter (/= txHash tx) $ map (.txid) spndrs
-  chains <- mapM (getChain wr memonly rbfcheck) (H.toList txids)
-  return . reverse . map snd . sortTxs . M.elems $
-    M.fromList [(txHash t, t) | t <- concat chains]
-
--- | Delete a transaction and its descendants, confirmed or not.
-deleteConfirmedTx :: Writer -> TxHash -> IO ()
-deleteConfirmedTx wr = deleteTx wr False False
-
--- | Delete an unconfirmed transaction and its descendants. If the flag is set and
--- the network has no replace-by-fee, throw 'DoubleSpend' instead. Does nothing if
--- the transaction is not found.
-deleteUnconfirmedTx :: Writer -> Bool -> TxHash -> IO ()
-deleteUnconfirmedTx wr rbfcheck th =
-  getActiveTxData wr th >>= \case
-    Just _ -> deleteTx wr True rbfcheck th
-    Nothing ->
-      logDebug wr $
-        "Not found or already deleted: " <> txHashToHex th
-
--- | Delete a transaction and its descendants.
-deleteTx ::
-  Writer ->
-  -- | only delete transaction if unconfirmed
-  Bool ->
-  -- | only delete if network has RBF
-  Bool ->
-  TxHash ->
-  IO ()
-deleteTx wr memonly rbfcheck th = do
-  chain <- getChain wr memonly rbfcheck th
-  logDebug wr $
-    "Deleting "
-      <> cs (show (length chain))
-      <> " txs from chain leading to "
-      <> txHashToHex th
-  mapM_ (\t -> let h = txHash t in deleteSingleTx wr h >> return h) chain
-
--- | A transaction and all its descendants, in an order in which they can be
--- deleted: spenders first.
-getChain ::
-  Writer ->
-  -- | only delete transaction if unconfirmed
-  Bool ->
-  -- | only delete if network has RBF
-  Bool ->
-  TxHash ->
-  IO [Tx]
-getChain wr memonly rbfcheck th' = do
-  logDebug wr $
-    "Getting chain for tx " <> txHashToHex th'
-  sort_clean <$> go M.empty (H.singleton th')
-  where
-    sort_clean = reverse . map snd . sortTxs
-    get_tx th =
-      getActiveTxData wr th >>= \case
-        Nothing -> do
-          logDebug wr $
-            "Transaction not found: " <> txHashToHex th
-          return Nothing
-        Just td
-          | memonly && confirmed td.block -> do
-              logError wr $
-                "Transaction already confirmed: "
-                  <> txHashToHex th
-              throwIO TxConfirmed
-          | rbfcheck ->
-              getNetwork wr >>= \net ->
-                if net.replaceByFee
-                  then return $ Just td
-                  else do
-                    logError wr $
-                      "Double-spending transaction: "
-                        <> txHashToHex th
-                    throwIO DoubleSpend
-          | otherwise -> return $ Just td
-    go txm pdg = do
-      let ths = filter (not . (`M.member` txm)) (H.toList pdg)
-      tds <- catMaybes <$> mapM get_tx ths
-      let txmn = M.fromList $ fmap (\d -> (txHash d.tx, d.tx)) tds
-          spds = concatMap (map (.txid) . I.elems . (.spenders)) tds
-          pdg' = H.fromList spds
-          txm' = txmn <> txm
-      if H.null pdg'
-        then do
-          logDebug wr $
-            "Chain for tx "
-              <> txHashToHex th'
-              <> " contains "
-              <> cs (show (M.size txm'))
-              <> " txs"
-          return $ M.elems txm'
-        else go txm' pdg'
-
--- | Delete a transaction that nothing spends. Throws 'TxSpent' otherwise.
-deleteSingleTx :: Writer -> TxHash -> IO ()
-deleteSingleTx wr th =
-  getActiveTxData wr th >>= \case
-    Nothing -> do
-      logError wr $
-        "Already deleted: " <> txHashToHex th
-      throwIO TxNotFound
-    Just td ->
-      if I.null td.spenders
-        then do
-          logDebug wr $
-            "Deleting tx: " <> txHashToHex th
-          commitDelTx wr td
-        else do
-          logError wr $
-            "Tried to delete spent tx: "
-              <> txHashToHex th
-          throwIO TxSpent
-
--- | Remove a transaction from every index and mark it as deleted.
-commitDelTx :: Writer -> TxData -> IO ()
-commitDelTx wr = commitModTx wr False
-
--- | Add a transaction to every index.
-commitAddTx :: Writer -> TxData -> IO ()
-commitAddTx wr = commitModTx wr True
-
--- | Add a transaction to every index, or remove it if the flag is 'False'.
-commitModTx :: Writer -> Bool -> TxData -> IO ()
-commitModTx wr add tx_data = do
-  net <- getNetwork wr
-  mapM_ mod_addr_tx (txDataAddresses net td)
-  mod_outputs
-  mod_unspent
-  insertTx wr td
-  updateMempool wr td
-  where
-    tx = td.tx
-    br = td.block
-    td = (tx_data :: TxData) {deleted = not add}
-    tx_ref = TxRef br (txHash tx)
-    mod_addr_tx a
-      | add = do
-          insertAddrTx wr a tx_ref
-          modAddressCount wr add a
-      | otherwise = do
-          deleteAddrTx wr a tx_ref
-          modAddressCount wr add a
-    mod_unspent
-      | add = spendOutputs wr tx
-      | otherwise = unspendOutputs wr tx
-    mod_outputs
-      | add = addOutputs wr br tx
-      | otherwise = delOutputs wr br tx
-
--- | Add a transaction to the mempool if it is unconfirmed, or remove it otherwise.
-updateMempool :: Writer -> TxData -> IO ()
-updateMempool wr td@TxData {deleted = True} =
-  deleteFromMempool wr (txHash td.tx)
-updateMempool wr td@TxData {block = MemRef t} =
-  addToMempool wr (txHash td.tx) t
-updateMempool wr td@TxData {block = BlockRef {}} =
-  deleteFromMempool wr (txHash td.tx)
-
--- | Mark the outputs spent by a transaction as spent.
-spendOutputs :: Writer -> Tx -> IO ()
-spendOutputs wr tx =
-  zipWithM_ (spendOutput wr (txHash tx)) [0 ..] (prevOuts tx)
-
--- | Add the outputs of a transaction as unspent.
-addOutputs :: Writer -> BlockRef -> Tx -> IO ()
-addOutputs wr br tx =
-  zipWithM_ (addOutput wr br . OutPoint (txHash tx)) [0 ..] tx.outputs
-
--- | Whether an unconfirmed transaction can be replaced by fee: it signals BIP125
--- in one of its inputs, or it spends an unconfirmed transaction that can be
--- replaced. Always 'False' for confirmed transactions and on networks without
--- replace-by-fee.
-isRBF ::
-  Writer ->
-  BlockRef ->
-  Tx ->
-  IO Bool
-isRBF wr br tx
-  | confirmed br = return False
-  | otherwise =
-      getNetwork wr >>= \net ->
-        if net.replaceByFee
-          then go
-          else return False
-  where
-    go
-      | any ((< 0xffffffff - 1) . (.sequence)) tx.inputs = return True
-      | otherwise = carry_on
-    carry_on =
-      let hs = nub' $ map (.outpoint.hash) tx.inputs
-          ck [] = return False
-          ck (h : hs') =
-            getActiveTxData wr h >>= \case
-              Nothing -> return False
-              Just t
-                | confirmed t.block -> ck hs'
-                | t.rbf -> return True
-                | otherwise -> ck hs'
-       in ck hs
-
--- | Add an unspent output.
-addOutput :: Writer -> BlockRef -> OutPoint -> TxOut -> IO ()
-addOutput wr = modOutput wr True
-
--- | Delete an output.
-delOutput :: Writer -> BlockRef -> OutPoint -> TxOut -> IO ()
-delOutput wr = modOutput wr False
-
--- | Add an unspent output, or delete it if the flag is 'False', updating the indices and balance of its address.
-modOutput ::
-  Writer ->
-  Bool ->
-  BlockRef ->
-  OutPoint ->
-  TxOut ->
-  IO ()
-modOutput wr add br op o = do
-  net <- getNetwork wr
-  let ma = eitherToMaybe (scriptToAddressBS net o.script)
-  mod_unspent ma
-  forM_ ma $ \a -> do
-    mod_addr_unspent a (u ma)
-    modBalance wr (confirmed br) add a o.value
-    modifyReceived wr a v
-  where
-    v
-      | add = (+ o.value)
-      | otherwise = subtract o.value
-    u ma =
-      Unspent
-        { script = o.script,
-          block = br,
-          outpoint = op,
-          value = o.value,
-          address = ma
-        }
-    mod_unspent ma
-      | add = insertUnspent wr (u ma)
-      | otherwise = deleteUnspent wr op
-    mod_addr_unspent
-      | add = insertAddrUnspent wr
-      | otherwise = deleteAddrUnspent wr
-
--- | Delete the outputs of a transaction.
-delOutputs :: Writer -> BlockRef -> Tx -> IO ()
-delOutputs wr br tx =
-  forM_ (zip [0 ..] tx.outputs) $ \(i, o) -> do
-    let op = OutPoint (txHash tx) i
-    delOutput wr br op o
-
--- | Data of a transaction. Throws 'TxNotFound' if it is missing or deleted.
-getImportTxData :: Writer -> TxHash -> IO TxData
-getImportTxData wr th =
-  getActiveTxData wr th >>= \case
-    Nothing -> do
-      logDebug wr $ "Tx not found: " <> txHashToHex th
-      throwIO TxNotFound
-    Just d -> return d
+-------------------------------------------------------------------------------
+-- Transactions
+-------------------------------------------------------------------------------
 
 -- | Output of a transaction at an index, or 'Nothing' if out of range.
 getTxOut :: Word32 -> Tx -> Maybe TxOut
@@ -865,139 +640,17 @@ getTxOut i tx = do
   guard (fromIntegral i < length tx.outputs)
   return $ tx.outputs !! fromIntegral i
 
--- | Record which input spends an output.
-insertSpender :: Writer -> OutPoint -> Spender -> IO ()
-insertSpender wr op s = do
-  td <- getImportTxData wr op.hash
-  let p = td.spenders
-      p' = I.insert (fromIntegral op.index) s p
-      td' = (td :: TxData) {spenders = p'}
-  insertTx wr td'
-
--- | Forget which input spends an output.
-deleteSpender :: Writer -> OutPoint -> IO ()
-deleteSpender wr op = do
-  td <- getImportTxData wr op.hash
-  let p = td.spenders
-      p' = I.delete (fromIntegral op.index) p
-      td' = (td :: TxData) {spenders = p'}
-  insertTx wr td'
-
--- | Spend an unspent output with an input of a transaction.
-spendOutput :: Writer -> TxHash -> Word32 -> OutPoint -> IO ()
-spendOutput wr th ix op = do
-  u <-
-    getUnspent wr op >>= \case
-      Just u -> return u
-      Nothing -> error $ "Could not find UTXO to spend: " <> show op
-  deleteUnspent wr op
-  insertSpender wr op (Spender th ix)
-  let pk = u.script
-  net <- getNetwork wr
-  forM_ (scriptToAddressBS net pk) $ \a -> do
-    decreaseBalance wr (confirmed u.block) a u.value
-    deleteAddrUnspent wr a u
-
--- | Make the outputs spent by a transaction unspent again.
-unspendOutputs :: Writer -> Tx -> IO ()
-unspendOutputs wr = mapM_ (unspendOutput wr) . prevOuts
-
--- | Make an output unspent again.
-unspendOutput :: Writer -> OutPoint -> IO ()
-unspendOutput wr op = do
-  net <- getNetwork wr
-  t <-
-    getActiveTxData wr op.hash >>= \case
-      Nothing -> error $ "Could not find tx data: " <> show op.hash
-      Just t -> return t
-  let o =
-        fromMaybe
-          (error ("Could not find output: " <> show op))
-          (getTxOut op.index t.tx)
-      m = eitherToMaybe (scriptToAddressBS net o.script)
-      u =
-        Unspent
-          { value = o.value,
-            block = t.block,
-            script = o.script,
-            outpoint = op,
-            address = m
-          }
-  deleteSpender wr op
-  insertUnspent wr u
-  forM_ m $ \a -> do
-    insertAddrUnspent wr a u
-    increaseBalance wr (confirmed u.block) a o.value
-
--- | Change the total received by an address.
-modifyReceived :: Writer -> Address -> (Word64 -> Word64) -> IO ()
-modifyReceived wr a f = do
-  b <- getDefaultBalance wr a
-  setBalance wr b {received = f b.received}
-
--- | Remove an output from the confirmed or unconfirmed balance of an address.
-decreaseBalance :: Writer -> Bool -> Address -> Word64 -> IO ()
-decreaseBalance wr conf = modBalance wr conf False
-
--- | Add an output to the confirmed or unconfirmed balance of an address.
-increaseBalance :: Writer -> Bool -> Address -> Word64 -> IO ()
-increaseBalance wr conf = modBalance wr conf True
-
--- | Add or remove an output from the confirmed or unconfirmed balance of an address, and its count of unspent outputs.
-modBalance ::
-  Writer ->
-  -- | confirmed
-  Bool ->
-  -- | add
-  Bool ->
-  Address ->
-  Word64 ->
-  IO ()
-modBalance wr conf add a val = do
-  b <- getDefaultBalance wr a
-  setBalance wr $ (g . f) b
+-- | Addresses that a transaction is indexed under: those of its outputs and
+-- of the outputs that it spends. An output script counts only when it has
+-- an address on the network.
+txDataAddresses :: Writer -> TxData -> [Address]
+txDataAddresses wr t =
+  nub' . rights $
+    map (scriptToAddressBS net . (.script)) (I.elems t.prevs)
+      <> map (scriptToAddressBS net . (.script)) t.tx.outputs
   where
-    g b = (b :: Balance) {utxo = m 1 b.utxo}
-    f b
-      | conf = (b :: Balance) {confirmed = m val b.confirmed}
-      | otherwise = (b :: Balance) {unconfirmed = m val b.unconfirmed}
-    m
-      | add = (+)
-      | otherwise = subtract
-
--- | Increase or decrease the number of transactions of an address.
-modAddressCount :: Writer -> Bool -> Address -> IO ()
-modAddressCount wr add a = do
-  b <- getDefaultBalance wr a
-  setBalance wr b {txs = f b.txs}
-  where
-    f
-      | add = (+ 1)
-      | otherwise = subtract 1
-
--- | Addresses of a list of outputs, without duplicates.
-txOutAddrs :: Network -> [TxOut] -> [Address]
-txOutAddrs net =
-  nub' . rights . map (scriptToAddressBS net . (.script))
-
--- | Addresses of the outputs spent by a transaction, without duplicates.
-txInAddrs :: Network -> [Prev] -> [Address]
-txInAddrs net =
-  nub' . rights . map (scriptToAddressBS net . (.script))
-
--- | Addresses that a transaction is indexed under. An output script counts
--- only when it has an address on the network.
-txDataAddresses :: Network -> TxData -> [Address]
-txDataAddresses net t =
-  nub' $ txInAddrs net prevs <> txOutAddrs net outs
-  where
-    prevs = I.elems t.prevs
-    outs = t.tx.outputs
+    net = writerNet wr :: Network
 
 -- | Outputs spent by a transaction, without the null outpoint of a coinbase.
 prevOuts :: Tx -> [OutPoint]
 prevOuts tx = filter (/= nullOutPoint) (map (.outpoint) tx.inputs)
-
--- | Whether a transaction is in the database and not deleted.
-testPresent :: Writer -> Tx -> IO Bool
-testPresent wr tx = isJust <$> getActiveTxData wr (txHash tx)

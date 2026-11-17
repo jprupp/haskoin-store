@@ -13,7 +13,7 @@
 -- the same answer to the same request. The rules are in
 -- "Haskoin.Store.Fleet" and "Haskoin.Store.Fleet.Pool", Redis carries them
 -- out through "Haskoin.Store.Fleet.Redis", and the reasons are in "A fleet
--- that answers as one" in @docs\/layered-database.md@.
+-- that answers as one" in @docs\/one-fleet.md@.
 --
 -- = What a member does
 --
@@ -41,9 +41,10 @@
 -- * __It keeps the fleet's cache of extended public keys__
 --   ("Haskoin.Store.Fleet.XPub"): it answers the queries about a key from
 --   it when the cache has the key ('answeringCached'), builds the entries
---   that requests missed ('memberCacheLoop'), brings the cache to the new
---   block when it moves the tip, and empties a cache that was left behind
---   ('syncCache').
+--   that requests missed ('memberCacheLoop'), with the lookahead of each
+--   ('Haskoin.Store.Fleet.XPub.lookahead'), and brings the cache to the new
+--   block in the same commit as the pool when it moves the tip
+--   ('moveTip'), a reorganisation undone address by address.
 --
 -- = Why the member does not withdraw what it deletes
 --
@@ -66,6 +67,7 @@ module Haskoin.Store.Fleet.Member
     memberLoop,
     memberAlive,
     memberEvents,
+    noteEpoch,
 
     -- * Answering
     Standing (..),
@@ -79,8 +81,8 @@ module Haskoin.Store.Fleet.Member
     -- * The cache of extended public keys
     CacheMetrics (..),
     memberCacheLoop,
-    wantCached,
-    syncCache,
+    fleetSession,
+    cacheGauges,
 
     -- * The parts of a tick
     report,
@@ -92,20 +94,27 @@ module Haskoin.Store.Fleet.Member
     farthest,
     changeBetween,
     offerMempool,
+    memberReceived,
+    memberPoolBody,
+    memberNewest,
     expirePool,
     poolTx,
   )
 where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
   ( TVar,
     atomically,
+    check,
     modifyTVar',
     newTVarIO,
+    orElse,
     readTVar,
     readTVarIO,
+    registerDelay,
     retry,
-    stateTVar,
     writeTVar,
   )
 import Control.Exception (Exception, handle, throwIO)
@@ -119,7 +128,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as Map
@@ -131,6 +140,7 @@ import Data.Text.Encoding (decodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import Database.Redis qualified as R
+import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
   ( BlockHash,
     BlockHeader (..),
@@ -139,42 +149,50 @@ import Haskoin
     Tx (..),
     TxHash,
     TxIn (..),
+    TxOut (..),
     blockHashToHex,
+    eitherToMaybe,
     headerHash,
     nullOutPoint,
+    scriptToAddressBS,
     txHash,
   )
 import Haskoin.Node (LogLevel (..))
-import Haskoin.Store.Common (Limits (..), Replaced (..), StoreRead (..))
+import Haskoin.Store.Common (Limits (..), Replaced (..), StoreRead (..), loopForever)
 import Haskoin.Store.Data
-  ( Balance (..),
-    BlockData (..),
+  ( BlockData (..),
     BlockRef (..),
+    Prev (..),
     Spender (..),
     TxData (..),
     UnixTime,
     Unspent (..),
-    XPubBal (..),
     XPubSpec,
-    nullBalance,
   )
-import Haskoin.Store.Database.Mempool qualified as M
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered qualified as L
-import Haskoin.Store.Database.Query.Pooled (PoolReads (..), pageStart, pooledRead)
-import Haskoin.Store.Database.Reader (DatabaseReader (..), txCF)
-import Haskoin.Store.Database.Types
-  ( MemAddrKey (..),
-    MemAddrVal (..),
-    MemSummary (..),
-    TxKey (..),
-  )
+import Haskoin.Store.Database.Query.Pooled (From, PoolReads (..), pageStart, pooledRead)
+import Haskoin.Store.Database.Reader (DatabaseReader (..), txCF, withSnapshotReader)
+import Haskoin.Store.Database.Types (MemSummary (..), TxKey (..))
 import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, takeView, withViewAt)
-import Haskoin.Store.Exception (handleAny)
+import Haskoin.Store.Exception (handleAny, tryAny)
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
 import Haskoin.Store.Outage (Outage, attempt, newOutage)
+import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
+import Haskoin.Store.XPub.Indexer
+  ( Indexer,
+    Runner (..),
+    Settings (..),
+    newIndexer,
+    plainRunner,
+    prefetch,
+    requestWithin,
+    runIndexer,
+  )
+import Haskoin.Store.XPub.Lock (Lock (..), defaultLockConfig, redisLock)
+import Haskoin.Store.XPub.Service (Backend (..), Session (..), XPubs (..))
+import System.IO (fixIO)
 import System.Metrics.StatsD
   ( StatCounter,
     StatGauge,
@@ -187,6 +205,7 @@ import System.Metrics.StatsD
     newStatTiming,
     setGauge,
   )
+import System.Random (randomIO)
 import System.Timeout (timeout)
 
 -- | How a store takes part in a fleet.
@@ -206,13 +225,12 @@ data MemberConfig = MemberConfig
     -- for never
     expiry :: !Word64,
     -- | how many extended public keys the fleet's cache of them may hold
-    -- ("Haskoin.Store.Fleet.XPub"), the least recently used going first, or
-    -- 0 not to use the cache
+    -- ("Haskoin.Store.Fleet.XPub"), evicted by GreedyDual: at least 1, as
+    -- the cache cannot be turned off
     cacheMax :: !Int,
-    -- | cache a key that has at least this many used addresses
-    cacheMinAddrs :: !Int,
-    -- | or at least this many transactions in its addresses
-    cacheMinTxs :: !Int,
+    -- | the settings of the indexer of xpubs: its threads, and how long a
+    -- request waits for an xpub ("Haskoin.Store.XPub.Indexer")
+    indexer :: !Settings,
     -- | StatsD client, to report what the cache of extended public keys
     -- does, as t'CacheMetrics' lists
     stats :: !(Maybe Stats),
@@ -223,8 +241,7 @@ data MemberConfig = MemberConfig
   }
 
 -- | StatsD metrics of the fleet's cache of extended public keys, as this
--- store sees it. They have the names of those of "Haskoin.Store.Cache"
--- under @fleet@, so that a dashboard reads both alike.
+-- store sees it, under @fleet.cache@.
 data CacheMetrics = CacheMetrics
   { -- | requests about a key whose balances the cache gave
     -- (@fleet.cache.hits@)
@@ -239,8 +256,8 @@ data CacheMetrics = CacheMetrics
     -- | builds that this store gave up, because the tip moved or another
     -- store wrote the entry (@fleet.cache.abandoned@)
     abandoned :: !StatCounter,
-    -- | entries that this store deleted for being the least recently used
-    -- (@fleet.cache.evictions@)
+    -- | entries that this store evicted, those of the lowest priority by
+    -- GreedyDual (@fleet.cache.evictions@)
     evictions :: !StatCounter,
     -- | times that this store emptied the cache (@fleet.cache.emptied@)
     emptied :: !StatCounter,
@@ -292,7 +309,7 @@ data Member = Member
     offered :: !(TVar (HashSet TxHash)),
     -- | those that it refused, or that there was no time to offer, with
     -- the times at which they entered the mempool: they are offered again
-    waiting :: !(TVar (HashMap TxHash UnixTime)),
+    waiting :: !(TVar (HashMap TxHash (UnixTime, Tx))),
     -- | how many times the mempool was offered, and at which tip last
     rounds :: !(TVar Int),
     offeredAt :: !(TVar (Maybe BlockHash)),
@@ -302,13 +319,14 @@ data Member = Member
     -- member does nothing, so that its lease runs out and a store that is
     -- stuck does not hold the fleet back.
     healthy :: !(TVar Bool),
-    -- | the extended public keys that requests asked about and the cache
-    -- did not have, by their names in Redis: 'memberCacheLoop' builds
-    -- their entries
-    wanted :: !(TVar (HashMap ByteString XPubSpec)),
-    -- | the fleet tip at which the cache was found at another block, at
-    -- the last turn
-    lagging :: !(TVar (Maybe ByteString)),
+    -- | the indexer that builds the entries of the xpubs that requests
+    -- miss, one store of the fleet for each, holding its dibs in Redis
+    indexer :: !(Indexer XPubSpec ()),
+    lock :: !(Lock XPubSpec),
+    -- | how many builds Redis announced, by xpub, for those that wait
+    built :: !(TVar (HashMap ByteString Int)),
+    -- | the door to the cache, for the web server
+    door :: !XPubs,
     -- | how many times the pool had been emptied at this store's last
     -- turn ('noteRestarts')
     restarts :: !(TVar (Maybe Integer)),
@@ -321,8 +339,26 @@ data Member = Member
     gone :: !(TVar (HashSet TxHash)),
     -- | whether the last thing that the member tried with Redis failed,
     -- so that an outage is logged once, by whichever loop meets it
-    outage :: !Outage
+    outage :: !Outage,
+    -- | the epoch of Redis at the last turn ('noteEpoch')
+    epoch :: !(TVar (Maybe ByteString)),
+    -- | how many times this store found that Redis had lost its data: the
+    -- web server fills the pool again each time ('Haskoin.Store.Web')
+    refills :: !(TVar Int),
+    -- | the last tip that Redis was seen to have, and when, by the clock of
+    -- 'getMonotonicTimeNSec': a request that read nothing of the pool
+    -- takes it for the tip for 'seenFor', instead of asking Redis
+    -- ('answeringWith')
+    seen :: !(IORef (ByteString, Word64))
   }
+
+-- | For how long, in nanoseconds, a tip that Redis was seen to have is
+-- taken to be the tip still, by a request that reads nothing of the pool.
+-- Asking Redis is a round trip for every such request, and a request a
+-- few milliseconds earlier would have had that tip anyway. It never mixes
+-- tips: a read of the pool checks the tip in Redis in the same step.
+seenFor :: Word64
+seenFor = 5000000
 
 -- | A member with no views yet, on a connection to the Redis of the fleet.
 newMember :: MemberConfig -> R.Connection -> DatabaseReader -> IO Member
@@ -337,13 +373,30 @@ newMember config redis db = do
   offeredAt <- newTVarIO Nothing
   changed <- newTVarIO True
   healthy <- newTVarIO True
-  wanted <- newTVarIO HashMap.empty
-  lagging <- newTVarIO Nothing
   restarts <- newTVarIO Nothing
   metrics <- mapM newCacheMetrics config.stats
   gone <- newTVarIO HashSet.empty
   outage <- newOutage
-  return Member {keys = fleetKeys config.prefix 32, ..}
+  built <- newTVarIO HashMap.empty
+  epoch <- newTVarIO Nothing
+  refills <- newTVarIO 0
+  seen <- newIORef ("", 0)
+  lock <- redisLock (defaultLockConfig (config.prefix <> "fleet:") config.name) redis xpubId
+  fixIO $ \m -> do
+    let runner = (plainRunner (\_ x () -> buildFor m x)) {ready = isJust <$> readTVarIO m.tip}
+    indexer <- newIndexer config.indexer lock runner
+    let door =
+          XPubs
+            { backend =
+                Backend
+                  { ask = \x w -> requestWithin indexer w x (),
+                    await = awaitBuilt m,
+                    eta = \x -> fmap fst <$> lock.holder x,
+                    delete = \x -> True <$ cacheDrop redis (fleetKeys config.prefix 32) x
+                  },
+              patience = config.indexer.wait
+            }
+    return Member {keys = fleetKeys config.prefix 32, ..}
 
 -- | Take a view of the database for its best block. The block store calls
 -- this right after it imports or reverts a block, and when it starts,
@@ -394,6 +447,7 @@ memberAlive m =
 -- call it: its lease then runs out, and the fleet goes on without it.
 memberTick :: Member -> IO ()
 memberTick m = do
+  noteEpoch m
   report m
   moved <- moveTip m
   -- the tip is read after the report, as the rule of 'F.keep' asks
@@ -401,7 +455,7 @@ memberTick m = do
   atomically (writeTVar m.tip (fromMaybe Nothing tip))
   noteRestarts m
   prune m
-  syncCache m
+  cacheGauges m
   unless moved (expirePool m)
   offerMempool m
   where
@@ -422,6 +476,40 @@ noteRestarts m = do
       writeTVar m.offered HashSet.empty
       writeTVar m.waiting HashMap.empty
       writeTVar m.changed True
+
+-- | Find out whether Redis lost its data since this store's last turn.
+-- Redis keeps an epoch, a random number that the first store to find it
+-- missing sets. A store that finds it missing or changed forgets what it
+-- offered to the pool and its view of the fleet tip, so that it is
+-- unhealthy until a tip is set again, which its next turn does, since
+-- every live store reports. It counts the loss in 'refills', and the web
+-- server then asks the peers, and the node over RPC if it has one, for
+-- their mempools, which fill the pool again through 'memberReceived'.
+-- Entries of the cache of extended public keys are built again on demand.
+--
+-- Without an epoch, a loss would show only in the count of restarts of
+-- the pool going back, which says nothing when it was 0 before.
+noteEpoch :: Member -> IO ()
+noteEpoch m = do
+  mine <- C.pack . show <$> (randomIO :: IO Word64)
+  now <- redis' (R.setnx key mine >> R.get key)
+  lost <- atomically $ do
+    before <- readTVar m.epoch
+    writeTVar m.epoch now
+    let lost = isJust before && before /= now
+    when lost $ do
+      writeTVar m.offered HashSet.empty
+      writeTVar m.offeredAt Nothing
+      writeTVar m.tip Nothing
+      writeTVar m.changed True
+      modifyTVar' m.refills (+ 1)
+    return lost
+  when lost . m.config.note LevelWarn $
+    "Redis lost its data: the pool fills again from the peers, and xpub entries are built again on demand"
+  where
+    key = m.keys.prefix <> "fleet:epoch"
+    redis' :: R.Redis (Either R.Reply a) -> IO a
+    redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
 
 -- | Take a turn as a member every two seconds, and at once when an action
 -- that waits for the next best block returns, for as long as the store's
@@ -478,10 +566,18 @@ report m = do
     main h = maybe False (.main) <$> Q.getBlock m.db h
 
 -- | Move the fleet tip to the block that the live stores agree on, if it is
--- another one, with what the blocks in between did to the pool. Says
--- whether it moved. When this store cannot say what they did, the pool is
--- emptied: Redis allows that to a store that is alone, and to any store
--- when the way is too long for all of them (v'TooFar').
+-- another one, with what the blocks in between did to the pool and to the
+-- cache of extended public keys, in one commit. Says whether it moved.
+--
+-- The move begins under a token ('cacheBegin'), which has builds wait;
+-- what the blocks did at the addresses that entries have, a reorganisation
+-- undone address by address, is written in pieces ('tipMoves',
+-- 'cachePieces'); then 'fleetCommit' moves the pool, the tip and the cache
+-- together. A move that is refused is aborted, and the entries that it
+-- wrote are dropped ('cacheAbort'). When this store cannot say what the
+-- blocks did, the pool is emptied, and the cache with it: Redis allows that
+-- to a store that is alone, and to any store when the way is too long for
+-- all of them (v'TooFar').
 moveTip :: Member -> IO Bool
 moveTip m = do
   seen <- fleetTip m.redis m.keys
@@ -497,23 +593,51 @@ moveTip m = do
       fleet = F.Fleet {tip = seen, reports}
   case F.agreed now fleet of
     Just target | Just target /= seen -> do
+      token <- C.pack . show <$> (randomIO :: IO Word64)
+      cacheBegin m.redis m.keys token (fromMaybe "" seen) >>= \case
+        Moving -> do
+          m.config.note LevelDebug "Fleet tip not moved: another store is moving it"
+          return False
+        BeginRaced -> return False
+        Begun -> moveWith seen token target
+    agreed -> do
+      when (isNothing agreed) . m.config.note LevelDebug $
+        "The live stores have no block in common: " <> shown (Map.size reports) <> " reports"
+      return False
+  where
+    -- the move under a token of the cache: what the blocks did at the
+    -- addresses of the entries is written in pieces, and the commit moves
+    -- the pool, the tip and the cache together
+    moveWith seen token target = do
       way <- case (traverse decode seen, decode target) of
-        (Right from, Right to) -> wayBetween m.db from to
+        (Right from, Right to) -> wayBetween m.views m.db from to
         _ -> return NoWay
       let between = case way of
             Way b -> Just b
             _ -> Nothing
           path = maybe [] (map encode . (.path)) between
-      moved <- case way of
-        TooFar -> do
-          m.config.note LevelWarn $
-            "The fleet tip is more than "
-              <> shown farthest
-              <> " blocks from "
-              <> blockName target
-              <> ": starting the shared mempool again there"
-          fleetRestart m.redis m.keys 32 Nothing seen target
-        _ -> fleetAdvance m.redis m.keys 32 Nothing seen target ((.pool) <$> between) path
+      -- what the blocks did at the addresses of the entries, read at the
+      -- new tip: without a view of it, this store does not move the tip
+      written <- case (way, decode target) of
+        (Way b, Right to) ->
+          withViewAt m.views to (\r -> tipMoves m.redis m.keys r b.abandoned b.added) >>= \case
+            Just moves -> cachePieces m.redis m.keys token (fromMaybe "" seen) moves
+            Nothing -> return False
+        (Way _, _) -> return False
+        _ -> return True
+      moved <-
+        if not written
+          then return Raced
+          else case way of
+            TooFar -> do
+              m.config.note LevelWarn $
+                "The fleet tip is more than "
+                  <> shown farthest
+                  <> " blocks from "
+                  <> blockName target
+                  <> ": starting the shared mempool again there"
+              fleetRestart m.redis m.keys 32 Nothing seen target
+            _ -> fleetCommit m.redis m.keys 32 Nothing seen target ((.pool) <$> between) path token
       m.config.note LevelDebug . mconcat $
         [ "Fleet tip from ",
           maybe "none" blockName seen,
@@ -529,13 +653,13 @@ moveTip m = do
             TooFar -> " (the way is too long)"
         ]
       case moved of
-        MovedTo _ -> advanceCache m seen target between >> return True
-        _ -> return False
-    agreed -> do
-      when (isNothing agreed) . m.config.note LevelDebug $
-        "The live stores have no block in common: " <> shown (Map.size reports) <> " reports"
-      return False
-  where
+        MovedTo _ -> do
+          let restarted = case way of
+                Way _ -> False
+                _ -> True
+          when restarted $ wasEmptied m target "the shared mempool started again"
+          return True
+        _ -> False <$ cacheAbort m.redis m.keys token
     redis' :: R.Redis (Either R.Reply a) -> IO a
     redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
     chunks bytes
@@ -560,8 +684,8 @@ farthest = 50
 -- 'Nothing' if the database does not have one of the tips, if the second
 -- is not on its main chain, or if the way is longer than 'farthest'
 -- blocks on either side.
-changeBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe PoolChange)
-changeBetween db from to = fmap (.pool) <$> blocksBetween db from to
+changeBetween :: Views BlockHash -> DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe PoolChange)
+changeBetween views db from to = fmap (.pool) <$> blocksBetween views db from to
 
 -- | What the blocks between two tips did.
 data Between = Between
@@ -572,17 +696,20 @@ data Between = Between
     added :: ![TxData],
     -- | whether blocks of the way to the first tip were abandoned
     reorganised :: !Bool,
+    -- | the transactions of those abandoned blocks, in their order, as the
+    -- view of the database at the first tip has them
+    abandoned :: ![TxData],
     -- | those blocks of the main chain, oldest first, the second tip last:
     -- what the fleet tells its clients that the tip moved through
     path :: ![BlockHash]
   }
 
--- | 'changeBetween', with the transactions that the new blocks confirm,
--- which is what the cache of extended public keys is brought to the new
--- tip with ('advanceCache').
-blocksBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe Between)
-blocksBetween db from to =
-  wayBetween db from to <&> \case
+-- | 'changeBetween', with the transactions that the new blocks confirm and
+-- those of the abandoned blocks, which is what the cache of extended public
+-- keys is brought to the new tip with ('moveTip').
+blocksBetween :: Views BlockHash -> DatabaseReader -> Maybe BlockHash -> BlockHash -> IO (Maybe Between)
+blocksBetween views db from to =
+  wayBetween views db from to <&> \case
     Way between -> Just between
     _ -> Nothing
 
@@ -601,10 +728,17 @@ data Way
 -- store does not know. The fleet treats them differently: a tip that no
 -- store will ever say the way from has to be left behind
 -- ('fleetRestart'), and one that another store may know has to wait.
-wayBetween :: DatabaseReader -> Maybe BlockHash -> BlockHash -> IO Way
-wayBetween db from to = L.withView db $ \view -> do
-  let r = L.viewReader view
-      -- the blocks from one that is not on the main chain back to it
+--
+-- The transactions of the blocks that a reorganisation abandoned are no
+-- longer in the database: reverting a block takes them out
+-- ("Haskoin.Store.Logic"). They are read from the store's view of the
+-- database at the first tip, which it keeps ('noteBest'). Without that
+-- view the store cannot say what they held, and the way is v'NoWay': it
+-- does not move the tip, which keeps the cache of extended public keys
+-- whole, since a reorganisation never empties it. Another store may know.
+wayBetween :: Views BlockHash -> DatabaseReader -> Maybe BlockHash -> BlockHash -> IO Way
+wayBetween views db from to = withSnapshotReader db $ \r -> do
+  let -- the blocks from one that is not on the main chain back to it
       back :: Int -> BlockHash -> IO (Either Way ([BlockData], BlockData))
       back n h
         | n > farthest = return (Left TooFar)
@@ -634,68 +768,92 @@ wayBetween db from to = L.withView db $ \view -> do
       | bd.main ->
           down 0 fork bd >>= \case
             Left none -> return none
-            Right added -> do
-              old <- concat <$> mapM (bodies view) (reverse abandoned)
-              new <- concat <$> mapM (confirmedBy r) (reverse added)
-              -- those of the abandoned blocks that this store has as
-              -- replaced: every store had them confirmed, and says the same
-              let named h rep = encode h <> encode rep.by <> runPut (putWord32be rep.height)
-              lostOnes <- fmap catMaybes . forM [h | (h, Nothing) <- old] $ \h ->
-                fmap (named h) <$> Q.getReplaced r h
-              let pool =
-                    PoolChange
-                      { returned = [poolTx r.net td | (_, Just td) <- old, not (coinbase td)],
-                        gone = [encode h | (h, found) <- old, maybe True coinbase found],
-                        confirmed = map (encode . txHash . (.tx)) new,
-                        -- with what spends each output and where, for what
-                        -- the blocks replaced
-                        spent =
-                          [ encode i.outpoint <> encode (txHash td.tx) <> runPut (putWord32be h)
-                          | td <- new,
-                            BlockRef {height = h} <- [td.block],
-                            i <- td.tx.inputs,
-                            i.outpoint /= nullOutPoint
-                          ],
-                        height = Just bd.height,
-                        lost = lostOnes
-                      }
-              let path = map (headerHash . (.header)) (reverse added)
-              return (Way Between {pool, added = new, reorganised = not (null abandoned), path})
+            Right added -> maybe (return NoWay) (wayWith r bd abandoned added) =<< abandonedBodies (reverse abandoned)
     _ -> return NoWay
   where
-    -- the transactions of an abandoned block, each with what the store has
-    -- of it now, if it still has it and did not delete it
-    bodies view bd = do
-      found <- L.getManyTxData view bd.txs
-      return [(h, found' >>= live) | (h, found') <- zip bd.txs found]
+    wayWith r bd abandoned added old = do
+      new <- concat <$> mapM (confirmedBy r) (reverse added)
+      -- what the abandoned blocks give back enters the pool now, not at
+      -- the time of its block, which the pool would expire at once
+      now <- round <$> getPOSIXTime
+      -- those of the abandoned blocks that this store has as
+      -- replaced: every store had them confirmed, and says the same
+      let named h rep = encode h <> encode rep.by <> runPut (putWord32be rep.height)
+      lostOnes <- fmap catMaybes . forM [h | (h, Nothing) <- old] $ \h ->
+        fmap (named h) <$> Q.getReplaced r h
+      let pool =
+            PoolChange
+              { returned = [poolTx r.net (td :: TxData) {block = MemRef now} | (_, Just td) <- old, not (coinbase td)],
+                gone = [encode h | (h, found) <- old, maybe True coinbase found],
+                confirmed = map (encode . txHash . (.tx)) new,
+                -- with what spends each output and where, for what
+                -- the blocks replaced
+                spent =
+                  [ encode i.outpoint <> encode (txHash td.tx) <> runPut (putWord32be h)
+                  | td <- new,
+                    BlockRef {height = h} <- [td.block],
+                    i <- td.tx.inputs,
+                    i.outpoint /= nullOutPoint
+                  ],
+                height = Just bd.height,
+                lost = lostOnes
+              }
+      let path = map (headerHash . (.header)) (reverse added)
+      let held = [td | (_, Just td) <- old]
+      return (Way Between {pool, added = new, reorganised = not (null abandoned), abandoned = held, path})
+    -- the transactions of the abandoned blocks, each with what the view at
+    -- the first tip has of it; 'Nothing' without that view
+    abandonedBodies [] = return (Just [])
+    abandonedBodies bds = do
+      let hs = concatMap (.txs) bds
+      case from of
+        Nothing -> return Nothing
+        Just tip -> withViewAt views tip (\old -> zip hs . map (>>= live) <$> bodiesIn old hs)
+    bodiesIn old hs = Q.retrieveManyCF old (txCF old.db) (map TxKey hs)
     live td = if td.deleted then Nothing else Just td
     confirmedBy :: DatabaseReader -> BlockData -> IO [TxData]
-    confirmedBy r bd = catMaybes <$> Q.retrieveManyCF r.db (txCF r.db) (map TxKey bd.txs)
+    confirmedBy r bd = catMaybes <$> Q.retrieveManyCF r (txCF r.db) (map TxKey bd.txs)
     coinbase td = any ((== nullOutPoint) . (.outpoint)) td.tx.inputs
 
--- | A transaction as the pool keeps it: its body without spenders, and
--- what it does at each address, as "Haskoin.Store.Database.Mempool" works
--- them out for the store's own mempool area.
+-- | A transaction as the pool keeps it: its body without spenders, at the
+-- time that it entered the pool, and what it does at each address: the
+-- transaction touches it, spends an output of it, or pays to it. It is a
+-- function of the transaction and that time alone.
 poolTx :: Network -> TxData -> PoolTx
 poolTx net td =
   PoolTx
-    { txid = encode records.txid,
+    { txid = encode h,
       time,
-      inputs = [encode op | (op, _) <- records.spends],
-      body = encode records.body,
+      inputs = [encode op | op <- spent],
+      body = encode (td :: TxData) {block = MemRef time, deleted = False, spenders = IntMap.empty},
       signals = net.replaceByFee && any ((< 0xffffffff - 1) . (.sequence)) td.tx.inputs,
-      entries = mapMaybe entry records.addresses
+      entries =
+        [PoolTouches (encode a) | a <- touched]
+          <> [ PoolSpends (encode a) (encode i.outpoint) p.value
+             | (k, i) <- zip [0 :: Int ..] td.tx.inputs,
+               i.outpoint /= nullOutPoint,
+               Just p <- [IntMap.lookup k td.prevs],
+               Just a <- [address p.script]
+             ]
+          <> [ PoolPays (encode a) (encode (OutPoint h i)) o.value o.script
+             | (i, o) <- zip [0 ..] td.tx.outputs,
+               Just a <- [address o.script]
+             ]
     }
   where
+    h = txHash td.tx
+    -- never 0, which in an entry is the chain's layer
+    -- ("Haskoin.Store.Fleet.XPub".'score'); what a reorganisation gives
+    -- back comes with the time it is given back ('wayBetween')
     time = case td.block of
-      MemRef t -> t
-      BlockRef {} -> 0
-    records = M.mempoolRecords net time td
-    entry = \case
-      (MemAddrTxKey a _ _, _) -> Just (PoolTouches (encode a))
-      (MemAddrSpentKey a p, MemAddrSpentVal v) -> Just (PoolSpends (encode a) (encode p) v)
-      (MemAddrOutKey a _ p, MemAddrOutVal v s) -> Just (PoolPays (encode a) (encode p) v s)
-      _ -> Nothing
+      MemRef t -> max 1 t
+      BlockRef {} -> max 1 td.timestamp
+    spent = [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint]
+    address = eitherToMaybe . scriptToAddressBS net
+    touched =
+      nub $
+        mapMaybe (address . (.script)) (IntMap.elems td.prevs)
+          <> mapMaybe (address . (.script)) td.tx.outputs
 
 -- | Offer to the pool the transactions of the store's mempool that it does
 -- not have, oldest first, so that each comes after those that it spends
@@ -727,81 +885,92 @@ offerMempool m =
   readTVarIO m.tip >>= \case
     Nothing -> return ()
     Just tip -> void . withViewAt m.views tip $ \at -> do
-      before <- readTVarIO m.offeredAt
-      (n, dirty) <- atomically $ do
-        writeTVar m.offeredAt (Just tip)
-        (,) <$> stateTVar m.rounds (\k -> (k, k + 1)) <*> stateTVar m.changed (,False)
-      todo <- if dirty || before /= Just tip || n `mod` wholeEvery == 0 then everything else newest
-      let (now, later) = splitAt mostOffers (sortOn fst todo)
-      atomically (modifyTVar' m.waiting (HashMap.union (HashMap.fromList [(h, time) | (time, h) <- later])))
-      go at tip now
-  where
-    -- all of the mempool that the pool does not have, forgetting what has
-    -- left the mempool
-    everything = do
-      mempool <- Q.getMempool m.db
-      have <- readTVarIO m.offered
-      let kept = HashSet.intersection have (HashSet.fromList (map snd mempool))
-      atomically (writeTVar m.offered kept >> writeTVar m.waiting HashMap.empty)
-      return [(time, h) | (time, h) <- mempool, not (HashSet.member h kept)]
-    -- the newest of the mempool that this member has not seen, and what is
-    -- waiting
-    newest = do
-      have <- readTVarIO m.offered
       held <- readTVarIO m.waiting
-      let known h = HashSet.member h have || HashMap.member h held
-          scan offset = do
-            page <- Q.getMempoolPage m.db Limits {limit = pageSize, offset, start = Nothing}
-            let fresh = filter (not . known . snd) page
-            if null fresh || length page < fromIntegral pageSize
-              then return fresh
-              else (fresh <>) <$> scan (offset + pageSize)
-      found <- scan 0
-      return (found <> [(time, h) | (h, time) <- HashMap.toList held])
-    pageSize = 256
-    go _ _ [] = return ()
-    go at tip ((time, h) : rest) =
-      M.getMempoolTx m.db h >>= \case
-        Nothing -> forget h >> go at tip rest
+      let todo = take mostOffers (sortOn (fst . snd) (HashMap.toList held))
+          pool = redisPool m.redis m.keys (encode tip) (return ())
+      go at pool tip todo
+  where
+    go _ _ _ [] = return ()
+    go at pool tip ((h, (time, tx)) : rest) =
+      txDataAt at pool time tx >>= \case
+        -- an input that neither the tip nor the pool has: an orphan for now
+        Nothing -> go at pool tip rest
         Just td -> do
-          let tx = poolTx m.db.net td
-          unspent <- forM [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
+          unspent <- forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
             isJust <$> Q.getUnspent at p
-          let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) tx unspent
+          let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) (poolTx m.db.net td) unspent
               done = atomically $ do
                 modifyTVar' m.offered (HashSet.insert h)
                 modifyTVar' m.waiting (HashMap.delete h)
-              wait = atomically (modifyTVar' m.waiting (HashMap.insert h time))
           offer [] >>= \case
-            Taken -> done >> go at tip rest
-            Known -> done >> go at tip rest
-            Orphan _ -> wait >> go at tip rest
-            -- the tip moved: the next round reads the whole mempool
+            Taken -> done >> go at pool tip rest
+            Known -> done >> go at pool tip rest
+            Orphan _ -> go at pool tip rest
             Late -> return ()
-            Conflict rivals -> do
-              mine <- mapM deletedHere rivals
-              if and mine
-                then
-                  offer rivals >>= \case
-                    Taken -> done
-                    _ -> wait
-                else wait
-              go at tip rest
-    forget h = atomically (modifyTVar' m.waiting (HashMap.delete h))
-    deletedHere rival = case decode rival of
-      Left _ -> return False
-      -- it deleted it, and has not taken it back since. A store that was
-      -- started again does not remember, and leaves the conflict as it
-      -- is: the first of the two stays in the pool.
-      Right h -> do
-        deleted <- HashSet.member h <$> readTVarIO m.gone
-        back <- isJust <$> M.getMempoolTx m.db h
-        return (deleted && not back)
+            -- a peer relayed it, so its node took it in place of what it
+            -- conflicts with: it replaces them in the pool too
+            Conflict rivals -> offer rivals >> done >> go at pool tip rest
 
--- | How many rounds of offers go by between two that read the whole
--- mempool: five minutes of them.
-wholeEvery :: Int
-wholeEvery = 150
+-- | A transaction that the store heard from a peer, to offer to the pool at
+-- the next turn, with the time at which it was heard. There is no mempool
+-- of the store's own: the pool in Redis is the mempool.
+memberReceived :: Member -> UnixTime -> Tx -> IO ()
+memberReceived m time tx = atomically $ do
+  have <- HashSet.member (txHash tx) <$> readTVar m.offered
+  unless have $ modifyTVar' m.waiting (HashMap.insertWith (\_ old -> old) (txHash tx) (time, tx))
+
+-- | The body of a transaction of the pool, for the filters of @/events@.
+memberPoolBody :: Member -> TxHash -> IO (Maybe TxData)
+memberPoolBody m h =
+  readTVarIO m.tip >>= \case
+    Nothing -> return Nothing
+    Just tip ->
+      (redisPool m.redis m.keys (encode tip) (return ())).bodies [h] <&> \case
+        [(td, _)] -> td
+        _ -> Nothing
+
+-- | The time at which the newest transaction of the pool entered it, if the
+-- pool has any and the member can read it at the tip that it knows: what
+-- tells the health check that transactions still come in.
+memberNewest :: Member -> IO (Maybe UnixTime)
+memberNewest m =
+  readTVarIO m.tip >>= \case
+    Nothing -> return Nothing
+    Just tip ->
+      handleAny (\_ -> return Nothing) $
+        (redisPool m.redis m.keys (encode tip) (return ())).page 0 1 <&> \case
+          (t, _) : _ -> Just t
+          [] -> Nothing
+
+-- | A transaction with the outputs that it spends, from the view at the tip
+-- or from the pool; 'Nothing' if one of them is in neither.
+txDataAt :: DatabaseReader -> PoolReads -> UnixTime -> Tx -> IO (Maybe TxData)
+txDataAt at pool time tx = do
+  prevs <- forM (zip [0 :: Int ..] tx.inputs) $ \(n, i) ->
+    if i.outpoint == nullOutPoint
+      then return (Just Nothing)
+      else
+        Q.getUnspent at i.outpoint >>= \case
+          Just u -> return (Just (Just (n, Prev u.script u.value)))
+          Nothing ->
+            pool.bodies [i.outpoint.hash] >>= \case
+              [(Just parent, _)]
+                | fromIntegral i.outpoint.index < length parent.tx.outputs ->
+                    let o = parent.tx.outputs !! fromIntegral i.outpoint.index
+                     in return (Just (Just (n, Prev o.script o.value)))
+              _ -> return Nothing
+  return $ do
+    ps <- sequence prevs
+    return
+      TxData
+        { block = MemRef time,
+          tx,
+          prevs = IntMap.fromList (catMaybes ps),
+          deleted = False,
+          rbf = False,
+          timestamp = time,
+          spenders = IntMap.empty
+        }
 
 -- | The most transactions that one round offers. An offer takes a tenth of
 -- a millisecond or two, so this is well under the two seconds of a round.
@@ -860,7 +1029,8 @@ memberTip m = fleetTip m.redis m.keys
 -- asking. Every read of the pool checks it and throws v'TipMoved' if the tip
 -- is another one. The action is also given a check to run when it has what
 -- it needs: it asks Redis for the tip if no read of the pool has done so,
--- and throws the same. An answer that passed either is one that every
+-- and no request saw that tip in Redis in the last 'seenFor', and throws
+-- the same. An answer that passed either is one that every
 -- store of the fleet gave at that moment.
 answeringAt :: Member -> ByteString -> (DatabaseReader -> PoolReads -> IO () -> IO a) -> IO (Maybe a)
 answeringAt m tip action = answeringWith m tip (\r pool _ confirm -> action r pool confirm)
@@ -873,13 +1043,19 @@ answeringWith m tip action = case decode tip of
   Left _ -> return Nothing
   Right block -> withViewAt m.views block $ \r -> do
     checked <- newIORef False
-    let confirm =
+    let saw = getMonotonicTimeNSec >>= \t -> writeIORef m.seen (tip, t)
+        confirm =
           readIORef checked >>= \case
             True -> return ()
             False -> do
-              now <- memberTip m
-              if now == Just tip then writeIORef checked True else throwIO TipMoved
-        found = writeIORef checked True
+              (last', at) <- readIORef m.seen
+              t <- getMonotonicTimeNSec
+              if last' == tip && t - at < seenFor
+                then writeIORef checked True
+                else do
+                  now <- memberTip m
+                  if now == Just tip then saw >> writeIORef checked True else throwIO TipMoved
+        found = saw >> writeIORef checked True
     action r (redisPool m.redis m.keys tip found) found confirm
 
 -- | 'answeringAt' with the queries ready: those of
@@ -887,176 +1063,143 @@ answeringWith m tip action = case decode tip of
 -- the same with the cache of extended public keys in front
 -- ('cachedRead'), which is what requests are answered with unless they
 -- ask not to be.
-answeringCached :: Member -> ByteString -> (StoreRead -> StoreRead -> IO () -> IO a) -> IO (Maybe a)
+answeringCached :: Member -> ByteString -> (StoreRead -> Session -> IO () -> IO a) -> IO (Maybe a)
 answeringCached m tip action = answeringWith m tip $ \r pool found confirm -> do
-  cached <- cachedRead m tip r pool found
-  action (pooledRead r pool) cached confirm
+  sess <- fleetSession m tip r pool found
+  action (pooledRead r pool) sess confirm
 
 -------------------------------------------------------------------------------
 -- The cache of extended public keys
 -------------------------------------------------------------------------------
 
--- | The queries of a request with the fleet's cache of extended public
--- keys in front of those about them: given the tip that the request
--- answers from, the view at that block, the pool, and what to run after a
--- read that found the tip where it should be.
---
--- The balances of a key come from the cache if it has the key with the
--- addresses that it has now. The other three queries about a key are given
--- its balances by the caller, and are answered from the cache when this
--- same request got them there: the cache is then asked for an entry with
--- as many addresses, so that an entry that changed in between is not
--- used. Whatever the cache does not answer the database does, and a key
--- that it did not have is put down to be built ('wantCached'). A read that
--- finds the tip moved throws v'TipMoved', like those of the pool.
-cachedRead :: Member -> ByteString -> DatabaseReader -> PoolReads -> IO () -> IO StoreRead
-cachedRead m tip r pool found
-  | m.config.cacheMax <= 0 = return base
-  | otherwise = do
-      seen <- newIORef HashMap.empty
-      let hit :: Cached a -> IO (Maybe a)
-          hit = \case
-            Hit x -> Just x <$ found
-            Miss -> return Nothing
-            Moved -> throwIO TipMoved
-          entryOf x = HashMap.lookup (xpubId x) <$> readIORef seen
-          -- from the cache if this request has the entry of the key, and
-          -- from where the page starts if it has a start
-          paged :: XPubSpec -> Limits -> IO [a] -> (Entry -> L.From -> IO (Cached [a])) -> IO [a]
-          paged x limits direct cached =
-            entryOf x >>= \case
-              Nothing -> direct
-              Just e ->
-                pageStart r pool limits.start >>= \case
-                  Nothing -> return []
-                  Just from -> cached e from >>= hit >>= maybe direct return
-      return
-        base
-          { xPubBals = \x -> do
-              now <- milliseconds
-              cachedEntry m.redis m.keys tip r.initGap r.maxGap now x >>= hit >>= \case
-                Just e -> do
-                  tally m (.hits) 1
-                  e.balances <$ modifyIORef' seen (HashMap.insert (xpubId x) e)
-                Nothing -> do
-                  tally m (.misses) 1
-                  bals <- base.xPubBals x
-                  wantCached m x bals
-                  return bals,
-            xPubTxs = \x bals limits ->
-              paged x limits (base.xPubTxs x bals limits) $ \e from ->
-                cachedTxs m.redis m.keys tip x e.sizes from limits,
-            xPubUnspents = \x bals limits ->
-              paged x limits (base.xPubUnspents x bals limits) $ \e from ->
-                cachedUnspents m.redis m.keys tip x e from limits,
-            xPubTxCount = \x bals ->
-              entryOf x >>= \case
-                Nothing -> base.xPubTxCount x bals
-                Just e ->
-                  cachedCount m.redis m.keys tip x e.sizes >>= hit >>= maybe (base.xPubTxCount x bals) return
-          }
-  where
-    base = pooledRead r pool
+-- | The reads of the fleet's cache of xpubs for one request, at the tip
+-- that it answers from, with its view and the pool: the balances of a key
+-- if the cache has it with the addresses that it has now, and its other
+-- lists from the entry with as many addresses. A read that finds the tip
+-- moved throws v'TipMoved'; a miss is 'Nothing', and the door asks.
+fleetSession :: Member -> ByteString -> DatabaseReader -> PoolReads -> IO () -> IO Session
+fleetSession m tip r pool found = do
+  seen <- newIORef HashMap.empty
+  let hit :: Cached a -> IO (Maybe a)
+      hit = \case
+        Hit x -> Just x <$ found
+        Miss -> return Nothing
+        Moved -> throwIO TipMoved
+      entryOf x = HashMap.lookup (xpubId x) <$> readIORef seen
+      -- a list of the version of the entry that the request read, or the
+      -- request is answered again
+      same :: Entry -> Maybe (ByteString, b) -> IO (Maybe b)
+      same e = \case
+        Just (v, a) | v == e.version -> return (Just a)
+        Just _ -> throwIO EntryMoved
+        Nothing -> return Nothing
+      paged :: XPubSpec -> Limits -> (Entry -> From -> IO (Cached (ByteString, [a]))) -> IO (Maybe [a])
+      paged x limits cached =
+        entryOf x >>= \case
+          Nothing -> throwIO EntryMoved
+          Just e ->
+            pageStart r pool limits.start >>= \case
+              Nothing -> return (Just [])
+              Just from -> cached e from >>= hit >>= same e
+  return
+    Session
+      { reads =
+          XPubReads
+            { balances = \x ->
+                cachedEntry m.redis m.keys tip r.initGap r.maxGap True x >>= hit >>= \case
+                  Just e -> do
+                    -- read again, as after a miss: of the version read first
+                    entryOf x >>= mapM_ (\old -> when (old.version /= e.version) (throwIO EntryMoved))
+                    tally m (.hits) 1
+                    -- payments used up most of the lookahead: the indexer
+                    -- extends it, and the entry answers meanwhile
+                    when e.short (void (prefetch m.indexer x ()))
+                    Just e.balances <$ modifyIORef' seen (HashMap.insert (xpubId x) e)
+                  Nothing -> Nothing <$ tally m (.misses) 1,
+              transactions = \x limits ->
+                paged x limits $ \e from -> cachedTxs m.redis m.keys tip x e.sizes from limits,
+              unspents = \x _ limits -> paged x limits $ \e from -> cachedUnspents m.redis m.keys tip x e from limits,
+              count = \x ->
+                entryOf x >>= \case
+                  Nothing -> throwIO EntryMoved
+                  Just e -> cachedCount m.redis m.keys tip x e.sizes >>= hit >>= same e,
+              bodies = return . map (const Nothing),
+              wallet = return
+            },
+        settle = return ()
+      }
 
--- | The time in milliseconds, by which the cache orders the keys by use.
+-- | The time in milliseconds, by which a build is timed.
 milliseconds :: IO Word64
 milliseconds = round . (* 1000) <$> getPOSIXTime
 
--- | Put an extended public key down to be cached, given its balances, if
--- it is worth it: a key with few addresses and few transactions is read
--- from the database as fast as from Redis. The thresholds are those of the
--- configuration, and count as "Haskoin.Store.Cache" counts them.
-wantCached :: Member -> XPubSpec -> [XPubBal] -> IO ()
-wantCached m x bals =
-  when (m.config.cacheMax > 0 && (length used >= m.config.cacheMinAddrs || txs >= m.config.cacheMinTxs)) $
-    atomically . modifyTVar' m.wanted $ \w ->
-      if HashMap.size w < 1000 then HashMap.insert (xpubId x) x w else w
-  where
-    used = filter (not . nullBalance . (.balance)) bals
-    txs = fromIntegral (sum (map (.balance.txs) used)) :: Int
-
--- | Build the entries of the keys that requests asked about and the cache
--- did not have, one at a time, for as long as the store runs. A build that
--- fails is told to a function. The least recently used entries are deleted
--- when there are more than the configuration allows.
---
--- This is apart from the turns of the member because an entry of a wallet
--- with a long history takes seconds to read from the database, and a
--- member that does not report for that long loses its lease.
+-- | Run the indexer of the fleet's cache of xpubs, and hear the builds that
+-- Redis announces, for as long as the store runs. The indexer is apart from
+-- the turns of the member because an entry of a wallet with a long history
+-- takes seconds to read, and a member that does not report for that long
+-- loses its lease.
 memberCacheLoop :: Member -> IO a
-memberCacheLoop m = go
+memberCacheLoop m = withAsync hear $ \a -> link a >> runIndexer m.indexer >> loopForever (return ())
   where
-    go = do
-      spec <- atomically $ do
-        w <- readTVar m.wanted
-        case HashMap.toList w of
-          [] -> retry
-          (k, x) : _ -> x <$ writeTVar m.wanted (HashMap.delete k w)
-      void (attempt m.outage m.config.note "cache an xpub for the fleet" (build spec))
-      go
-    build spec =
-      readTVarIO m.tip >>= \case
-        Nothing -> return ()
-        Just block -> do
-          now <- milliseconds
-          let tip = encode block
-              name = decodeUtf8 (xpubId spec)
+    hear = loopForever $ do
+      ctl <- R.newPubSubController [(m.config.prefix <> "fleet:built", heard)] []
+      _ <- tryAny (R.pubSubForever m.redis ctl (return ()))
+      atomically (modifyTVar' m.built (HashMap.map (+ 1)))
+    heard i = atomically (modifyTVar' m.built (HashMap.insertWith (+) i 1))
+
+-- | Wait at most so many microseconds for Redis to announce a build of the
+-- entry of a key; whether it did.
+awaitBuilt :: Member -> XPubSpec -> Int -> IO Bool
+awaitBuilt m x us = do
+  n0 <- HashMap.lookupDefault 0 (xpubId x) <$> readTVarIO m.built
+  timer <- registerDelay (max 1 us)
+  atomically $
+    (HashMap.lookupDefault 0 (xpubId x) <$> readTVar m.built >>= check . (> n0) >> return True)
+      `orElse` (readTVar timer >>= check >> return False)
+
+-- | Build the entry of a key at the fleet tip, the job of the indexer, and
+-- announce it; then evict past the size of the cache.
+--
+-- A build waits while a move of the tip is under way, a few milliseconds
+-- at a time, and is then made at the new tip, which it reads from Redis:
+-- the member's own may be a turn old.
+buildFor :: Member -> XPubSpec -> IO ()
+buildFor m spec = do
+  now <- milliseconds
+  building (200 :: Int) >>= \case
+    Nothing -> return ()
+    Just built -> do
+      let name = decodeUtf8 (xpubId spec)
+      took <- subtract now <$> milliseconds
+      _ <- R.runRedis m.redis (R.publish (m.config.prefix <> "fleet:built") (xpubId spec))
+      case built of
+        Just (Built n) | n > 0 -> do
+          tally m (.builds) 1
+          forM_ m.metrics (\x -> addTiming x.buildTime (fromIntegral took))
+          m.config.note LevelDebug $
+            "Cached xpub " <> name <> ": " <> shown n <> " addresses added in " <> shown took <> " ms"
+          gone <- cacheEvict m.redis m.keys m.config.cacheMax
+          when (gone > 0) $ tally m (.evictions) gone
+        Just Abandoned -> tally m (.abandoned) 1
+        _ -> return ()
+  where
+    building tries =
+      memberTip m >>= \case
+        Nothing -> return Nothing
+        Just tip -> do
           built <-
             handle (\TipMoved -> return (Just Abandoned)) $
-              answeringAt m tip (\r pool _ -> cacheBuild m.redis m.keys tip r pool now spec)
-          took <- subtract now <$> milliseconds
+              answeringAt m tip (\r pool _ -> cacheBuild m.redis m.keys tip r pool spec)
           case built of
-            Just (Built n) | n > 0 -> do
-              tally m (.builds) 1
-              forM_ m.metrics (\x -> addTiming x.buildTime (fromIntegral took))
-              m.config.note LevelDebug $
-                "Cached xpub " <> name <> ": " <> shown n <> " addresses added in " <> shown took <> " ms"
-              gone <- cacheEvict m.redis m.keys m.config.cacheMax
-              when (gone > 0) $ do
-                tally m (.evictions) gone
-                m.config.note LevelDebug ("Evicted " <> shown gone <> " xpubs from the cache")
-            Just Abandoned -> do
-              tally m (.abandoned) 1
-              m.config.note LevelDebug ("Gave up caching xpub " <> name <> ": the fleet or the entry moved on")
-            _ -> return ()
-
--- | Bring the cache of extended public keys to the block that this member
--- just moved the fleet tip to, with what the blocks in between did at the
--- addresses that its entries have. The cache is emptied instead when the
--- member cannot say what they did, when the chain was reorganised, which
--- is rare and would need what the abandoned blocks did undone, or when
--- the member has no view of the block.
-advanceCache :: Member -> Maybe ByteString -> ByteString -> Maybe Between -> IO ()
-advanceCache m seen target between = when (m.config.cacheMax > 0) $ do
-  changes <- case (between, decode target) of
-    (Just b, Right to) | not b.reorganised -> withViewAt m.views to $ \r -> do
-      let touched = HashMap.toList (blockChanges r.net b.added)
-      flags <- cacheTracked m.redis m.keys (map fst touched)
-      forM [x | (x, True) <- zip touched flags] $ \(a, change) -> do
-        bal <- Q.getBalance r a
-        return (a, bal, change)
-    _ -> return Nothing
-  let why = case (between, changes) of
-        (Nothing, _) -> "this store cannot say what the blocks since the last tip did"
-        (Just b, _) | b.reorganised -> "the chain was reorganised"
-        (_, Nothing) -> "this store has no view of the block"
-        _ -> "it was at another block than the last tip"
-  cacheAdvance m.redis m.keys seen target changes >>= \case
-    CacheEmptied -> wasEmptied m target why
-    CacheMoved ->
-      m.config.note LevelDebug $
-        "The xpub cache is at block "
-          <> blockName target
-          <> ": "
-          <> shown (maybe 0 length changes)
-          <> " addresses changed"
-    _ -> return ()
+            Just Busy | tries > 0 -> threadDelay 25000 >> building (tries - 1)
+            Just Abandoned | tries > 197 -> building (tries - 1)
+            _ -> return (Just built)
 
 -- | Count and say that this store emptied the cache, at a block and for a
 -- reason. It is information and not a warning: nothing is wrong with what
--- the fleet answers, which comes from the database until entries are
--- built again. Emptied at every block, though, the cache is of no use,
--- and the log is where that shows.
+-- the fleet answers, and entries are built again on demand. It happens
+-- only when the pool starts again, or when a store cannot say what the
+-- abandoned blocks of a reorganisation held.
 wasEmptied :: Member -> ByteString -> Text -> IO ()
 wasEmptied m block why = do
   tally m (.emptied) 1
@@ -1069,31 +1212,16 @@ blockName bytes = either (const "?") blockHashToHex (decode bytes :: Either Stri
 shown :: (Show a) => a -> Text
 shown = T.pack . show
 
--- | See that the cache of extended public keys does not stay at another
--- block than the fleet tip. It is there for a moment after every move of
--- the tip, until the store that moved it has brought the cache along, and
--- for good if that store stopped before it did. So a member that finds
--- the cache behind the same tip at two turns in a row empties it, and it
--- starts again at the tip. Every turn of a member runs this.
-syncCache :: Member -> IO ()
-syncCache m = when (m.config.cacheMax > 0) $ do
-  -- how large the cache is, at every turn: it is one small read, and the
-  -- number is the fleet's, the same from every store
+-- | Tell StatsD how large the cache of extended public keys is, at every
+-- turn: it is one small read, and the numbers are the fleet's, the same
+-- from every store. The cache cannot lag behind the tip: it moves with it
+-- ('moveTip').
+cacheGauges :: Member -> IO ()
+cacheGauges m =
   forM_ m.metrics $ \x -> do
     (entries, held) <- cacheSize m.redis m.keys
     setGauge x.xpubs entries
     setGauge x.addresses held
-  tip <- fmap encode <$> readTVarIO m.tip
-  at <- cacheTip m.redis m.keys
-  before <- readTVarIO m.lagging
-  case tip of
-    Just t | at /= Just t -> do
-      when (before == Just t) $
-        cacheAdvance m.redis m.keys Nothing t Nothing >>= \case
-          CacheEmptied -> wasEmptied m t "no store brought it to the fleet tip"
-          _ -> return ()
-      atomically (writeTVar m.lagging (Just t))
-    _ -> atomically (writeTVar m.lagging Nothing)
 
 -- | The shared pool of a fleet as it is at a tip, for the queries of
 -- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if

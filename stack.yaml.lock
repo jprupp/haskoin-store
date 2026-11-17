@@ -74,6 +74,13 @@ packages:
       size: 837
   original:
     hackage: haskoin-store-data-3.0.0
+- completed:
+    hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550
+    pantry-tree:
+      sha256: 5a0fd2ace4f1defdb9fc4b5f294d193d93671d870fe871b25301d1abf36bb210
+      size: 532
+  original:
+    hackage: time-manager-0.4.2
 snapshots:
 - completed:
     sha256: 2c234e9f6c9b52dbbd8e0c369dd55e275f1c143474d4a984a000588d37306e2c

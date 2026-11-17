@@ -30,11 +30,14 @@ import Haskoin.Store
     StoreConfig (..),
     WebConfig (..),
     WebLimits (..),
+    XPubConfig (..),
+    defaultXPubConfig,
     runWeb,
     withStore,
   )
 import Haskoin.Store.Common (loopForever)
 import Haskoin.Store.Runtime (runtimeMetrics)
+import Haskoin.Store.XPub.Indexer (Settings (..))
 import NQE (receive, withSubscription)
 import Options.Applicative
   ( Mod,
@@ -101,15 +104,12 @@ data Config = Config
     maxLaggingBlocks :: !Int,
     minPeers :: !Int,
     webLimits :: !WebLimits,
-    redis :: !Bool,
-    fleet :: !Bool,
     redisURL :: !String,
-    redisMinAddrs :: !Int,
-    redisMinTxs :: !Int,
     redisMaxXPubs :: !Int,
-    noMempool :: !Bool,
-    wipeMempool :: !Bool,
-    syncMempool :: !Bool,
+    xpubWorkers :: !Int,
+    xpubWait :: !Int,
+    xpubHorizon :: !Int,
+    xpubQueue :: !Int,
     blockWindow :: !Int,
     peerTimeout :: !Int,
     blockStall :: !Int,
@@ -127,7 +127,6 @@ data Config = Config
     tickerURL :: !String,
     priceHistoryURL :: !String,
     noBlockchainInfo :: !Bool,
-    noXPub :: !Bool,
     healthCheckInterval :: !Int,
     accessLog :: !Bool,
     nodeRpc :: !String,
@@ -173,24 +172,18 @@ defConfig = do
     env "MIN_PEERS" 1 readMaybe
   webLimits <-
     getWebLimits
-  redis <-
-    env "REDIS" False parseBool
-  fleet <-
-    env "FLEET" False parseBool
   redisURL <-
-    env "REDIS_URL" "" pure
-  redisMinAddrs <-
-    env "REDIS_MIN_ADDRS" 100 readMaybe
-  redisMinTxs <-
-    env "REDIS_MIN_TXS" 1000 readMaybe
+    env "REDIS_URL" "redis://localhost:6379" pure
   redisMaxXPubs <-
     env "REDIS_MAX_XPUBS" 10000 readMaybe
-  noMempool <-
-    env "NO_MEMPOOL" False parseBool
-  wipeMempool <-
-    env "WIPE_MEMPOOL" False parseBool
-  syncMempool <-
-    env "SYNC_MEMPOOL" False parseBool
+  xpubWorkers <-
+    env "XPUB_WORKERS" 0 readMaybe
+  xpubWait <-
+    env "XPUB_WAIT" 10 readMaybe
+  xpubHorizon <-
+    env "XPUB_HORIZON" 30 readMaybe
+  xpubQueue <-
+    env "XPUB_QUEUE" 1000 readMaybe
   blockWindow <-
     env "BLOCK_WINDOW" 64 readMaybe
   mempoolTimeout <-
@@ -225,8 +218,6 @@ defConfig = do
     env "PRICE_HISTORY_URL" priceHistoryString pure
   noBlockchainInfo <-
     env "NO_BLOCKCHAIN_INFO" False parseBool
-  noXPub <-
-    env "NO_XPUB" False parseBool
   healthCheckInterval <-
     env "HEALTH_CHECK_INTERVAL" 1 readMaybe
   accessLog <-
@@ -280,11 +271,17 @@ defConfig = do
         env "TX_TIMEOUT" d.txTimeout readMaybe
       slowRequest <-
         env "SLOW_REQUEST" d.slowRequest readMaybe
-      -- four long requests a core: most of the time of one goes in RocksDB,
-      -- on a thread of its own, often waiting for the disk
+      -- the limit on long requests moves between one a core, for requests
+      -- that compute, and sixteen a core, for requests that wait for the
+      -- disk: 64 on four cores, twice the 32 reads in flight at which the
+      -- disk of a production store gave its most (README, Overload)
       cores <- getNumCapabilities
       maxRequests <-
-        env "MAX_REQUESTS" (fromIntegral (4 * cores)) readMaybe
+        env "MAX_REQUESTS" (fromIntegral (16 * cores)) readMaybe
+      minRequests <-
+        env "MIN_REQUESTS" (fromIntegral cores) readMaybe
+      targetDelay <-
+        env "TARGET_DELAY" d.targetDelay readMaybe
       requestQueue <-
         env "REQUEST_QUEUE" d.requestQueue readMaybe
       requestWait <-
@@ -463,77 +460,88 @@ config c = do
           <> long "max-requests"
           <> helpEnv
             "MAX_REQUESTS"
-            "Long requests (lists, whole blocks, xpubs) answered at once; the default is four a core (0 = no cap)"
+            ( unwords
+                [ "Most long requests (lists, whole blocks, xpubs) answered at once;",
+                  "the limit adapts below this; the default is sixteen a core (0 = no limit)"
+                ]
+            )
           <> showDefault
           <> value c.webLimits.maxRequests
+    minRequests <-
+      option auto $
+        metavar "INT"
+          <> long "min-requests"
+          <> helpEnv
+            "MIN_REQUESTS"
+            "Fewest long requests answered at once, where the limit starts; the default is one a core"
+          <> showDefault
+          <> value c.webLimits.minRequests
+    targetDelay <-
+      option auto $
+        metavar "MILLISECONDS"
+          <> long "target-delay"
+          <> helpEnv
+            "TARGET_DELAY"
+            "Lower the limit on long requests when threads wait longer than this for a core"
+          <> showDefault
+          <> value c.webLimits.targetDelay
     requestQueue <-
       option auto $
         metavar "INT"
           <> long "request-queue"
-          <> helpEnv "REQUEST_QUEUE" "Long requests that may wait for one of those to end; more are refused"
+          <> helpEnv "REQUEST_QUEUE" "Long requests that may wait for a slot; more are refused"
           <> showDefault
           <> value c.webLimits.requestQueue
     requestWait <-
       option auto $
         metavar "SECONDS"
           <> long "request-wait"
-          <> helpEnv "REQUEST_WAIT" "Refuse a long request that has waited this long"
+          <> helpEnv "REQUEST_WAIT" "Refuse a long request that has waited this long for a slot"
           <> showDefault
           <> value c.webLimits.requestWait
     return WebLimits {..}
-  redis <-
-    flag c.redis True $
-      long "redis"
-        <> helpEnv "REDIS" "Redis cache for xpub data"
-  fleet <-
-    flag c.fleet True $
-      long "fleet"
-        <> helpEnv
-          "FLEET"
-          ( unwords
-              [ "Answer as one of the servers that share the Redis of --redis:",
-                "all from the same block and the same mempool"
-              ]
-          )
   redisURL <-
     strOption $
       metavar "URL"
         <> long "redis-url"
-        <> helpEnv "REDIS_URL" "URL for Redis cache"
+        <> helpEnv "REDIS_URL" "Redis of the fleet: its tip, mempool and xpub cache"
+        <> showDefault
         <> value c.redisURL
-  redisMinAddrs <-
-    option auto $
-      metavar "COUNT"
-        <> long "redis-min-addrs"
-        <> helpEnv "REDIS_MIN_ADDRS" "Cache xpubs with at least this many used addresses"
-        <> showDefault
-        <> value c.redisMinAddrs
-  redisMinTxs <-
-    option auto $
-      metavar "COUNT"
-        <> long "redis-min-txs"
-        <> helpEnv "REDIS_MIN_TXS" "Cache xpubs with at least this many transactions in their addresses"
-        <> showDefault
-        <> value c.redisMinTxs
   redisMaxXPubs <-
     option auto $
       metavar "COUNT"
         <> long "redis-max-xpubs"
-        <> helpEnv "REDIS_MAX_XPUBS" "Evict the least recently used xpubs from Redis past this many"
+        <> helpEnv "REDIS_MAX_XPUBS" "Size of the xpub cache in Redis, at least 1"
         <> showDefault
         <> value c.redisMaxXPubs
-  noMempool <-
-    flag c.noMempool True $
-      long "no-mempool"
-        <> helpEnv "NO_MEMPOOL" "Do not index mempool transactions"
-  wipeMempool <-
-    flag c.wipeMempool True $
-      long "wipe-mempool"
-        <> helpEnv "WIPE_MEMPOOL" "Wipe indexed mempool at start"
-  syncMempool <-
-    flag c.syncMempool True $
-      long "sync-mempool"
-        <> helpEnv "SYNC_MEMPOOL" "Attempt to download peer mempools"
+  xpubWorkers <-
+    option auto $
+      metavar "COUNT"
+        <> long "xpub-workers"
+        <> helpEnv "XPUB_WORKERS" "Threads that index xpubs into the cache (0 for one per core)"
+        <> showDefault
+        <> value c.xpubWorkers
+  xpubWait <-
+    option auto $
+      metavar "SECONDS"
+        <> long "xpub-wait"
+        <> helpEnv "XPUB_WAIT" "Most seconds a request waits for an xpub to be indexed"
+        <> showDefault
+        <> value c.xpubWait
+  xpubHorizon <-
+    option auto $
+      metavar "SECONDS"
+        <> long "xpub-horizon"
+        <> helpEnv "XPUB_HORIZON" "Take no job for an xpub that would be indexed later than this"
+        <> showDefault
+        <> value c.xpubHorizon
+  xpubQueue <-
+    option auto $
+      metavar "COUNT"
+        <> long "xpub-queue"
+        <> helpEnv "XPUB_QUEUE" "Most xpubs that requests wait for in the queue of the indexer"
+        <> showDefault
+        <> value c.xpubQueue
   blockWindow <-
     option auto $
       metavar "COUNT"
@@ -641,10 +649,6 @@ config c = do
     flag c.noBlockchainInfo True $
       long "no-blockchain-info"
         <> helpEnv "NO_BLOCKCHAIN_INFO" "Disable Blockchain.info-style API endpoints"
-  noXPub <-
-    flag c.noXPub True $
-      long "no-xpub"
-        <> helpEnv "NO_XPUB" "Disable extended public key support"
   healthCheckInterval <-
     option auto $
       metavar "SECONDS"
@@ -662,7 +666,11 @@ config c = do
         <> long "node-rpc"
         <> helpEnv
           "NODE_RPC"
-          "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails"
+          ( unwords
+              [ "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails;",
+                "fill the shared mempool from it again after Redis loses its data"
+              ]
+          )
         <> value c.nodeRpc
   tlsCert <-
     strOption $
@@ -754,6 +762,9 @@ main = do
   when c.version $ do
     putStrLn haskoinStoreVersion
     exitSuccess
+  -- the cache of xpubs cannot be turned off: its size is all that is set
+  when (c.redisMaxXPubs < 1) $
+    error "--redis-max-xpubs must be at least 1"
   if null c.peers && not c.discover
     then run $ let Config {..} = c in Config {discover = True, ..}
     else run c
@@ -790,16 +801,20 @@ run cfg =
             discover = cfg.discover,
             db = dir </> "db",
             net = net,
-            redis = if cfg.redis then Just cfg.redisURL else Nothing,
-            fleet = cfg.fleet,
+            redis = Just cfg.redisURL,
             gap = cfg.webLimits.xpubGap,
             initGap = cfg.webLimits.xpubGapInit,
-            redisMinAddrs = cfg.redisMinAddrs,
-            redisMinTxs = cfg.redisMinTxs,
             redisMaxXPubs = cfg.redisMaxXPubs,
-            wipeMempool = cfg.wipeMempool,
-            noMempool = cfg.noMempool,
-            syncMempool = cfg.syncMempool,
+            xpubs =
+              defaultXPubConfig
+                { indexer =
+                    defaultXPubConfig.indexer
+                      { workers = cfg.xpubWorkers,
+                        wait = cfg.xpubWait * 1000000,
+                        horizon = cfg.xpubHorizon * 1000000,
+                        room = cfg.xpubQueue
+                      }
+                },
             blockWindow = cfg.blockWindow,
             mempoolTimeout = cfg.mempoolTimeout,
             peerTimeout = fromIntegral cfg.peerTimeout,
@@ -836,12 +851,10 @@ run cfg =
             maxLaggingBlocks = cfg.maxLaggingBlocks,
             minPeers = cfg.minPeers,
             version = haskoinStoreVersion,
-            noMempool = cfg.noMempool,
             stats = stats,
             tickerRefresh = cfg.tickerRefresh,
             tickerURL = cfg.tickerURL,
             priceHistoryURL = cfg.priceHistoryURL,
-            noXPub = cfg.noXPub,
             noBlockchainInfo = cfg.noBlockchainInfo,
             healthCheckInterval = cfg.healthCheckInterval,
             accessLog = cfg.accessLog,

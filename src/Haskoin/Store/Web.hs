@@ -41,15 +41,22 @@
 --   queue. A client that falls too far behind is disconnected rather than allowed
 --   to make the server buffer events without limit.
 --
+-- * __Long requests take turns.__ Only so many long requests, lists,
+--   whole blocks and xpubs, are answered at once, as many as the cores keep
+--   up with ("Haskoin.Store.Web.Admission", "Haskoin.Store.Web.Congestion");
+--   the next ones wait in a short line, and are refused with 503 when it
+--   stops moving. A store with more to do than its cores can do still
+--   answers the simple requests at once.
+--
 -- * __Compatibility endpoints ease migration.__ The @\/blockchain\/@ endpoints
 --   follow the Blockchain.info API so that existing wallets can switch to a
 --   self-hosted server with few changes.
 --
 -- * __Handlers are plain functions.__ A handler takes the 'WebState' and
 --   the request ('Req'), and returns a response in 'IO'. The state holds the
---   queries to answer with in 'query' ('webQuery': the database, with the
---   cache in front of the queries about xpubs); @nocache=true@ is the same
---   handler given a state whose queries read only the database ('cacheOr').
+--   queries to answer with in 'query' ('xpubQuery': the database, with the
+--   door to the fleet's cache of xpubs in front of the queries about
+--   them, which asks the indexer for an xpub that it does not have).
 --   The state is made for each request, around one view of the database,
 --   so that everything a request reads is of one moment; a store that is a
 --   member of a fleet takes the view at the block that its fleet answers
@@ -76,6 +83,12 @@ module Haskoin.Store.Web
     -- * Logging
     logIt,
     ailments,
+
+    -- * Xpubs
+    Unindexed (..),
+    xpubQuery,
+    askXPubs,
+    unindexedResponseOf,
   )
 where
 
@@ -98,7 +111,7 @@ import Conduit
   )
 import Control.Applicative ((<|>))
 import Control.Concurrent (getNumCapabilities, threadDelay)
-import Control.Concurrent.Async (link, race_, withAsync)
+import Control.Concurrent.Async (link, mapConcurrently, race_, withAsync)
 import Control.Concurrent.STM
   ( TVar,
     atomically,
@@ -109,12 +122,13 @@ import Control.Concurrent.STM
     readTVar,
     readTVarIO,
     registerDelay,
+    retry,
     stateTVar,
     writeTQueue,
     writeTVar,
   )
-import Control.Exception (Exception, catch, fromException, throwIO, try)
-import Control.Lens ((&), (.~), (?~), (^.))
+import Control.Exception (Exception, catch, evaluate, fromException, throwIO, try)
+import Control.Lens ((&), (.~), (<&>), (?~), (^.))
 import Control.Monad
   ( filterM,
     forM,
@@ -123,7 +137,6 @@ import Control.Monad
     guard,
     join,
     unless,
-    void,
     when,
     (<=<),
   )
@@ -152,6 +165,7 @@ import Data.Bytes.Put
 import Data.Bytes.Serial
 import Data.Char (isSpace)
 import Data.Default (Default (..))
+import Data.Foldable qualified as Foldable
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
@@ -178,7 +192,9 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32, Word64)
 import Database.RocksDB
   ( Property (..),
@@ -190,7 +206,8 @@ import Haskoin.Crypto.Keys
 import Haskoin.Network
 import Haskoin.Node
   ( Chain,
-    Logger,
+    LogLevel (..),
+    Logger (..),
     OnlinePeer (..),
     PeerMgr,
     chainGetAncestor,
@@ -205,7 +222,6 @@ import Haskoin.Node
   )
 import Haskoin.Script
 import Haskoin.Store.BlockStore
-import Haskoin.Store.Cache
 import Haskoin.Store.Common hiding
   ( blockAtOrAfter,
     blockAtOrAfterMTP,
@@ -220,7 +236,7 @@ import Haskoin.Store.Common hiding
 import Haskoin.Store.Common qualified as C
 import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered qualified as L
+import Haskoin.Store.Database.Query.Pooled (chainRead)
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Exception (bracket, bracket_, catchAny, finally, handleAny, onException, tryAny)
 import Haskoin.Store.Fleet.Member
@@ -229,17 +245,49 @@ import Haskoin.Store.Fleet.Member
     answeringCached,
     memberAlive,
     memberEvents,
+    memberNewest,
+    memberPoolBody,
+    memberReceived,
     memberTip,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
-import Haskoin.Store.Web.Admission (Admission, Load (..), admitted, load, newAdmission)
+import Haskoin.Store.Web.Admission
+  ( Admission,
+    Load (..),
+    Refusal (..),
+    Report (..),
+    Settings (..),
+    admitted,
+    load,
+    newAdmission,
+    regulate,
+  )
+import Haskoin.Store.Web.Congestion (snooze)
 import Haskoin.Store.Web.Docs (swaggerPage, swaggerYaml)
 import Haskoin.Store.Web.Events
-import Haskoin.Store.Web.Pieces (Piece, around, hexOf, listPieces, piece, pieced, piecesResponse)
+import Haskoin.Store.Web.Pieces
+  ( Piece,
+    around,
+    hexOf,
+    listPieces,
+    piece,
+    pieceOf,
+    pieced,
+    piecesResponse,
+  )
 import Haskoin.Store.Web.Publish qualified as Publish
 import Haskoin.Store.Web.Router hiding (header)
 import Haskoin.Store.WebCommon
+import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
+import Haskoin.Store.XPub.Service
+  ( Answer (..),
+    XPubs,
+    retryAfter,
+    unpinned,
+    xpubAsk,
+  )
+import Haskoin.Store.XPub.Service qualified as Door
 import Haskoin.Transaction
 import Haskoin.Util
 import NQE
@@ -256,13 +304,13 @@ import Network.HTTP.Types
     renderStdMethod,
     status200,
     status202,
-    status203,
     status204,
     status400,
     status404,
     status409,
     status410,
     status413,
+    status429,
     status500,
     status503,
     statusIsClientError,
@@ -279,6 +327,7 @@ import Network.Wai
     mapResponseHeaders,
     modifyResponse,
     responseBuilder,
+    responseHeaders,
     responseLBS,
     responseStatus,
     responseStream,
@@ -341,12 +390,19 @@ data WebLimits = WebLimits
     -- | seconds that a request may take before the log has a warning
     -- about it ('logIt')
     slowRequest :: !Word32,
-    -- | long requests answered at once
-    -- ("Haskoin.Store.Web.Admission"); 0 is no cap
+    -- | most long requests answered at once: the ceiling of the limit
+    -- that adapts to how busy the cores are
+    -- ("Haskoin.Store.Web.Admission"); 0 is no admission control at all
     maxRequests :: !Word32,
-    -- | requests that may wait for one of those to end
+    -- | fewest long requests answered at once: the floor of that limit,
+    -- where it starts; at least one, and at most 'maxRequests'
+    minRequests :: !Word32,
+    -- | milliseconds that a thread ready to run may wait for its turn
+    -- before the limit comes down ("Haskoin.Store.Web.Congestion")
+    targetDelay :: !Word32,
+    -- | requests that may wait for a slot; more are refused
     requestQueue :: !Word32,
-    -- | seconds that a request waits before it is refused
+    -- | seconds that a request may wait for a slot while the line moves
     requestWait :: !Word32
   }
   deriving (Eq, Show)
@@ -354,8 +410,9 @@ data WebLimits = WebLimits
 -- | 200000 items, 5000 full transactions, offset up to 50000, 100 items by
 -- default, xpub gaps of 32 and 20, transaction timeout of 30 minutes,
 -- block timeout of four hours, and a warning for requests of five seconds.
--- No cap on the requests answered at once, which the executable sets from
--- the number of cores; with one, 64 may wait, for five seconds.
+-- No admission control, which the executable turns on with limits from the
+-- number of cores; with it, a target of 25 ms, and 64 requests that may
+-- wait, for a second.
 instance Default WebLimits where
   def =
     WebLimits
@@ -369,8 +426,10 @@ instance Default WebLimits where
         blockTimeout = 4 * 3600,
         slowRequest = 5,
         maxRequests = 0,
+        minRequests = 1,
+        targetDelay = 25,
         requestQueue = 64,
-        requestWait = 5
+        requestWait = 1
       }
 
 -- | Configuration of the web server.
@@ -393,8 +452,6 @@ data WebConfig = WebConfig
     limits :: !WebLimits,
     -- | version reported by the health check
     version :: !String,
-    -- | the mempool is not indexed, so do not report it in health checks
-    noMempool :: !Bool,
     -- | StatsD client, if metrics are enabled
     stats :: !(Maybe Stats),
     -- | microseconds between updates of the price ticker
@@ -403,8 +460,6 @@ data WebConfig = WebConfig
     tickerURL :: !String,
     -- | URL of the historical price service
     priceHistoryURL :: !String,
-    -- | disable the xpub endpoints
-    noXPub :: !Bool,
     -- | disable the Blockchain.info compatible endpoints
     noBlockchainInfo :: !Bool,
     -- | seconds between health checks; there is one at each new block
@@ -436,26 +491,30 @@ data WebState = WebState
     session :: !Wreq.Session,
     -- | result of the latest health check
     health :: !(TVar HealthCheck),
-    -- | the queries to answer with, the cache included ('webQuery'): those
+    -- | the queries to answer with, the cache included ('xpubQuery'): those
     -- of one view of the database, taken for the request
     query :: !StoreRead,
     -- | the same queries without the cache, on the same view
     direct :: !StoreRead,
-    -- | whether Redis answered the last time it was asked; always 'True'
-    -- for a store without a cache
+    -- | whether Redis answered the last time it was asked
     cacheUp :: !(TVar Bool),
     -- | the events that the clients of @\/events@ read ('feedEvents')
     eventLog :: !EventLog,
     -- | the transactions that were handed over and that the store asks
     -- for until it has them ("Haskoin.Store.Web.Publish")
     asking :: !Publish.Asking,
-    -- | the cap on the requests answered at once
-    admission :: !Admission
+    -- | the limit on the long requests answered at once
+    admission :: !Admission,
+    -- | the reads of the caches of xpubs for this request, each xpub of one
+    -- version, and the check that ends it ('xpubSession'); outside of a
+    -- request, reads of no request
+    reading :: !Door.Session
   }
 
 -- | StatsD metrics of the web server: a timing for each kind of request,
--- under @web.\<name\>@, error counters and a gauge of connected event
--- clients.
+-- under @web.\<name\>@, error counters, a gauge of connected event
+-- clients, and the metrics of admission control, under @web.cap.*@
+-- ("Haskoin.Store.Web.Admission").
 data WebMetrics = WebMetrics
   { -- Addresses
     addressTx :: !StatTiming,
@@ -511,10 +570,21 @@ data WebMetrics = WebMetrics
     -- Errors
     serverErrors :: StatCounter,
     clientErrors :: StatCounter,
+    -- | requests answered again because an entry of a cache that they read
+    -- changed meanwhile (@web.reruns@, 'xpubSession')
+    reruns :: StatCounter,
     -- Admission
     refused :: StatCounter,
     running :: !StatGauge,
     waiting :: !StatGauge,
+    capLimit :: !StatGauge,
+    capDelay :: !StatGauge,
+    capLateness :: !StatGauge,
+    capOverloaded :: !StatGauge,
+    capSojourn :: !StatTiming,
+    refusedFull :: !StatCounter,
+    refusedWaited :: !StatCounter,
+    refusedCodel :: !StatCounter,
     -- Others
     health :: !StatTiming,
     peers :: !StatTiming,
@@ -584,9 +654,18 @@ createMetrics s = do
   -- Errors
   serverErrors <- c "server_errors"
   clientErrors <- c "client_errors"
+  reruns <- c "reruns"
   refused <- newStatCounter s "web.requests_refused" 1
   running <- g "requests_running"
   waiting <- g "requests_waiting"
+  capLimit <- g "cap.limit"
+  capDelay <- g "cap.delay_us"
+  capLateness <- g "cap.lateness_us"
+  capOverloaded <- g "cap.overloaded"
+  capSojourn <- newStatTiming s "web.cap.sojourn" 1
+  refusedFull <- newStatCounter s "web.cap.refused_full" 1
+  refusedWaited <- newStatCounter s "web.cap.refused_waited" 1
+  refusedCodel <- newStatCounter s "web.cap.refused_codel" 1
 
   -- Others
   health <- d "health"
@@ -680,35 +759,49 @@ serveWeb config serve = do
   -- web server has nothing else to say when; with one, a store that had
   -- just started took a turn before its first check, reported the blocks
   -- that it had then, and with nobody else there moved the fleet to them.
-  forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first))
+  forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first.blocks && isOK first.peers))
   cacheUp <- cacheCheck >>= newTVarIO
   eventLog <- newEventLog
   asking <- Publish.newAsking
   admission <-
     newAdmission
-      (fromIntegral config.limits.maxRequests)
-      (fromIntegral config.limits.requestQueue)
-      (fromIntegral config.limits.requestWait * 1000000)
+      Settings
+        { ceiling = fromIntegral config.limits.maxRequests,
+          floor = fromIntegral config.limits.minRequests,
+          target = fromIntegral config.limits.targetDelay * 1000,
+          room = fromIntegral config.limits.requestQueue,
+          patience = fromIntegral config.limits.requestWait * 1000000
+        }
   let db = config.store.db
-      stateOf q = WebState {query = webQuery config.store cacheUp q, direct = q, ..}
-      routesOf s = map (guarded s) (concatMap withPost (handlePaths s config))
+      -- the door to the fleet's cache of xpubs; a store without Redis has
+      -- none, and answers about no xpub
+      xpubDoor = (.door) <$> config.store.fleet
+      stateOf sess q =
+        WebState
+          { query = xpubQuery xpubDoor sess q,
+            direct = q,
+            reading = sess,
+            ..
+          }
+      routesOf s = map (guarded s . settled s) (concatMap withPost (handlePaths s config))
       -- outside of a request, each query has a view of its own; a request
       -- has one view for all that it reads, which is let go when its
       -- response is sent
-      st = stateOf (L.standaloneRead db)
-      local answer = L.withView db (answer . routesOf . stateOf . L.layeredRead)
+      st = stateOf unpinned (chainRead db)
+      -- every store is a member of a fleet: without Redis, or without a
+      -- view of the fleet tip, it is unhealthy and answers 503
       scoped answer = case config.store.fleet of
-        Nothing -> local answer
+        Nothing -> behind answer
         Just member ->
           readTVarIO cacheUp >>= \case
             True -> shared member (3 :: Int) False answer
-            -- without Redis there is no fleet to answer with
-            False -> local answer
+            False -> behind answer
       -- as a member of a fleet: from the view at the fleet tip, with the
       -- pool that the fleet shares on top. The tip is taken to be the one
       -- that the member read at its last turn, which saves asking Redis
       -- for it: the first read of the pool checks it, and a request that
-      -- reads nothing from the pool checks it when its handler is done. If
+      -- reads nothing from the pool checks it when its handler is done,
+      -- unless a request saw it in Redis a moment ago ('answeringAt'). If
       -- it is not the tip any more, the request is answered again, from the
       -- tip that Redis has.
       shared member tries fresh answer = do
@@ -717,31 +810,39 @@ serveWeb config serve = do
           Just tip -> return (Just (Just tip))
           Nothing -> timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing
         case asked of
-          Nothing -> atomically (writeTVar cacheUp False) >> local answer
+          Nothing -> atomically (writeTVar cacheUp False) >> behind answer
           -- no store has reported yet
-          Just Nothing -> local answer
+          Just Nothing -> behind answer
           Just (Just tip) -> do
             handled <- newIORef False
             let marked confirm r = r {handler = \req -> r.handler req <* confirm <* writeIORef handled True} :: Route
                 -- extended public keys through the fleet's cache of
                 -- them, unless a request asks for the database
-                inFleet plain cached confirm =
-                  answer (map (marked confirm) (routesOf WebState {query = cached, direct = plain, ..}))
-            try (answeringCached member tip inFleet) >>= \case
-              Right (Just sent) -> return sent
-              Right Nothing
-                -- a tip from the member's last turn of which there is no
-                -- view may not be the tip any more
-                | not fresh && tries > 0 -> shared member (tries - 1) True answer
-                | otherwise -> behind answer
-              Left TipMoved ->
-                -- the tip moved while the handler was reading: answer
-                -- again from the new one, unless the response is on its way
-                readIORef handled >>= \case
-                  True -> throwIO TipMoved
-                  False
-                    | tries > 0 -> shared member (tries - 1) True answer
-                    | otherwise -> behind answer
+                inFleet plain sess confirm =
+                  answer (map (marked confirm) (routesOf (stateOf sess plain)))
+            try (try (answeringCached member tip inFleet)) >>= \case
+              -- an entry of the cache changed or was evicted while the
+              -- request read it: answered again, from the start
+              Left EntryMoved
+                | tries > 0 -> do
+                    forM_ metrics (\x -> incrementCounter x.reruns 1)
+                    shared member (tries - 1) False answer
+                | otherwise -> answer [r {handler = \_ -> unindexedResponse st JobBroke} :: Route | r <- routes]
+              Right r -> case r of
+                Right (Just sent) -> return sent
+                Right Nothing
+                  -- a tip from the member's last turn of which there is no
+                  -- view may not be the tip any more
+                  | not fresh && tries > 0 -> shared member (tries - 1) True answer
+                  | otherwise -> behind answer
+                Left TipMoved ->
+                  -- the tip moved while the handler was reading: answer
+                  -- again from the new one, unless the response is on its way
+                  readIORef handled >>= \case
+                    True -> throwIO TipMoved
+                    False
+                      | tries > 0 -> shared member (tries - 1) True answer
+                      | otherwise -> behind answer
       behind answer = answer [r {handler = behindResponse st} :: Route | r <- routes]
       routes = routesOf st
   -- the metrics of each long route, by its name
@@ -758,18 +859,27 @@ serveWeb config serve = do
       capped r answer = case r.cost of
         Light -> answer routes
         Short -> scoped answer
-        Long -> case HashMap.lookup (routeName r) capStats of
-          Nothing -> admitted admission (answer full) (scoped answer)
-          Just m -> do
+        Long -> case (metrics, HashMap.lookup (routeName r) capStats) of
+          (Just w, Just m) -> do
             asked <- millis
-            admitted admission (incrementCounter m.refused 1 >> answer full) $ do
+            let refused why = do
+                  incrementCounter m.refused 1
+                  incrementCounter (refusedBy w why) 1
+                  answer full
+            admitted admission refused $ do
               entered <- millis
               addTiming m.waited (entered - asked)
+              addTiming w.capSojourn (entered - asked)
               bracket_
                 (atomicModifyIORef' m.inSlot (\n -> (n + 1, ())))
                 (atomicModifyIORef' m.inSlot (\n -> (n - 1, ())))
                 (scoped answer)
                 `finally` (millis >>= \left -> addTiming m.held (left - entered))
+          _ -> admitted admission (const (answer full)) (scoped answer)
+      refusedBy w = \case
+        LineFull -> w.refusedFull
+        WaitedTooLong -> w.refusedWaited
+        Overloaded -> w.refusedCodel
       millis = round . (* 1000) <$> getPOSIXTime :: IO Int
       full = [r {handler = busyResponse st} :: Route | r <- routes]
       notFound _ NoRoute = errorResponse st ThingNotFound
@@ -782,15 +892,20 @@ serveWeb config serve = do
   -- set when the store has a new best block, for the health check to run
   -- at once
   newBlock <- newTVarIO False
-  withAsync (priceUpdater session ticker) $ \_a1 ->
-    withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
-      withAsync (admissionLoop metrics capStats admission) $ \_a5 ->
-        withAsync (feedEvents st) $ \a3 ->
-          withAsync (askingLoop st) $ \_a4 ->
-            link a3 >> do
-              let logged = logIt config.logger config.accessLog config.limits.slowRequest
-                  outer = webSocketEvents st . logged . anyOrigin . preflight . autohead . compressed
-              serve . outer . cappedBody st $ app
+  date <- httpDate >>= newIORef
+  withAsync (forever (snooze 500_000 >> httpDate >>= writeIORef date)) $ \_a0 ->
+    withAsync (priceUpdater session ticker) $ \_a1 ->
+      withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
+        withAsync (admissionLoop metrics capStats admission) $ \_a5 ->
+          withAsync (regulate admission (reportControl metrics)) $ \_a6 ->
+            withAsync (feedEvents st) $ \a3 ->
+              withAsync (askingLoop st) $ \_a4 ->
+                withAsync (refillLoop st) $ \_a7 ->
+                  link a3 >> do
+                    let logged = logIt config.logger config.accessLog config.limits.slowRequest
+                        outer =
+                          webSocketEvents st . logged . dated date . anyOrigin . preflight . autohead . compressed
+                    serve . outer . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -801,10 +916,7 @@ serveWeb config serve = do
           config.tickerURL
           config.tickerRefresh
     runHealthCheck = healthCheck config
-    cacheCheck = case (config.store.cache, config.store.fleet) of
-      (Just cache, _) -> cacheAlive cache
-      (_, Just member) -> memberAlive member
-      _ -> return True
+    cacheCheck = maybe (return False) memberAlive config.store.fleet
     -- The check is run every second by default, and at once when the
     -- store has a new best block, which is when its answer changes most:
     -- /health answers from the last result, and a load balancer or a
@@ -828,7 +940,7 @@ serveWeb config serve = do
           tellHealth saidWell h
           -- a store whose checks fail stops taking its turns as a member
           -- of its fleet, so that it does not hold the others back
-          forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h))
+          forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h.blocks && isOK h.peers))
           -- Redis is asked less often, every five seconds: it is the one
           -- part of the check that leaves the program, and waits up to
           -- two seconds for a Redis that is away. Requests find out by
@@ -859,7 +971,7 @@ serveWeb config serve = do
         (Nothing, True) -> logInfo health' "Healthy"
         _ -> return ()
     -- the same for the Redis that a store with a cache answers through;
-    -- /health says 203 without it
+    -- /health says 503 without it
     tellRedis said redis = do
       before <- readIORef said
       writeIORef said redis
@@ -898,15 +1010,37 @@ serveWeb config serve = do
       [("Access-Control-Allow-Origin", "*"), ("Vary", "Accept-Encoding")]
         <> filter ((/= "Vary") . fst) headers
 
+-- | Give every response the @Date@ header from the store's own clock
+-- ('httpDate'), so that Warp does not add its own.
+--
+-- Warp keeps the date in a value that it makes again once a second and
+-- does not compute until a response needs it: the first response of the
+-- second computes it, and the others wait for it. When that thread is
+-- stopped in the middle, at the end of its time slice on a busy core,
+-- every response waits until it runs again: an eventlog of an overload
+-- showed 58 responses wait up to 70 ms at once on it. This date is made
+-- whole by a thread of its own, twice a second, and responses only read
+-- it.
+dated :: IORef C.ByteString -> Middleware
+dated ref app req respond =
+  app req $ \res -> readIORef ref >>= \d -> respond (mapResponseHeaders (("Date", d) :) res)
+
+-- | The time now as the @Date@ header of HTTP has it, computed whole.
+httpDate :: IO C.ByteString
+httpDate = getCurrentTime >>= evaluate . C.pack . formatTime defaultTimeLocale "%a, %d %b %Y %H:%M:%S GMT"
+
 -- | Answer the errors of the handler of a route: an 'Except' with its
--- status and JSON, any other error as a server error, after logging it. A
--- request passed on to the next route goes on.
+-- status and JSON, any other
+-- error as a server error, after logging it. A request passed on to the next
+-- route goes on.
 guarded :: WebState -> Route -> Route
 guarded st r = r {handler = \req -> r.handler req `catchAny` answer req}
   where
     answer req e
       | Just Next <- fromException e = throwIO Next
       | Just TipMoved <- fromException e = throwIO TipMoved
+      | Just EntryMoved <- fromException e = throwIO EntryMoved
+      | Just u <- fromException e = unindexedResponse st u
       | Just x <- fromException e = errorResponse st x
       | Just g <- fromException e = goneResponse st g
       | otherwise = do
@@ -980,13 +1114,33 @@ admissionLoop (Just m) capStats admission = forever $ do
   forM_ capStats $ \c -> readIORef c.inSlot >>= setGauge c.running
   threadDelay 1000000
 
--- | The metrics of one long route under the cap on requests
+-- | Report a step of the controller of the limit to StatsD
+-- ("Haskoin.Store.Web.Congestion"): the limit, the 90th percentile of the
+-- delay of the scheduler without the pauses of GHC's collector, which the
+-- limit follows, and with them, in microseconds, and whether the line is
+-- overloaded, as 1 or 0.
+reportControl :: Maybe WebMetrics -> Report -> IO ()
+reportControl Nothing _ = return ()
+reportControl (Just m) r = do
+  setGauge m.capLimit r.limit
+  setGauge m.capDelay r.delay
+  setGauge m.capLateness r.lateness
+  setGauge m.capOverloaded (if r.overloaded then 1 else 0)
+
+-- | A route whose handler, once it has its response and before the response
+-- is sent, checks that every cached xpub that the request read is still of
+-- the version that it read ('xpubSession'): if one is not, it throws
+-- v'EntryMoved', and the request is answered again. The routes of xpubs read
+-- the caches only before they respond.
+settled :: WebState -> Route -> Route
+settled st r = r {handler = \req -> r.handler req <* st.reading.settle} :: Route
+
+-- | The metrics of one long route under the limit on requests
 -- ("Haskoin.Store.Web.Admission"), under @web.cap.\<route\>.*@.
 --
 -- The totals of 'WebMetrics' say that the server is full, and not with
--- what. A cap that is too low for one route and too high for another
--- shows only here: which routes hold the slots and for how long, which
--- wait, and which are refused. They also tell a route that is slow from
+-- what: which routes hold the slots and for how long, which wait, and
+-- which are refused. They also tell a route that is slow from
 -- one that waits: the timing of a request ('withMetrics') starts when its
 -- handler does, after the wait.
 data CapStats = CapStats
@@ -1019,9 +1173,10 @@ createCapStats s n =
 -- | The name of a route in the metrics: the fixed segments of its path,
 -- so that @\/address\/:address\/transactions\/full@ is
 -- @address_transactions_full@. Routes that differ only in their method,
--- or in what they capture, share a name and their metrics.
+-- or in what they capture, share a name and their metrics. The route keeps
+-- it, made once, as every request looks up its kind by it.
 routeName :: Route -> Text
-routeName r = T.intercalate "_" [l | Left l <- r.pattern]
+routeName r = r.name
 
 -- | Mark a route as one that answers from memory alone, to be answered
 -- even by a server that is full.
@@ -1222,7 +1377,7 @@ handlePaths st cfg =
     lightly (get "/" [] (\_ -> file "text/html; charset=utf-8" swaggerPage)),
     lightly (get "/swagger.yaml" [] (\_ -> file "application/yaml" swaggerYaml))
   ]
-    <> (if cfg.noXPub then [] else xpubRoutes)
+    <> xpubRoutes
     <> (if cfg.noBlockchainInfo then [] else binfoRoutes)
   where
     file kind bytes = return (responseLBS status200 [(hContentType, kind)] (L.fromStrict bytes))
@@ -1255,7 +1410,11 @@ handlePaths st cfg =
       (ApiResource a b, MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> Route
     marshalled ps p h = pathCompact ps p h (marshalEncoding net)
     marshalledList ::
-      (ApiResource a (SerialList b), MarshalJSON Network b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
+      (ApiResource a (SerialList b), MarshalJSON Network b) =>
+      [Text] ->
+      (Req -> IO a) ->
+      (a -> IO [b]) ->
+      Route
     marshalledList ps p h =
       long (pathCompact ps p (fmap SerialList . h) (list (marshalEncoding net) . (.get)))
     -- routes of what is answered while it is read: a list of items in
@@ -1265,9 +1424,10 @@ handlePaths st cfg =
       (WebMetrics -> StatTiming) ->
       [Text] ->
       (Req -> IO a) ->
-      (a -> IO [IO [b]]) ->
+      (a -> IO [(Int, IO [b])]) ->
       Route
     marshalledPieces df ps p h = pieces df ps p (listPieces (marshalEncoding net) <=< h)
+    -- pieces that the handler made
     pieces ::
       (ApiResource a b) =>
       (WebMetrics -> StatTiming) ->
@@ -1281,27 +1441,31 @@ handlePaths st cfg =
     plainList ::
       (ApiResource a (SerialList b), ToJSON b) => [Text] -> (Req -> IO a) -> (a -> IO [b]) -> Route
     plainList ps p h = long (plain ps p (fmap SerialList . h))
+    -- @nocache@ is taken and ignored: the cache always answers, and older
+    -- clients that still send it are not refused
+    cached = pure (NoCache False)
     xpubRoutes =
-      [ long (plain ["derive", "nocache"] (\r -> GetXPub <$> cap r <*> dflt r <*> dflt r) (handleXPub st)),
+      [ long (plain ["derive", "nocache"] (\r -> GetXPub <$> cap r <*> dflt r <*> cached) (handleXPub st)),
         plainList
           ("derive" : "nocache" : limits)
-          (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (\r -> GetXPubTxs <$> cap r <*> dflt r <*> lim r <*> cached)
           (handleXPubTxs st),
         marshalledPieces
           (.xpubTxFull)
           ("derive" : "nocache" : limits)
-          (\r -> GetXPubTxsFull <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (\r -> GetXPubTxsFull <$> cap r <*> dflt r <*> lim r <*> cached)
           (handleXPubTxsFull st),
         marshalledList
           ["derive", "nocache"]
-          (\r -> GetXPubBalances <$> cap r <*> dflt r <*> dflt r)
+          (\r -> GetXPubBalances <$> cap r <*> dflt r <*> cached)
           (handleXPubBalances st),
         marshalledList
           ("derive" : "nocache" : limits)
-          (\r -> GetXPubUnspent <$> cap r <*> dflt r <*> lim r <*> dflt r)
+          (\r -> GetXPubUnspent <$> cap r <*> dflt r <*> lim r <*> cached)
           (handleXPubUnspent st),
         plain ["derive"] (\r -> DelCachedXPub <$> cap r <*> dflt r) (handleDelXPub st)
       ]
+    -- the routes of Blockchain.info take their parameters themselves
     binfoRoutes =
       [ long (post "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st))),
         long (get "/blockchain/multiaddr" multiaddrParams (jsonOnly (handleMultiAddr st))),
@@ -1321,7 +1485,10 @@ handlePaths st cfg =
             ["format", "limit", "offset", "txidindex"]
             (jsonOnly (handleBinfoMempool st)),
         long $
-          get "/blockchain/block-height/:height" ["format", "txidindex"] (jsonOnly (handleBinfoBlockHeight st)),
+          get
+            "/blockchain/block-height/:height"
+            ["format", "txidindex"]
+            (jsonOnly (handleBinfoBlockHeight st)),
         long (get "/blockchain/blocks/:milliseconds" ["format"] (jsonOnly (handleBinfoBlocksDay st))),
         long (get "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st))),
         long (post "/blockchain/export-history" historyParams (jsonOnly (handleBinfoHistory st))),
@@ -1354,13 +1521,15 @@ jsonOnly h req = do
     json "json" = Just ()
     json _ = Nothing
 
--- | The route of an API resource: parse the request, run the handler, and
--- encode the response as JSON.
-pathCompact :: (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> (b -> Encoding) -> Route
+-- | The route of an API resource: parse the request, run the handler, and encode the
+-- response as JSON, as it is sent ('lazyResponse').
+pathCompact ::
+  (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO b) -> (b -> Encoding) -> Route
 pathCompact ps parser action encJson =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req -> do
-    res <- action =<< parser req
-    return $ responseLBS status200 jsonType (encodingToLazyByteString (encJson res))
+    asked <- parser req
+    res <- action asked
+    lazyResponse status200 jsonType (encodingToLazyByteString (encJson res))
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
@@ -1369,11 +1538,13 @@ pathCompact ps parser action encJson =
 -- | The route of an API resource whose handler chooses the status of its
 -- answer: @POST \/transactions@, which answers 202 for a transaction that
 -- it handed over.
-pathPosted :: (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO (Status, Encoding)) -> Route
+pathPosted ::
+  (ApiResource a b) => [Text] -> (Req -> IO a) -> (a -> IO (Status, Encoding)) -> Route
 pathPosted ps parser action =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req -> do
-    (status, res) <- action =<< parser req
-    return $ responseLBS status jsonType (encodingToLazyByteString res)
+    asked <- parser req
+    (status, res) <- action asked
+    lazyResponse status jsonType (encodingToLazyByteString res)
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
@@ -1392,7 +1563,9 @@ pathPieces ::
   Route
 pathPieces st df ps parser action =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) ps $ \req ->
-    inPieces st df jsonType (action =<< parser req)
+    inPieces st df jsonType $ do
+      asked <- parser req
+      action asked
   where
     toProxy :: (Req -> IO a) -> Proxy a
     toProxy = const Proxy
@@ -1420,11 +1593,16 @@ encoders = min 8 <$> getNumCapabilities
 jsonType :: ResponseHeaders
 jsonType = [(hContentType, "application/json")]
 
--- | Respond with JSON.
+-- | Respond with JSON, encoded as it is sent ('lazyResponse').
 streamEncoding :: Encoding -> IO Response
 streamEncoding e =
-  return $
-    responseLBS status200 [(hContentType, "application/json; charset=utf-8")] (encodingToLazyByteString e)
+  lazyResponse status200 [(hContentType, "application/json; charset=utf-8")] (encodingToLazyByteString e)
+
+-- | A response of bytes made as they are sent, such as JSON from its
+-- encoding. Warp writes a lazy byte string a chunk at a time, as the
+-- encoding makes them, so a long answer is never all in memory at once.
+lazyResponse :: Status -> ResponseHeaders -> L.ByteString -> IO Response
+lazyResponse status headers bytes = return (responseLBS status headers bytes)
 
 -- | Respond with text.
 textResponse :: TL.Text -> IO Response
@@ -1488,7 +1666,7 @@ getRawBlock st h =
 rawBlock :: StoreRead -> BlockData -> [Piece]
 rawBlock q b =
   around (hexOf b.header <> hexOf (VarInt (fromIntegral (length b.txs)))) mempty $
-    map piece (pieced pieceSize (fmap (foldMap rawHex . catMaybes) . q.getManyTxBytes) b.txs)
+    map (uncurry pieceOf) (pieced pieceSize (fmap (foldMap rawHex . catMaybes) . q.getManyTxBytes) b.txs)
 
 -- | The hex of bytes as stored, such as a transaction in the format of the
 -- network: read as they are, and written with the table of haskoin-core's
@@ -1634,7 +1812,7 @@ handleTxRaw ::
   IO [Piece]
 handleTxRaw st (GetTxRaw txid) =
   st.query.getManyTxBytes [txid] >>= \case
-    [Just bytes] -> return (rawResult [piece (return (rawHex bytes))])
+    [Just bytes] -> return (rawResult [pieceOf 1 (return (rawHex bytes))])
     _ -> notFoundTx st txid
 
 -- | Handler for @GET \/transactions\/raw?txids=…@: several transactions, serialized. The client names
@@ -1656,7 +1834,7 @@ getTxsBlock :: WebState -> H.BlockHash -> IO [TxHash]
 getTxsBlock st h = st.query.getBlock h >>= maybe (raise st ThingNotFound) (return . (.txs))
 
 -- | Handler for @GET \/transactions\/block\/:block@: the transactions of a block, in pieces.
-handleTxsBlock :: WebState -> GetTxsBlock -> IO [IO [Transaction]]
+handleTxsBlock :: WebState -> GetTxsBlock -> IO [(Int, IO [Transaction])]
 handleTxsBlock st (GetTxsBlock h) = transactionPieces st.query <$> getTxsBlock st h
 
 -- | Handler for @GET \/transactions\/block\/:block\/raw@: the transactions of a block, serialized, in pieces.
@@ -1841,7 +2019,7 @@ publishing st =
               patience = 10,
               logger = withSource "Courier" st.config.logger
             },
-      fetch = if st.config.noMempool then \_ -> return () else Publish.askFor st.asking,
+      fetch = Publish.askFor st.asking,
       note = \level -> logAt level (withSource "Publish" st.config.logger)
     }
   where
@@ -1865,8 +2043,88 @@ askingLoop st = forever $ do
   threadDelay 1000000
   where
     own = st.config.store
-    present h = L.withView own.db $ \v -> maybe False (not . (.deleted)) <$> (L.layeredRead v).getTxData h
+    -- in the chain, or in the pool
+    present h =
+      (chainRead own.db).getTxData h >>= \case
+        Just _ -> return True
+        Nothing -> maybe (return False) (\m -> isJust <$> memberPoolBody m h) own.fleet
     ask h = getPeers own.peerMgr >>= mapM_ (\op -> blockStoreTxHash op.mailbox [h] own.block)
+
+-- | Fill the pool again each time the member finds that Redis lost its
+-- data ('Haskoin.Store.Fleet.Member.noteEpoch'): ask every peer for its
+-- mempool ('blockStoreRefill'), and with the RPC of the store's node
+-- (@--node-rpc@), read the node's whole mempool, 'refillBatch'
+-- transactions every two seconds, a turn of the member, each given to the
+-- member as if a peer had sent it ('memberReceived'). The peers alone may
+-- not answer: a node answers a request for its mempool only from a peer
+-- that it allows to use bloom filters.
+refillLoop :: WebState -> IO ()
+refillLoop st = forM_ own.fleet $ \m -> go m 0
+  where
+    own = st.config.store
+    say = withSource "Fleet" st.config.logger
+    go m seen = do
+      n <- atomically $ do
+        n <- readTVar m.refills
+        when (n == seen) retry
+        return n
+      blockStoreRefill own.block
+      forM_ st.config.nodeRpc $ \url ->
+        tryAny (refillFromNode st m url) >>= \case
+          Left e -> logWarn say ("Could not read the mempool of the node over RPC: " <> cs (show e))
+          Right k -> logInfo say ("Gave the pool " <> cs (show k) <> " transactions of the node's mempool")
+      go m n
+
+-- | How many transactions 'refillLoop' reads from the node at a time.
+refillBatch :: Int
+refillBatch = 2000
+
+-- | Give a member every transaction of the mempool of a node, read over its
+-- RPC (@getrawmempool@, then @getrawtransaction@ in batches of
+-- 'refillBatch'). Says how many it gave.
+refillFromNode :: WebState -> Member -> String -> IO Int
+refillFromNode st m url = do
+  ids <-
+    nodeCalls st url [("getrawmempool", [])] <&> \case
+      [Just (A.Array a)] -> [h | A.String h <- Foldable.toList a]
+      _ -> []
+  fmap sum . forM (batches ids) $ \hs -> do
+    now <- fromIntegral . (floor :: POSIXTime -> Integer) <$> getPOSIXTime
+    found <- nodeCalls st url [("getrawtransaction", [A.String h]) | h <- hs]
+    let txs = [tx | Just (A.String hex) <- found, Just bytes <- [decodeHex hex], Right tx <- [decode bytes]]
+    mapM_ (memberReceived m now) txs
+    threadDelay 2000000
+    return (length txs)
+  where
+    batches xs
+      | null xs = []
+      | otherwise = take refillBatch xs : batches (drop refillBatch xs)
+
+-- | The results of calls to the JSON-RPC of a node, made in one batch, in
+-- their order: 'Nothing' for one that failed.
+nodeCalls :: WebState -> String -> [(Text, [A.Value])] -> IO [Maybe A.Value]
+nodeCalls st url calls = do
+  r <- Wreq.Session.postWith opts st.session url (A.toJSON (zipWith call [0 :: Int ..] calls))
+  let answers = case A.decode (r ^. Wreq.responseBody) of
+        Just (A.Array a) ->
+          HashMap.fromList
+            [ (i, v)
+            | A.Object o <- Foldable.toList a,
+              Just (A.String i) <- [KeyMap.lookup "id" o],
+              Just v <- [KeyMap.lookup "result" o],
+              v /= A.Null
+            ]
+        _ -> HashMap.empty
+  return [HashMap.lookup (T.pack (show i)) answers | i <- [0 .. length calls - 1]]
+  where
+    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
+    call i (method, params) =
+      A.object
+        [ "jsonrpc" .= ("1.0" :: Text),
+          "id" .= T.pack (show i),
+          "method" .= method,
+          "params" .= params
+        ]
 
 -- GET Mempool / Events --
 
@@ -1913,9 +2171,10 @@ webSocketEvents s =
       if path /= "/events"
         then turnAway pending ThingNotFound
         else
-          eventsOpen s (\name -> T.decodeUtf8Lenient <$> join (lookup (T.encodeUtf8 name) asked)) >>= \case
-            Left e -> turnAway pending e
-            Right (start, watch) -> do
+          try (eventsOpen s (\name -> T.decodeUtf8Lenient <$> join (lookup (T.encodeUtf8 name) asked))) >>= \case
+            Left u -> turnBusy pending u
+            Right (Left e) -> turnAway pending e
+            Right (Right (start, watch)) -> do
               conn <- acceptRequest pending
               -- websockets only sees pongs while reading, which the
               -- thread that hears the commands does
@@ -1933,12 +2192,32 @@ webSocketEvents s =
       case read' of
         Nothing -> refuse c "Could not read the command"
         Just cmd ->
-          try (command gap s.query.xPubBals watch cmd) >>= \case
-            Right (Right ()) -> hear c watch
-            Right (Left why) -> refuse c why
-            Left (_ :: Except) -> refuse c "Could not do the command"
+          try (try (command gap (watching s) watch cmd)) >>= \case
+            Right (Right (Right ())) -> hear c watch
+            Right (Right (Left why)) -> refuse c why
+            Right (Left (_ :: Except)) -> refuse c "Could not do the command"
+            Left u -> busy c u
     -- 1008: the message is against what the server allows
     refuse c why = WebSockets.sendCloseCode c 1008 (T.pack why)
+    -- 1013: try again later, as 429 or 503 says to a request, for an xpub
+    -- that the indexer refused or could not read
+    busy c u = WebSockets.sendCloseCode c 1013 (T.pack ("Busy: try again in " <> show (secondsOf u) <> " s"))
+    secondsOf = \case
+      NotYet t -> retryAfter t
+      JobBroke -> 1
+    -- the 429 or 503 of 'unindexedResponse', before the websocket opens
+    turnBusy pending u =
+      let r = unindexedResponseOf u
+       in rejectRequestWith
+            pending
+            WebSockets.defaultRejectRequest
+              { WebSockets.rejectBody = case u of
+                  NotYet _ -> "{\"error\":\"server-busy\"}"
+                  JobBroke -> L.toStrict (A.encode ServerError),
+                WebSockets.rejectCode = statusCode (responseStatus r),
+                WebSockets.rejectMessage = statusMessage (responseStatus r),
+                WebSockets.rejectHeaders = responseHeaders r
+              }
     -- the events from a place in the log on, those that the client chose
     tell c watch from =
       atomically (readEvents s.eventLog from) >>= \case
@@ -2011,7 +2290,7 @@ eventsOpen st asked =
         watch <- newTVarIO everything
         let run [] = return (Right (start, watch))
             run (cmd : rest) =
-              command st.query.maxGap st.query.xPubBals watch cmd >>= \case
+              command st.query.maxGap (watching st) watch cmd >>= \case
                 Left why -> return (Left (UserError why))
                 Right () -> run rest
         run cmds
@@ -2095,7 +2374,7 @@ feedEvents st = case own.fleet of
       Right (t, False) -> atomically (appendEvent st.eventLog (TxLeft t))
       Right (t, True) -> do
         -- a transaction that cannot be read is told to every client
-        known <- st.direct.getTxData t `catchAny` \_ -> return Nothing
+        known <- maybe (st.direct.getTxData t) (`memberPoolBody` t) own.fleet `catchAny` \_ -> return Nothing
         atomically (appendEvent st.eventLog (TxEntered t (seenOf own.net <$> known)))
 
 -- GET Address Transactions --
@@ -2124,7 +2403,7 @@ handleAddrsTxs st (GetAddrsTxs addrs pLimits) =
 handleAddrTxsFull ::
   WebState ->
   GetAddrTxsFull ->
-  IO [IO [Transaction]]
+  IO [(Int, IO [Transaction])]
 handleAddrTxsFull st (GetAddrTxsFull addr pLimits) = do
   txs <- st.query.getAddressTxs addr =<< paramToLimits st True pLimits
   return (transactionPieces st.query (map (.txid) txs))
@@ -2134,7 +2413,7 @@ handleAddrTxsFull st (GetAddrTxsFull addr pLimits) = do
 handleAddrsTxsFull ::
   WebState ->
   GetAddrsTxsFull ->
-  IO [IO [Transaction]]
+  IO [(Int, IO [Transaction])]
 handleAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) = do
   txs <- st.query.getAddressesTxs addrs =<< paramToLimits st True pLimits
   return (transactionPieces st.query (map (.txid) txs))
@@ -2144,7 +2423,7 @@ handleAddrsTxsFull st (GetAddrsTxsFull addrs pLimits) = do
 -- of a block or of addresses, so the transactions are there; one that is
 -- gone by the time its piece is read is left out, as it is when the list
 -- is read at once.
-transactionPieces :: StoreRead -> [TxHash] -> [IO [Transaction]]
+transactionPieces :: StoreRead -> [TxHash] -> [(Int, IO [Transaction])]
 transactionPieces q = pieced pieceSize (fmap catMaybes . C.getTransactions q)
 
 -- | Transactions in a piece of a list answered piece by piece. With 20 the
@@ -2191,28 +2470,28 @@ handleXPub ::
   WebState ->
   GetXPub ->
   IO XPubSummary
-handleXPub st (GetXPub xpub deriv (NoCache noCache)) =
+handleXPub st (GetXPub xpub deriv _) =
   withMetrics st (.xpub) $
     let xs = XPubSpec xpub deriv
-     in xPubSummary xs <$> xPubBalsChecked st noCache xs
+     in xPubSummary xs <$> xPubBalsChecked st xs
 
--- | Handler for @DELETE \/xpub\/:xpub@: remove an extended public key from the cache. Returns 'True' if it was cached.
+-- | Handler for @DELETE \/xpub\/:xpub@: remove an extended public key from
+-- the fleet's cache. Returns 'True' if the store has the cache.
 handleDelXPub ::
   WebState ->
   DelCachedXPub ->
   IO (GenericResult Bool)
 handleDelXPub st (DelCachedXPub xpub deriv) =
-  withMetrics st (.xpubDelete) $ do
-    let c = st.config.store.cache
-    r <- maybe (return False) (`cacheDelete` XPubSpec xpub deriv) c
-    return $ GenericResult r
+  withMetrics st (.xpubDelete) $
+    GenericResult <$> case st.config.store.fleet of
+      Just member -> Door.xpubDelete member.door (XPubSpec xpub deriv)
+      Nothing -> return False
 
 -- | Balances of the addresses of an extended public key ('xPubBals'), from
--- the cache unless told not to, refusing a wrong kind of address
--- ('checkDerive').
-xPubBalsChecked :: WebState -> Bool -> XPubSpec -> IO [XPubBal]
-xPubBalsChecked st noCache xs = do
-  bals <- (cacheOr noCache st).query.xPubBals xs
+-- the cache, refusing a wrong kind of address ('checkDerive').
+xPubBalsChecked :: WebState -> XPubSpec -> IO [XPubBal]
+xPubBalsChecked st xs = do
+  bals <- st.query.xPubBals xs
   checkDerive st xs bals
   return bals
 
@@ -2253,57 +2532,54 @@ checkDerive st xs bals =
               deriveAddresses (deriveFunction d) external 0
       any (\b -> b.txs > 0) <$> st.query.getBalances addrs
 
--- | Transactions of an extended public key, optionally without the cache.
+-- | Transactions of an extended public key, from the cache.
 getXPubTxs ::
   WebState ->
   XPubKey ->
   DeriveType ->
   LimitsParam ->
-  Bool ->
   IO [TxRef]
-getXPubTxs st xpub deriv plimits nocache = do
+getXPubTxs st xpub deriv plimits = do
   limits <- paramToLimits st False plimits
   let xs = XPubSpec xpub deriv
-      st' = cacheOr nocache st
-  xbals <- xPubBalsChecked st nocache xs
-  st'.query.xPubTxs xs xbals limits
+  xbals <- xPubBalsChecked st xs
+  st.query.xPubTxs xs xbals limits
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions@: transactions of an extended public key.
 handleXPubTxs ::
   WebState ->
   GetXPubTxs ->
   IO [TxRef]
-handleXPubTxs st (GetXPubTxs xpub deriv plimits (NoCache nocache)) =
+handleXPubTxs st (GetXPubTxs xpub deriv plimits _) =
   withMetrics st (.xpubTx) $
-    getXPubTxs st xpub deriv plimits nocache
+    getXPubTxs st xpub deriv plimits
 
 -- | Handler for @GET \/xpub\/:xpub\/transactions\/full@: full transactions of an extended public key, in pieces.
-handleXPubTxsFull :: WebState -> GetXPubTxsFull -> IO [IO [Transaction]]
-handleXPubTxsFull st (GetXPubTxsFull xpub deriv plimits (NoCache nocache)) =
-  transactionPieces (cacheOr nocache st).query . map (.txid)
-    <$> getXPubTxs st xpub deriv plimits nocache
+handleXPubTxsFull :: WebState -> GetXPubTxsFull -> IO [(Int, IO [Transaction])]
+handleXPubTxsFull st (GetXPubTxsFull xpub deriv plimits _) =
+  transactionPieces st.query . map (.txid)
+    <$> getXPubTxs st xpub deriv plimits
 
 -- | Handler for @GET \/xpub\/:xpub\/balances@: balances of the used addresses of an extended public key.
 handleXPubBalances ::
   WebState ->
   GetXPubBalances ->
   IO [XPubBal]
-handleXPubBalances st (GetXPubBalances xpub deriv (NoCache noCache)) =
+handleXPubBalances st (GetXPubBalances xpub deriv _) =
   withMetrics st (.xpubBalance) $
-    xPubBalsChecked st noCache (XPubSpec xpub deriv)
+    xPubBalsChecked st (XPubSpec xpub deriv)
 
 -- | Handler for @GET \/xpub\/:xpub\/unspent@: unspent outputs of an extended public key.
 handleXPubUnspent ::
   WebState ->
   GetXPubUnspent ->
   IO [XPubUnspent]
-handleXPubUnspent st (GetXPubUnspent xpub deriv pLimits (NoCache noCache)) =
+handleXPubUnspent st (GetXPubUnspent xpub deriv pLimits _) =
   withMetrics st (.xpubUnspent) $ do
     limits <- paramToLimits st False pLimits
     let xspec = XPubSpec xpub deriv
-        st' = cacheOr noCache st
-    xbals <- xPubBalsChecked st noCache xspec
-    st'.query.xPubUnspents xspec xbals limits
+    xbals <- xPubBalsChecked st xspec
+    st.query.xPubUnspents xspec xbals limits
 
 ---------------------------------------
 -- Blockchain.info API Compatibility --
@@ -2428,7 +2704,7 @@ handleBinfoUnspent st req =
     let net = st.config.store.net
     height <- getChainHeight st
     let mn u = min_conf > u.confirmations
-    xbals <- getXBals st.query xspecs
+    xbals <- getXBals st xspecs
     bus <-
       runConduit $
         getBinfoUnspents st.query numtxid height xbals xspecs addrs
@@ -2485,15 +2761,18 @@ getBinfoUnspents q numtxid height xbals xspecs addrs = do
           g a = streamThings (h a) Nothing l .| mapC f
        in map g (HashSet.toList addrs)
 
--- | Balances of the used addresses of each xpub.
+-- | Balances of the used addresses of each xpub of a request: those that
+-- the cache has, and those that it does not have once the indexer has read
+-- them, all asked for at once ('askXPubs'). If any is refused, the request
+-- is, with the latest @Retry-After@ of them.
 getXBals ::
-  StoreRead ->
+  WebState ->
   HashSet XPubSpec ->
   IO (HashMap XPubSpec [XPubBal])
-getXBals q =
-  fmap HashMap.fromList . mapM f . HashSet.toList
-  where
-    f x = (x,) . filter (not . nullBalance . (.balance)) <$> q.xPubBals x
+getXBals st xspecs = do
+  found <- askXPubs ((.door) <$> st.config.store.fleet) st.reading.reads (HashSet.toList xspecs)
+  bals <- forM found $ \(x, cached) -> (x,) <$> maybe (st.query.xPubBals x) return cached
+  return (HashMap.fromList [(x, filter (not . nullBalance . (.balance)) b) | (x, b) <- bals])
 
 -- | Balances of an xpub, or none if missing.
 xBals :: XPubSpec -> HashMap XPubSpec [XPubBal] -> [XPubBal]
@@ -2631,7 +2910,7 @@ handleBinfoHistory st req =
     (xspecs, addrs) <- getBinfoActive st req
     (startM, endM) <- get_dates
     (code, price') <- getPrice st req
-    xbals <- (getXBals st.query xspecs)
+    xbals <- getXBals st xspecs
     let xaddrs = HashSet.fromList $ concatMap (map get_addr) (HashMap.elems xbals)
         aaddrs = xaddrs <> addrs
         cur = price'.fifteen
@@ -2751,7 +3030,7 @@ handleMultiAddr st req =
     n <- getBinfoCount st req "n"
     prune <- get_prune
     fltr <- get_filter
-    xbals <- (getXBals st.query xspecs)
+    xbals <- getXBals st xspecs
     xtxns <- get_xpub_tx_count xbals xspecs
     let sxbals = only_show_xbals sxpubs xbals
         xabals = compute_xabals xbals
@@ -2959,7 +3238,7 @@ handleRawAddr st req =
       let xspec = XPubSpec xpub derive
       n <- getBinfoCount st req "limit"
       off <- getBinfoOffset st req
-      xbals <- (getXBals st.query (HashSet.singleton xspec))
+      xbals <- getXBals st (HashSet.singleton xspec)
       checkDerive st xspec (xBals xspec xbals)
       let net = st.config.store.net
       let summary = xPubSummary xspec (xBals xspec xbals)
@@ -3116,7 +3395,8 @@ handleShortBal st req =
     cashaddr <- getCashAddr req
     let net = st.config.store.net
     abals <- catMaybes <$> mapM (getabal net cashaddr) (HashSet.toList addrs)
-    xbals <- mapM (getxbal net) (HashSet.toList xspecs)
+    found <- askXPubs ((.door) <$> st.config.store.fleet) st.reading.reads (HashSet.toList xspecs)
+    xbals <- mapM (getxbal net) found
     let res = HashMap.fromList (abals <> xbals)
     streamEncoding $ toEncoding res
   where
@@ -3140,8 +3420,8 @@ handleShortBal st req =
               st.query.getBalance a >>= \case
                 Nothing -> return $ Just (a', shorten (zeroBalance a))
                 Just b -> return $ Just (a', shorten b)
-    getxbal net xpub = do
-      xbals <- st.query.xPubBals xpub
+    getxbal net (xpub, cached) = do
+      xbals <- maybe (st.query.xPubBals xpub) return cached
       ntx <- fromIntegral <$> st.query.xPubTxCount xpub xbals
       let val = sum $ map (.balance.confirmed) xbals
           zro = sum $ map (.balance.unconfirmed) xbals
@@ -3212,7 +3492,7 @@ binfoBlockPieces st numtxid b = do
       around (lazyByteString before) "}"
         <$> listPieces (marshalEncoding net . toBinfoTxSimple numtxid) txs
     else do
-      whole <- map (toBinfoTxSimple numtxid) . concat <$> sequence txs
+      whole <- map (toBinfoTxSimple numtxid) . concat <$> mapM snd txs
       return [piece (return (fromEncoding (marshalEncoding net (toBinfoBlock b whole nxt))))]
   where
     net = st.config.store.net
@@ -3532,38 +3812,25 @@ getPeersInformation mgr =
 -- | The route of @GET \/health@. Its status says in one number what a load
 -- balancer needs to know:
 --
--- * 200: every check passes;
+-- * 200: every check passes, Redis answering;
 --
--- * 203: every check passes, but Redis does not answer, so the store
---   answers from its own database and mempool alone;
+-- * 503: a check fails, or Redis does not answer.
 --
--- * 503: a check fails.
+-- = Why 503 for a store without its Redis
 --
--- = Why 203 for a store without its Redis
---
--- Such a store is not broken: its answers are right for what it has seen. A
--- load balancer should go on sending it requests, which it does for any
--- status in the 200s, so the status cannot be an error. But the answers are
--- no longer those of the fleet: they do not come from the copy that the
--- stores share. That is what 203, Non-Authoritative Information, says of a
--- response, and a monitor that expects exactly 200 will notice it. 207 was
--- the other candidate, for a body with a status for each part; it promises
--- a format that this body does not have. The response also names what is
--- missing in a @Haskoin-Degraded@ header.
---
--- = The check of Redis in the body
---
--- The body of a store that has a cache has one more check than the others,
--- 'Haskoin.Store.Data.redis', which says whether Redis answers. It does not
--- count towards the @ok@ of the whole, which stays the answer to "is this
--- store fit to serve".
+-- Redis holds the mempool and the cache of xpubs that every store answers
+-- from (@docs\/one-fleet.md@). Without it a store knows no mempool and
+-- answers no query about an xpub, so the load balancer must stop sending
+-- it requests. The response names what is missing in a @Haskoin-Degraded@
+-- header, and the body says whether Redis answers in
+-- 'Haskoin.Store.Data.redis'.
 pathHealth :: WebState -> Route
 pathHealth st =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) [] $ \_ -> do
     h <- handleHealth st GetHealth
     let (status, extra)
           | not (isOK h) = (status503, [("Retry-After", "5")])
-          | h.redis == Just False = (status203, [("Haskoin-Degraded", "redis")])
+          | h.redis == Just False = (status503, [("Retry-After", "5"), ("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
       responseLBS status ((hContentType, "application/json") : extra) (encodingToLazyByteString (toEncoding h))
@@ -3581,8 +3848,7 @@ handleHealth st _ =
     up <- readTVarIO st.cacheUp
     -- a store without a cache has no Redis to be without
     let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
-    let shares = void st.config.store.cache <|> void st.config.store.fleet
-    return HealthCheck {redis = up <$ shares, ..}
+    return HealthCheck {redis = Just up, ..}
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth
@@ -3614,26 +3880,20 @@ lastBlockHealthCheck ch WebLimits {blockTimeout} = do
 
 -- | Age of the newest mempool transaction or best header, and the maximum allowed.
 lastTxHealthCheck :: WebConfig -> IO TimeHealth
-lastTxHealthCheck WebConfig {noMempool, store = store', limits} = do
+lastTxHealthCheck WebConfig {store = store', limits} = do
   n <- round <$> getPOSIXTime
   b <- fromIntegral . (.header.timestamp) <$> (chainGetBest ch)
   t <-
-    Q.getMempoolPage store'.db (Limits 1 0 Nothing) >>= \case
-      t : _ ->
-        let x = fromIntegral $ fst t
-         in return $ max x b
-      [] -> return b
+    maybe (return Nothing) memberNewest store'.fleet >>= \case
+      Just x -> return (max (fromIntegral x) b)
+      Nothing -> return b
   return
     TimeHealth
       { age = n - t,
-        max = fromIntegral to
+        max = fromIntegral limits.txTimeout
       }
   where
     ch = store'.chain
-    to =
-      if noMempool
-        then limits.blockTimeout
-        else limits.txTimeout
 
 -- | Transactions waiting to be imported and the maximum allowed.
 pendingTxsHealthCheck :: WebConfig -> IO MaxHealth
@@ -3808,68 +4068,155 @@ validateLimit wl full limitM =
 -- Utilities --
 ---------------
 
+-- | Why a request about xpubs cannot be answered yet: the indexer refused
+-- it, saying in how many microseconds to come back (429), or the job of
+-- one of its xpubs failed (503). Thrown by the queries of 'xpubQuery', and
+-- answered by 'unindexedResponse'.
+data Unindexed
+  = NotYet !Int
+  | JobBroke
+  deriving (Eq, Show)
+
+instance Exception Unindexed
+
 -- | The queries that the web server answers with: those of the database,
--- with the Redis cache, if there is one, in front of the queries about xpubs
--- and of the bodies of transactions. An xpub that the cache does not have is
--- read from the database, and cached for next time if it is large enough.
+-- with the door to the fleet's cache of xpubs in front of the queries about
+-- xpubs and of the bodies of transactions (@docs\/xpub-indexing.md@).
 --
--- When Redis does not answer, every query is answered from the database, as
--- if the store had no cache. The variable says whether Redis answered the
--- last time: a query that fails clears it, so that the next ones do not wait
--- for Redis in turn, and the health check sets it again when Redis is back.
-webQuery :: Store -> TVar Bool -> StoreRead -> StoreRead
-webQuery s up base = case s.cache of
-  Nothing -> base
-  Just c ->
-    (base :: StoreRead)
-      { getTxData = fmap listToMaybe' . txData c . pure,
-        getManyTxData = txData c,
-        xPubBals = \x ->
-          cached (cacheXPubBals c x) >>= \case
-            Just bals -> return bals
-            Nothing -> do
-              bals <- base.xPubBals x
-              _ <- cached (Just <$> cacheRequest c x bals)
-              return bals,
-        xPubUnspents = \x bals l ->
-          cached (cacheXPubUnspents c x bals l) >>= maybe (base.xPubUnspents x bals l) return,
-        xPubTxs = \x bals l ->
-          cached (cacheXPubTxs c x l) >>= maybe (base.xPubTxs x bals l) return,
-        xPubTxCount = \x bals ->
-          cached (cacheXPubTxCount c x) >>= maybe (base.xPubTxCount x bals) return
-      }
+-- * __The balances of an xpub__ come from the cache. On a miss the indexer
+--   is asked for the xpub ('xpubAsk'), and the request waits for it, up to
+--   the wait of the indexer: once it is indexed, the cache answers;
+--   refused, the request is, with 429 and @Retry-After@; if its job failed,
+--   with 503. An xpub evicted before the request read it is asked for once
+--   more, and then the request has 503.
+-- * __Its transactions, outputs and count__ come from the cache too, of
+--   the version of the balances. One that is not there, because the entry
+--   was evicted since, has the request answered again (v'EntryMoved').
+-- * __Bodies of transactions__ come from Redis when it has them, and from
+--   the database otherwise.
+--
+-- The database never answers a query about an xpub (decision of
+-- 2026-11-17): every answer is of one version of an entry. There is no
+-- setting that turns the cache off. A store without Redis has no door
+-- ('Nothing'), and answers 503 to every query about an xpub.
+xpubQuery :: Maybe XPubs -> Door.Session -> StoreRead -> StoreRead
+xpubQuery gate sess base =
+  (base :: StoreRead)
+    { getTxData = fmap listToMaybe' . txData . pure,
+      getManyTxData = txData,
+      xPubBals = balances,
+      xPubUnspents = \x bals l -> cached (r.unspents x bals l),
+      xPubTxs = \x _ l -> cached (r.transactions x l),
+      xPubTxCount = \x _ -> cached (r.count x)
+    }
   where
-    -- ask Redis, unless it is down, and take a failure, or no answer within
-    -- two seconds, for "not cached"
-    cached :: IO (Maybe a) -> IO (Maybe a)
-    cached ask =
-      readTVarIO up >>= \case
-        False -> return Nothing
-        True ->
-          (timeout 2000000 ask `catchAny` \_ -> return Nothing) >>= \case
-            Just answer -> return answer
-            Nothing -> atomically (writeTVar up False) >> return Nothing
-    -- bodies from Redis when the cache has them, so that the transactions
-    -- of a cached xpub are served in full even before this store has
-    -- imported them, and from the database otherwise
-    txData _ [] = return []
-    txData c ths = do
-      found <- cached (Just <$> cacheTxData c ths)
-      let fromCache = fromMaybe (map (const Nothing) ths) found
-          missing = [h | (h, Nothing) <- zip ths fromCache]
+    r = sess.reads
+    cached :: IO (Maybe a) -> IO a
+    cached ask = ask >>= maybe (throwIO EntryMoved) return
+    balances x = r.balances x >>= maybe (asked x (2 :: Int)) return
+    -- once indexed, the cache, read at one version as every read of the
+    -- request ('xpubSession'); an xpub evicted at once is asked for again
+    asked x tries = case gate of
+      Nothing -> throwIO JobBroke
+      Just xs -> do
+        a <- xpubAsk xs x
+        unindexed [a]
+        r.balances x >>= \case
+          Just bals -> return bals
+          Nothing
+            | tries > 1 -> asked x (tries - 1)
+            | otherwise -> throwIO JobBroke
+    txData [] = return []
+    txData ths = do
+      fromCache <- r.bodies ths
+      let missing = [h | (h, Nothing) <- zip ths fromCache]
       fromDB <- HashMap.fromList . zip missing <$> base.getManyTxData missing
-      -- deleted ones are left out, wherever they come from
-      return $
+      -- deleted ones are left out, wherever they come from, and the wallets
+      -- that the request read say what their entries say of each
+      r.wallet . map notDeleted $
         zipWith
-          (\h m -> notDeleted (maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m))
+          (\h m -> maybe (fromMaybe Nothing (HashMap.lookup h fromDB)) Just m)
           ths
           fromCache
 
--- | The state of the web server, answering without the cache if the flag is
--- 'True', as @nocache=true@ asks.
-cacheOr :: Bool -> WebState -> WebState
-cacheOr False st = st
-cacheOr True st = (st :: WebState) {query = st.direct}
+-- | Throw what the answers of the indexer about the xpubs of a request say,
+-- if they do not all say that the cache has them now: the latest
+-- @Retry-After@ of those refused, or that a job failed.
+unindexed :: [Answer] -> IO ()
+unindexed answers
+  | not (null waits) = throwIO (NotYet (maximum waits))
+  | Failed `elem` answers = throwIO JobBroke
+  | otherwise = return ()
+  where
+    waits = [t | Refused _ t <- answers]
+
+-- | The balances of some xpubs from the cache, with their misses all asked
+-- for at once, concurrently, and read from the cache once indexed; with
+-- 'Nothing' for a miss evicted at once, which the request reads through
+-- its queries. If the indexer refused any, this throws, with the latest
+-- @Retry-After@ of them ('unindexed'); a store without Redis throws that
+-- the job failed (503).
+askXPubs :: Maybe XPubs -> XPubReads -> [XPubSpec] -> IO [(XPubSpec, Maybe [XPubBal])]
+askXPubs gate r specs = do
+  found <- forM specs $ \x -> (x,) <$> r.balances x
+  let misses = [x | (x, Nothing) <- found]
+  answers <- case (misses, gate) of
+    ([], _) -> return []
+    (_, Nothing) -> throwIO JobBroke
+    (_, Just xs) -> mapConcurrently (xpubAsk xs) misses
+  unindexed answers
+  -- the misses that were indexed, read at one version, as every read of
+  -- the request
+  indexed <- HashMap.fromList <$> forM misses (\x -> (x,) <$> r.balances x)
+  return [(x, maybe (join (HashMap.lookup x indexed)) Just b) | (x, b) <- found]
+
+-- | The balances of an xpub for the filters of @\/events@, which ask the
+-- indexer for an xpub that the cache does not have, as every query does.
+-- A filter is not made inside a request, so it reads the cache in a
+-- session of its own, at the fleet tip, taken again if the tip moves. A
+-- refusal turns the HTTP stream away with 429, as any request, and the
+-- websocket with 1013, try again later; so does a store that has no view
+-- of the fleet tip, or no Redis.
+watching :: WebState -> XPubSpec -> IO [XPubBal]
+watching st x = go (3 :: Int)
+  where
+    go n = case st.config.store.fleet of
+      Nothing -> throwIO JobBroke
+      Just m ->
+        memberTip m >>= \case
+          Nothing -> throwIO JobBroke
+          Just tip ->
+            try (answeringCached m tip (balances m)) >>= \case
+              Right (Just bals) -> return bals
+              Right Nothing | n > 1 -> go (n - 1)
+              Left TipMoved | n > 1 -> go (n - 1)
+              _ -> throwIO JobBroke
+    balances m q sess _ = (xpubQuery (Just m.door) sess q).xPubBals x <* sess.settle
+
+-- | The answer to a request about xpubs that cannot be answered yet: 429
+-- with @{"error":"server-busy"}@ and @Retry-After@ in whole seconds, the
+-- time that the job is expected to take, or 503 with @Retry-After: 1@ for a job that
+-- failed.
+unindexedResponse :: WebState -> Unindexed -> IO Response
+unindexedResponse st u = do
+  forM_ st.metrics $ \m -> case u of
+    NotYet _ -> incrementCounter m.refused 1
+    JobBroke -> incrementCounter m.serverErrors 1
+  return (unindexedResponseOf u)
+
+-- | The response of 'unindexedResponse'.
+unindexedResponseOf :: Unindexed -> Response
+unindexedResponseOf = \case
+  NotYet t ->
+    responseLBS
+      status429
+      [(hContentType, "application/json"), ("Retry-After", C.pack (show (retryAfter t)))]
+      "{\"error\":\"server-busy\"}"
+  JobBroke ->
+    responseLBS
+      status503
+      [(hContentType, "application/json"), ("Retry-After", "1")]
+      (A.encode ServerError)
 
 -- | The only element of a list of one optional value.
 listToMaybe' :: [Maybe a] -> Maybe a
@@ -3925,7 +4272,8 @@ logIt logger access slow app req respond = do
       if
         | statusIsServerError s && s /= status503 -> logError logger msg
         | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")
-        | otherwise -> logDebug logger msg
+        | logger.level <= LevelDebug -> logDebug logger msg
+        | otherwise -> return ()
       when (slow > 0 && took >= fromIntegral slow && pathInfo req /= ["events"]) $
         logWarn logger ("Slow request, " <> seconds <> " seconds: " <> msg)
 

@@ -23,6 +23,7 @@ extra-source-files:
   - cbits/haskoin_store_merge.h
   - src/Haskoin/Store/Cache/lua/*.lua
   - src/Haskoin/Store/Fleet/lua/*.lua
+  - src/Haskoin/Store/XPub/lua/*.lua
   - stress/wrk.lua
   - swagger.yaml
 extra-doc-files:
@@ -75,6 +76,10 @@ dependencies:
   - wai-extra ^>= 3.1.18
   - wai-websockets ^>= 3.0.1.2
   - warp ^>= 3.4.17
+  # not imported: a bound on the time-manager that Warp uses. Before 0.4,
+  # every fragment of a streaming answer edits GHC's one timer queue, and
+  # under load requests queue up behind each other there (stack.yaml)
+  - time-manager >= 0.4.2 && < 0.5
   - warp-tls ^>= 3.4.14
   - websockets ^>= 0.13.0.0
   - wreq ^>= 0.5.4.5
@@ -94,8 +99,11 @@ ghc-options:
 library:
   source-dirs: src
   # the merge operators of the database, which RocksDB calls from its own
-  # threads: see cbits/haskoin_store_merge.h
-  c-sources: cbits/haskoin_store_merge.c
+  # threads: see cbits/haskoin_store_merge.h; and the bell of the probes of
+  # the scheduler's delay (Haskoin.Store.Web.Congestion)
+  c-sources:
+    - cbits/haskoin_store_merge.c
+    - cbits/haskoin_store_probe.c
   include-dirs: cbits
   cc-options: -Wall
 internal-libraries:

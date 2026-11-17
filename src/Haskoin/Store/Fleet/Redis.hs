@@ -72,6 +72,7 @@ module Haskoin.Store.Fleet.Redis
     poolOffer,
     poolWithdraw,
     fleetAdvance,
+    fleetCommit,
     fleetRestart,
     fleetRestarts,
     FleetEvent (..),
@@ -80,18 +81,26 @@ module Haskoin.Store.Fleet.Redis
     poolSpends,
     poolBody,
     poolRead,
+
+    -- * Scripts
+    Script,
+    script,
+    evalScript,
   )
 where
 
+import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word64)
-import Database.Redis (Connection, Redis, Reply)
+import Database.Redis (Connection, Redis, RedisResult, Reply (..))
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | The keys of a fleet in Redis, and the size of its blocks in bytes.
 data FleetKeys = FleetKeys
@@ -137,7 +146,7 @@ data Moved
 -- tip and another store is live ('Haskoin.Store.Fleet.mayReport').
 fleetReport :: Connection -> FleetKeys -> Maybe Time -> Time -> ByteString -> [ByteString] -> [ByteString] -> IO Bool
 fleetReport conn keys clock term store blocks views =
-  (== 1) <$> run conn (R.eval reportScript (scriptKeys keys) args :: Redis (Either Reply Integer))
+  (== 1) <$> run conn (evalScript reportScript (scriptKeys keys) args :: Redis (Either Reply Integer))
   where
     args = [store, num term, maybe "" num clock, num keys.size, B.concat blocks, B.concat views]
 
@@ -145,7 +154,7 @@ fleetReport conn keys clock term store blocks views =
 -- the tip that the caller saw.
 fleetMove :: Connection -> FleetKeys -> Maybe Time -> Maybe ByteString -> IO Moved
 fleetMove conn keys clock seen =
-  run conn (R.eval moveScript (scriptKeys keys) args) >>= \case
+  run conn (evalScript moveScript (scriptKeys keys) args) >>= \case
     ["moved", block] -> return (MovedTo block)
     ["stays"] -> return Stays
     ["raced"] -> return Raced
@@ -247,7 +256,7 @@ poolOffer ::
   [ByteString] ->
   IO Offered
 poolOffer conn keys tsize seen tx unspents replaced =
-  run conn (R.eval poolScript [] args) >>= \case
+  run conn (evalScript poolScript [] args) >>= \case
     ["taken"] -> return Taken
     ["known"] -> return Known
     "conflict" : rivals -> return (Conflict rivals)
@@ -262,7 +271,7 @@ poolOffer conn keys tsize seen tx unspents replaced =
 -- those that left.
 poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString]
 poolWithdraw conn keys tsize ts =
-  run conn (R.eval poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
+  run conn (evalScript poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
 
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the
@@ -288,9 +297,33 @@ fleetAdvance ::
   Maybe PoolChange ->
   [ByteString] ->
   IO Moved
-fleetAdvance conn keys tsize clock seen target known =
-  advance conn keys tsize clock seen target (maybe "1" (const "0") known) (fromMaybe unchanged known)
+fleetAdvance conn keys tsize clock seen target known path =
+  fleetCommit conn keys tsize clock seen target known path ""
+
+-- | 'fleetAdvance' as the commit of a move of the tip with the cache of
+-- extended public keys: given also the token of the move of the cache that
+-- the store began ('Haskoin.Store.Fleet.XPub.cacheBegin'), whose pieces
+-- marked the entries that it wrote. The cache is never emptied here: a
+-- store that cannot say what the abandoned blocks held does not move the
+-- tip. The pool, the tip and the cache change together: every marked entry gets
+-- a new version and the cache is at the new tip, in the same script. The
+-- answer is 'Raced' if another move of the cache is under way, or if the
+-- store's was aborted.
+fleetCommit ::
+  Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe Time ->
+  Maybe ByteString ->
+  ByteString ->
+  Maybe PoolChange ->
+  [ByteString] ->
+  ByteString ->
+  IO Moved
+fleetCommit conn keys tsize clock seen target known path token =
+  advance conn keys tsize clock seen target how (fromMaybe unchanged known) (path, token)
   where
+    how = maybe "1" (const "0") known
     unchanged = PoolChange [] [] [] [] Nothing []
 
 -- | Move the tip to a block and empty the pool, for a store that has both
@@ -306,7 +339,7 @@ fleetAdvance conn keys tsize clock seen target known =
 -- count of 'fleetRestarts' went up.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
-  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) []
+  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) ([], "")
 
 -- | How many times the pool was emptied to move the tip. A store that sees
 -- another number than at its last turn offers all of its mempool again:
@@ -326,10 +359,10 @@ advance ::
   ByteString ->
   ByteString ->
   PoolChange ->
-  [ByteString] ->
+  ([ByteString], ByteString) ->
   IO Moved
-advance conn keys tsize clock seen target how change path =
-  run conn (R.eval poolScript [] args) >>= \case
+advance conn keys tsize clock seen target how change (path, token) =
+  run conn (evalScript poolScript [] args) >>= \case
     ["moved"] -> return (MovedTo target)
     ["stays"] -> return Stays
     ["raced"] -> return Raced
@@ -341,14 +374,14 @@ advance conn keys tsize clock seen target how change path =
         <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent, B.concat change.lost]
         <> [num (length change.returned)]
         <> concatMap txArgs change.returned
-        <> [B.concat path]
+        <> [B.concat path, token]
 
 -- | Read from the pool as it is at a tip: given the size of a transaction
 -- id, the tip that the caller answers from, what to read and its arguments,
 -- as @read.lua@ takes them. 'Nothing' if the tip is another one by now.
 poolRead :: Connection -> FleetKeys -> Int -> Maybe ByteString -> ByteString -> [ByteString] -> IO (Maybe [ByteString])
 poolRead conn keys tsize tip what args =
-  run conn (R.eval readScript [] (what : keys.prefix : num tsize : maybe "" id tip : args)) >>= \case
+  run conn (evalScript readScript [] (what : keys.prefix : num tsize : maybe "" id tip : args)) >>= \case
     "ok" : rows -> return (Just rows)
     ["raced"] -> return Nothing
     other -> fail ("Unexpected answer of the read script: " <> show (take 1 other))
@@ -431,21 +464,63 @@ run conn f =
     Right x -> return x
     Left e -> fail ("Redis error: " <> show e)
 
+-- | A Lua script that Redis keeps compiled under its digest.
+--
+-- @EVAL@ sends the whole script with every call, and Redis hashes it every
+-- time to find it compiled: for the scripts of the pool, several kilobytes
+-- for a read of a few bytes. That was most of what Redis did for a simple
+-- request, and Redis has one thread for the whole fleet. So a script is
+-- loaded once, its digest kept here, and called by it with @EVALSHA@. A
+-- Redis that lost its scripts, as one that restarted, says @NOSCRIPT@, and
+-- the script is loaded again. The digest is the same on every Redis, so
+-- one is kept for the program, not for each connection.
+data Script = Script
+  { source :: !ByteString,
+    digest :: !(IORef (Maybe ByteString))
+  }
+
+-- | A script of this source. Only for a top-level binding marked NOINLINE,
+-- so that there is one of each script.
+script :: ByteString -> Script
+script s = unsafePerformIO (Script s <$> newIORef Nothing)
+{-# NOINLINE script #-}
+
+-- | Run a script, as 'R.eval' does, by its digest.
+evalScript :: (RedisResult a) => Script -> [ByteString] -> [ByteString] -> Redis (Either Reply a)
+evalScript sc keys args =
+  liftIO (readIORef sc.digest) >>= \case
+    Nothing -> load
+    Just sha ->
+      R.evalsha sha keys args >>= \case
+        Left (Error e) | "NOSCRIPT" `B.isPrefixOf` e -> load
+        r -> return r
+  where
+    load =
+      R.scriptLoad sc.source >>= \case
+        Left e -> return (Left e)
+        Right sha -> do
+          liftIO (writeIORef sc.digest (Just sha))
+          R.evalsha sha keys args
+
 -- | 'Haskoin.Store.Fleet.mayReport' and 'Haskoin.Store.Fleet.report' in one
 -- step.
-reportScript :: ByteString
-reportScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/report.lua" >>= embedFile)
+reportScript :: Script
+reportScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/report.lua" >>= embedFile)
+{-# NOINLINE reportScript #-}
 
 -- | 'Haskoin.Store.Fleet.move'.
-moveScript :: ByteString
-moveScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/move.lua" >>= embedFile)
+moveScript :: Script
+moveScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/move.lua" >>= embedFile)
+{-# NOINLINE moveScript #-}
 
 -- | What a store reads from the pool, each read with a check that the tip
 -- is the one that the store answers from.
-readScript :: ByteString
-readScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/read.lua" >>= embedFile)
+readScript :: Script
+readScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/read.lua" >>= embedFile)
+{-# NOINLINE readScript #-}
 
 -- | 'Haskoin.Store.Fleet.Pool.offer', 'Haskoin.Store.Fleet.Pool.withdraw',
 -- and 'Haskoin.Store.Fleet.Pool.advance' with the move of the tip.
-poolScript :: ByteString
-poolScript = $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/pool.lua" >>= embedFile)
+poolScript :: Script
+poolScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/pool.lua" >>= embedFile)
+{-# NOINLINE poolScript #-}

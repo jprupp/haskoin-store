@@ -65,7 +65,7 @@
 -- * __Readers pay for the merge.__ A read of a key with merge records
 --   pending looks into every table file that has one of them, down to the
 --   value, and merges. @haskoin-store-bench merge@ measures it, and
---   @docs\/layered-database.md@ has the figures.
+--   @docs\/one-fleet.md@ has the figures.
 --
 -- * __Reverts read.__ Only the import of a block writes merge records.
 --   Taking a block out of the chain, and everything else that changes a

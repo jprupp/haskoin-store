@@ -1,5 +1,5 @@
--- | How long a full block takes to import, in stages and as it did until
--- version 1.15.1.
+-- | How long a full block takes to import, in stages with its reads made
+-- ahead, and with every read made when the rules come to it.
 --
 -- > haskoin-store-bench import [OUTPUTS [TXS [BLOCKS [CACHE_MIB [DIR]]]]] +RTS -N4
 --
@@ -7,70 +7,35 @@
 -- default) over half as many addresses, with the rules of the store,
 -- closes it so that RocksDB writes it all to table files, and makes two
 -- copies. It then imports the same blocks of TXS transactions (3,500) into
--- each: into one with 'importBlockSequential' and no read cache, which is
--- the import as it was until version 1.15.1 but for the hash tables and
--- the serialising of the batch, which it shares with the new one; and into
--- the other with 'importBlock'.
+-- each: into one with 'importBlock' and no read cache ('withoutReadCache'),
+-- which reads every key when the rules ask for it; and into the other with 'importBlock' as the store runs it.
 --
--- = Four kinds of block
---
--- BLOCKS blocks (5) of each kind are imported, in this order:
---
--- 1. with an empty mempool, as a store that syncs or catches up does;
---
--- 2. with an empty mempool again, and chains of transactions in the block
---    ('Chained'): three inputs in four spend an output that a transaction
---    of the same block makes, as on Bitcoin mainnet today, where the
---    blocks of the first kind have one in twenty;
---
--- 3. with every transaction of the block in the mempool first, as at the
---    tip of the chain;
---
--- 4. with a mempool of TXS transactions that have nothing to do with the
---    block, and a block of chains again, none of whose transactions the
---    mempool has seen: what a miner was given directly.
---
--- The fourth kind is there because nothing measured it, and it was the
--- slow one. A block whose transactions the mempool has is taken out of
--- the mempool, and one that meets an empty mempool asks it nothing. A
--- block that the mempool has not seen, on a mempool that is not empty,
--- has to find out which mempool transactions it conflicts with. That
--- looked in the chain for the spender of every output that the block both
--- makes and spends, one read each, and a block of mainnet spent ten
--- seconds on it.
+-- BLOCKS blocks (5) of two kinds are imported, in this order: blocks whose
+-- inputs spend outputs spread over the set, and blocks of chains
+-- ('Chained'), where three inputs in four spend an output that a
+-- transaction of the same block makes, as on Bitcoin mainnet today.
 --
 -- = What a block is made of
 --
--- A transaction of the first and third kinds spends two outputs spread
+-- A transaction of the first kind spends two outputs spread
 -- over the set, or one of them and an output of the transaction before it
 -- in the block for one in ten, and pays an address that has outputs and a
 -- new one. So a block of 3,500 spends about 6,650 unspent outputs, adds a
 -- spender to the groups of as many transactions and changes 14,000
--- balances, about what a block of mainnet does. The sequential import
--- reads all of those. The import in stages reads the outputs, and since
+-- balances, about what a block of mainnet does. The import in stages reads
+-- the outputs, and since
 -- database version 23 writes the spenders and the balances as merge
 -- records, without reading them ("Haskoin.Store.Database.Merge"). The
 -- outputs of the set come from transactions of 50 outputs each, and a
 -- block spends outputs of thousands of them.
 --
--- A block of the second and fourth kinds has as many transactions, inputs
+-- A block of the second kind has as many transactions, inputs
 -- and outputs, in chains of a hundred ('chainLength'), and spends about
 -- 1,850 outputs of the set.
 --
 -- The database is built by the import in stages, so the balances and the
 -- spenders that it starts with are merge records in table files, as on a
--- store: the sequential import, which reads them, has RocksDB merge them.
---
--- Before the fourth kind it says what the copy in memory of the mempool
--- area costs ("Haskoin.Store.Database.Copy"), and what is remembered with
--- it of the outputs that mempool transactions spend: the transactions of
--- one more block are given to the mempool, where they stay for the blocks
--- of the fourth kind, and the copy is loaded from the database again.
--- With @+RTS -T@ it also says how much heap they take and how long a full
--- collection takes with the copy. For a mempool of the size of mainnet's,
--- ask for blocks of 25,000 transactions:
---
--- > haskoin-store-bench import 1000000 25000 1 +RTS -N4 -A64m -T
+-- store.
 --
 -- The block cache is CACHE_MIB (32), a fraction of the database, so that
 -- most reads fetch and decompress a block of a table file, as on a store
@@ -81,27 +46,21 @@ module Import (importBench) where
 import Control.Concurrent (getNumCapabilities)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM_, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
-import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (find)
 import Data.Maybe (fromMaybe)
 import Data.Serialize (encode)
 import Data.Word (Word64)
-import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Haskoin
 import Haskoin.Node (LogLevel (..), Logger (..))
 import Haskoin.Store.Data (BlockData (..))
-import Haskoin.Store.Database.Copy (copySize, spentOutputs)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
-    forgetMempoolCopy,
-    knownMempoolCopy,
-    mempoolCopy,
     withLayeredReader,
   )
 import Haskoin.Store.Database.Writer
@@ -116,11 +75,10 @@ import Haskoin.Store.Database.Writer
     withoutReadCache,
   )
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory, withTempDirectory)
-import Haskoin.Store.Logic.Layered (importBlock, importBlockSequential, initBest, newMempoolTx)
+import Haskoin.Store.Logic (importBlock, initBest)
 import System.Directory (copyFile, createDirectory, listDirectory)
 import System.FilePath ((</>))
 import System.IO (hFlush, stdout)
-import System.Mem (performMajorGC)
 import Text.Printf (printf)
 
 net :: Network
@@ -173,12 +131,7 @@ run plan dir = do
   let n = plan.blocks
       (tip1, empty) = measured plan Spread tip 0 n
       (tip2, emptyChained) = measured plan Chained tip1 n n
-      (tip3, pooled) = measured plan Spread tip2 (2 * n) n
-      (tip4, unseen) = measured plan Chained tip3 (3 * n) n
-      -- one more block, which is not imported: its transactions go to the
-      -- mempool and stay there
-      others = map fst (snd (measured plan Spread tip4 (4 * n) 1))
-  _ <- evaluate (force (map fst (empty <> emptyChained <> pooled <> unseen) <> others))
+  _ <- evaluate (force (map fst (empty <> emptyChained)))
   forM_ [("spread" :: String, empty), ("chained", emptyChained)] $ \(shape, blocks) ->
     printf
       "%s blocks of %d transactions, %d inputs and %d outputs: %d inputs spend an output of the block\n"
@@ -190,36 +143,24 @@ run plan dir = do
   putStrLn ""
   hFlush stdout
   (old, oldBest) <- open plan before $ \db -> do
-    a <- mapM (measure db False sequential) empty
-    b <- mapM (measure db False sequential) emptyChained
-    c <- mapM (measure db True sequential) pooled
-    mapM_ (fill db) others
-    d <- mapM (measure db False sequential) unseen
-    ((a, b, c, d),) <$> Q.getBestBlock db
-  (new, newBest, copied) <- open plan after $ \db -> do
-    a <- mapM (measure db False importBlock) empty
-    b <- mapM (measure db False importBlock) emptyChained
-    c <- mapM (measure db True importBlock) pooled
-    -- the transactions that stay in the mempool, and what their copy
-    -- costs
-    copied <- mapM (copyCost db) others
-    d <- mapM (measure db False importBlock) unseen
-    best <- Q.getBestBlock db
-    return ((a, b, c, d), best, copied)
-  when (oldBest /= newBest || oldBest /= Just (headerHash (fst tip4))) $
+    a <- mapM (measure db plain) empty
+    b <- mapM (measure db plain) emptyChained
+    ((a, b),) <$> Q.getBestBlock db
+  (new, newBest) <- open plan after $ \db -> do
+    a <- mapM (measure db importBlock) empty
+    b <- mapM (measure db importBlock) emptyChained
+    ((a, b),) <$> Q.getBestBlock db
+  when (oldBest /= newBest || oldBest /= Just (headerHash (fst tip2))) $
     fail "the two databases did not end at the last block"
-  let (oldEmpty, oldEmptyChained, oldPooled, oldUnseen) = old
-      (newEmpty, newEmptyChained, newPooled, newUnseen) = new
-  report "mempool empty, as when syncing or catching up" oldEmpty newEmpty
+  let (oldEmpty, oldEmptyChained) = old
+      (newEmpty, newEmptyChained) = new
+  report "outputs spread over the set" oldEmpty newEmpty
   report
-    "mempool empty, a block of chains: three inputs in four spend an output of the block"
+    "a block of chains: three inputs in four spend an output of the block"
     oldEmptyChained
     newEmptyChained
-  report "every transaction in the mempool first, as at the tip" oldPooled newPooled
-  report "a mempool of other transactions, and a block of chains that it has not seen" oldUnseen newUnseen
-  mapM_ putStr copied
   where
-    sequential w = importBlockSequential (withoutReadCache w)
+    plain w = importBlock (withoutReadCache w)
     inputsOf bs = sum [length tx.inputs | (b, _) <- take 1 bs, tx <- b.txs]
     outputsOf bs = sum [length tx.outputs | (b, _) <- take 1 bs, tx <- b.txs]
     -- inputs of the first block that spend an output of the block itself
@@ -242,14 +183,13 @@ report title before after = do
     fail "the two imports did not write the same number of keys"
   printf "%s (milliseconds a block, mean of %d)\n" title (length new)
   printf "  one batch a block: %d keys set or deleted, %d bytes\n" (average (.operations)) (average (.bytes))
-  printf "  %-40s %10s %10s\n" ("" :: String) ("sequential" :: String) ("in stages" :: String)
+  printf "  %-40s %10s %10s\n" ("" :: String) ("no cache" :: String) ("in stages" :: String)
   line "prepare" (.prepare)
   line "read ahead" (.prefetch)
   line "  unspent outputs" (.reads.unspentReads)
   line "  groups of spenders" (.reads.spenderReads)
   line "  balances" (.reads.balanceReads)
-  line "  mempool" (.reads.mempoolReads)
-  line "apply the rules (sequential: reads too)" (.apply)
+  line "apply the rules (no cache: reads too)" (.apply)
   line "write the batch" (.write)
   line "whole block" total
   printf "  %-40s %20.1fx\n\n" ("faster by" :: String) (mean total old / mean total new)
@@ -267,18 +207,13 @@ report title before after = do
 open :: Plan -> FilePath -> (DatabaseReader -> IO a) -> IO a
 open plan dir = withLayeredReader net 20 32 dir True Nothing Nothing Nothing Nothing (Just plan.cache) Nothing
 
--- | Import a block and say how long each stage took. With the flag, its
--- transactions are given to the mempool first, which is not measured. The
--- sequential import does not note its stages: all its time before the
--- write is given as that of applying the rules.
+-- | Import a block and say how long each stage took.
 measure ::
   DatabaseReader ->
-  Bool ->
   (Writer -> Block -> BlockNode -> IO (BlockData, [a])) ->
   (Block, BlockNode) ->
   IO (BlockTimes, BatchReport)
-measure db pool rules (block, node) = do
-  when pool (fill db block)
+measure db rules (block, node) = do
   inside <- newIORef 0
   ((_, batch), whole) <- stopwatch . runWriterReport net db quiet $ \w -> do
     (_, took) <- stopwatch (rules w block node)
@@ -287,69 +222,6 @@ measure db pool rules (block, node) = do
   return . (,batch) $ case batch.block of
     Just t -> t
     Nothing -> BlockTimes {prepare = 0, prefetch = 0, reads = noReads, apply = applied, write = whole - applied}
-
--- | Give the transactions of a block to the mempool, a hundred in a
--- batch.
-fill :: DatabaseReader -> Block -> IO ()
-fill db block =
-  forM_ (chunks 100 (drop 1 block.txs)) $ \txs ->
-    runWriter net db quiet $ \w -> forM_ txs $ \tx -> do
-      accepted <- newMempoolTx w tx 1700000000
-      unless accepted (fail "a transaction was not accepted into the mempool")
-
--- | What the copy in memory of the mempool area costs, with the
--- transactions of a block in the mempool: how many keys and bytes it has,
--- how long it takes to load from the database, and, if the program runs
--- with @+RTS -T@, how much of the heap it is and how long a full
--- collection takes with it and without it.
---
--- It says the same of what is remembered of the outputs that those
--- transactions spend, which the batches that put them in the mempool left
--- with the copy: how many, and how much heap they take. Loading the copy
--- again, as this does to time it, starts with none remembered, so the
--- heap of the copy that the batches made, less that of the copy that was
--- loaded, is theirs.
-copyCost :: DatabaseReader -> Block -> IO String
-copyCost db block = do
-  fill db block
-  let txs = length block.txs - 1
-  -- counted now, so that nothing holds on to the copy that the batches
-  -- made once it is forgotten
-  kept <- knownMempoolCopy db >>= evaluate . maybe 0 (HashMap.size . spentOutputs)
-  remembering <- live
-  forgetMempoolCopy db
-  (without, collecting) <- stopwatch live
-  (copy, loading) <- stopwatch (mempoolCopy db)
-  (with, collectingWith) <- stopwatch live
-  let (keys, bytes) = copySize copy
-      heap = case (,,) <$> with <*> without <*> remembering of
-        Nothing -> ["  heap: run with +RTS -T to have it measured\n"]
-        Just (a, b, c) ->
-          [ printf "  heap: %.1f MiB, %d bytes a transaction\n" (mib (a - b)) ((a - b) `div` max 1 txs),
-            printf
-              "  a full collection: %.0f ms with the copy, %.0f ms without\n"
-              (1000 * collectingWith)
-              (1000 * collecting),
-            printf
-              "  heap of the outputs remembered: %.1f MiB, %d bytes an output\n"
-              (mib (c - a))
-              ((c - a) `div` max 1 kept)
-          ]
-  return . concat $
-    [ printf "the copy in memory of the mempool area, with %d transactions in the mempool\n" txs,
-      printf "  %d keys, %.1f MiB of keys and values\n" keys (mib bytes),
-      printf "  loaded from the database in %.0f ms\n" (1000 * loading),
-      printf "  %d outputs that those transactions spend are remembered\n" kept
-    ]
-      <> heap
-  where
-    mib :: Int -> Double
-    mib n = fromIntegral n / (1024 * 1024)
-    -- bytes of live data after a full collection, if the runtime counts
-    live = do
-      counted <- getRTSStatsEnabled
-      performMajorGC
-      if counted then Just . fromIntegral . (.gc.gcdetails_live_bytes) <$> getRTSStats else return Nothing
 
 chunks :: Int -> [a] -> [[a]]
 chunks _ [] = []

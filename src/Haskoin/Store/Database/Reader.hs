@@ -8,7 +8,7 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- The RocksDB database of the store: opening it ('withDatabaseReader'), which
+-- The RocksDB database of the store: opening it ('withLayeredReader'), which
 -- also creates or migrates it, its column families, its metrics, and the
 -- memo of the addresses of extended public keys. The queries are in
 -- "Haskoin.Store.Database.Query".
@@ -30,22 +30,15 @@
 -- its own key prefix length for filters and seeks, and keep scans over one kind
 -- of data from wading through another.
 --
--- = The copy of the mempool area
+-- = The column families of the old mempool
 --
--- An open database also has a place for a copy in memory of its mempool
--- area ("Haskoin.Store.Database.Copy"), which the batches of the block
--- store read instead of RocksDB ('mempoolCopy'). It belongs here because
--- it goes with the open database: one for each, loaded when a batch first
--- needs it, and gone when the database is closed. The queries of the API
--- do not use it.
---
--- The copy also holds what the block store remembers of the outputs that
--- mempool transactions spend. Both are what the database has now, between
--- two batches, and neither is true of the database as a view of it sees
--- it. So a reader of a snapshot ('snapshotReader'), which is what every
--- request of the API and every member of a fleet reads through, has a
--- place of its own for a copy, which nothing fills: the copy of the block
--- store cannot be reached from it.
+-- Two column families, @mempool@ and @mempool-addr@, held the mempool of
+-- the store until version 1.16.0. The mempool is now the pool that the
+-- fleet shares in Redis, and nothing reads or writes them, but for the
+-- migration of a database of version 20 ("Haskoin.Store.Database.Migrate"),
+-- which reads the list of its mempool there. They are still opened:
+-- RocksDB opens a database only with all of its column families, and
+-- keeping them lets an older store open the database again.
 --
 -- = Why addresses of xpubs are cached
 --
@@ -59,14 +52,13 @@ module Haskoin.Store.Database.Reader
     DataMetrics (..),
     Derived (..),
     derivedAddrs,
+    derivedAddrsCached,
     createDataMetrics,
-    withDatabaseReader,
     withLayeredReader,
     withReader,
     columnFamilyConfig,
     layeredFamilyConfig,
     mergeGuardFamily,
-    initRocksDB,
     memoryReport,
     addrTxCF,
     addrOutCF,
@@ -77,45 +69,28 @@ module Haskoin.Store.Database.Reader
     heightCF,
     balanceCF,
     mempoolCF,
-    mempoolAddrCF,
-    mempoolInsertOps,
 
-    -- * The copy of the mempool area
-    mempoolCopy,
-    knownMempoolCopy,
-    forgetMempoolCopy,
+    -- * Snapshots
     snapshotReader,
-    mempoolFamily,
+    withSnapshotReader,
   )
 where
 
-import Control.Monad (forM, guard)
+import Control.Monad (forM)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
 import Database.RocksDB hiding (withDB)
-import Database.RocksDB.Query
 import Haskoin
 import Haskoin.Store.Common
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Copy
-  ( Copy,
-    CopyRef,
-    Family (..),
-    forgetCopy,
-    knownCopy,
-    loadCopy,
-    newCopyRef,
-    setCopy,
-  )
 import Haskoin.Store.Database.Merge (balanceOperator, spenderOperator)
-import Haskoin.Store.Database.Types
 import System.Metrics.StatsD
 import Text.Read (readMaybe)
 
@@ -132,10 +107,7 @@ data DatabaseReader = DatabaseReader
     -- | StatsD metrics, if enabled
     metrics :: !(Maybe DataMetrics),
     -- | addresses derived from recently queried xpubs
-    derived :: !(IORef DerivedCache),
-    -- | the copy in memory of the mempool area, once a batch of writes has
-    -- needed it ('mempoolCopy'). Each open database has its own.
-    copy :: !CopyRef
+    derived :: !(IORef DerivedCache)
   }
 
 -- | Addresses of an xpub, external then change, in order of index. Each
@@ -159,7 +131,14 @@ derivedCacheSize = 512
 
 -- | Addresses of an xpub, from the cache or a new lazy derivation.
 derivedAddrs :: DatabaseReader -> XPubSpec -> IO Derived
-derivedAddrs r xpub = do
+derivedAddrs r xpub = fst <$> derivedAddrsCached r xpub
+
+-- | Addresses of an xpub, from the cache or a new lazy derivation, and
+-- whether the cache had them. A request pays for deriving the addresses of
+-- an xpub only when it did not ("Haskoin.Store.Web.Tokens"): those that
+-- the cache has were derived for an earlier request, as far as it needed.
+derivedAddrsCached :: DatabaseReader -> XPubSpec -> IO (Derived, Bool)
+derivedAddrsCached r xpub = do
   let ref = r.derived
       fresh =
         let addrs m =
@@ -170,14 +149,14 @@ derivedAddrs r xpub = do
          in Derived (addrs 0) (addrs 1)
   atomicModifyIORef' ref $ \c ->
     case HashMap.lookup xpub c.newer of
-      Just d -> (c, d)
+      Just d -> (c, (d, True))
       Nothing ->
-        let d = fromMaybe fresh (HashMap.lookup xpub c.older)
+        let (d, hit) = maybe (fresh, False) (,True) (HashMap.lookup xpub c.older)
             c'
               | HashMap.size c.newer >= derivedCacheSize =
                   DerivedCache {newer = HashMap.singleton xpub d, older = c.newer}
               | otherwise = c {newer = HashMap.insert xpub d c.newer}
-         in (c', d)
+         in (c', (d, hit))
 
 -- | StatsD metrics of database reads. Counters count the items read.
 data DataMetrics = DataMetrics
@@ -187,8 +166,6 @@ data DataMetrics = DataMetrics
     dataBlockCount :: !StatCounter,
     -- | transactions read (@db.txs@)
     dataTxCount :: !StatCounter,
-    -- | mempool entries read (@db.mempool@)
-    dataMempoolCount :: !StatCounter,
     -- | balances read (@db.balances@)
     dataBalanceCount :: !StatCounter,
     -- | unspent outputs read (@db.unspents@)
@@ -213,7 +190,6 @@ createDataMetrics s = do
   dataBestCount <- newStatCounter s "db.best_block" n
   dataBlockCount <- newStatCounter s "db.blocks" n
   dataTxCount <- newStatCounter s "db.txs" n
-  dataMempoolCount <- newStatCounter s "db.mempool" n
   dataBalanceCount <- newStatCounter s "db.balances" n
   dataUnspentCount <- newStatCounter s "db.unspents" n
   dataAddrTxCount <- newStatCounter s "db.address_txs" n
@@ -226,61 +202,24 @@ createDataMetrics s = do
   where
     n = 10
 
--- | Version of the layout that 'withDatabaseReader' opens, in which the
--- mempool is written into the indices of the chain. Databases of versions
--- 18 and 19 are migrated to it when opened that way; other versions are
--- refused.
---
--- The store runs on a later one,
--- 'Haskoin.Store.Database.Migrate.currentVersion', and opens its database
--- with 'withLayeredReader' and 'Haskoin.Store.Database.Migrate.upgradeDatabase'.
--- This version is kept for the tests, which hold the new layout to the
--- answers of this one, and as the way through for databases of 18 and 19.
---
--- Bumping the version is how a change to the database layout is made safe: an
--- old database is either migrated in place when it is opened or refused, never
--- read with the wrong layout.
-dataVersion :: Word32
-dataVersion = 20
-
--- | Open the database and run a query against it. Creates the database and its
--- column families if missing, and migrates it from older versions.
+-- | Open the database and run an action with it. Creates the database and
+-- its column families if missing ('layeredFamilyConfig').
 --
 -- Arguments, in order: network, initial xpub gap, maximum xpub gap, directory,
 -- whether to use Bloom filters, maximum open files, total memtable size in
 -- bytes, write-ahead log size in bytes after which column families are
 -- flushed, threads for flushes and compactions together, block cache size in
 -- bytes, and metrics. 'Nothing' leaves a setting to RocksDB.
-withDatabaseReader ::
-  Network ->
-  Word32 ->
-  Word32 ->
-  FilePath ->
-  Bool ->
-  Maybe Int ->
-  Maybe Int ->
-  Maybe Int ->
-  Maybe Int ->
-  Maybe Int ->
-  Maybe DataMetrics ->
-  (DatabaseReader -> IO a) ->
-  IO a
-withDatabaseReader = withReader columnFamilyConfig initRocksDB
-
--- | Open a database with the column families of the layered layout of
--- @docs\/layered-database.md@: those of 'withDatabaseReader' and two more,
--- one for what the mempool does at each address, and one that is empty
--- ('layeredFamilyConfig'). The arguments are those of 'withDatabaseReader'.
 --
 -- It neither checks nor sets the version of the database:
 -- 'Haskoin.Store.Database.Migrate.upgradeDatabase' does, and has to be
 -- called before anything reads the database. The store opens its database
 -- with the two.
 --
--- Opening a database this way adds the two column families to it. RocksDB
--- only opens a database when given all its column families, so a store
--- that does not know them can no longer open the database afterwards: not
--- one through 'withDatabaseReader', and not one older than database
+-- Opening a database this way adds the column families of the layout to
+-- it. RocksDB only opens a database when given all its column families, so
+-- a store that does not know them can no longer open the database
+-- afterwards: not one older than database
 -- version 23, which does not know the empty one and could not read the
 -- merge records of the balances and the spenders. That is the point of no
 -- return of an upgrade.
@@ -303,7 +242,7 @@ withLayeredReader = withReader layeredFamilyConfig (\_ -> return ())
 -- | Open a database with these column families, given whether to use Bloom
 -- filters and whether there is a shared block cache, and run a check on it
 -- before anything else. The other arguments are those of
--- 'withDatabaseReader'.
+-- 'withLayeredReader'.
 --
 -- The store opens its database with 'withLayeredReader'. This is for the
 -- tests and the benchmarks, which open one with the column families of
@@ -331,7 +270,6 @@ withReader ::
 withReader families check net igap gap dir bloom maxOpenFiles writeBuffers maxWal jobs blockCache stats m =
   withDBCF dir cfg (families bloom (isJust blockCache)) $ \db -> do
     derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
-    copy <- newCopyRef
     let bdb =
           DatabaseReader
             { db = db,
@@ -339,8 +277,7 @@ withReader families check net igap gap dir bloom maxOpenFiles writeBuffers maxWa
               net = net,
               initGap = igap,
               metrics = stats,
-              derived = derived,
-              copy = copy
+              derived = derived
             }
     check bdb
     m bdb
@@ -446,30 +383,11 @@ columnFamilyConfig bloom cached =
         }
     scanned p = (c p) {bloomFilter = False}
 
--- | Column families of the layered layout: those of 'columnFamilyConfig',
--- one for the entries of the mempool by address ('MemAddrKey'), and one
--- that is empty and keeps older versions out.
---
--- The two column families of the mempool always have Bloom filters, whatever
--- the setting for the others. Almost every lookup in them is for something
--- that is not there: a confirmed transaction, an output that no mempool
--- transaction spends, an address with nothing in the mempool. A filter
--- answers those without reading a block, and for column families this small
--- it takes a few megabytes; on the column families of the chain the same
--- filters would take gigabytes, which is why they are optional there.
---
--- The entries by address are in a column family of their own because their
--- filter is on the first 22 bytes of the key, the kind of key and the
--- address: a scan of an address with nothing in the mempool then stops at
--- the filter. The mempool column family is read by whole keys and scanned
--- across prefixes, for the index by time, so it cannot have a filter by
--- prefix.
---
--- That scan through a filter is what 'columnFamilyConfig' keeps out of the
--- indices of the chain, and it is as slow here after a block, which deletes
--- the keys of the transactions it confirms: 1.6 milliseconds for an address
--- with nothing, measured. It is one of the things that have to change before
--- this layout is used; @docs\/layered-database.md@ says how.
+-- | Column families of the layout that the store runs on: those of
+-- 'columnFamilyConfig', one that held the entries of the old mempool by
+-- address, and one that is empty and keeps older versions out. The two of
+-- the old mempool have nothing written to them any more (see the head of
+-- this module).
 --
 -- = The empty one
 --
@@ -541,123 +459,18 @@ heightCF db = columnFamilies db !! 6
 balanceCF :: DB -> ColumnFamily
 balanceCF db = columnFamilies db !! 7
 
--- | Column family for mempool transactions ('MemTxKey' and 'MemTimeKey').
--- In the layered layout it also has their bodies, under t'TxKey', and
--- their spenders, under t'MemSpenderKey'.
+-- | Column family of the old mempool: the list of a database of version
+-- 20 ('MemTxKey'), which only its migration reads.
 mempoolCF :: DB -> ColumnFamily
 mempoolCF db = columnFamilies db !! 8
 
--- | Column family for what the mempool does at each address ('MemAddrKey').
--- Only a database opened with 'withLayeredReader' has it.
-mempoolAddrCF :: DB -> ColumnFamily
-mempoolAddrCF db = columnFamilies db !! 9
-
--- | The copy in memory of the mempool area of the database
--- ("Haskoin.Store.Database.Copy"): the one that the database has, or, the
--- first time and whenever that one was forgotten, a new one from a scan of
--- the two column families.
---
--- It is for the block store, through its batches of writes, and for
--- nothing else. The copy is what the database has only between two
--- batches and for the batch that is open: a request of the API that read
--- it could see a batch that RocksDB has and the copy has not yet, or the
--- other way around. Requests read RocksDB.
-mempoolCopy :: DatabaseReader -> IO Copy
-mempoolCopy r =
-  knownCopy r.copy >>= \case
-    Just c -> return c
-    Nothing -> do
-      c <- loadCopy r.db (mempoolCF r.db) (mempoolAddrCF r.db <$ guard layered)
-      setCopy r.copy c
-      return c
-  where
-    -- a database of the layout of version 20 has no entries by address
-    layered = length (columnFamilies r.db) > 9
-
--- | The copy of the mempool area if the database has one that is known to
--- be right, without loading it: for what should use the copy only where a
--- batch has asked for it, and for the tests.
-knownMempoolCopy :: DatabaseReader -> IO (Maybe Copy)
-knownMempoolCopy r = knownCopy r.copy
-
--- | Say that the mempool area was written to by something else than a
--- batch of 'Haskoin.Store.Database.Writer.runWriterReport', so that the
--- copy is loaded again by the next batch that needs it. Whatever writes
--- to 'mempoolCF' or 'mempoolAddrCF' by itself has to call this afterwards:
--- a migration, a wipe of the mempool, a test. A batch does not need to: it
--- changes the copy as it is written.
-forgetMempoolCopy :: DatabaseReader -> IO ()
-forgetMempoolCopy r = forgetCopy r.copy
-
 -- | A reader of a snapshot of the database of another reader: the same
--- in everything, but that it reads the snapshot, and that it does not
--- share the copy of the mempool area.
---
--- The copy, with what it remembers of the outputs that mempool
--- transactions spend, is what the database has now. A snapshot is the
--- database as it was. So the reader of a snapshot gets a place of its own
--- for a copy, with nothing in it. Nothing that reads through a view asks
--- for a copy; if something ever did, it would get one loaded from the
--- snapshot, which is right for it, and not the one of the block store.
+-- in everything, but that it reads the snapshot.
 snapshotReader :: DatabaseReader -> DB -> IO DatabaseReader
-snapshotReader r snapshot = do
-  own <- newCopyRef
-  return r {db = snapshot, copy = own}
+snapshotReader r snapshot = return r {db = snapshot}
 
--- | Which column family of the mempool area a column family of this
--- database is, if it is one of the two.
-mempoolFamily :: DB -> ColumnFamily -> Maybe Family
-mempoolFamily db = which
-  where
-    which cf
-      | cf == general = Just General
-      | Just cf == byAddress = Just ByAddress
-      | otherwise = Nothing
-    families = columnFamilies db
-    general = families !! 8
-    byAddress = case drop 9 families of
-      a : _ -> Just a
-      [] -> Nothing
-
--- | Set the version of a new database, migrate an old one, or call 'error' if the version is not supported.
-initRocksDB :: DatabaseReader -> IO ()
-initRocksDB DatabaseReader {db = db} =
-  retrieve db VersionKey >>= \case
-    Just v
-      | v == dataVersion -> return ()
-      | v == 19 -> migrateMempoolIndex db
-      | v == 18 -> migrateMempool db
-      | otherwise -> error "Incorrect RocksDB database version"
-    Nothing -> setInitRocksDB db
-
--- | Version 18 kept the whole mempool as one list under 'MemKey'. Move each
--- transaction to its own key in the mempool column family, and index it by
--- time, in the same batch that sets the new version.
-migrateMempool :: DB -> IO ()
-migrateMempool db = do
-  mempool <- fromMaybe [] <$> (retrieve db MemKey :: IO (Maybe [(UnixTime, TxHash)]))
-  writeBatch db $
-    concat [mempoolInsertOps db h t | (t, h) <- mempool]
-      <> [deleteOp MemKey, insertOp VersionKey dataVersion]
-
--- | Version 19 kept one key per mempool transaction, but no index by time,
--- so every page of the mempool had to read and sort all of it. Build the
--- index in the same batch that sets the new version.
-migrateMempoolIndex :: DB -> IO ()
-migrateMempoolIndex db = do
-  mempool <- matchingAsListCF db (mempoolCF db) MemTxKeyS
-  writeBatch db $
-    [insertOpCF (mempoolCF db) (MemTimeKey t h) () | (MemTxKey h, t) <- mempool]
-      <> [insertOp VersionKey dataVersion]
-
--- | Operations that add a transaction to the mempool: its key and its entry
--- in the index by time.
-mempoolInsertOps :: DB -> TxHash -> UnixTime -> [BatchOp]
-mempoolInsertOps db h t =
-  [ insertOpCF (mempoolCF db) (MemTxKey h) t,
-    insertOpCF (mempoolCF db) (MemTimeKey t h) ()
-  ]
-
--- | Set the version of a new database.
-setInitRocksDB :: DB -> IO ()
-setInitRocksDB db = insert db VersionKey dataVersion
+-- | Run an action with a reader of a snapshot of the database as it is now,
+-- for reads that must see one moment. The reader must not be used after
+-- the action returns: the snapshot is released then.
+withSnapshotReader :: DatabaseReader -> (DatabaseReader -> IO a) -> IO a
+withSnapshotReader r action = withSnapshot r.db $ \snapshot -> snapshotReader r snapshot >>= action

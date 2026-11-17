@@ -1,17 +1,14 @@
 module Haskoin.Store.Database.WriterSpec (spec) where
 
-import Control.Exception (IOException, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe)
 import Data.Serialize (encode)
 import Data.Word (Word32, Word64)
 import Database.RocksDB (columnFamilies)
-import Database.RocksDB.Query (insertCF)
 import Haskoin
   ( Address,
     OutPoint (..),
@@ -32,23 +29,13 @@ import Haskoin.Store.Data
     Spender (..),
     TxData (..),
     TxRef (..),
-    UnixTime,
     Unspent (..),
   )
-import Haskoin.Store.Database.Copy (Family (..), copyEntries, copySize)
-import Haskoin.Store.Database.Mempool (MemRecords (..), mempoolRecords, summaryEntries)
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Reader (DatabaseReader (..), forgetMempoolCopy, knownMempoolCopy, mempoolCF)
-import Haskoin.Store.Database.Types
-  ( BalVal (..),
-    MemAddrKey (..),
-    MemAddrVal (..),
-    MemDeletedKey (..),
-    MemSummary (..),
-    MemTxKey (..),
-  )
+import Haskoin.Store.Database.Reader (DatabaseReader (..))
+import Haskoin.Store.Database.Types (BalVal (..))
 import Haskoin.Store.Database.Writer
-import Haskoin.Store.Histories (copyIsArea, dump, openLayered, openOlder)
+import Haskoin.Store.Histories (dump, openLayered)
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Test.Hspec
 
@@ -226,183 +213,6 @@ spec = describe "a batch of writes" $ do
           getChainSpenders w made 48 `shouldReturn` group [2, 3, 4, 21, 33, 34, 35]
         Q.getChainSpenders db made `shouldReturn` group [2, 3, 4, 21, 33, 34, 35]
 
-  describe "mempoolAreaEmpty" $ do
-    it "is true of a database with no mempool transaction, and of what version 21 left of deleted ones" $
-      withDB $ \db -> do
-        batch db mempoolAreaEmpty `shouldReturn` True
-        insertCF db.db (mempoolCF db.db) (MemDeletedKey (txHash big)) (txData 0 big)
-        forgetMempoolCopy db
-        batch db mempoolAreaEmpty `shouldReturn` True
-        -- and then nothing is asked of the area
-        batch db (\w -> mempoolAreaEmpty w >> getMempoolTx w (txHash big)) `shouldReturn` Nothing
-    it "is false as soon as the mempool lists a transaction, and never true without the cache" $
-      withDB $ \db -> do
-        batch db (mempoolAreaEmpty . withoutReadCache) `shouldReturn` False
-        insertCF db.db (mempoolCF db.db) (MemTxKey (txHash big)) (7 :: UnixTime)
-        forgetMempoolCopy db
-        batch db mempoolAreaEmpty `shouldReturn` False
-        batch db (\w -> mempoolAreaEmpty w >> inMempool w (txHash big)) `shouldReturn` True
-    it "does not hide what the batch itself puts in the mempool" $
-      withDB $ \db ->
-        batch db $ \w -> do
-          mempoolAreaEmpty w `shouldReturn` True
-          mempoolUntouched w `shouldReturn` True
-          insertMempoolTx w (txData 0 big)
-          addToMempool w (txHash big) 7
-          mempoolUntouched w `shouldReturn` False
-          fmap (.tx) <$> getMempoolTx w (txHash big) `shouldReturn` Just big
-          inMempool w (txHash big) `shouldReturn` True
-
-  describe "the copy of the mempool area" $ do
-    it "answers every read of the area as the database does, also for what the batch has changed" $
-      withDB $ \db -> do
-        let known = map payment [1 .. 6] <> map child [1 .. 4]
-        batch db $ \w -> do
-          forM_ [1 .. 4] $ \i -> pool w (100 + fromIntegral i) (payment i)
-          forM_ [1, 2] $ \i -> pool w (200 + fromIntegral i) (child i)
-        batch db $ \w -> do
-          agree w known
-          -- what the database has
-          fmap (.tx) <$> getMempoolTx w (txHash (payment 2)) `shouldReturn` Just (payment 2)
-          getMempoolSpenders w (txHash (payment 2)) 1
-            `shouldReturn` IntMap.fromList [(0, Spender (txHash (child 2)) 0)]
-          inMempool w (txHash (child 2)) `shouldReturn` True
-          inMempool w (txHash (child 3)) `shouldReturn` False
-          getMempool w `shouldReturn` [(202, txHash (child 2)), (201, txHash (child 1))] <> listed [4, 3, 2, 1]
-          -- changes: one leaves, two come, one summary is set and one is
-          -- deleted
-          unpool w 202 (child 2)
-          pool w 105 (payment 5)
-          pool w 203 (child 3)
-          insertMempoolAddr w (MemAddrSumKey (address 2)) (MemAddrSumVal (MemSummary 9 8 7 6 5 4 3))
-          deleteMempoolAddr w (MemAddrSumKey (address 5))
-          -- and they come before what the copy has, as before what the
-          -- database has
-          agree w known
-          getMempoolTx w (txHash (child 2)) `shouldReturn` Nothing
-          fmap (.tx) <$> getMempoolTx w (txHash (payment 5)) `shouldReturn` Just (payment 5)
-          getMempoolSpender w (OutPoint (txHash (payment 2)) 0) `shouldReturn` Nothing
-          getMempoolSpenders w (txHash (payment 2)) 1 `shouldReturn` IntMap.empty
-          getMempoolSpenders w (txHash (payment 3)) 1
-            `shouldReturn` IntMap.fromList [(0, Spender (txHash (child 3)) 0)]
-          inMempool w (txHash (child 2)) `shouldReturn` False
-          inMempool w (txHash (child 3)) `shouldReturn` True
-          getMempoolAddr w (MemAddrSumKey (address 2))
-            `shouldReturn` Just (MemAddrSumVal (MemSummary 9 8 7 6 5 4 3))
-          getMempoolAddr w (MemAddrSumKey (address 5)) `shouldReturn` Nothing
-          getMempool w
-            `shouldReturn` [(203, txHash (child 3)), (201, txHash (child 1))] <> listed [5, 4, 3, 2, 1]
-        -- and once the batch is written, the copy has what it changed
-        copyIsArea "after the changes" db
-        batch db $ \w -> do
-          agree w known
-          getMempoolTx w (txHash (child 2)) `shouldReturn` Nothing
-          inMempool w (txHash (child 3)) `shouldReturn` True
-          getMempoolAddr w (MemAddrSumKey (address 5)) `shouldReturn` Nothing
-          getMempool w
-            `shouldReturn` [(203, txHash (child 3)), (201, txHash (child 1))] <> listed [5, 4, 3, 2, 1]
-
-    it "is what a batch reads, not the database, until it is told that something else wrote to the area" $
-      withDB $ \db -> do
-        let h = txHash (payment 9)
-        batch db (\w -> pool w 101 (payment 1) >> mempoolAreaEmpty w) `shouldReturn` True
-        copyIsArea "after a batch" db
-        -- behind the back of the batches
-        insertCF db.db (mempoolCF db.db) (MemTxKey h) (7 :: UnixTime)
-        batch db (`inMempool` h) `shouldReturn` False
-        batch db ((`inMempool` h) . withoutReadCache) `shouldReturn` True
-        forgetMempoolCopy db
-        isNothing <$> knownMempoolCopy db `shouldReturn` True
-        batch db (`inMempool` h) `shouldReturn` True
-        copyIsArea "after it was loaded again" db
-
-    it "is not loaded by a batch that reads the database every time" $
-      withDB $ \db -> do
-        batch db $ \w -> do
-          let plain = withoutReadCache w
-          pool plain 101 (payment 1)
-          fmap (.tx) <$> getMempoolTx plain (txHash (payment 1)) `shouldReturn` Just (payment 1)
-          inMempool plain (txHash (payment 2)) `shouldReturn` False
-          getMempoolSpenders plain (txHash (payment 1)) 1 `shouldReturn` IntMap.empty
-        batch db $ \w -> unpool (withoutReadCache w) 101 (payment 1)
-        isNothing <$> knownMempoolCopy db `shouldReturn` True
-        Q.getMempool db `shouldReturn` []
-
-    it "is left as it was by a batch that throws" $
-      withDB $ \db -> do
-        batch db (\w -> pool w 101 (payment 1) >> mempoolAreaEmpty w) `shouldReturn` True
-        Just earlier <- knownMempoolCopy db
-        let failing w = do
-              pool w 102 (payment 2)
-              unpool w 101 (payment 1)
-              fmap (.tx) <$> getMempoolTx w (txHash (payment 2)) `shouldReturn` Just (payment 2)
-              throwIO (userError "not this one")
-        batch db failing `shouldThrow` anyIOException
-        Just later <- knownMempoolCopy db
-        forM_ [General, ByAddress] $ \f -> copyEntries f later `shouldBe` copyEntries f earlier
-        copyIsArea "after a batch that threw" db
-        batch db (\w -> inMempool w (txHash (payment 2))) `shouldReturn` False
-
-    it "is forgotten when the write of a batch fails, and loaded again by the next batch" $
-      -- a database without merge operators, which refuses a batch that
-      -- has a merge record
-      withSystemTempDirectory "haskoin-store-writer-" $ \dir -> openOlder btcRegTest dir $ \db -> do
-        batch db (\w -> pool w 101 (payment 1) >> mempoolAreaEmpty w) `shouldReturn` True
-        copyIsArea "before the write that fails" db
-        -- the merge record comes after the changes to the mempool area
-        -- in the batch, and RocksDB 8.9 keeps what came before it
-        let refused w = do
-              pool w 102 (payment 2)
-              unpool w 101 (payment 1)
-              mergeSpender w (OutPoint (txHash (payment 7)) 0) (Spender (txHash (payment 8)) 0)
-        batch db refused `shouldThrow` anyIOException
-        -- so the copy is not trusted any more
-        isNothing <$> knownMempoolCopy db `shouldReturn` True
-        -- and the next batch reads the column families again, whatever
-        -- RocksDB made of the batch. That batch may not be written, though
-        -- it changes nothing: RocksDB 11 takes no write after such a
-        -- failure until the database is opened again
-        seen <- newIORef []
-        let reading w = do
-              agree w (map payment [1, 2])
-              mapM (inMempool w . txHash . payment) [1, 2] >>= writeIORef seen
-        _ <- try (batch db reading) :: IO (Either IOException ())
-        listedNow <- map snd <$> Q.getMempool db
-        readIORef seen `shouldReturn` map ((`elem` listedNow) . txHash . payment) [1, 2]
-        copyIsArea "after the write that failed" db
-
-    it "is loaded from a database that is opened with a mempool in it" $
-      withSystemTempDirectory "haskoin-store-writer-" $ \dir -> do
-        openLayered btcRegTest dir $ \db ->
-          batch db $ \w -> forM_ [1 .. 5] (\i -> pool w (100 + fromIntegral i) (payment i))
-        openLayered btcRegTest dir $ \db -> do
-          isNothing <$> knownMempoolCopy db `shouldReturn` True
-          batch db $ \w -> do
-            mempoolAreaEmpty w `shouldReturn` False
-            fmap (.tx) <$> getMempoolTx w (txHash (payment 3)) `shouldReturn` Just (payment 3)
-            agree w (map payment [1 .. 6])
-          copyIsArea "after it was opened" db
-          Just copy <- knownMempoolCopy db
-          fst (copySize copy) `shouldSatisfy` (>= 25)
-
-    it "follows a large batch, whose changes are packed on all cores, with values of any size" $
-      withDB $ \db -> do
-        batch db mempoolAreaEmpty `shouldReturn` True
-        -- a hundred payments to addresses, four hundred transactions of
-        -- three kilobytes, one with a script too long to be copied into a
-        -- shared buffer and one larger than such a buffer: the copy takes
-        -- their bytes out of the buffers
-        let many = map payment [11 .. 110] <> [wide i | i <- [1 .. 400]] <> [long, big]
-        report <- snd <$> runWriterReport btcRegTest db quiet (\w -> forM_ many (pool w 300))
-        report.operations `shouldSatisfy` (> 2300)
-        copyIsArea "after a large batch" db
-        batch db (\w -> agree w (take 5 many <> [wide 1, long, big]))
-        -- and a large batch of deletes
-        gone <- snd <$> runWriterReport btcRegTest db quiet (\w -> forM_ (drop 100 many) (unpool w 300))
-        gone.operations `shouldSatisfy` (> 1200)
-        copyIsArea "after a large batch of deletes" db
-        length <$> Q.getMempool db `shouldReturn` 100
-
   it "writes a large batch, packed on all cores, as it writes the same changes a few at a time" $
     withDB $ \large ->
       withDB $ \small -> do
@@ -452,70 +262,6 @@ spec = describe "a batch of writes" $ do
         report.bytes `shouldBe` sum [B.length k + B.length v | (k, v) <- entries]
         report.bytes `shouldSatisfy` (> 3600000)
         Q.getBalance large (address 5001) `shouldReturn` Just (numbers 5001 10002 0 2 0)
-
--- | Put a transaction in the mempool area at a time, as the rules do when
--- it enters the mempool, without their checks: its body, its spenders, its
--- entries by address with a summary for each address, and its place in
--- the list.
-pool :: Writer -> UnixTime -> Tx -> IO ()
-pool w time tx = do
-  insertMempoolTx w r.body
-  forM_ r.spends (uncurry (insertMempoolSpender w))
-  forM_ r.addresses (uncurry (insertMempoolAddr w))
-  forM_ (summaryEntries r.addresses) (uncurry (insertMempoolAddr w))
-  addToMempool w r.txid r.time
-  where
-    r = mempoolRecords btcRegTest time (txData 0 tx)
-
--- | Take out what 'pool' put in.
-unpool :: Writer -> UnixTime -> Tx -> IO ()
-unpool w time tx = do
-  deleteMempoolTx w r.txid
-  forM_ r.spends (deleteMempoolSpender w . fst)
-  forM_ r.addresses (deleteMempoolAddr w . fst)
-  forM_ (summaryEntries r.addresses) (deleteMempoolAddr w . fst)
-  deleteFromMempool w r.txid
-  where
-    r = mempoolRecords btcRegTest time (txData 0 tx)
-
--- | Every read of the mempool area gives the same through a batch, which
--- reads the copy of the area, and through the same batch without its read
--- cache, which reads the database: for these transactions, their outputs,
--- the outputs that they spend and their addresses, and for the list of
--- the mempool.
-agree :: Writer -> [Tx] -> IO ()
-agree w txs = do
-  forM_ txs $ \tx -> do
-    let h = txHash tx
-        r = mempoolRecords btcRegTest 0 (txData 0 tx)
-        outputs = [OutPoint h i | i <- [0 .. 2]]
-    both (`getMempoolTx` h)
-    both (`inMempool` h)
-    both (\x -> getMempoolSpenders x h 3)
-    forM_ (outputs <> map fst r.spends) $ \p -> both (`getMempoolSpender` p)
-    forM_ (summaryEntries r.addresses) $ \(k, _) -> both (`getMempoolAddr` k)
-    -- the entries themselves, at the times that the tests use
-    forM_ r.addresses $ \case
-      (MemAddrTxKey a _ _, _) -> forM_ times $ \t -> both (`getMempoolAddr` MemAddrTxKey a t h)
-      (MemAddrOutKey a _ p, _) -> forM_ times $ \t -> both (`getMempoolAddr` MemAddrOutKey a t p)
-      (k, _) -> both (`getMempoolAddr` k)
-  both getMempool
-  where
-    times = [101 .. 105] <> [201 .. 203] <> [300]
-    both :: (Eq a, Show a) => (Writer -> IO a) -> IO ()
-    both f = do
-      copied <- f w
-      read' <- f (withoutReadCache w)
-      copied `shouldBe` read'
-
--- | The entries of the list of the mempool of 'payment's put there at the
--- time of their number.
-listed :: [Word32] -> [(UnixTime, TxHash)]
-listed is = [(100 + fromIntegral i, txHash (payment i)) | i <- is]
-
--- | A transaction that spends the output of the 'payment' of a number.
-child :: Word32 -> Tx
-child i = Tx 2 [TxIn (OutPoint (txHash (payment i)) 0) "" maxBound] [TxOut 800 (scriptOf (i + 100))] [] 0
 
 quiet :: Logger
 quiet = Logger {level = LevelError, source = "", push = \_ -> return ()}

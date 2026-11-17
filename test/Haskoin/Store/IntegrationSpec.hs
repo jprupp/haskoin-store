@@ -34,7 +34,7 @@
 module Haskoin.Store.IntegrationSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel, link, withAsync)
+import Control.Concurrent.Async (async, cancel, forConcurrently, link, withAsync)
 import Control.Exception (throwIO, try)
 import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (forM_, forever, replicateM_, unless, void, when)
@@ -48,13 +48,14 @@ import Data.Bytes.Serial (serialize)
 import Data.Default (def)
 import Data.Either (isRight)
 import Data.Foldable (toList)
+import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sort, sortOn)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
@@ -63,6 +64,7 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
+import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
   ( Address (..),
     BloomFlags (..),
@@ -106,24 +108,13 @@ import Haskoin.Store
     WebConfig (..),
     WebLimits (..),
     XPubSpec (..),
+    cachePrefix,
     decodeTxBody,
+    defaultXPubConfig,
     runWebSocket,
     withStore,
   )
-import Haskoin.Store.Cache
-  ( Cache,
-    CacheCounters (..),
-    Reload (..),
-    cacheCounters,
-    cacheEvict,
-    cacheIsCached,
-    cachePrefix,
-    cacheRefresh,
-    cacheTxData,
-    cacheXPubBals,
-    xpubId,
-  )
-import Haskoin.Store.Common (StoreEvent (..))
+import Haskoin.Store.Common (Limits (..), StoreEvent (..))
 import Haskoin.Store.Data
   ( Balance (..),
     BlockData (..),
@@ -138,12 +129,14 @@ import Haskoin.Store.Data
     Spender (..),
     Transaction (..),
     TxData (..),
+    TxRef (..),
     XPubBal (..),
   )
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Fleet.Member (memberTip)
+import Haskoin.Store.Fleet.Redis (fleetKeys)
+import Haskoin.Store.Fleet.XPub (cacheHave, xpubId)
 import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Podman
@@ -151,7 +144,11 @@ import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Integration.Valkey
 import Haskoin.Store.WebClient qualified as Client
 import Haskoin.Store.WebCommon (ApiResource, NoCache (..), NoTx (..))
-import NQE (receive, withSubscription)
+import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
+import Haskoin.Store.XPub.Indexer (Settings (..))
+import Haskoin.Store.XPub.Service (XPubConfig (..))
+import NQE (publish, receive, withSubscription)
+import Network.HTTP.Types (ResponseHeaders)
 import Network.Socket qualified as Socket
 import Network.WebSockets qualified as WS
 import Network.Wreq qualified as Wreq
@@ -161,6 +158,7 @@ import System.Exit (ExitCode (..))
 import System.Log.FastLogger (toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
+import Text.Read (readMaybe)
 
 spec :: Spec
 spec = do
@@ -199,12 +197,6 @@ chainSpec kind = do
     it "derives native and nested SegWit addresses" segwitTest
     it "refuses the wrong kind of address for an xpub" deriveTest
   it "refuses unknown parameters and values it cannot read" strictTest
-  it "does not use or fill the cache when asked not to" noCacheTest
-  it "recovers from damaged entries and keeps newer data" damagedTest
-  it "updates cached xpubs from what changed, and reads them whole when unsure" incrementalTest
-  it "catches up with changes that the database has before their events" catchUpTest
-  it "keeps the spenders of cached transactions up to date" spenderTest
-  it "evicts the least recently used xpubs" evictTest
   it "answers an error in JSON, whatever was asked for" errorFormatTest
   it "answers the Haskell client of haskoin-store-data" clientTest
   it "hands what it verified to its peers, and shows only what a node announced back" publishTest
@@ -218,10 +210,6 @@ chainSpec kind = do
   it "tells each client of the transactions it chose, and takes up where it left" eventsTest
   it "drops a transaction double-spent in a reorganisation" reorgTest
   it "sends again a payment that the nodes forgot and the store lists" resendTest
-  it "applies each change once with two stores sharing Redis" onceTest
-  it "does not replace what it does not know" unknownTest
-  it "leaves the keys of older caches alone" oldKeysTest
-  it "answers from its database, and says so, while Redis does not answer" redisDownTest
   it "gives the same answers from every store of a fleet, from one block and one mempool" fleetTest
 
 -------------------------------------------------------------------------------
@@ -241,8 +229,6 @@ data Env = Env
     plain :: !String,
     -- | address of the wallet of the node, to mine to
     miner :: !Text,
-    -- | the cache of the store
-    redisCache :: !Cache,
     -- | connection to Redis, to look at the keys
     redis :: !Redis.Connection,
     -- | configuration of a store like this one with its database in a
@@ -299,14 +285,15 @@ withEnvAt whitelisted ago kind go = do
       void $ generateTo node 150 miner
       withRamDir $ \dir -> withTestLogger $ \logger -> do
         let net = nodeNetwork kind
-            cfg = (storeConfig net logger dir redisURL p2pPort False) {syncMempool = whitelisted}
+            cfg = storeConfig net logger dir redisURL p2pPort
         withStore cfg $ \store -> do
           listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
             let web s = runWebSocket (webConfig logger s)
             conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
-            cache <- maybe (fail "The store has no cache") return store.cache
             withAsync (web store cachedSock) $ \a1 ->
-              withAsync (web store {cache = Nothing} plainSock) $ \a2 -> do
+              -- a second server of the same store: the cache cannot be
+              -- turned off, so both answer xpubs from it
+              withAsync (web store plainSock) $ \a2 -> do
                 link a1
                 link a2
                 let env =
@@ -318,10 +305,9 @@ withEnvAt whitelisted ago kind go = do
                           cached = "http://127.0.0.1:" <> show cachedPort,
                           plain = "http://127.0.0.1:" <> show plainPort,
                           miner = miner,
-                          redisCache = cache,
                           redis = conn,
-                          configIn = \d -> storeConfig net logger d redisURL p2pPort False,
-                          memberIn = \d -> storeConfig net logger d redisURL p2pPort True
+                          configIn = \d -> storeConfig net logger d redisURL p2pPort,
+                          memberIn = \d -> storeConfig net logger d redisURL p2pPort
                         }
                 waitSynced env
                 go env
@@ -344,9 +330,9 @@ withTestLogger f =
       return (toLogStr (show seconds <> "." <> padded <> " "))
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
--- buffers and caches, as a member of a fleet or not.
-storeConfig :: Network -> Logger -> FilePath -> String -> Int -> Bool -> StoreConfig
-storeConfig net logger dir redisURL p2pPort fleet =
+-- buffers and caches.
+storeConfig :: Network -> Logger -> FilePath -> String -> Int -> StoreConfig
+storeConfig net logger dir redisURL p2pPort =
   StoreConfig
     { maxPeers = 1,
       initPeers = ["127.0.0.1:" <> show p2pPort],
@@ -356,13 +342,10 @@ storeConfig net logger dir redisURL p2pPort fleet =
       redis = Just redisURL,
       initGap = initGap,
       gap = gap,
-      redisMinAddrs = 1,
-      redisMinTxs = 1000,
       redisMaxXPubs = 10000,
-      noMempool = False,
-      wipeMempool = False,
-      fleet = fleet,
-      syncMempool = True,
+      -- requests wait three seconds for an xpub, not ten, so that the tests
+      -- of the wait run fast
+      xpubs = defaultXPubConfig {indexer = defaultXPubConfig.indexer {wait = 3000000}},
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 120,
@@ -391,12 +374,10 @@ webConfig logger store =
       minPeers = 0,
       limits = def,
       version = "test",
-      noMempool = False,
       stats = Nothing,
       tickerRefresh = 90 * 1000 * 1000,
       tickerURL = "http://127.0.0.1:9/",
       priceHistoryURL = "http://127.0.0.1:9/",
-      noXPub = False,
       noBlockchainInfo = False,
       healthCheckInterval = 5,
       accessLog = False,
@@ -771,14 +752,6 @@ checkXPub env x ref = do
     _ <- getJSON env.cached (b <> "/balances" <> q)
     waitCached env x
   sameAnswers env (xpubPaths x ts heights)
-  unless (null e.used) $ do
-    -- every body of the xpub is in Redis, and is the body of the database,
-    -- spenders included
-    let hs = map (\t -> fromMaybe (error "bad txid") (hexToTxHash t)) e.txids
-    waitFor "cached bodies" $ do
-      fromCache <- cacheTxData env.redisCache hs
-      fromDB <- L.withView env.store.db (`L.getManyTxData` hs)
-      return (fromCache == fromDB && all isJust fromCache)
 
 -- | Requests about an xpub to compare between the servers. The balances come
 -- first, as they are what puts an xpub in the cache.
@@ -793,10 +766,7 @@ xpubPaths x ts heights =
     b <> "/transactions/full" <> q <> "&limit=4",
     u,
     u <> "&limit=1",
-    u <> "&limit=2&offset=1",
-    b <> q <> "&nocache=true",
-    t <> "&nocache=true",
-    u <> "&nocache=true"
+    u <> "&limit=2&offset=1"
   ]
     <> concat
       [ [ t <> "&height=" <> s <> "&limit=2",
@@ -919,11 +889,15 @@ gapTest env = do
   e1.used `shouldBe` [[0, 0], [0, 1], [0, 2], [0, 5], [0, 37]]
   e1.balance `shouldBe` 1500000
   checkXPub env x ref
+  full0 <- redisRun env (Redis.hget (xpubKey env x "meta") "full")
   void $ pay env x ref [([0, 69], 700000)]
   waitSynced env
   e2 <- expect <$> readIORef ref
   e2.used `shouldBe` [[0, 0], [0, 1], [0, 2], [0, 5], [0, 37], [0, 69], [0, 70]]
   checkXPub env x ref
+  -- index 70 came into the gap with its payment, and the cache read it
+  -- without reading the xpub whole
+  redisRun env (Redis.hget (xpubKey env x "meta") "full") `shouldReturn` full0
   void $ mine env 1
   checkXPub env x ref
 
@@ -1127,8 +1101,7 @@ piecesTest env = do
   forM_
     [ "/address/" <> cs a <> "/transactions/full?limit=200",
       "/address/transactions/full?limit=200&addresses=" <> cs a,
-      "/xpub/" <> x.text <> "/transactions/full?limit=200",
-      "/xpub/" <> x.text <> "/transactions/full?limit=200&nocache=true"
+      "/xpub/" <> x.text <> "/transactions/full?limit=200"
     ]
     $ \p -> (arr <$> plainJSON env p) `shouldReturn` wanted
   -- a block that is not there is an error, not a response cut short
@@ -1262,7 +1235,8 @@ strictTest env = do
   forM_
     [ "/block/best?notx=true",
       "/blockchain/latestblock?format=json&txidindex=true",
-      "/xpub/" <> x.text <> "?derive=normal&nocache=false"
+      -- taken from older clients, and ignored
+      "/xpub/" <> x.text <> "?derive=normal&nocache=true"
     ]
     $ \p -> do
       (code', _) <- getJSON env.plain p
@@ -1446,7 +1420,7 @@ waitCached env x = waitFor ("xpub " <> x.text <> " to be cached") (isCached env 
 
 -- | Whether an xpub is cached.
 isCached :: Env -> XPub -> IO Bool
-isCached env x = cacheIsCached env.redisCache x.spec
+isCached env x = (\(a, b) -> a + b > 0) <$> cacheHave env.redis (fleetKeys (cachePrefix env.net) 32) x.spec
 
 -- | Key of the entry of an xpub in Redis.
 xpubKey :: Env -> XPub -> C8.ByteString -> C8.ByteString
@@ -1473,277 +1447,6 @@ writeOldKeys url = do
   conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo url))
   void . Redis.runRedis conn $ mapM_ (uncurry Redis.set) oldKeys
   Redis.disconnect conn
-
--- | Queries with @nocache=true@ must neither read the cache nor put the xpub
--- in it; a query without it then caches the xpub.
-noCacheTest :: Env -> IO ()
-noCacheTest env = do
-  let x = newXPub env "nocache" DeriveNormal
-      b = "/xpub/" <> x.text
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000), ([0, 1], 100000)]
-  void $ mine env 1
-  forM_ ["/transactions", "/transactions/full", "/unspent", "/balances", ""] $ \p -> do
-    (code, _) <- getJSON env.cached (b <> p <> "?nocache=true")
-    code `shouldBe` 200
-  threadDelay 1000000
-  isCached env x `shouldReturn` False
-  checkXPub env x ref
-
--- | A cached entry that cannot be decoded is cached again instead of failing
--- the request, and a reload does not replace an entry stamped with a higher
--- block, as one written by a store that is ahead would be.
-damagedTest :: Env -> IO ()
-damagedTest env = do
-  let x = newXPub env "damaged" DeriveNormal
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000), ([0, 1], 200000)]
-  void $ mine env 1
-  checkXPub env x ref
-  void . redisRun env $ Redis.set (xpubKey env x "bal") "garbage"
-  checkXPub env x ref
-  bal <- redisRun env $ Redis.get (xpubKey env x "bal")
-  (decode <$> bal :: Maybe (Either String [XPubBal])) `shouldSatisfy` maybe False isRight
-  void . redisRun env $ Redis.hset (xpubKey env x "meta") (pure ("height", "999999999"))
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Behind
-  void . redisRun env $ Redis.hset (xpubKey env x "meta") (pure ("height", "0"))
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
-  checkXPub env x ref
-  -- a reload writes only differences, computed from what Redis has, so
-  -- members that should not be there go, and the generation goes up
-  gen0 <- redisRun env $ Redis.hget (xpubKey env x "meta") "gen"
-  void . redisRun env $ Redis.zadd (xpubKey env x "txs") [(1, "not a transaction")]
-  void . redisRun env $ Redis.zadd (xpubKey env x "utxo") [(1, "not an output")]
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
-  redisRun env (Redis.zscore (xpubKey env x "txs") "not a transaction") `shouldReturn` Nothing
-  redisRun env (Redis.zscore (xpubKey env x "utxo") "not an output") `shouldReturn` Nothing
-  gen1 <- redisRun env $ Redis.hget (xpubKey env x "meta") "gen"
-  (read . C8.unpack <$> gen1) `shouldBe` ((+ (1 :: Int)) . read . C8.unpack <$> gen0)
-  checkXPub env x ref
-
--- | Changes of a cached xpub are applied from the transactions that make
--- them, without a full reload: the time of the last full reload in the entry
--- stays, and the answers stay those of the database. When Redis has a balance
--- that no changed transaction explains, a change was missed, and the next
--- reload reads the xpub whole, which repairs it.
-incrementalTest :: Env -> IO ()
-incrementalTest env = do
-  let x = newXPub env "incremental" DeriveNormal
-      meta k = redisRun env (Redis.hget (xpubKey env x "meta") k)
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000), ([0, 1], 200000), ([1, 0], 300000)]
-  void $ mine env 1
-  checkXPub env x ref
-  full0 <- meta "full"
-  full0 `shouldSatisfy` isJust
-  meta "ver" `shouldReturn` Just "3"
-  -- a payment in the mempool, its confirmation, and a spend
-  void $ pay env x ref [([0, 2], 400000)]
-  waitSynced env
-  checkXPub env x ref
-  void $ mine env 1
-  checkXPub env x ref
-  out <- getNewAddress env.node
-  l <- readIORef ref
-  void $ spend env x ref [coinAt l [0, 1]] [(out, 50000), (at env x [1, 1], 140000)]
-  waitSynced env
-  checkXPub env x ref
-  void $ mine env 1
-  checkXPub env x ref
-  meta "full" `shouldReturn` full0
-  -- the index of outputs by outpoint matches the outputs
-  nu <- redisRun env (Redis.zcard (xpubKey env x "utxo"))
-  no <- redisRun env (Redis.hlen (xpubKey env x "uop"))
-  no `shouldBe` nu
-  -- a balance that Redis has wrong, at an address the next change does not
-  -- touch, as if a change had been missed
-  Just blob <- redisRun env (Redis.get (xpubKey env x "bal"))
-  bals <- either fail return (decode blob :: Either String [XPubBal])
-  let target = addrOf x [0, 0]
-      wrong :: XPubBal -> XPubBal
-      wrong b
-        | b.balance.address == target =
-            XPubBal {path = b.path, balance = (b.balance :: Balance) {received = b.balance.received + 1}}
-        | otherwise = b
-  void . redisRun env $ Redis.set (xpubKey env x "bal") (encode (map wrong bals))
-  void $ pay env x ref [([0, 3], 500000)]
-  waitSynced env
-  checkXPub env x ref
-  full1 <- meta "full"
-  (full1 > full0) `shouldBe` True
-  -- the wrong balance is gone: Redis has the balances of the database
-  fromDB <- L.withView env.store.db (`L.xPubBals` x.spec)
-  Just blob' <- redisRun env (Redis.get (xpubKey env x "bal"))
-  decode blob' `shouldBe` Right fromDB
-
--- | Under load, the database can have transactions whose events the cache has
--- not applied yet, and the balances that a reload reads include them. The
--- reload finds them from the addresses whose balances moved, without reading
--- the xpub whole. Here the entry is wound back to before a payment, as if
--- its event had not come, and a reload is told only of an older change.
-catchUpTest :: Env -> IO ()
-catchUpTest env = do
-  let x = newXPub env "catch-up" DeriveNormal
-      key = xpubKey env x
-      meta k = redisRun env (Redis.hget (key "meta") k)
-  ref <- newLedger
-  old <- pay env x ref [([0, 0], 100000)]
-  void $ mine env 1
-  checkXPub env x ref
-  full0 <- meta "full"
-  Just blob0 <- redisRun env (Redis.get (key "bal"))
-  -- a payment in the mempool, applied by the cache
-  newT <- pay env x ref [([0, 1], 200000)]
-  waitSynced env
-  checkXPub env x ref
-  let new = fromMaybe (error "bad txid") (hexToTxHash newT)
-      oldH = fromMaybe (error "bad txid") (hexToTxHash old)
-  -- wind the entry back: balances, transaction and outputs of the payment
-  uop <- redisRun env (Redis.hgetall (key "uop"))
-  let paidBy o = either (const False) (\p -> p.hash == new) (decode o :: Either String OutPoint)
-      ours = [(op, u) | (op, u) <- uop, paidBy op]
-  outs <- maybe (fail "no outputs of the payment in the entry") return (NonEmpty.nonEmpty ours)
-  void . redisRun env $ Redis.set (key "bal") blob0
-  void . redisRun env $ Redis.zrem (key "txs") (NonEmpty.singleton (encode new))
-  void . redisRun env $ Redis.zrem (key "utxo") (snd <$> outs)
-  void . redisRun env $ Redis.hdel (key "uop") (fst <$> outs)
-  cacheRefresh env.redisCache x.spec (HashSet.singleton oldH) `shouldReturn` Reloaded
-  meta "full" `shouldReturn` full0
-  redisRun env (Redis.zscore (key "txs") (encode new)) >>= (`shouldSatisfy` isJust)
-  checkXPub env x ref
-  fromDB <- L.withView env.store.db (`L.xPubBals` x.spec)
-  Just blob1 <- redisRun env (Redis.get (key "bal"))
-  decode blob1 `shouldBe` Right fromDB
-
--- | An output of a cached transaction that pays an address outside the xpub
--- is spent by a transaction that does not touch the xpub. The xpub is not
--- reloaded, but the cached body must show the spender.
-spenderTest :: Env -> IO ()
-spenderTest env = do
-  let x = newXPub env "spender" DeriveNormal
-  ref <- newLedger
-  w <- getNewAddress env.node
-  raw <-
-    rpc
-      env.node
-      "createrawtransaction"
-      [ toJSON ([] :: [Value]),
-        object [Key.fromText (at env x [0, 0]) .= btc 200000, Key.fromText w .= btc 300000]
-      ]
-  funded <- rpc env.node "fundrawtransaction" [raw]
-  signed <- rpc env.node "signrawtransactionwithwallet" [(funded ! "hex")]
-  txT <-
-    rpc env.node "sendrawtransaction" [(signed ! "hex")] >>= \case
-      String t -> return t
-      v -> fail (show v)
-  record env x ref txT
-  void $ mine env 1
-  checkXPub env x ref
-  info <- rpc env.node "getaddressinfo" [String w]
-  tx <- getRawTx env.node txT
-  let wScript = textField "scriptPubKey" info
-  vout <- case [ numV n
-               | o <- arr ((tx ! "vout")),
-                 Just n <- [field "n" o],
-                 (textField "hex" =<< field "scriptPubKey" o) == wScript
-               ] of
-    v : _ -> return v
-    [] -> fail "No output to the wallet address"
-  w2 <- getNewAddress env.node
-  raw2 <-
-    rpc
-      env.node
-      "createrawtransaction"
-      [ toJSON [object ["txid" .= txT, "vout" .= vout]],
-        object [Key.fromText w2 .= btc 290000]
-      ]
-  signed2 <- rpc env.node "signrawtransactionwithwallet" [raw2]
-  txU <-
-    rpc env.node "sendrawtransaction" [(signed2 ! "hex")] >>= \case
-      String t -> return t
-      v -> fail (show v)
-  waitSynced env
-  let th = fromMaybe (error "bad txid") (hexToTxHash txT)
-      spenderOf = \case
-        [Just td] -> (.txid) <$> IntMap.lookup (fromIntegral vout) td.spenders
-        _ -> Nothing
-  waitFor "the spender of a cached body" $
-    (== hexToTxHash txU) . spenderOf <$> cacheTxData env.redisCache [th]
-  sameAnswers env ["/xpub/" <> x.text <> "/transactions/full", "/transaction/" <> cs txT]
-  void $ mine env 1
-  sameAnswers env ["/xpub/" <> x.text <> "/transactions/full", "/transaction/" <> cs txT]
-
--- | Evicting down to one xpub keeps the one used last, and removes everything
--- of the others: their entries, their addresses in the index, and the
--- bodies that no other cached xpub refers to.
-evictTest :: Env -> IO ()
-evictTest env = do
-  let xa = newXPub env "evict a" DeriveNormal
-      xb = newXPub env "evict b" DeriveNormal
-  ra <- newLedger
-  rb <- newLedger
-  void $ pay env xa ra [([0, 0], 100000)]
-  void $ pay env xb rb [([0, 0], 100000), ([0, 1], 100000)]
-  void $ mine env 1
-  checkXPub env xb rb
-  checkXPub env xa ra
-  _ <- getJSON env.cached ("/xpub/" <> xa.text <> "/balances")
-  n <- cacheEvict env.redisCache 1
-  n `shouldSatisfy` (>= 1)
-  isCached env xa `shouldReturn` True
-  isCached env xb `shouldReturn` False
-  left <- redisRun env $ Redis.keys (xpubKey env xb "*")
-  left `shouldBe` []
-  addrs <- redisRun env $ Redis.smembers (cachePrefix env.net <> "a:" <> encode (addrOf xb [0, 0]))
-  addrs `shouldBe` []
-  eb <- expect <$> readIORef rb
-  forM_ eb.txids $ \t -> do
-    let h = fromMaybe (error "bad txid") (hexToTxHash t)
-    stored <- redisRun env $ Redis.exists (cachePrefix env.net <> "tx:" <> encode h)
-    stored `shouldBe` False
-  -- the evicted xpub is answered from the database and cached again
-  checkXPub env xb rb
-
--- | The keys of older caches, written before the store started, are as they
--- were.
-oldKeysTest :: Env -> IO ()
-oldKeysTest env =
-  forM_ oldKeys $ \(k, v) ->
-    redisRun env (Redis.get k) `shouldReturn` Just v
-
--- | While Redis does not answer, the store answers from its own database,
--- and its health check says that it does with status 203: not a failure,
--- since the store works, and not the 200 of a store that has everything.
--- When Redis is back, so is the 200. Redis is told to hold every client for
--- a while, which is what a server that hangs looks like from outside.
-redisDownTest :: Env -> IO ()
-redisDownTest env = do
-  let x = newXPub env "redisdown" DeriveNormal
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000), ([1, 0], 50000)]
-  void $ mine env 1
-  checkXPub env x ref
-  let redisOK (_, v) = (v ! "redis") ! "ok"
-  (code0, healthy) <- getJSON env.cached "/health"
-  code0 `shouldBe` 200
-  redisOK (code0, healthy) `shouldBe` Bool True
-  -- a store without a cache has no such check
-  (_, bare) <- getJSON env.plain "/health"
-  bare `shouldSatisfy` \case
-    Object o -> not (KeyMap.member "redis" o)
-    _ -> False
-  held <- redisRun env (Redis.sendRequest ["CLIENT", "PAUSE", "12000"])
-  held `shouldBe` Redis.Ok
-  -- the first request waits two seconds for Redis and gives up on it
-  (code, _) <- getJSON env.cached ("/xpub/" <> x.text <> "/balances")
-  code `shouldBe` 200
-  waitFor "the health check to notice that Redis is gone" $
-    (== 203) . fst <$> getJSON env.cached "/health"
-  redisOK <$> getJSON env.cached "/health" `shouldReturn` Bool False
-  checkXPub env x ref
-  waitFor "the health check to notice that Redis is back" $
-    (== 200) . fst <$> getJSON env.cached "/health"
-  checkXPub env x ref
 
 -- | An error is answered in JSON, whatever the request asks for, and
 -- every answer says that it depends on whether the client reads gzip, and
@@ -2497,7 +2200,7 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
         ]
       cachedKey = cachePrefix env.net <> "fx:e:" <> xpubId x.spec <> ":meta"
       -- the cache has the key, at the fleet tip, and each store answers
-      -- about it as it does without the cache, and as the other store does
+      -- about it as the other store does
       throughCache what = do
         waitFor ("the cache to have the key, " <> what) $ do
           _ <- getJSON urlA (xpub <> "/balances" <> q)
@@ -2508,13 +2211,6 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
           let here = (\n t -> n <> "@" <> t) <$> moves <*> tip
           return (has && isJust tip && cached == here)
         alike ("the two stores to answer alike from the cache, " <> what) about
-        waitFor ("each store to answer from the cache as from its database, " <> what) $ do
-          let direct = map (<> "&nocache=true") about
-          cachedA <- mapM (getJSON urlA) about
-          directA <- mapM (getJSON urlA) direct
-          cachedB <- mapM (getJSON urlB) about
-          directB <- mapM (getJSON urlB) direct
-          return (cachedA == directA && cachedB == directB && cachedA == cachedB)
   waitStore env a
   waitStore env b
   atTip
@@ -2637,57 +2333,20 @@ waitStore env st =
     ours <- Q.getBestBlock st.db
     return (fmap blockHashToHex ours == Just best)
 
--- | Two stores share a Redis and see the same events. A payment to a cached
--- xpub, then the block that confirms it, are each applied once: one store
--- claims each change and reloads the xpub, the other finds it done.
---
--- The stores record their own times for mempool transactions, so which of
--- them wrote the entry shows in the times of its transactions; only the
--- balances are compared with the database here.
-onceTest :: Env -> IO ()
-onceTest env = withOther env $ \other -> do
-  cache2 <- maybe (fail "The second store has no cache") return other.cache
-  let x = newXPub env "once" DeriveNormal
-      both = do
-        a <- cacheCounters env.redisCache
-        b <- cacheCounters cache2
-        return (a.reloads + b.reloads, a.behind + b.behind)
-      synced = waitSynced env >> waitStore env other
-      balancesMatch =
-        waitFor "the cached balances" $ do
-          cached <- cacheXPubBals env.redisCache x.spec
-          stored <- L.withView env.store.db (`L.xPubBals` x.spec)
-          return (cached == Just stored)
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000)]
-  void $ mine env 1
-  synced
-  _ <- getJSON env.cached ("/xpub/" <> x.text <> "/balances")
-  waitCached env x
-  threadDelay 1000000
-  (r0, b0) <- both
-  void $ pay env x ref [([0, 1], 200000)]
-  synced
-  balancesMatch
-  void $ mine env 1
-  synced
-  balancesMatch
-  threadDelay 2000000
-  (r1, b1) <- both
-  (r1 - r0, b1 - b0) `shouldBe` (2, 0)
+-- | GET a path, with the status, the headers and the body of the answer.
+getWithHeaders :: String -> String -> IO (Int, ResponseHeaders, Value)
+getWithHeaders base path = do
+  r <- Wreq.getWith opts (base <> path)
+  return
+    ( r ^. Wreq.responseStatus . Wreq.statusCode,
+      r ^. Wreq.responseHeaders,
+      body (r ^. Wreq.responseBody)
+    )
+  where
+    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
 
--- | Redis has a transaction of a cached xpub that this store has never seen:
--- a store that is behind must not replace the entry, which would drop it.
-unknownTest :: Env -> IO ()
-unknownTest env = do
-  let x = newXPub env "unknown" DeriveNormal
-      unknown = encode (TxHash (sha256 ("never seen" :: C8.ByteString)))
-  ref <- newLedger
-  void $ pay env x ref [([0, 0], 100000)]
-  void $ mine env 1
-  checkXPub env x ref
-  void . redisRun env $ Redis.zadd (xpubKey env x "txs") [(1, unknown)]
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Behind
-  void . redisRun env $ Redis.zrem (xpubKey env x "txs") (pure unknown)
-  cacheRefresh env.redisCache x.spec HashSet.empty `shouldReturn` Reloaded
-  checkXPub env x ref
+-- | The clock of Redis, in milliseconds.
+redisNowMs :: Env -> IO Integer
+redisNowMs env = do
+  (seconds, micros) <- redisRun env Redis.time
+  return (seconds * 1000 + micros `div` 1000)

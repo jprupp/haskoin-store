@@ -131,13 +131,12 @@ info:
     | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
     | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
     | 410 | `replaced` | A transaction asked for by its id was replaced by one that a block confirmed; `replaced-by` and `height` say which and where. |
+    | 429 | `server-busy` | A wallet asked for is not in the cache yet, and the server cannot have it there soon. Try again after the seconds of its `Retry-After` header. Any endpoint of wallets may answer it; `/events` only for an `xpub` to watch. |
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
+    | 503 | `server-error` | Reading a wallet into the cache failed; ask again after a second. |
+    | 503 | `server-busy` | The server has more long requests (lists, whole blocks, wallets) than it can answer now. Try again after a second, or ask another server. |
     | 503 | | From `/health`: the server is not ready. |
     | 503 | `behind-fleet` | The server is one of a fleet and does not have the block that the fleet answers from; another server of the fleet does. |
-    | 503 | `server-busy` | The server has more requests than it can answer soon. Try again after the seconds of its `Retry-After` header, or ask another server. |
-
-    `/health` also answers 203 for a server that works but cannot reach its
-    Redis; see there.
 
     A value in the path that does not parse, such as a misspelt address, gives
     404 rather than 400. Paths are matched by the shape of what is in them, and
@@ -217,12 +216,21 @@ info:
     of any kind is new, and gets an empty answer. The check only runs for
     wallets that look empty, so it costs nothing for wallets in use.
 
-    Servers with a Redis cache keep large wallets ready: their first query reads
-    the database and caches the result, and later ones are answered from memory.
-    A cached answer is always the same as the database's; `nocache=true` skips
-    the cache. The servers of a fleet share one such cache, and each answers
-    from it what it would answer from its database at the block that the
-    fleet answers from.
+    Servers keep wallets ready in a cache, in the Redis that the servers of
+    a fleet share. A wallet that is not in the cache is read
+    into it first, once, by one server: the queries that come meanwhile, to
+    this server or to another that shares the Redis, wait for that one
+    reading, ten seconds at most by default, and are then answered with it.
+    When the wallet is not expected to be ready within that time, because
+    many wallets are waiting or this one is large, or when the wait runs out,
+    the server answers 429 with `Retry-After`: the seconds after which the
+    server that reads it expects to have it. Every server that shares the
+    Redis gives the same number, from that one estimate. The reading goes on
+    meanwhile, so ask again then. A cached answer is always the same as the
+    database's at some moment, never parts of two. The caches keep the wallets used most recently and those that take
+    longest to read. The servers of a fleet share one cache in Redis, and each
+    answers from it what it would answer from its database at the block that
+    the fleet answers from.
 
     ## Live updates
 
@@ -292,7 +300,15 @@ info:
     - **`Vary: Accept-Encoding`** is on every answer, so that a cache keeps
       compressed and plain answers apart.
     - **`Retry-After`** is on a 503: one second from a server that is behind
-      its fleet, five from a health check that fails.
+      its fleet or failed to read a wallet into its cache, five from a health
+      check that fails, and one from a server that is too busy. It is on a
+      429 too: for a wallet that is not in the cache yet, it is when the
+      server expects to have it there, from the wallets ahead of it and how
+      long a wallet takes to read; from a server that another one is reading
+      it for, when that one expects to be done.
+    - **A busy server makes long requests wait** for a moment, and refuses
+      with 503 those that it cannot start soon. A request that it started
+      is answered in full.
     - **The reference itself** is at the root of every server: `/` is this
       page, for the version that the server runs, and `/swagger.yaml` the file
       behind it.
@@ -334,34 +350,16 @@ paths:
         still catching up with the network answers 503, so a load balancer stops
         sending it traffic until its answers are current.
 
-        A server that has a Redis cache and cannot reach it answers **203** when
-        every check passes, with the header `Haskoin-Degraded: redis` and
-        `"redis": {"ok": false}` in the body. It goes on
-        answering every request, from its own database: the answers are right for
-        what this server has seen, but they are no longer the ones that the servers
-        sharing that Redis give together, and requests about large wallets are
-        slower. A load balancer that takes any status in the 200s for healthy keeps
-        sending it traffic, which is what it should do; a monitor that expects 200
-        sees that something is wrong.
+        A server that cannot reach its Redis answers **503** too, with the
+        header `Haskoin-Degraded: redis` and `"redis": {"ok": false}` in the
+        body: Redis holds the mempool and the cache of extended public keys
+        that every server of the fleet answers from.
 
         The checks are run in the background every 30 seconds (unless the operator
         changed it), and this endpoint returns the latest result. It does no work of
         its own, so it is safe to call as often as a load balancer likes.
       operationId: healthCheck
       responses:
-        '203':
-          description: |
-            Every check passes, but the server cannot reach its Redis and answers
-            from its own database alone. The body is that of 200.
-          headers:
-            Haskoin-Degraded:
-              description: What the server is doing without; `redis`.
-              schema:
-                type: string
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthCheck'
         '200':
           description: success
           content:
@@ -2566,6 +2564,13 @@ paths:
         - **No answers.** As between a node and an SPV client, nothing is sent
           back. A message that the server cannot read or will not do closes
           the connection with code 1008 and the reason.
+        - **Wallets come from the cache.** An `xpub` to watch that the server
+          does not have in its cache yet is read into it first, as for
+          `/xpub/{xpub}`. If that cannot be done soon, the stream, or the
+          opening of the websocket, is answered 429 with `Retry-After`, or
+          503 if reading the wallet failed; a message to watch a key on an open
+          websocket closes it with code 1013, to try again later, with the
+          seconds to wait in the reason.
         - When the server does not know the transaction of an event, which
           happens when one leaves the mempool long after it entered, the event
           goes to every client.
@@ -2591,6 +2596,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/peers':
     get:
@@ -2645,7 +2654,6 @@ paths:
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
-        - $ref: '#/components/parameters/nocacheParam'
       responses:
         '200':
           description: Information about extended public key.
@@ -2682,19 +2690,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
     delete:
       tags:
         - Address
       operationId: deleteCachedXPub
       summary: Delete Cached Extended Key
       description: |
-        Remove a wallet from the Redis cache of this server, if it has one. The
-        answer says whether it was cached.
+        Remove a wallet from the cache of the fleet, in Redis.
+        The answer says whether the cache had it.
 
         There is rarely a reason to call this: cached wallets are kept up to date
-        with every block and transaction, and the least recently used ones are
-        evicted when the cache is full. It is there to free memory, or to rule out
-        the cache when looking into a problem.
+        with every block and transaction, and when a cache is full it evicts the
+        wallets that were used least recently and are quickest to read again. It is
+        there to free memory, or to rule out the cache when looking into a problem.
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
@@ -2734,7 +2746,6 @@ paths:
         - $ref: '#/components/parameters/heightParam'
         - $ref: '#/components/parameters/limitParam'
         - $ref: '#/components/parameters/offsetParam'
-        - $ref: '#/components/parameters/nocacheParam'
       responses:
         '200':
           description: List of transaction objects.
@@ -2973,6 +2984,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/xpub/{xpub}/transactions':
     get:
@@ -2990,7 +3005,6 @@ paths:
         - $ref: '#/components/parameters/heightParam'
         - $ref: '#/components/parameters/limitParam'
         - $ref: '#/components/parameters/offsetParam'
-        - $ref: '#/components/parameters/nocacheParam'
       responses:
         '200':
           description: List of transactions.
@@ -3033,6 +3047,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/xpub/{xpub}/balances':
     get:
@@ -3048,7 +3066,6 @@ paths:
       parameters:
         - $ref: '#/components/parameters/xpubParam'
         - $ref: '#/components/parameters/xpubDerive'
-        - $ref: '#/components/parameters/nocacheParam'
       responses:
         '200':
           description: Balances only for used addresses.
@@ -3109,6 +3126,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/xpub/{xpub}/unspent':
     get:
@@ -3125,7 +3146,6 @@ paths:
         - $ref: '#/components/parameters/heightParam'
         - $ref: '#/components/parameters/limitParam'
         - $ref: '#/components/parameters/offsetParam'
-        - $ref: '#/components/parameters/nocacheParam'
       responses:
         '200':
           description: List of unspent output objects.
@@ -3192,6 +3212,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/balance':
     get:
@@ -3230,6 +3254,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
     post:
       tags:
         - Blockchain
@@ -3265,6 +3293,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/rawaddr/{address}':
     get:
@@ -3428,6 +3460,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/unconfirmed-transactions':
     get:
@@ -3596,6 +3632,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
     post:
       tags:
         - Blockchain
@@ -3895,6 +3935,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/rawblock/{block}':
     get:
@@ -5163,6 +5207,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
     post:
       tags:
         - Blockchain
@@ -5224,6 +5272,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/export-history':
     get:
@@ -5280,6 +5332,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
     post:
       tags:
         - Blockchain
@@ -5326,6 +5382,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/walletNotReady'
+        '503':
+          $ref: '#/components/responses/walletFailed'
 
   '/blockchain/q/addresstohash/{address}':
     get:
@@ -7155,6 +7215,45 @@ components:
           type: boolean
           example: true
 
+  responses:
+
+    walletNotReady:
+      description: |
+        A wallet asked for is not in the cache yet, and cannot be there soon: many
+        wallets are waiting to be read, or this one is large; another server that
+        shares the cache may be reading it, which this one waits for as long as it
+        would for its own. Unless its queue is full, or it is not in sync with the
+        network, the server goes on reading it. Ask again after `Retry-After`
+        seconds, when the server expects to have it, or ask another server. A
+        request for several wallets is refused if one of them is not ready, with
+        the longest wait of those that are not.
+      headers:
+        Retry-After:
+          description: Seconds after which to ask again.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: server-busy
+
+    walletFailed:
+      description: Reading a wallet into the cache failed. Ask again after a second.
+      headers:
+        Retry-After:
+          description: Always one second.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: server-error
+            message: Server error
+
   parameters:
 
     pubKeyParam:
@@ -7247,19 +7346,6 @@ components:
       required: false
       schema:
         type: integer
-
-    nocacheParam:
-      name: nocache
-      in: query
-      description: |
-        Answer from the database of this server, without reading the Redis cache and
-        without caching the wallet. The answer is the same; this is for comparing,
-        and for servers whose cache is shared with others that may be ahead of or
-        behind this one. A server of a fleet still answers from the block and the
-        mempool that the fleet shares, only without its cache of wallets.
-      required: false
-      schema:
-        type: boolean
 
     notxParam:
       name: notx

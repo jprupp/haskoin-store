@@ -17,6 +17,7 @@
 -- and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
+    cachePrefix,
     Store (..),
     withStore,
   )
@@ -40,7 +41,7 @@ import Haskoin
     InvVector (..),
     Message (..),
     MessageCommand (..),
-    Network,
+    Network (..),
     NetworkAddress (..),
     NotFound (..),
     Pong (..),
@@ -79,7 +80,6 @@ import Haskoin.Store.BlockStore
     blockStoreTxSTM,
     withBlockStore,
   )
-import Haskoin.Store.Cache (Cache, CacheConfig (..), cachePrefix, withCache)
 import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
@@ -91,16 +91,18 @@ import Haskoin.Store.Database.Reader
     withLayeredReader,
   )
 import Haskoin.Store.Fleet.Member
-  ( Member,
+  ( Member (..),
     MemberConfig (..),
     memberCacheLoop,
     memberEvents,
     memberForget,
     memberLoop,
+    memberReceived,
     newMember,
     noteBest,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
+import Haskoin.Store.XPub.Service (XPubConfig (..))
 import NQE
   ( Inbox,
     Publisher,
@@ -125,10 +127,9 @@ data Store = Store
     block :: !BlockStore,
     -- | database reader
     db :: !DatabaseReader,
-    -- | cache of extended public keys, if Redis is configured and the store
-    -- is not a member of a fleet
-    cache :: !(Maybe Cache),
-    -- | the store as a member of a fleet, if it is one
+    -- | the store as a member of its fleet, with the door to the fleet's
+    -- cache of xpubs that the web server answers them from; 'Nothing'
+    -- without Redis, when the store is unhealthy and answers 503
     fleet :: !(Maybe Member),
     -- | what the store tells its clients: new best blocks and changes of
     -- the mempool. For a store alone they are its own, those that the
@@ -158,34 +159,22 @@ data StoreConfig = StoreConfig
     db :: !FilePath,
     -- | network constants
     net :: !Network,
-    -- | Redis URL for the cache of extended public keys ("Haskoin.Store.Cache");
-    -- 'Nothing' for no cache, an empty URL for the local Redis
+    -- | Redis URL of the fleet: its tip, pool and cache of extended public
+    -- keys ("Haskoin.Store.Fleet.Member"); an empty URL for the local Redis.
+    -- A store always has one: 'Nothing' is for tests of the block store
+    -- alone, which then syncs blocks but answers 503.
     redis :: !(Maybe String),
     -- | gap on extended public key with no transactions
     initGap :: !Word32,
     -- | gap for extended public keys
     gap :: !Word32,
-    -- | cache xpubs with at least this many used addresses
-    redisMinAddrs :: !Int,
-    -- | or with at least this many transactions in their addresses
-    redisMinTxs :: !Int,
-    -- | evict the least recently used xpubs from the cache past this many
+    -- | most xpubs in the fleet's cache, at least 1, by GreedyDual: those
+    -- that cost least to index again go first, of those not used for a
+    -- while
     redisMaxXPubs :: !Int,
-    -- | do not index new mempool transactions
-    noMempool :: !Bool,
-    -- | wipe mempool when starting
-    wipeMempool :: !Bool,
-    -- | answer as one of a fleet of stores that share the Redis of 'redis':
-    -- every store of the fleet then gives the same answer to the same
-    -- request, from the block that they agree on and the mempool that they
-    -- share ("Haskoin.Store.Fleet.Member"). The cache of extended public
-    -- keys of a store alone ("Haskoin.Store.Cache") is not used then: its
-    -- entries follow each store's own database, which is what a fleet does
-    -- not answer from. A fleet has one of its own
-    -- ("Haskoin.Store.Fleet.XPub"), under the same three settings.
-    fleet :: !Bool,
-    -- | sync mempool from peers
-    syncMempool :: !Bool,
+    -- | the indexers of xpubs ("Haskoin.Store.XPub.Service");
+    -- 'Haskoin.Store.XPub.Service.defaultXPubConfig' for one thread a core
+    xpubs :: !XPubConfig,
     -- | blocks to request from the syncing peer in one batch
     blockWindow :: !Int,
     -- | delete mempool transactions older than this number of days
@@ -252,7 +241,7 @@ withStore cfg action =
             withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
               withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                 link fwd
-                withStoreFleet cfg pub member . withStoreCache cfg db node.chain pub $ \cache ->
+                withStoreFleet cfg pub member $
                   withFleetEvents cfg pub member $ \events ->
                     action $
                       Store
@@ -260,7 +249,6 @@ withStore cfg action =
                           chain = node.chain,
                           block = block_store,
                           db = db,
-                          cache = cache,
                           fleet = member,
                           events = events,
                           pub = pub,
@@ -268,13 +256,17 @@ withStore cfg action =
                           connect = cfg.connect
                         }
 
+-- | What every key of the fleet in Redis starts with.
+cachePrefix :: Network -> ByteString
+cachePrefix net = "hs2:" <> C.pack net.name <> ":"
+
 -- | The store as a member of a fleet, if the configuration says that it is
 -- one and has a Redis to share: under a name of its own, with a lease of
 -- ten seconds, views of its last six blocks, and the store's limit on the
 -- age of unconfirmed transactions.
 storeMember :: StoreConfig -> DatabaseReader -> IO (Maybe Member)
-storeMember cfg db = case (cfg.fleet, cfg.redis) of
-  (True, Just url) -> do
+storeMember cfg db = case cfg.redis of
+  Just url -> do
     info <-
       if null url
         then return Redis.defaultConnectInfo
@@ -289,15 +281,15 @@ storeMember cfg db = case (cfg.fleet, cfg.redis) of
             lease = 10000,
             depth = 6,
             expiry = fromIntegral cfg.mempoolTimeout * 24 * 3600,
-            cacheMax = cfg.redisMaxXPubs,
-            cacheMinAddrs = cfg.redisMinAddrs,
-            cacheMinTxs = cfg.redisMinTxs,
+            cacheMax = max 1 cfg.redisMaxXPubs,
+            indexer = cfg.xpubs.indexer,
             stats = cfg.stats,
             note = \level -> logAt level (withSource "Fleet" cfg.logger)
           }
         conn
         db
-  _ -> return Nothing
+  -- without Redis the store syncs blocks, but is unhealthy and answers 503
+  Nothing -> return Nothing
 
 -- | Take the store's turns as a member of its fleet while an action runs,
 -- if it is one: every two seconds, and whenever the best block changes.
@@ -338,33 +330,6 @@ withFleetEvents _ _ (Just member) action =
       FleetLeft h -> StoreMempoolDelete <$> hash h
     hash :: (Serialize x) => ByteString -> Maybe x
     hash = either (const Nothing) Just . decode
-
--- | Run the cache while an action runs, if Redis is configured.
-withStoreCache ::
-  StoreConfig ->
-  DatabaseReader ->
-  Chain ->
-  Publisher StoreEvent ->
-  (Maybe Cache -> IO a) ->
-  IO a
-withStoreCache cfg db chain pub action =
-  case cfg.redis of
-    Nothing -> action Nothing
-    Just _ | cfg.fleet -> action Nothing
-    Just url ->
-      withCache
-        CacheConfig
-          { url = url,
-            minAddrs = cfg.redisMinAddrs,
-            minTxs = cfg.redisMinTxs,
-            maxXPubs = cfg.redisMaxXPubs,
-            stats = cfg.stats
-          }
-        db
-        chain
-        pub
-        (withSource "Cache" cfg.logger)
-        (action . Just)
 
 -- | Open the database described by the configuration, bring it to the
 -- layout that the store runs on ('upgradeDatabase'), and run an action with
@@ -414,10 +379,8 @@ blockStoreCfg cfg node pub db member =
       pub = pub,
       db = db,
       net = cfg.net,
-      noMempool = cfg.noMempool,
-      wipeMempool = cfg.wipeMempool,
       onBest = maybe (\_ -> return ()) noteBest member,
-      syncMempool = cfg.syncMempool,
+      onTx = maybe (\_ _ -> return ()) memberReceived member,
       blockWindow = cfg.blockWindow,
       mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,

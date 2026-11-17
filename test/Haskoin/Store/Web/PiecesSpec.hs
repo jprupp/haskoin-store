@@ -23,14 +23,14 @@ spec = describe "a response in pieces" $ do
   it "has the bytes of a list encoded at once, for pieces of its items" $ do
     let lists = [[], [[]], [[1]], [[1, 2], [3]], [[], [1], [], [2, 3], []], [[1 .. 100], [101 .. 150]]]
         listed :: [[Int]] -> IO (L.ByteString, Bool)
-        listed l = listPieces toEncoding (map return l) >>= answer
+        listed l = listPieces toEncoding [(length x, return x) | x <- l] >>= answer
     mapM_ (\l -> listed l `shouldReturn` (encode (concat l), True)) lists
   it "has the same bytes when its pieces take turns to finish" $ do
     -- later pieces finish first, so that what is settled in order, the
     -- commas, is settled after all of them are encoded
     let slow n items = threadDelay (1000 * (5 - n `mod` 5)) >> return items
         l = [[], [1, 2], [], [3], [4 .. 9], [], [10 :: Int]]
-    pieces <- listPieces toEncoding (zipWith slow [0 ..] l)
+    pieces <- listPieces toEncoding (zipWith (\n x -> (length x, slow n x)) [0 ..] l)
     answer pieces `shouldReturn` (encode (concat l), True)
   it "cuts keys into pieces of the size, and the last of what is left" $ do
     read' <- newIORef []
@@ -39,6 +39,7 @@ spec = describe "a response in pieces" $ do
     answer pieces `shouldReturn` (encode [1 .. 8 :: Int], True)
     -- pieces are read at the same time, in no fixed order
     sort <$> readIORef read' `shouldReturn` [[1, 2, 3], [4, 5, 6], [7, 8]]
+    map fst (pieced 3 fetch [1 .. 8 :: Int]) `shouldBe` [3, 3, 2]
   it "puts bytes around pieces without a piece more" $ do
     let wrapped ps = around "<" ">" (map plain ps)
     let cases = [[], ["a"], ["a", "b"], ["a", "b", "c"]]

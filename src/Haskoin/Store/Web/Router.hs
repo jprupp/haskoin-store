@@ -99,12 +99,16 @@ data Route = Route
     accepts :: ![Text],
     handler :: Req -> IO Response,
     -- | what answering it may cost; 'route' makes routes that are 'Short'
-    cost :: !Cost
+    cost :: !Cost,
+    -- | the fixed segments of its path, joined by underscores, as the
+    -- metrics and the kinds of request name it; made the first time that it
+    -- is asked for, and kept
+    name :: Text
   }
 
--- | What a request to a route may cost the server, by which a server with
--- too much to do tells what to answer at once from what has to wait
--- ("Haskoin.Store.Web.Admission").
+-- | What a request to a route may cost the server, roughly. A 'Light' or
+-- 'Short' route is answered at once; only so many 'Long' ones run at once
+-- ("Haskoin.Store.Web.Admission"), and the next ones wait their turn.
 --
 -- It is the route that has a cost, and not the request: a list may turn out
 -- to have one item, and is 'Long' all the same. Telling by the request
@@ -127,12 +131,14 @@ route :: Method -> Text -> [Text] -> (Req -> IO Response) -> Route
 route m path accepts handler =
   Route
     { method = m,
-      pattern = [segment t | t <- T.splitOn "/" path, not (T.null t)],
+      pattern = segments,
       accepts = accepts,
       handler = handler,
-      cost = Short
+      cost = Short,
+      name = T.intercalate "_" [l | Left l <- segments]
     }
   where
+    segments = [segment t | t <- T.splitOn "/" path, not (T.null t)]
     segment t = maybe (Left t) Right (T.stripPrefix ":" t)
 
 -- | A route for @GET@.

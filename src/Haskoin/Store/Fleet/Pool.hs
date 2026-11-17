@@ -8,7 +8,7 @@
 --
 -- The mempool that stores sharing one Redis answer from, as pure decisions:
 -- the second part of "A fleet that answers as one" in
--- @docs\/layered-database.md@, after the fleet tip of "Haskoin.Store.Fleet".
+-- @docs\/one-fleet.md@, after the fleet tip of "Haskoin.Store.Fleet".
 -- "Haskoin.Store.Fleet.Redis" carries it out.
 --
 -- = The problem
@@ -273,9 +273,9 @@ advanceReplacing maker change label lost waiting pool0 = (final, now <> clashed,
         let leaving = Set.toList (descendants [s] p)
          in (withdraw [s] p, replaced <> maybe [] (\w -> [(t, w) | t <- leaving]) (label o))
 
--- | What a transaction does at an address, for addresses of type @a@: the
--- entries by address of "Haskoin.Store.Database.Mempool", which a store
--- works out from the transaction alone and gives to the pool with it.
+-- | What a transaction does at an address, for addresses of type @a@, which
+-- a store works out from the transaction alone and gives to the pool with
+-- it ('Haskoin.Store.Fleet.Member.poolTx').
 data Entry a o
   = -- | it spends from the address or pays to it
     Touches !a

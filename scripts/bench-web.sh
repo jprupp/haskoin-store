@@ -36,7 +36,17 @@ if [ -z "${BIN:-}" ]; then
   BIN=$BIN/build/haskoin-store-bench/haskoin-store-bench
 fi
 OUT=$(mktemp)
-trap 'kill $SERVER 2>/dev/null || true; rm -f "$OUT" "$OUT.wrk"' EXIT
+# An interrupt, not a kill, so that the server removes its database from the
+# temporary directory; then wait for it to have done so.
+SERVER=
+stop() {
+  if [ -n "$SERVER" ]; then
+    kill -INT "$SERVER" 2>/dev/null || true
+    wait "$SERVER" 2>/dev/null || true
+  fi
+  rm -f "$OUT" "$OUT.wrk"
+}
+trap stop EXIT
 
 taskset -c "$SERVER_CPUS" "$BIN" "$PORT" "$BLOCKS" ${REDIS_URL:+"$REDIS_URL"} \
   +RTS -N3 ${RTS[@]+"${RTS[@]}"} -RTS >"$OUT" 2>&1 &
@@ -52,8 +62,9 @@ XPUB=$(sed -n 's/^xpub: //p' "$OUT")
 BEST=$(sed -n 's/^best block: //p' "$OUT")
 TXID=$(curl -s "http://127.0.0.1:$PORT/address/$HOT/transactions?limit=1" |
   python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["txid"])')
-# The xpub is cached in Redis on its first balance query.
-curl -s "http://127.0.0.1:$PORT/xpub/$XPUB" >/dev/null
+# The xpub goes into the cache, Redis or else memory, on its first query.
+# Until the indexer has it, the server may answer 429, which curl -f fails on.
+until curl -sf "http://127.0.0.1:$PORT/xpub/$XPUB" >/dev/null; do sleep 1; done
 
 run() {
   local name=$1 path=$2

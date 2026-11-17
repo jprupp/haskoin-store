@@ -53,15 +53,17 @@ Bitcoin Cash APIs such as api.haskoin.com.
 - **Index for the questions people ask.** Every index is laid out so that an
   API query is one seek and a short scan in RocksDB, newest first, which keeps
   response times flat as the chain grows.
-- **Never half-write.** Each block, and each batch of mempool transactions, is
-  one atomic database write. A crash leaves the store at the previous block,
+- **Never half-write.** Each block is one atomic database write, and each
+  change of the shared pool one Redis script. A crash leaves the store at the previous block,
   with no repair step on restart.
-- **Unconfirmed transactions matter.** The mempool is indexed and persisted like
-  the chain, ordered before confirmed history, and handles replace-by-fee on
-  Bitcoin. A wallet sees a payment the moment the network does.
+- **Unconfirmed transactions matter.** The mempool is one pool in Redis that
+  every store of a fleet shares, indexed by address, ordered before
+  confirmed history, with replace-by-fee on Bitcoin. A wallet sees a
+  payment the moment the network does.
 - **Extended public keys are first class.** Wallets are mostly xpubs, so the
   store derives their addresses up to an exact gap, remembers the derivations,
-  and can keep large wallets ready in a Redis shared by several stores.
+  and keeps wallets ready in a cache in the Redis that the stores of a
+  fleet share.
 - **Bounded resources.** API limits stop one request from monopolising the
   server, slow event clients are dropped, and RocksDB memory has a budget.
 - **Operable.** A health endpoint that tells a load balancer when an instance is
@@ -79,9 +81,9 @@ Bitcoin Cash APIs such as api.haskoin.com.
 | --------------- | ------------------------------------------------------------------------------------------- |
 | Networks        | Bitcoin and Bitcoin Cash: mainnet, testnets and regtest                                     |
 | Addresses       | Balances, transactions and unspent outputs (UTXO) of any address, alone or many at once      |
-| Xpubs           | Balances, transactions and UTXO of extended public keys, for legacy, nested SegWit and native SegWit addresses, with an optional Redis cache for large wallets |
+| Xpubs           | Balances, transactions and UTXO of extended public keys, for legacy, nested SegWit and native SegWit addresses, from the fleet's cache in Redis |
 | Blocks and txs  | Lookup by hash, height or time; raw serialized forms; transactions of a block               |
-| Mempool         | Persistent, indexed by arrival time, with replace-by-fee on BTC and pruning of old entries   |
+| Mempool         | One pool in Redis shared by the fleet, by arrival time, with replace-by-fee on BTC and expiry |
 | Formats         | JSON                                                                                         |
 | Live events     | New blocks and transactions as a JSON stream or over a WebSocket                            |
 | Compatibility   | Endpoints in the style of Blockchain.info under `/blockchain/`                               |
@@ -289,19 +291,18 @@ parameter.
 
 ### 7. Make big wallets fast
 
-Start the store with `--redis` and a Redis (or Valkey) server.
+Wallets are answered from the fleet's cache in Redis, which follows every
+block and the shared mempool.
 
-- **Large xpubs are cached** after their first query and answered from
-  Redis, transactions in full included. Large means at least
-  `--redis-min-addrs` used addresses, or at least `--redis-min-txs`
-  transactions.
-- **Several stores can share one Redis.** They keep each other's cache up
-  to date.
-- Add `nocache=true` to a query to read the database instead.
+- **Every xpub is cached** on its first query. The query waits while one
+  store of the fleet reads the wallet, ten seconds at most (`--xpub-wait`).
+  If the wallet is not expected that soon, or the wait runs out, the store
+  answers 429 with `Retry-After`, the same on every store: ask again then.
+- **The cache keeps the costly ones longest**, up to `--redis-max-xpubs`.
+  The cache cannot be turned off; that option sets only its size, at least
+  1. There is no `nocache`: an answer from the cache is always exact.
 
-Servers behind a load balancer should also be started with `--fleet`
-([A fleet of servers](#a-fleet-of-servers)). They then answer every request
-alike, and share a cache of xpubs that is built for that.
+`docs/xpub-indexing.md` has the details.
 
 ## Configuration
 
@@ -328,9 +329,6 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--no-mempool` | `NO_MEMPOOL` | off | Do not index unconfirmed transactions |
-| `--sync-mempool` | `SYNC_MEMPOOL` | off | Ask each peer for its whole mempool once in sync |
-| `--wipe-mempool` | `WIPE_MEMPOOL` | off | Empty the mempool area of the database at start |
 | `--mempool-timeout` | `MEMPOOL_TIMEOUT` | `14` | Days after which unconfirmed transactions are deleted (0 = never) |
 
 ### Web server and limits
@@ -340,16 +338,17 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--host` / `--port` | `HOST` / `PORT` | `*` / `3000` | Address the API listens on |
 | `--noweb` | `NO_WEB` | off | Index only, no API |
 | `--tls-cert` / `--tls-key` | `TLS_CERT` / `TLS_KEY` | none | Serve HTTPS with this certificate chain and private key, both files in PEM |
-| `--no-xpub` | `NO_XPUB` | off | Disable the xpub endpoints |
 | `--no-blockchain-info` | `NO_BLOCKCHAIN_INFO` | off | Disable the `/blockchain/` endpoints and price lookups |
 | `--max-item-count` | `MAX_ITEM_COUNT` | `200000` | Most items in a list (0 = no limit) |
 | `--max-full-item-count` | `MAX_FULL_ITEM_COUNT` | `5000` | Most full transactions in a list (0 = no limit) |
 | `--max-offset` | `MAX_OFFSET` | `50000` | Largest `offset` (0 = no limit) |
 | `--slow-request` | `SLOW_REQUEST` | `5` | Seconds a request may take before the log warns of it (0 = never) |
-| `--max-requests` | `MAX_REQUESTS` | four a core | Long requests answered at once; see [Overload](#overload) (0 = no cap) |
-| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for one of those to end; more are refused with 503 |
-| `--request-wait` | `REQUEST_WAIT` | `5` | Seconds that a long request waits before it is refused with 503 |
-| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through; without it, or when it does not answer, they go to the peers |
+| `--max-requests` | `MAX_REQUESTS` | 16 a core | Most long requests (lists, whole blocks, xpubs) answered at once, the ceiling of a limit that adapts; see [Overload](#overload) (0 = no limit) |
+| `--min-requests` | `MIN_REQUESTS` | 1 a core | Fewest long requests answered at once, where the limit starts |
+| `--target-delay` | `TARGET_DELAY` | `25` | Milliseconds that a thread ready to run may wait for a core before the limit comes down |
+| `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 503 |
+| `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 503 |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after Redis loses its data; without it, or when it does not answer, transactions go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -357,71 +356,42 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--price-history-url` | `PRICE_HISTORY_URL` | Blockchain.info price index | Source of historical prices |
 | `--ticker-refresh` | `TICKER_REFRESH` | `90000000` | Microseconds between price updates |
 
-### Redis cache
+### Cache of xpubs
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--redis` | `REDIS` | off | Cache large xpubs in Redis |
-| `--redis-url` | `REDIS_URL` | local Redis | Redis URL, such as `redis://host:6379` |
-| `--redis-min-addrs` | `REDIS_MIN_ADDRS` | `100` | Cache xpubs with at least this many used addresses |
-| `--redis-min-txs` | `REDIS_MIN_TXS` | `1000` | Or with at least this many transactions in their addresses |
-| `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Evict the least recently used xpubs past this many |
+| `--xpub-workers` | `XPUB_WORKERS` | `0` | Threads that read xpubs into the cache (0 = one per core) |
+| `--xpub-wait` | `XPUB_WAIT` | `10` | Most seconds that a request waits for its xpub to be read; one that would wait longer gets 429 |
+| `--xpub-horizon` | `XPUB_HORIZON` | `30` | Seconds: an xpub that the store expects to read later than this is not queued at all |
+| `--xpub-queue` | `XPUB_QUEUE` | `1000` | Most xpubs that requests wait for in the queue; more are refused with 429 |
 
-Every key of the cache starts with `hs2:<network>:`, so a Redis can be shared
-by stores of several networks, and by stores of older versions, whose cache
-uses other keys. `--redis-max-keys` and `--redis-sync-interval` of older
-versions are gone.
-
-### A fleet of servers
+### Redis: the fleet
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--fleet` | `FLEET` | off | Answer as one of the servers that share the Redis of `--redis` |
+| `--redis-url` | `REDIS_URL` | `redis://localhost:6379` | Redis of the fleet, which every store needs: its tip, mempool and xpub cache |
+| `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Size of the xpub cache, at least 1; evicted by cost to index again and by use |
 
-Servers behind a load balancer import the same blocks and transactions at
-slightly different times, so the same request can get different answers
-depending on which of them it reaches. Start every one of them with
-`--redis`, the same `--redis-url` and `--fleet`, and they all answer from
-the same block and the same mempool:
+Redis is how stores agree, and every store is a member of a fleet, even a
+fleet of one. Every key starts with `hs2:<network>:`.
 
-- **The block** is the newest that every live server has. Each server
-  imports blocks when it gets them and keeps its database as it was at each
-  of its last six, and a request is answered from the block that the fleet
-  agreed on. The fleet moves to a new block in one step, when the last
-  server has it.
-- **The mempool** is one pool in Redis, which every server offers its
-  unconfirmed transactions to and all answer from. A transaction has one
-  time of arrival there, so lists come in the same order everywhere.
-- **A server that falls behind** answers 503 with `behind-fleet` rather
-  than something that the others would not say, and stops counting after
-  ten seconds without a report, so that it holds nobody up. A server whose
-  health check fails stops reporting.
-- **After a long outage** the fleet starts its shared mempool again. When
-  the servers come back more than 50 blocks past the block that the fleet
-  last answered from, the first of them moves the fleet there, empties
-  the shared mempool, and all offer their unconfirmed transactions again.
-  The log has a warning when it happens.
-- **`/events` is the same stream on every server.** What changes the
-  shared mempool or moves the fleet to a block writes an event to Redis
-  in the same step, and every server sends those events, in that order,
-  instead of what its own node saw. A block is told when the whole fleet
-  can answer about it. Each server keeps the same last events, so a
-  client that reconnects with `after=` may land on any of them.
-- **Without Redis** each server answers from its own database, and
-  `/health` says 203, as it does for the cache.
-- **Large xpubs are cached for the whole fleet**, under the same
-  `--redis-min-addrs`, `--redis-min-txs` and `--redis-max-xpubs` as the
-  cache of a server alone. Set them the same on every server.
-  - A cached answer is the one that the database gives, on every server.
-  - The server that moves the fleet to a new block brings the cache along.
-    In the moment before it has, and for a wallet that just gained or lost
-    an address, requests are answered from the database.
-  - A reorganisation empties the cache.
-  - A request about a wallet of 464 addresses and 19,499 transactions
-    takes 1.3 to 2.2 milliseconds with it, where it took 5 to 38.
-
-The rules, and the tests that hold Redis to them, are described in "A fleet
-that answers as one" in `docs/layered-database.md`.
+- **The block** is the newest that every live store has. A request is
+  answered from it, from the store's view of its database at that block.
+- **The mempool** is one pool in Redis, and only there: a store keeps no
+  mempool of its own. Each store offers the transactions that its peers
+  send it (`docs/fleet-mempool.md`).
+- **A store that falls behind**, or loses Redis, answers 503 and reports
+  unhealthy, and stops counting after ten seconds without a report, so
+  that it holds nobody up.
+- **When Redis loses its data**, the stores notice it by an epoch key that
+  is gone or changed. Each forgets what it offered, reports unhealthy until
+  the fleet has a tip again, and asks its peers for their mempools again;
+  with `--node-rpc` it also reads the node's mempool (`getrawmempool`),
+  2,000 transactions every two seconds. Xpub entries are built again as
+  requests ask for them.
+- **`/events` is the same stream on every store**, written to Redis with
+  each change of the pool and each move of the tip.
+- **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).
 
 ### Health check
 
@@ -510,7 +480,7 @@ cannot have a key, which is most of what a lookup of a transaction, an
 output or a balance would otherwise read.
 
 - **What has them:** the data that is read by key: transactions, spenders,
-  unspent outputs, blocks, balances and the mempool. The two indices by
+  unspent outputs, blocks and balances. The two indices by
   address, which are scanned, do not.
 - **What they cost:** about 1.25 bytes for each key, held in the block
   cache. On a chain with billions of keys that is gigabytes: size
@@ -583,7 +553,7 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   `POST /transactions` may be as long as the longest transaction of the
   network in hexadecimal, 8 MB with SegWit and 2 MB on Bitcoin Cash. More
   is answered 413 without being read whole.
-- **A 503 says when to try again**, in `Retry-After`.
+- **A 503 or a 429 says when to try again**, in `Retry-After`.
 - **HTTPS is optional and off by default.** With `--tls-cert` and
   `--tls-key` the server speaks HTTPS on its port, and nothing else. A
   public service usually has a proxy in front that holds the certificate;
@@ -599,12 +569,12 @@ curl -N localhost:3000/events              # stream of new blocks and txs
 | Mempool | `/mempool` |
 | Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
 | Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=legacy\|compat\|segwit` picks the address type (`normal`, the old name of `legacy`, still works) |
-| Network | `/peers`, `/health` (503 when unhealthy, 203 without its Redis), `/dbstats` |
+| Network | `/peers`, `/health` (503 when unhealthy, Redis included), `/dbstats` |
 | Events | `/events`, as JSON lines over HTTP or as a WebSocket; `after=` resumes, and a WebSocket client can filter by address, xpub or Bloom filter |
 | Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |
 
-Turn off the xpub endpoints with `--no-xpub` and the Blockchain.info ones
-with `--no-blockchain-info`.
+Turn off the Blockchain.info endpoints with `--no-blockchain-info`. The xpub
+endpoints are always on: they answer from the fleet's cache in Redis.
 
 ## How it works
 
@@ -615,18 +585,16 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
 ```
 
 - **haskoin-node** keeps a pool of peers and syncs block headers.
-- The **block store** downloads blocks from one peer at a time and mempool
-  transactions from all of them, and imports them. Each import is one
-  atomic RocksDB batch, so a crash never leaves a half-written block.
+- The **block store** downloads blocks from one peer at a time, and
+  transactions from all of them, which it hands to the fleet's pool. Each
+  block is one atomic RocksDB batch, so a crash never leaves a half-written block.
 - **A block is imported in stages**, so that a full block takes a second
   or two: what it needs is worked out on all cores, everything it will
   read is read from RocksDB ahead of time, many keys at once, and then the
   rules run in memory. See [Importing a block](#importing-a-block).
-- **The block store keeps a copy of the mempool area of the database in
-  memory**, and answers its own reads of it from there. With it, it
-  remembers the outputs that mempool transactions spend, so that the block
-  which confirms them does not read them a second time. Requests of the
-  API read RocksDB.
+- **The database holds the chain alone.** A transaction from a peer goes
+  to the pool that the fleet shares in Redis, which is the mempool;
+  RocksDB has no mempool of its own.
 - **A peer is asked only for blocks that it has announced:** it sent the
   header of the block or of a later one, or gave a height at least that of
   the block when it connected. A peer asked for a block that it does not
@@ -643,8 +611,9 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   still owes blocks after `--peer-timeout` is disconnected.
 - **Reorganisations** are handled by reverting blocks until the best block
   is back on the main chain of headers.
-- The **web server** answers from RocksDB, and from Redis for what is
-  cached there.
+- The **web server** answers from the view of RocksDB at the fleet tip,
+  with the fleet's pool in Redis on top, and xpubs from their cache in
+  Redis.
 
 ### Importing a block
 
@@ -659,10 +628,7 @@ Now a block goes through four stages:
    and the sizes, from the block alone, on all cores.
 2. **Read ahead:** every key of the chain that the rules will read, with
    RocksDB multi-gets, eight at a time for each core, into a cache that
-   belongs to the batch. Each key is read once. What the mempool has for
-   the block comes from [a copy in memory](#the-mempool-area-in-memory),
-   and so do the outputs that its transactions spend, which the store
-   read when they came.
+   belongs to the batch. Each key is read once.
 3. **Apply:** the rules, one transaction after another, as before. They
    find everything in memory.
 4. **Write:** one atomic batch, as before, serialised on all cores and
@@ -674,22 +640,17 @@ are not read. The block writes how they change, as RocksDB merge records,
 and RocksDB works out the values when they are read. On a store of mainnet
 they were more than half of the read ahead.
 
-- **The database that comes out is the same**, byte for byte. The tests
-  give random histories to this import and to the one of version 1.15.1,
-  which stays in the library for that, and compare every key.
 - **A mined block is not validated.** It passed proof of work and the
   node took it, so the store takes it that every output it spends is
   unspent in the chain or made by the block itself, and that none is
   spent twice. The import reads the outputs that the block spends, which
   it needs to write the block, and nothing to check it: no spender of the
-  chain, no output that the block itself makes, and no conflict of a
-  transaction that the mempool already has. Only a coinbase is looked up
+  chain and no output that the block itself makes. Only a coinbase is looked up
   in the chain in case it is confirmed already, as two of 2010 were. A
   block that is not valid is written whole or not at all, and is refused
   when what the import needs to read is not there.
 - **What keeps the store's own data right stays:** the order in which
-  transactions are applied, and all that the mempool does to give way to a
-  block. Reverts and the rules of the mempool check what they always did.
+  transactions are applied. Reverts check what they always did.
 
 Measured with `haskoin-store-bench import`, on four cores of an AMD Ryzen
 9 3900X, with a database of a million unspent outputs on tmpfs and blocks
@@ -708,14 +669,11 @@ buffers, its write took 86 ms where it took 134, in later runs of the same
 benchmark in which the whole block went from 250 to 198 ms, and from 522
 to 447 ms at the tip. Without the reads of balances and spenders, in a
 third set of runs, the read ahead went from 56 to 21 ms and the block from
-189 to 148 ms, and from 433 to 398 ms at the tip. With the mempool area
-read from a copy in memory, in a fourth set, a block at the tip went from
-371 to 337 ms. Without the reads that checked a mined block, in a fifth
-set, a block of chains of transactions that the mempool had not seen went
-from 161 to 138 ms, and a block at the tip from 351 to 339 ms. With the
-outputs that mempool transactions spend kept in memory, in a sixth set, a
-block at the tip went from 329 to 322 ms. `docs/block-import.md` has the
-six sets of numbers.
+189 to 148 ms, and from 433 to 398 ms at the tip. Without the reads that
+checked a mined block, in a later set, a block of chains of transactions
+went from 161 to 138 ms. These were measured while the database still had
+a mempool of its own, which it no longer has. `docs/block-import.md` has
+the sets of numbers.
 
 A store of mainnet gains more than the benchmark shows. In the benchmark
 a read is 30 microseconds of CPU, as the files are in memory. On the
@@ -725,73 +683,9 @@ at a time: its reads are slower than the benchmark's, and gain more from
 being made together.
 
 `docs/block-import.md` has the design, what was measured, and what is left.
-`docs/block-import-next.md` says what could bring a block well below a
+`docs/block-import.md` says what could bring a block well below a
 second, and what each step would do to reads.
 The stages are timed for StatsD: see [StatsD](#statsd).
-
-### The mempool area, in memory
-
-At the tip of the chain a block takes its transactions out of the
-mempool. For that it read some fifty thousand keys of the mempool area of
-the database, the two column families of the unconfirmed transactions: 180
-to 460 ms of a block on a store of mainnet. None of it was the disk. The
-area is small and in RocksDB's memory, and a lookup in RocksDB still costs
-about 8 microseconds of processor time.
-
-So the block store keeps a copy of the area in memory, every key and
-value as bytes, and its batches read the area from the copy
-(`Haskoin.Store.Database.Copy`). A read is half a microsecond.
-
-- **It is right because the area has one writer.** The block store writes
-  one batch at a time. When a batch is written, its changes to the area
-  are applied to the copy. If the write fails, the copy is forgotten and
-  loaded again.
-- **Requests of the API do not use it.** They read RocksDB, as before.
-- **It takes memory:** 3.5 kB of heap for each transaction in the mempool,
-  85 MiB for 25,000 of them. See [Memory](#memory).
-- **It is loaded when it is first needed**, with a scan of the area: 0.3 s
-  for 25,000 transactions.
-- **One read is not made at all.** When a transaction leaves the mempool,
-  the store asked whether the transaction that made each output that it
-  spends is in the mempool. It no longer asks when the chain has the
-  output as unspent: then that transaction is confirmed.
-- **The tests** compare the copy with a scan of the two column families,
-  byte for byte, after every operation of their random histories.
-
-In `haskoin-store-bench import`, a block of 3,500 transactions that were
-all in the mempool went from 371 to 337 ms. The mempool was 73 ms of its
-read ahead and is 18. A store of mainnet should gain more: its reads of
-the area took several times what the benchmark's did.
-`docs/block-import.md` has the design and the measurements.
-
-#### The outputs that the mempool spends
-
-When a transaction enters the mempool, the store reads from the chain the
-unspent outputs that it spends. The block that confirms the transaction
-needs them again: their values and scripts for the balances, and their
-positions for the keys of the address index that it deletes. Reading them
-a second time was the largest part of what was left of the read ahead of
-a block at the tip: 40 to 375 ms a block on a store of mainnet.
-
-So the block store keeps them, with the copy, from the one read to the
-other, and a block takes them from memory.
-
-- **It is a cache.** An output that is not remembered is read from
-  RocksDB. After a restart nothing is remembered, and blocks read their
-  outputs as before until the mempool has turned over.
-- **An entry is never stale.** It goes when the mempool spender of its
-  output goes. Every unspent output that a batch writes is looked up, and
-  its entry follows. A reverted block empties the table.
-- **Only the block store reads it**, as it does the copy. Requests of the
-  API and the members of a [fleet](#a-fleet-of-servers) read the database
-  through views, which cannot reach either.
-- **It takes memory:** 162 bytes of heap for each output, 7.4 MiB for a
-  mempool of 25,000 transactions. See [Memory](#memory).
-
-In `haskoin-store-bench import`, the unspent outputs of a block at the
-tip took 6 ms where they took 19, and the block 322 ms where it took 329.
-There a read of RocksDB costs three microseconds, from files in memory.
-On a store of mainnet these reads were 40 to 375 ms of a block.
 
 ### Publishing
 
@@ -831,23 +725,24 @@ Bitcoin Cash Node, and how it differs from earlier versions.
 
 ### The database
 
-The chain and the mempool are kept apart.
+RocksDB holds the chain alone. The mempool is the fleet's pool in Redis.
 
 - **The chain's data is written once and is the same on every server** that
   has the same blocks. A confirmed transaction has the time of its block.
   What spends its outputs is under keys of its own, so its record never
   changes.
-- **Unconfirmed transactions live in an area of their own**, and are applied
-  on top of the chain when a query is answered. Nothing the mempool does
-  changes the chain's data.
+- **Unconfirmed transactions live in Redis**, in the pool that the fleet
+  shares, and are applied on top of the chain when a query is answered.
+  A reverted block's transactions leave RocksDB; the tip move hands them
+  back to the pool.
 - **A transaction that leaves the mempool unconfirmed is forgotten**: it was
   replaced, double-spent by a block, or too old. The API answers 404 for
   it, or 410, with the transaction that won, for one that a block replaced
   in the last 2016 blocks.
-- **Each request reads one snapshot** of the database, so everything in an
-  answer is of the same moment.
+- **Each request reads one snapshot** of the database, at the fleet tip, so
+  everything in an answer is of the same moment.
 
-`docs/layered-database.md` has the reasons, the measurements and the tests.
+`docs/one-fleet.md` has the reasons, the measurements and the tests.
 The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
@@ -858,7 +753,8 @@ cannot open the database afterwards, so take a copy first.
 
 | From | What the migration does | How long |
 | --- | --- | --- |
-| 20 | Moves the mempool to its own area | Seconds to minutes |
+| 18, 19 | Not migrated: sync again | |
+| 20 | Takes the unconfirmed transactions out of the chain's indices; the pool gets them again from the peers | Seconds to minutes |
 | 21 | Reads every transaction and writes nearly every one again | Many hours for Bitcoin |
 | 22 | Writes the new version | At once |
 
@@ -902,7 +798,7 @@ change, and nearly all do.
 What changed for clients in version 23: nothing in the answers. A balance
 or the spenders of a transaction that recent blocks changed take a few
 microseconds more to read until RocksDB has compacted them:
-`docs/layered-database.md` has the figures.
+`docs/one-fleet.md` has the figures.
 
 What changed for clients in version 22:
 
@@ -931,37 +827,9 @@ wallet derives, so a request names it with `derive`.
 - The extra reads happen only for wallets that look empty, and never on
   networks without SegWit, which have one kind of address.
 
-### The cache of a server alone
-
-With `--redis`, the cache (`Haskoin.Store.Cache`) keeps large xpubs in
-Redis: their balances, transactions, unspent outputs and the bodies of
-their transactions. Without Redis, xpub queries read RocksDB directly.
-
-- **It reads the database, it does not guess.** When a block, a mempool
-  transaction or a reorganisation touches a cached xpub, the store reads
-  what changed from RocksDB, with the same queries that answer uncached
-  requests, and writes the differences to Redis in one Lua script.
-- **An update costs the size of the change**, not of the xpub. Redis
-  answers one client at a time, so this is what keeps it responsive.
-- **The script writes nothing if the entry changed since it was read**, so
-  an entry is always what the database says.
-- **It reads the whole xpub when it cannot be sure** that the entry has
-  every earlier change: when it first caches it, when the entry is more
-  than a block behind, when an address enters or leaves the gap, when a
-  balance does not add up, and every five to ten minutes in any case.
-- **Stores that share a Redis** claim each change, so it is applied once. A
-  store never replaces an entry that knows more than its own database, and
-  a store that is catching up does no cache work.
-- **A page of a cached xpub** is one round trip to Redis.
-
-The Lua scripts are in `src/Haskoin/Store/Cache/lua/`, one file each,
-compiled into the library. The ways an entry could still come to differ
-from the database unnoticed, and what would rule them out, are in
-`docs/cache-consistency.md`.
-
 ### The cache of a fleet
 
-A fleet (`--fleet`) has a cache of another kind
+The fleet has a cache of xpubs
 (`Haskoin.Store.Fleet.XPub`), because its servers do not answer from their
 own databases but from one block and one shared mempool.
 
@@ -974,40 +842,58 @@ An entry has two layers:
 
 The first follows from the chain, so any server writes the same. Nothing
 has to be claimed or repaired: the server that moves the fleet to a new
-block applies what the block did, and a cache that was not brought along
-is emptied. `docs/layered-database.md` has the design and the tests.
+block applies what the block did, in the same Redis commit that moves the
+tip and the pool. A big move is written in pieces under the entries'
+version marks, so a request waits or is answered again and never sees half
+of it. A reorganisation is undone address by address, from the store's
+views of its database at recent blocks: it never empties the cache.
+
+An entry also holds a gap's worth of addresses after the window, derived
+ahead of time, so a payment to the next address of a wallet is in its
+entry as soon as the pool takes it. `docs/one-fleet.md` has the design and
+the tests.
 
 ### Where the code is
 
 | Module | What it does |
 | --- | --- |
-| `Haskoin.Store.BlockStore` | Downloads and imports blocks and mempool transactions |
-| `Haskoin.Store.Logic.Layered` | The rules that import blocks and transactions |
+| `Haskoin.Store.BlockStore` | Downloads and imports blocks, and hands transactions from peers to the fleet's pool |
+| `Haskoin.Store.Logic` | The rules that import and revert blocks |
 | `Haskoin.Store.Database.Writer` | A batch of writes, with its read cache and its reads ahead |
-| `Haskoin.Store.Database.Copy` | The copy in memory of the mempool area, and of the outputs that it spends |
 | `Haskoin.Store.Database.Table` | The hash tables of a batch, whose keys are hashed quickly |
 | `Haskoin.Store.Database.Merge` | The merge operators of balances and spenders, which are C functions (`cbits/`) |
-| `Haskoin.Store.Database.Mempool` | The keys of the mempool area, and what it does to balances |
-| `Haskoin.Store.Database.Query.Layered` | The queries over both areas, each on a snapshot |
+| `Haskoin.Store.Database.Query` | The queries of the chain's column families |
+| `Haskoin.Store.Database.Query.Pooled` | The queries of the chain with the fleet's pool on top |
+| `Haskoin.Store.Database.Views` | Views of the database at recent blocks, one of them the fleet tip |
 | `Haskoin.Store.Database.Slices` | Stored blocks and transactions read in part, for what an answer needs |
-| `Haskoin.Store.Database.Migrate` | The migrations from versions 20 and 21 |
-| `Haskoin.Store.Cache` | The Redis cache of a server alone |
+| `Haskoin.Store.Database.Migrate` | The migrations from versions 20, 21 and 22 |
+| `Haskoin.Store.XPub` | The vocabulary of the xpub cache: its reads and the budget of a job |
+| `Haskoin.Store.XPub.Indexer` | The threads that read xpubs into the cache, and the queue of their jobs |
+| `Haskoin.Store.XPub.Lock` | The lock in Redis that keeps two stores from reading the same xpub |
+| `Haskoin.Store.XPub.Service` | The door to the fleet's cache of xpubs: a hit answers, a miss asks the indexer |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
-| `Haskoin.Store.Web.Admission` | The cap on the long requests answered at once |
+| `Haskoin.Store.Web.Admission` | The limit on long requests answered at once, and the line in front of it (CoDel) |
+| `Haskoin.Store.Web.Congestion` | The delay of GHC's scheduler, and the controller that moves the limit with it |
 | `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
 | `Haskoin.Store.Exception` | Handlers that let a thread be stopped, and cleanups that cannot be cut short |
 | `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
-The rules and queries of version 20 (`Haskoin.Store.Logic`,
-`Haskoin.Store.Database.Query`) stay in the library as a reference. The
-tests hold the new ones to their results, operation by operation and page
-by page. Nothing in the store calls them.
+The tests hold the cache to the queries of `Query.Pooled` at the fleet tip
+with the pool: every cached entry equals what they give, after random
+histories of payments, blocks, reorganisations and builds.
 
 ## Monitoring
 
 ### Health
+
+A store is unhealthy when Redis does not answer within two seconds, when
+it has no view of the fleet tip, or when its lease in the fleet has
+lapsed: it then knows nothing of the mempool, answers no xpub query, and
+answers 503. A load balancer should stop sending it requests until
+`/health` passes again. A store that syncs from scratch is unhealthy until
+it reaches the fleet tip.
 
 `/health` returns the result of the latest check as JSON. Point your load
 balancer at it.
@@ -1015,8 +901,7 @@ balancer at it.
 | Status | Meaning |
 | --- | --- |
 | 200 | Every check passes |
-| 203 | Healthy, but its Redis does not answer |
-| 503 | A check fails; the body says which |
+| 503 | A check fails, Redis included; the body says which |
 
 The check runs every second, and at once when a block arrives, so what
 `/health` answers is at most a second old. Redis is asked every five
@@ -1024,58 +909,58 @@ seconds.
 
 The checks are: how far the index is behind the headers, the age of the
 last block and of the last transaction, the transactions waiting to be
-imported, and the connected peers.
+imported, the connected peers, and Redis (`"redis"` in the JSON).
 
-**Without its Redis**, a store that has a cache goes on answering from its
-own database:
-
-- `/health` says 203, with the header `Haskoin-Degraded: redis` and
-  `"redis": {"ok": false}` in its JSON.
-- A request waits at most two seconds for Redis before the store gives up
-  on it. The store tries Redis again at every health check.
-- Load balancers take 203 for healthy, so the store stays in rotation.
-  Alert on anything but 200 to hear of it.
-
-**In a fleet** (`--fleet`), a server that does not have the block that the
+**In a fleet**, a server that does not have the block that the
 fleet answers from can answer any request with 503 and
 `{"error": "behind-fleet"}`. Have the load balancer try another server, and
 alert if one keeps saying it: its `/health` will say why.
 
 ### Overload
 
-A server that is asked for more than its cores can do answers only so many
-long requests at once, `--max-requests`, four a core by default. The next
-ones wait in line, in the order that they came.
+A store asked for more than its cores can do still answers the simple
+requests at once. Only so many long requests run at once, and the limit
+follows what the cores keep up with.
+[docs/congestion-control.md](docs/congestion-control.md) explains the
+design.
 
-- **Long requests** are those whose answer is as long as their parameters
-  ask for: lists of transactions, unspent outputs or balances, the
-  transactions of a block, raw blocks, extended public keys, and the
-  Blockchain.info endpoints that do the same.
-- **Not capped:** requests for one thing by its key, such as a
-  transaction, the balance of an address or a block without its
-  transactions; and `/health`, `/peers`, `/dbstats`, `/events` and the
-  API reference, which read nothing from the database. They are what most
-  clients ask for most, and how you see what a full server is doing.
-
-- **A request that cannot be served soon is refused**, with 503,
-  `{"error": "server-busy"}` and `Retry-After: 1`. That happens when
-  `--request-queue` requests are waiting already, or when it has waited
-  `--request-wait` seconds. Have the load balancer try another server, and
-  clients try again.
-- **Why:** GHC gives every request a turn, with no priorities. Without a
-  cap, more load makes every request slower, the quick ones included: on
-  a store of mainnet with 56 connections asking for long lists, `/health`
-  took over a second. With it, the long requests let in are answered
-  sooner, and the short ones do not wait behind them.
-- **A slot is held until the response is sent.** A client that reads
-  slowly holds one while it does. A proxy that buffers responses, as nginx
-  does by default, takes them at the speed of the server. Without one,
-  give the server more slots.
-- **Sharing a machine:** the default counts all its cores. Several stores
-  on one machine should each have a smaller `--max-requests`.
-- **Watch** `web.requests_running`, `web.requests_waiting` and
-  `web.requests_refused` in StatsD. Requests that wait often, or any that
-  are refused, say that the server needs more cores or fewer requests.
+- **What is limited:** the long routes, those that answer lists, whole
+  blocks and xpubs. Each holds a slot until its last byte is sent.
+  Requests for one thing by its key, such as a transaction or a balance,
+  and those that read nothing from the database, such as `/health`,
+  `/peers` and `/events`, are not limited.
+- **The limit adapts.** A probe on each core notes how late a woken
+  thread runs, less the pauses of GHC's collector. Every half second, if
+  the slowest tenth of those delays was over `--target-delay` (25 ms),
+  the limit comes down by a quarter; if it was under, and every slot was
+  in use, it goes up by one. It stays between `--min-requests` (one a
+  core) and `--max-requests` (sixteen a core). Requests that wait for the
+  disk give their cores back, so the limit grows for them; requests that
+  compute hold it near one a core.
+- **The line** in front of the slots holds up to `--request-queue` (64)
+  requests for up to `--request-wait` (1 second). It is managed by CoDel:
+  when even the shortest wait in 100 ms was over 5 ms, the line is
+  overloaded, and a request that finds no slot free is refused at once.
+- **A refused request** gets 503, `{"error": "server-busy"}` and
+  `Retry-After: 1`. Have the load balancer try another server on a 503
+  (with nginx, `proxy_next_upstream error timeout http_503`).
+- **Xpubs:** reading an xpub into the cache is the work of the indexer,
+  in threads of its own, not of a request. A request that would wait for
+  the indexer too long gets 429, with when to come back
+  ([Extended public keys](#extended-public-keys)).
+- **Behind nginx:**
+  - **Keep connections to the store open:** `keepalive` in the
+    `upstream`, with `keepalive_timeout` under Warp's idle timeout of 30
+    seconds, and `proxy_http_version 1.1` with
+    `proxy_set_header Connection ""` in the `location`. A new connection
+    for each request makes the slowest requests much slower under load.
+  - **Keep clients apart in the proxy.** The store does not tell clients
+    apart. `limit_conn` per client address and `limit_req` do.
+- **Off:** `--max-requests 0` answers every request as it comes.
+- **Watch** `web.cap.limit`, `web.cap.delay_us` and the refusals in
+  StatsD ([StatsD](#statsd)). A limit stuck at the ceiling with long waits
+  points at the disk; one stuck at the floor with a high delay points at
+  work that is not limited.
 
 ### StatsD
 
@@ -1084,9 +969,9 @@ With `--statsd`, the store reports:
 | Prefix | What |
 | --- | --- |
 | `web.*` | Timing of every kind of request |
+| `web.reruns` | Requests answered again because a cached xpub that they read changed meanwhile |
 | `db.*` | Database reads |
-| `cache.*` | Cache hits, misses, reloads and full reloads |
-| `store.*` | Block and header heights, mempool size and other gauges |
+| `store.*` | Block and header heights and other gauges |
 | `fleet.cache.*` | What a server of a fleet does with the fleet's cache of xpubs |
 | `rts.*` | GHC's garbage collector |
 
@@ -1097,7 +982,6 @@ The metrics of the block store:
 | `store.blocks` | gauge | Height of the best block |
 | `store.headers` | gauge | Height of the best header |
 | `store.peers` | gauge | Peers online |
-| `store.mempool` | gauge | Transactions in the mempool |
 | `store.queued_txs` | gauge | Transactions waiting to be imported |
 | `store.block` | timing | Milliseconds to import a block, with publishing its events |
 | `store.block_prepare` | timing | Of those, working out what the import needs of the block |
@@ -1105,7 +989,6 @@ The metrics of the block store:
 | `store.block_read_unspents` | timing | Of the read ahead: the unspent outputs that the block spends |
 | `store.block_read_spenders` | timing | Zero: a block no longer reads spenders, as a mined block is not validated |
 | `store.block_read_balances` | timing | Zero since database version 23: a block no longer reads balances |
-| `store.block_read_mempool` | timing | Bodies and address summaries of the mempool, from its copy in memory |
 | `store.block_apply` | timing | The rules, in memory |
 | `store.block_write` | timing | Writing the batch to RocksDB |
 
@@ -1123,20 +1006,22 @@ The metrics of the fleet's cache:
 | Metric | Kind | Meaning |
 | --- | --- | --- |
 | `fleet.cache.hits` | counter | Requests about an xpub whose balances the cache gave |
-| `fleet.cache.misses` | counter | Requests about an xpub that the database answered |
+| `fleet.cache.misses` | counter | Requests about an xpub that the cache did not have |
 | `fleet.cache.builds` | counter | Entries that this server built, or added addresses to |
 | `fleet.cache.build` | timing | Milliseconds to build an entry |
 | `fleet.cache.abandoned` | counter | Builds given up because the fleet or the entry moved on |
-| `fleet.cache.evictions` | counter | Entries deleted for being the least recently used |
+| `fleet.cache.evictions` | counter | Entries evicted, those of the lowest priority first (GreedyDual) |
 | `fleet.cache.emptied` | counter | Times that this server emptied the cache |
 | `fleet.cache.xpubs` | gauge | Xpubs in the cache, whichever server cached them |
 | `fleet.cache.addresses` | gauge | Addresses that those xpubs have between them |
 
-- **Misses include small xpubs**, which are never cached. So the share of
-  hits says how much of the load the cache takes, not how well it holds
-  what it has.
-- **`fleet.cache.emptied`** should move only at a reorganisation or when a
-  server stops at the wrong moment. The log says why each time.
+- **Misses include xpubs being built**, and those built for other
+  addresses than they have now. So the share of hits says how much of the
+  load the cache takes, not how well it holds what it has.
+- **`fleet.cache.emptied`** moves only when the pool starts again: the way
+  to the new tip is longer than the stores go through, or a store that is
+  alone does not know it. A reorganisation never empties the cache. The
+  log says why each time.
 - With `--debug` the log also has a line for each entry built and each
   block that the cache was brought to.
 
@@ -1167,26 +1052,31 @@ The metrics of the garbage collector, sent once a second:
   environment. The executable uses GHC's default collector (see
   [Memory](#memory)).
 
-The metrics of the cap on requests ([Overload](#overload)):
+The metrics of admission control ([Overload](#overload)):
 
 | Metric | Kind | Meaning |
 | --- | --- | --- |
-| `web.requests_running` | gauge | Long requests being answered in a slot |
+| `web.cap.limit` | gauge | The limit on long requests, every half second |
+| `web.cap.delay_us` | gauge | 90th percentile of the scheduler's delay in the last half second, without the collector's pauses, in microseconds |
+| `web.cap.lateness_us` | gauge | The same with the collector's pauses |
+| `web.cap.overloaded` | gauge | 1 while CoDel finds the line overloaded |
+| `web.cap.sojourn` | timing | Milliseconds that an admitted long request waited for its slot |
+| `web.cap.refused_full` | counter | Requests refused because the line was full |
+| `web.cap.refused_waited` | counter | Requests refused after `--request-wait` |
+| `web.cap.refused_codel` | counter | Requests refused by CoDel |
+| `web.requests_refused` | counter | Requests refused with `server-busy`, for any reason |
+| `web.requests_running` | gauge | Long requests being answered |
 | `web.requests_waiting` | gauge | Long requests waiting for a slot |
-| `web.requests_refused` | counter | Long requests refused with `server-busy` |
 
 And for each long route, named by the fixed segments of its path, such as
 `address_transactions_full` or `blockchain_multiaddr`:
 
 | Metric | Kind | Meaning |
 | --- | --- | --- |
-| `web.cap.<route>.running` | gauge | Slots that the route holds |
+| `web.cap.<route>.running` | gauge | Slots that it holds |
 | `web.cap.<route>.waited` | timing | Milliseconds that a request waited for its slot |
-| `web.cap.<route>.held` | timing | Milliseconds that a request held its slot, to the last byte sent |
-| `web.cap.<route>.refused` | counter | Requests to the route refused with `server-busy` |
-
-They say what the server is full of: the routes that hold the slots, and
-those that wait or are refused. Every sample of these is sent.
+| `web.cap.<route>.held` | timing | Milliseconds that a request held its slot, to the last byte |
+| `web.cap.<route>.refused` | counter | Requests refused |
 
 ### Database statistics
 
@@ -1204,12 +1094,6 @@ The resident memory of the store is its GHC heap plus RocksDB.
   `--disable-delayed-os-memory-return` for that. Without the flag, Linux
   keeps counting returned memory as resident until it needs it, and the
   heap looks as if it never shrinks after a peak.
-- **The heap has a copy of the mempool area of the database**, which the
-  block store reads instead of RocksDB: 3.5 kB for each transaction in
-  the mempool, 85 MiB for 25,000 of them. A full collection copies it,
-  which took 11 ms more on four cores. With it are the outputs of the
-  chain that those transactions spend, 162 bytes each, 7 MiB more. See
-  [The mempool area, in memory](#the-mempool-area-in-memory).
 - **The heap collects less often**, with 64 MiB of new objects for each
   core between collections (`-A64m`), where GHC's default is 4. Every
   collection stops every thread. Measured under load on a store of mainnet
@@ -1225,11 +1109,6 @@ The resident memory of the store is its GHC heap plus RocksDB.
   the copying one did a little better. `GHCRTS=--nonmoving-gc` selects it.
 - If you build the store some other way, pass
   `+RTS -A64m --disable-delayed-os-memory-return -RTS` yourself.
-- **To tell such memory from a leak**, see
-  `stress/results/2026-11-09-memory/README.md`: how to read `smaps`, and a
-  heap profile of a busy store, with live data flat at about 10 MiB. That
-  was before the copy of the mempool area, which grows and shrinks with
-  the mempool.
 
 ### Logs
 
@@ -1295,9 +1174,9 @@ Or embed the indexer in your own program with `haskoin-store`:
 
 - `withStore` starts the node, the block store and the cache from a
   `StoreConfig`.
-- The functions of `Haskoin.Store.Database.Query.Layered` query its
-  database in `IO`, on a view taken with `withView`, such as
-  `withView store.db (\v -> getBalance v addr)`.
+- The functions of `Haskoin.Store.Database.Query` query the chain in its
+  database in `IO`, such as `getBalance store.db addr`, and `chainRead`
+  gives them as a `StoreRead`.
 - Subscribe to `Store.pub` to receive `StoreEvent`s.
 
 Every module has Haddock documentation; build it with `stack haddock`.
@@ -1398,10 +1277,6 @@ What it runs:
 - No container is left behind, even if the script is interrupted or
   killed: the program removes its containers when it ends, and the script
   removes any that carry its label and stops the server.
-- Results of past runs are kept in `stress/results/<date>/` for comparison:
-  the report, the measurements (without the server log), and a README with
-  the commits, the machine and what the run found. A new run worth keeping
-  goes there too.
 - To look for a leak, run the server with a heap profile by type, which needs
   no profiling build, and summarise it: the live heap over time and the types
   of closure that grew most.
@@ -1412,65 +1287,32 @@ What it runs:
   scripts/heap-profile-summary.py /tmp/heap.hp
   ```
 
-### Measurements for the layered database
-
-`docs/layered-database/` has the programs behind the numbers in
-`docs/layered-database.md`, with their output. They are not part of the
-package; each says in its header how to build and run it.
-
-- `MigrateBench.hs` times the migration to the layered layout against
-  wiping the same mempool.
-- `QueryCost.hs` writes the same synthetic history into a database of each
-  layout, with each set of rules, and times both: importing blocks and
-  mempool transactions, and every kind of query, for addresses and wallets
-  that have nothing, a little and much in the mempool. It checks that both
-  databases give the same answers.
-- `FleetCost.hs` asks one store the same questions alone and as a member
-  of a fleet, with its mempool in a pool in Redis, checks that the answers
-  are the same, and times both. It asks about wallets a third way too,
-  through the fleet's cache of xpubs.
-
 ### Measurements for importing blocks
 
 `haskoin-store-bench import [OUTPUTS [TXS [BLOCKS [CACHE_MIB [DIR]]]]]`
-(`bench/Import.hs`) times the import of full blocks, in stages and as
-version 1.15.1 did it.
+(`bench/Import.hs`) times the import of full blocks, in stages with the
+reads made ahead, and with every read made when the rules come to it.
 
 1. It builds a regtest database with a million unspent outputs at half a
    million addresses, closes it so that RocksDB writes it to table files,
    and copies it.
 2. It imports the same blocks of 3,500 transactions into each copy, five
-   of each of four kinds:
-   - with an empty mempool, as when syncing;
-   - with an empty mempool and chains of transactions in the block, so
-     that three inputs in four spend an output of the same block, as on
-     Bitcoin mainnet today;
-   - with every transaction in the mempool first, as at the tip of the
-     chain;
-   - with a mempool of 3,500 other transactions and a block of chains that
-     the mempool has not seen, as when a miner was given transactions
-     directly.
+   of each of two kinds:
+   - with inputs that spend outputs spread over the set;
+   - with chains of transactions in the block, so that three inputs in
+     four spend an output of the same block, as on Bitcoin mainnet today.
 3. It prints milliseconds a block for each stage, and the number of keys
    and bytes of the batch of a block.
-4. Before the fourth kind it gives the transactions of one more block to
-   the mempool, where they stay, and says what the copy of the mempool
-   area in memory costs: its keys and bytes, how long it takes to load,
-   and with `+RTS -T` its heap and what it adds to a full collection. It
-   says how many outputs that those transactions spend are remembered,
-   and their heap. For a mempool of the size of mainnet's, ask for blocks
-   of 25,000 transactions:
-   `haskoin-store-bench import 1000000 25000 1 +RTS -N4 -A64m -T`.
 
 Give it the cores of the machine you care about with `+RTS -N4`, and the
-allocation area of the store with `-A64m`. Its output
-for the numbers in this file is in `docs/block-import/import-bench.txt`.
+allocation area of the store with `-A64m`.
 
 `haskoin-store-bench merge [KEYS [READS [CACHE_MIB [DIR]]]]`
 (`bench/Merge.hs`) times what the merge records of blocks cost the readers
 of the database: the balance of an address, the spender of an output and
 the spenders of a transaction, for keys with no merge record, one, three
 and six, each in a table file of its own, and then the same keys once
-compacted. Its output is in `docs/layered-database/merge-bench.txt`.
+compacted.
 
 ### Contributing
 
@@ -1479,7 +1321,7 @@ Pull requests are welcome.
 - Format the code with `scripts/format` (Ormolu), and keep every line of
   code shorter than 120 columns.
 - Put scripts in files of their own rather than embedding them: Lua for
-  Redis under `src/Haskoin/Store/Cache/lua/`, shell under `scripts/`, called
+  Redis under `src/Haskoin/Store/Fleet/lua/`, shell under `scripts/`, called
   from CI rather than written into the workflow.
 - Catch any error with `catchAny`, `handleAny` or `tryAny` of
   `Haskoin.Store.Exception`, and clean up with its `bracket`, `finally` and

@@ -43,6 +43,7 @@ module Haskoin.Store.BlockStore.Pending
 
     -- * Transitions
     requested,
+    answered,
     received,
     takeReady,
     imported,
@@ -116,6 +117,11 @@ waiting p = filter (not . null . (.deps)) (HashMap.elems p.txs)
 -- | Transactions were requested.
 requested :: UTCTime -> [TxHash] -> Pending -> Pending
 requested now hs p = p {asked = HashMap.union (HashMap.fromList [(h, now) | h <- hs]) p.asked}
+
+-- | A transaction that was requested arrived, to be offered to the pool
+-- of the fleet: it is no longer a request.
+answered :: TxHash -> Pending -> Pending
+answered h p = p {asked = HashMap.delete h p.asked}
 
 -- | A transaction was received, with the parents that it spends and the
 -- database does not have. It is no longer a request.

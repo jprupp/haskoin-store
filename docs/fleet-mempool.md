@@ -1,8 +1,8 @@
-# The shared mempool of a fleet
+# The mempool: one pool in Redis
 
-How the servers of a fleet keep one mempool in Redis, and whether the
-design holds. Written on 2026-11-11, against version 1.9.1. It describes
-the code; it is not part of the package.
+How the servers of a fleet keep one mempool in Redis, and why the design
+holds. The architecture around it is in [one-fleet.md](one-fleet.md). It
+describes the code; it is not part of the package.
 
 ## The short answer
 
@@ -11,20 +11,14 @@ same mempool, that mempool is valid on top of the block the fleet answers
 from, and the two always change together. Each rule is a Lua script that
 Redis runs in one step, and the tests hold the scripts to a pure model.
 
-It has weak points, listed at the end. One is a real gap: **if Redis loses
-its data, the servers do not offer their mempools again**, and unconfirmed
-transactions disappear from every answer until they confirm.
+It has weak points, listed at the end.
 
 ## The problem
 
-Each server has its own mempool, filled in the order its peers sent
-transactions. No two are alike. Servers that answer from the same block
-still disagree if each lays its own mempool on top: one lists a payment,
-the next does not.
-
-So the fleet keeps one pool in Redis, and every server answers from it.
-A server's own mempool stays. It is what the server offers to the pool,
-what it relays to peers, and what it answers from when Redis is down.
+Servers that answer from the same block must also answer from the same
+mempool. So the mempool is in Redis, the pool, and nowhere else: a server
+keeps no mempool of its own, in RocksDB or in memory. A server without Redis
+knows nothing of the mempool, and is unhealthy.
 
 ## What Redis holds
 
@@ -43,9 +37,11 @@ changes them together or not at all.
 
 ## Getting in: the offer
 
-Every two seconds each server takes a turn. In it, the server offers the
-transactions of its mempool that it has not offered yet
-(`offerMempool`).
+A server hands each transaction that a peer sends it to its member of the
+fleet (`memberReceived`). Every two seconds the server takes a turn, and
+offers what it holds (`offerMempool`), reading the outputs that each
+spends from its view at the tip or from the pool. One whose outputs are in
+neither waits, as an orphan.
 
 1. The server reads the fleet tip, and opens its own view of its database
    at that block. A server without that view offers nothing.
@@ -67,15 +63,13 @@ What the server does with each answer:
 | --- | --- |
 | Taken, or already known | Marks it offered, and never offers it again |
 | Orphan | Keeps it waiting, and tries again next round |
-| Conflict | Offers it again naming the rivals as replaced, if it deleted all of them itself; else waits |
-| Late | Stops; the next round reads the whole mempool |
+| Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place |
+| Late | Stops; the next round offers it again at the new tip |
 
-**Replacement by fee** works through the conflict rule. A server's node
-replaces X with Y by its own rules and deletes X. When the server offers Y
-and the pool still has X, the server names X as replaced, and the script
-takes X out with everything that spends it, then puts Y in. A server that
-never saw Y cannot do this, so X stays. The first of two conflicting
-transactions wins unless a server that saw both says otherwise.
+**Replacement by fee** works through the conflict rule. A peer relays Y
+only once its node took Y in place of X, so a server that is told of a
+conflict offers Y again naming X as replaced, and the script takes X out
+with everything that spends it, then puts Y in.
 
 A server **ahead of the tip** may have transactions that spend outputs of
 its newer blocks. Their flags say "not unspent at the tip", so they come
@@ -94,22 +88,25 @@ Whatever leaves takes along everything that spends it, since those would
 spend outputs that no longer exist. A confirmed transaction leaves alone:
 what spends it now spends a confirmed output.
 
-A server **does not withdraw** what it deletes from its own mempool. It may
-simply not have a transaction that another server has.
+A server has no mempool of its own, so there is nothing for it to
+withdraw. What it heard and has not offered yet waits in memory, with the
+orphans, and is offered again at the next turn.
 
 ## When the tip moves
 
 A server whose turn finds that all live servers have a newer block in
-common moves the tip there (`moveTip`). It reads from its own database
-what the blocks between the old tip and the new one did, and hands the
-script all of it in one call:
+common moves the tip there (`moveTip`). It reads from its views of its
+database what the blocks between the old tip and the new one did, and
+hands the script all of it in one call, with the xpub entries
+(`docs/xpub-indexing.md`):
 
 - the transactions they confirmed, which leave quietly;
 - the outputs they spent, whose spenders in the pool leave with their
   descendants;
 - across a reorganisation, the transactions of the abandoned blocks, which
-  come back into the pool, and those that cannot (coinbases, and any the
-  server no longer has), whose spenders leave.
+  come back into the pool, read from the server's view at the old tip, and
+  those that cannot (coinbases), whose spenders leave. A server without a
+  view of the old tip does not move the tip: another server may have it.
 
 The script checks that the tip is still the one the server read, and that
 the new block is still the one the live servers agree on. Then it changes
@@ -119,9 +116,7 @@ Two servers that try at once do it once: the second finds the tip changed.
 ### What the blocks replaced
 
 The pool also keeps what the blocks replaced, so that every server answers
-410 alike for a transaction that lost to a transaction of a block. A
-server's own record of it depends on its own mempool, and is not used in a
-fleet.
+410 alike for a transaction that lost to a transaction of a block.
 
 - **A transaction of the pool** that leaves because it, or an ancestor,
   spent an output that the new blocks spend is kept with the transaction of
@@ -134,7 +129,7 @@ fleet.
   of it, so the server that moves the tip names it, and it waits
   (`pool:lost`) until a move confirms the transaction that replaced it.
   The tip may stop at the fork before it goes on, when the servers reach
-  the new blocks at different times; the test of the fleet ran into that.
+  the new blocks at different times.
 - **It is forgotten** when the winner comes back from an abandoned block,
   2,016 blocks after its height, and when the pool starts again.
 
@@ -147,16 +142,25 @@ A server goes through 50 blocks at most. Two cases are past that:
 
 - **It does not have the old tip** at all. It may then empty the pool and
   move the tip, but only when no other server is live: another might know.
+  A reorganisation from a tip that it has but cannot read is not this case:
+  it waits.
 - **The way is longer than 50 blocks.** That is true for every server, so
-  any of them may empty the pool and move the tip. Before version 1.9.1
-  only a server alone could, and two servers that came back together after
-  a long outage stopped the fleet for good.
+  any of them may empty the pool and move the tip.
 
-Either way the script adds one to the restart counter. Every server checks
-that counter each turn (`noteRestarts`), and when it changed, forgets what
-it offered and offers its whole mempool again, 2,000 transactions a turn.
-Until those offers arrive the pool is empty or partly filled: a turn for a
-small mempool, a minute or so for a large one.
+Either way the script adds one to the restart counter, and empties the
+xpub cache, whose pool layer is gone. Every server checks that counter each
+turn (`noteRestarts`), and when it changed, forgets what it offered. The
+pool fills again from what the peers announce.
+
+## When Redis loses its data
+
+Redis keeps a random epoch (`fleet:epoch`, set if missing). A server that
+finds it gone or changed at its turn (`noteEpoch`) forgets what it offered
+and its tip, and is unhealthy until the fleet has a tip again; the first
+turn sets one, since every live server reports. Then it asks every peer
+for its mempool again, and with `--node-rpc` reads its node's
+(`getrawmempool`, then `getrawtransaction`), 2,000 transactions every two
+seconds. Each goes through the offer as if a peer had sent it.
 
 ## Reading
 
@@ -168,54 +172,24 @@ mixes a block with a pool that belongs to another block.
 
 A request is one block, but not one moment of the pool: a transaction can
 enter between two reads of the same request. A balance and a list can
-differ by it. A server alone has no such gap.
+differ by it. Reads of an xpub are exact: they see one version of its
+entry, and the request is answered again if it changes.
 
 ## What a fleet reads of a server's database
 
-A fleet reads a server's database, and nothing that the block store keeps
-in memory:
+RocksDB holds the chain alone. A fleet reads:
 
-- **The server's own mempool**, which it offers, from the two column
-  families of the mempool area, in RocksDB.
 - **The blocks between two tips** (`moveTip`): the blocks, the records of
-  the transactions that they confirmed, with their inputs, and the
-  server's record of what replaced a payment of an abandoned block.
+  the transactions that they confirmed, with their inputs, and, across a
+  reorganisation, the transactions of the abandoned blocks from the view
+  at the old tip. A reverted block's transactions leave the database.
 - **The chain at the fleet tip**, through a view of the database at that
-  block.
+  block, for the offer and for every request.
 
 The block store imports a block [in stages](block-import.md), and takes a
 mined block to be valid without checking it. That changes nothing here:
-for a block that could be mined, the import leaves the database that it
-always left, key for key, in every column family, and the mempool gives
-way to a block as before, with the same records of what was replaced. The
-tests compare every key after every operation of random histories.
-
-The block store keeps two things in memory, for its own reads while it
-imports:
-
-- **a copy of its mempool area**, the two column families of its own
-  mempool;
-- **the chain's unspent output of each output that a mempool transaction
-  spends**, which it read when the transaction came, so that the block
-  which confirms the transaction does not read it again.
-
-Both are what the server's database has now, between two batches. A fleet
-answers from the database as it was at the fleet tip, which may be behind
-the server's best block or, for a moment, on a block that the server has
-reverted. So a fleet must never see either, and it cannot:
-
-- **Only a batch of the block store reads them**
-  (`Haskoin.Store.Database.Writer`). The offer, the move of the tip and
-  the requests of the API read RocksDB.
-- **A view of the database has no way to them.** Every view, of the
-  database as it is now or as it was at a block, reads through a handle
-  that has a place of its own for a copy, with nothing in it
-  (`snapshotReader`). A test checks that for both kinds of view.
-- **They change nothing that is written.** The database that a block
-  leaves is the same key for key whether an output came from memory or
-  from RocksDB; the tests compare the two after every operation of
-  random histories, with reorganisations and with blocks that conflict
-  with the mempool.
+for a block that could be mined, the import leaves the chain's column
+families as they always were.
 
 ## Why it holds
 
@@ -240,43 +214,31 @@ that block.
 
 ## Weak points
 
-**1. Redis losing data is not noticed. A real gap.** A server remembers
-what it offered, and never offers it again unless it deletes it or sees the
-restart counter change. If Redis is flushed, or fails over to a replica
-that missed the last writes, the pool loses transactions and nothing tells
-the servers. Those transactions vanish from every answer until they
-confirm or expire. A flushed Redis also resets the restart counter to
-zero, which a server that last saw zero does not notice. The design
-document already says Redis must not lose writes; nothing checks it.
-*Fix:* a random epoch in Redis, set if missing (`SET NX`). A server that
-finds a different epoch from its last turn offers its whole mempool again,
-as after a restart. A few lines in `noteRestarts`.
+**1. Redis losing data.** An epoch key tells the servers (see above). Until
+the peers and the node have sent the transactions again, the pool lacks
+them, and xpub entries are built again on demand.
 
 **2. Redis eviction would corrupt the pool.** With a memory limit and a
 policy that evicts keys, Redis can drop one key of the pool and keep the
 others: a spender without its transaction, sums that do not add up. The
-pool has to live in a Redis with `maxmemory-policy noeviction`. Nothing
-says so or checks it. *Fix:* check `CONFIG GET maxmemory-policy` at start
-and refuse to join a fleet otherwise, or say it in the README.
+pool has to live in a Redis with `maxmemory-policy noeviction`. The store
+does not check it.
 
 **3. A restart is abrupt for clients.** When the pool is started again,
 the events do not say that its transactions left, and only the new block
 is told, not the ones skipped. A client of `/events` should read again
 what it follows when it sees a block it cannot connect. The emptying uses
 `KEYS`, which blocks Redis for as long as it walks the whole key space.
-*Fix, if it matters:* keep the pool's keys in a set, or under one hash
-tag, and delete those.
+Keeping the pool's keys in a set, or under one hash tag, would avoid it.
 
 **4. One peer's transaction reaches every server.** The store does not
-check scripts; it trusts its peers, as it always has. A server alone shows
-a bad transaction from one of its peers only on that server. In a fleet it
-reaches the pool and every server shows it, until it conflicts with a
-block or expires (14 days by default). *Fix:* none needed if the servers
-connect to nodes you run, which is the advice already.
+check scripts; it trusts its peers. A bad transaction
+from one server's peer reaches the pool and every server shows it, until
+it conflicts with a block or expires (14 days by default). That is no
+risk when the servers connect to nodes you run, which is the advice.
 
 **5. The pool keeps what the network dropped.** A transaction that nodes
-evict for a low fee stays in the pool until it expires, as it does in a
-server alone. Same behaviour, now shared.
+evict for a low fee stays in the pool until it expires.
 
 **6. "First seen" is the pool's, not the miners'.** Of two conflicting
 transactions, the pool keeps the first that any server offered, unless a
@@ -285,13 +247,11 @@ then corrects itself when that block comes. This is the same rule a node
 uses, and cannot be better without knowing what miners will do.
 
 **7. Small ones.**
-- A server that expired a transaction earlier than the pool, by its own
-  clock, can replace it in the pool with a conflicting one that other
-  servers have not seen.
-- A server that was restarted forgets what it deleted, and cannot replace
-  anything in the pool it deleted before.
-- A tip move across many large blocks is one long script call, which holds
-  Redis while it runs. In normal running it is one block.
+- A replacement relayed by a peer replaces its rivals in the pool, on the
+  word of that peer's node.
+- The pool's part of a tip move across many large blocks is one long
+  script call, which holds Redis while it runs; the cache's part is
+  written in pieces before it. In normal running it is one block.
 - Pool times are the offering servers' clocks. Skewed clocks skew the
   order of the mempool list by as much.
 
@@ -302,15 +262,16 @@ uses, and cannot be better without knowing what miners will do.
   offered, mined and unwound (3,000 random histories).
 - `Haskoin.Store.Fleet.RedisSpec`: the scripts against a real Redis, step
   by step against the model, plus the emptying rules and the events.
-- `Haskoin.Store.Fleet.MemberSpec`: a member through random histories of
-  payments, replacements, blocks and reorganisations, each answer held to
-  the server's own; and two members stuck past 50 blocks, which must move
-  on and fill the pool again.
+- `Haskoin.Store.Fleet.CacheSpec`: two members on one chain and a real
+  Redis: random histories of payments, blocks, reorganisations and builds,
+  each cached entry held to the queries at the tip and the pool; a
+  reorganisation that keeps the cache; the pool filling again after Redis
+  lost its data.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 
-Not tested: Redis losing data, Redis evicting keys, more than two servers,
-and a pool of real size.
+Not tested: Redis evicting keys, more than two servers, a refill from a
+real node over RPC, and a pool of real size.
 
 ## Where the code is
 

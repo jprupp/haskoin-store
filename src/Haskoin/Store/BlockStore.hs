@@ -29,15 +29,16 @@
 -- about it, is the pure state machine of "Haskoin.Store.BlockStore.Sync";
 -- this module carries out what its transitions decide.
 --
--- = Mempool
+-- = Transactions
 --
--- Once the database is in sync, the block store asks each peer for its mempool
--- (if 'syncMempool' is set) and requests every transaction that peers
--- announce. Received transactions are queued and imported in batches on every
--- clock tick, in dependency order. Transactions that spend unknown outputs are
--- kept for up to an hour, waiting for their parents. Mempool transactions older
--- than 'mempoolTimeout' days are deleted. The transactions on their way in,
--- requested or received, are the pure value of
+-- Once the database is in sync, the block store requests every transaction
+-- that peers announce. It asks peers for their whole mempools only to fill
+-- the pool again after Redis lost it ('blockStoreRefill'): the pool outlives
+-- the store, so a store that starts has nothing to ask for. A transaction
+-- that arrives goes to 'onTx': the member of the fleet offers it to the
+-- pool that the fleet shares in Redis, which is the mempool
+-- ("Haskoin.Store.Fleet.Member"). The database holds the chain alone. The
+-- transactions on their way in, requested, are the pure value of
 -- "Haskoin.Store.BlockStore.Pending".
 --
 -- = Feeding the block store
@@ -59,14 +60,6 @@
 -- * __Mempool sync waits for the tip.__ Unconfirmed transactions only make sense
 --   against the current chain, so they are requested once the database is in
 --   sync.
---
--- * __Orphans get a grace period.__ A transaction can arrive before its parent.
---   It is held for up to an hour, waiting for the parent, instead of being
---   dropped and requested again.
---
--- * __Imports are batched.__ Mempool transactions are imported up to 2000 at a
---   time on each clock tick, which amortises the cost of a database write over
---   many transactions during bursts.
 module Haskoin.Store.BlockStore
   ( -- * Block Store
     BlockStore,
@@ -93,6 +86,7 @@ module Haskoin.Store.BlockStore
     blockStorePendingTxs,
     blockStorePendingTxsSTM,
     needsMoreBlocks,
+    blockStoreRefill,
   )
 where
 
@@ -108,8 +102,9 @@ import Control.Concurrent.STM
     readTVar,
     readTVarIO,
     stateTVar,
+    writeTVar,
   )
-import Control.Exception (Exception, catch, throwIO, try)
+import Control.Exception (Exception, throwIO, try)
 import Control.Monad
   ( filterM,
     forM,
@@ -119,7 +114,6 @@ import Control.Monad
     when,
     (>=>),
   )
-import Data.Bool (bool)
 import Data.ByteString qualified as B
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -203,25 +197,19 @@ import Haskoin.Store.BlockStore.Sync
 import Haskoin.Store.BlockStore.Sync qualified as Sync
 import Haskoin.Store.Common (StoreEvent (..), loopForever)
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Mempool (wipeMempoolArea)
-import Haskoin.Store.Database.Query (getMempoolBefore)
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Query.Layered qualified as L
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Writer
   ( BatchReport (..),
     BlockTimes (..),
-    MempoolChanges (..),
     Writer,
     runWriterReport,
   )
 import Haskoin.Store.Database.Writer qualified as W
-import Haskoin.Store.Logic (ImportException (..))
-import Haskoin.Store.Logic.Layered
-  ( deleteUnconfirmedTx,
+import Haskoin.Store.Logic
+  ( ImportException (..),
     importBlock,
     initBest,
-    newMempoolTx,
     revertBlock,
   )
 import NQE
@@ -274,8 +262,6 @@ data BlockException
     CorruptDatabase
   | -- | the node has no header at this height below this block
     AncestorNotInChain !BlockHeight !BlockHash
-  | -- | importing mempool transactions failed
-    MempoolImportFailed
   deriving (Show, Eq, Ord, Exception)
 
 -- | Block store process state.
@@ -293,15 +279,18 @@ data BlockStore = BlockStore
     metrics :: !(Maybe StoreMetrics),
     -- | labels of the peers whose mempool was already requested
     syncedMempool :: !(TVar (HashSet Text)),
+    -- | whether to ask peers for their mempools: from the first refill of
+    -- the pool on ('blockStoreRefill')
+    refilling :: !(TVar Bool),
     -- | what each peer said that it has, by its label: a peer is asked
     -- only for blocks that it announced
     knows :: !(TVar (HashMap Text Known)),
     -- | who reserves the syncing peer, so that no one else releases it
     owner :: !Owner,
-    -- | transactions that left the mempool unconfirmed since the store
-    -- started, as many as 'mostForgotten'. The database keeps nothing of
-    -- them, and peers go on announcing them: without this the store would
-    -- fetch each one again, only to refuse it again.
+    -- | transactions that peers sent since the store started, as many as
+    -- 'mostForgotten'. The database keeps nothing of the mempool, and every
+    -- peer announces each of them: without this the store would fetch each
+    -- one again from every peer.
     forgotten :: !(TVar (HashSet TxHash))
   }
 
@@ -319,7 +308,7 @@ data Known = Known
     tip :: !(Maybe BlockNode)
   }
 
--- | How many deleted transactions the store remembers not to fetch again.
+-- | How many transactions the store remembers not to fetch again.
 -- Past that many it forgets them all and starts over, which costs a few
 -- fetches that come to nothing.
 mostForgotten :: Int
@@ -335,12 +324,10 @@ data StoreMetrics = StoreMetrics
     queuedTxs :: !StatGauge,
     -- | online peers (@store.peers@)
     peers :: !StatGauge,
-    -- | transactions in the mempool (@store.mempool@)
-    mempool :: !StatGauge,
     -- | milliseconds to import a block (@store.block@)
     block :: !StatTiming,
     -- | milliseconds of each stage of the import of a block
-    -- ('Haskoin.Store.Logic.Layered.importBlock'): working out what it
+    -- ('Haskoin.Store.Logic.importBlock'): working out what it
     -- needs of the block (@store.block_prepare@)
     blockPrepare :: !StatTiming,
     -- | reading ahead what the rules will read (@store.block_prefetch@)
@@ -355,9 +342,6 @@ data StoreMetrics = StoreMetrics
     -- | the balances of the addresses of the block
     -- (@store.block_read_balances@): zero, as a block reads none
     blockReadBalances :: !StatTiming,
-    -- | what is read ahead of the mempool area, from its copy in memory:
-    -- bodies and summaries of addresses (@store.block_read_mempool@)
-    blockReadMempool :: !StatTiming,
     -- | the rules, in memory (@store.block_apply@)
     blockApply :: !StatTiming,
     -- | writing the batch to RocksDB (@store.block_write@)
@@ -368,7 +352,6 @@ data StoreMetrics = StoreMetrics
 newStoreMetrics :: BlockStoreConfig -> IO (Maybe StoreMetrics)
 newStoreMetrics cfg =
   forM cfg.stats $ \s -> do
-    m <- Q.getMempool cfg.db
     b <-
       Q.getBestBlock cfg.db >>= \case
         Nothing -> return 0
@@ -379,14 +362,12 @@ newStoreMetrics cfg =
     headers <- g s "headers" (fromIntegral h.height)
     queuedTxs <- g s "queued_txs" 0
     peers <- g s "peers" (length p)
-    mempool <- g s "mempool" (length m)
     block <- t s "block"
     blockPrepare <- t s "block_prepare"
     blockPrefetch <- t s "block_prefetch"
     blockReadUnspents <- t s "block_read_unspents"
     blockReadSpenders <- t s "block_read_spenders"
     blockReadBalances <- t s "block_read_balances"
-    blockReadMempool <- t s "block_read_mempool"
     blockApply <- t s "block_apply"
     blockWrite <- t s "block_write"
     return StoreMetrics {..}
@@ -450,17 +431,15 @@ data BlockStoreConfig = BlockStoreConfig
     db :: !DatabaseReader,
     -- | network constants
     net :: !Network,
-    -- | do not index new mempool transactions
-    noMempool :: !Bool,
-    -- | wipe mempool at start
-    wipeMempool :: !Bool,
     -- | what to do with the best block right after it changes, and when the
     -- store starts, before anything else is written to the database: a
     -- member of a fleet takes a view of the database for the block here
     -- ('Haskoin.Store.Fleet.Member.noteBest')
     onBest :: !(BlockHash -> IO ()),
-    -- | sync mempool from peers
-    syncMempool :: !Bool,
+    -- | what to do with a transaction that a peer sent: the member of the
+    -- fleet offers it to the pool, the mempool, which is in Redis alone
+    -- ('Haskoin.Store.Fleet.Member.memberReceived')
+    onTx :: !(UnixTime -> Tx -> IO ()),
     -- | blocks to request from the syncing peer in one batch
     blockWindow :: !Int,
     -- | delete transactions older than this number of days from mempool
@@ -488,20 +467,12 @@ logError self = logAt LevelError self.config.logger
 
 -- | Run an import against the database, returning the import error if it fails.
 runImport :: BlockStore -> Network -> (Writer -> IO a) -> IO (Either ImportException a)
-runImport self net f = fmap fst <$> runImportMempool self net f
-
--- | Like 'runImport', but also return how the import changed the mempool.
--- The mempool gauge is kept up to date from those changes instead of
--- counting the whole mempool on every clock tick.
-runImportMempool :: BlockStore -> Network -> (Writer -> IO a) -> IO (Either ImportException (a, MempoolChanges))
-runImportMempool self net f = do
+runImport self net f = do
   r <- try $ runWriterReport net self.config.db self.config.logger f
   forM_ r $ \(_, report) ->
     forM_
       self.metrics
-      ( \m -> do
-          incrementGauge m.mempool (length report.mempool.added)
-          decrementGauge m.mempool (length report.mempool.removed)
+      ( \m ->
           -- only a batch that imported a block has these
           forM_ report.block $ \t -> do
             addTiming m.blockPrepare (milliseconds t.prepare)
@@ -509,44 +480,24 @@ runImportMempool self net f = do
             addTiming m.blockReadUnspents (milliseconds t.reads.unspentReads)
             addTiming m.blockReadSpenders (milliseconds t.reads.spenderReads)
             addTiming m.blockReadBalances (milliseconds t.reads.balanceReads)
-            addTiming m.blockReadMempool (milliseconds t.reads.mempoolReads)
             addTiming m.blockApply (milliseconds t.apply)
             addTiming m.blockWrite (milliseconds t.write)
       )
-  return (fmap (.mempool) <$> r)
+  return (fst <$> r)
   where
     milliseconds :: Double -> Int
     milliseconds = round . (* 1000)
 
--- | Run an import and publish the transactions that it added to the
--- mempool or removed from it, then the new best block if there is one.
--- Transactions of the block are not published.
---
--- An import of a block comes with the hash of the block and with how to
--- get the hashes of its transactions from what the import returns. The
--- import has worked them out; hashing every transaction of the block
--- again here took 25 ms of each block at the tip of the chain.
+-- | Run an import, then publish the new best block if there is one.
 runImportNotify ::
-  BlockStore -> Maybe (BlockHash, a -> [TxHash]) -> (Writer -> IO a) -> IO (Either ImportException a)
+  BlockStore -> Maybe BlockHash -> (Writer -> IO a) -> IO (Either ImportException a)
 runImportNotify self block f = do
   net <- getNetwork self
-  runImportMempool self net f >>= \case
+  runImport self net f >>= \case
     Left e -> return (Left e)
-    Right (x, c) -> do
+    Right x -> do
       let l = self.config.pub
-          inBlock = maybe HashSet.empty (\(_, hashes) -> HashSet.fromList (hashes x)) block
-          notInBlock = not . (`HashSet.member` inBlock)
-      let deleted = filter notInBlock c.removed
-      atomically . modifyTVar' self.forgotten $ \seen ->
-        let more = foldr HashSet.insert seen deleted
-         in if HashSet.size more > mostForgotten then HashSet.fromList deleted else more
-      -- one that came back is not forgotten any more
-      atomically (modifyTVar' self.forgotten (\seen -> foldr HashSet.delete seen c.added))
-      forM_ deleted $ \h ->
-        publish (StoreMempoolDelete h) l
-      forM_ (filter notInBlock c.added) $ \h ->
-        publish (StoreMempoolNew h) l
-      forM_ block $ \(h, _) -> do
+      forM_ block $ \h -> do
         -- before the event, so that whoever hears of the block finds what
         -- was done for it
         self.config.onBest h
@@ -562,14 +513,13 @@ getBestBlock self = Q.getBestBlock self.config.db
 getBlock :: BlockStore -> BlockHash -> IO (Maybe BlockData)
 getBlock self = Q.getBlock self.config.db
 
--- | Data of a transaction in the database: confirmed, in the mempool, or
--- deleted from it and marked so.
+-- | Data of a confirmed transaction in the database.
 getTxData :: BlockStore -> TxHash -> IO (Maybe TxData)
-getTxData self h = L.withView self.config.db (`L.getTxData` h)
+getTxData self = Q.getTxData self.config.db
 
--- | Unspent output in the database, of the chain or of the mempool.
+-- | Unspent output of the chain in the database.
 getUnspent :: BlockStore -> OutPoint -> IO (Maybe Unspent)
-getUnspent self p = L.withView self.config.db (`L.getUnspent` p)
+getUnspent self = Q.getUnspent self.config.db
 
 -- | Network of the block store.
 getNetwork :: BlockStore -> IO Network
@@ -584,6 +534,7 @@ withBlockStore cfg action = do
   pb <- newTVarIO . Sync.idle =<< getCurrentTime
   ts <- newTVarIO Pending.empty
   sy <- newTVarIO HashSet.empty
+  refilling <- newTVarIO False
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
@@ -597,6 +548,7 @@ withBlockStore cfg action = do
             pending = ts,
             metrics = metrics,
             syncedMempool = sy,
+            refilling = refilling,
             knows = knows,
             owner = owner,
             forgotten = forgotten
@@ -607,18 +559,8 @@ withBlockStore cfg action = do
   where
     go self inbox = do
       ini
-      wipe
       run
       where
-        -- the mempool is an area of its own, so wiping it is deleting the
-        -- keys of that area: nothing of the chain has to be put right. The
-        -- wipe also has the copy of the area in memory loaded again, by
-        -- the next batch that needs it
-        wipe = when cfg.wipeMempool $ do
-          keys <- wipeMempoolArea cfg.db
-          forM_ self.metrics $ \m -> setGauge m.mempool 0
-          logAt LevelInfo cfg.logger $
-            "Wiped the mempool: " <> cs (show keys) <> " keys deleted"
         ini = do
           net <- getNetwork self
           runImport self net initBest >>= \case
@@ -657,15 +599,12 @@ isInSync self =
 guardSync :: BlockStore -> IO () -> IO ()
 guardSync self f = isInSync self >>= \s -> when s f
 
--- | Run an action only if the mempool is indexed.
-guardMempool :: BlockStore -> IO () -> IO ()
-guardMempool self f = unless self.config.noMempool f
-
--- | Ask a peer for its mempool, once per peer, if in sync and mempool sync is enabled.
+-- | Ask a peer for its mempool, once per peer, if in sync and the pool is
+-- being filled again ('blockStoreRefill').
 syncMempool :: BlockStore -> Peer -> IO ()
 syncMempool self p =
-  guardMempool self . guardSync self $ do
-    let s = self.config.syncMempool
+  guardSync self $ do
+    s <- readTVarIO self.refilling
     let m = self.syncedMempool
     y <- not . HashSet.member p.label <$> readTVarIO m
     when (s && y) $ do
@@ -673,6 +612,18 @@ syncMempool self p =
         "Requesting mempool from peer: " <> p.label
       atomically . modifyTVar m $ HashSet.insert p.label
       MMempool `sendMessage` p
+
+-- | Ask every peer for its mempool again, and fetch every transaction that
+-- it announces, as if none had been heard before: for when Redis lost its
+-- data, and the pool with it ('Haskoin.Store.Fleet.Member.noteEpoch').
+-- The transactions go to 'onTx', which offers them to the pool again.
+blockStoreRefill :: BlockStore -> IO ()
+blockStoreRefill self = do
+  atomically $ do
+    writeTVar self.forgotten HashSet.empty
+    writeTVar self.syncedMempool HashSet.empty
+    writeTVar self.refilling True
+  getPeers self.config.peerMgr >>= mapM_ (syncMempool self . (.mailbox))
 
 -- | Import a block from the syncing peer, then ask for more blocks or, if now in
 -- sync, sync the mempool. Disconnects the peer if it is not the syncing peer, if
@@ -701,7 +652,7 @@ processBlock self peer block =
               <> peer.label
           ret <-
             withBlockTiming self $
-              runImportNotify self (Just (blockhash, (.txs) . fst)) (\wr -> importBlock wr block node)
+              runImportNotify self (Just blockhash) (\wr -> importBlock wr block node)
           case ret of
             Left e -> failure e
             Right _ -> success node
@@ -765,21 +716,18 @@ processNoBlocks self p hs = do
 
 -- | Queue a transaction received from a peer for import.
 processTx :: BlockStore -> Peer -> Tx -> IO ()
-processTx self p tx = guardMempool self $ do
+processTx self p tx = do
   t <- getCurrentTime
   logDebug self $
     "Received tx "
       <> txHashToHex (txHash tx)
       <> " by peer: "
       <> p.label
-  changePending self (Pending.received t tx HashSet.empty)
-
--- | Forget old requests, and drop transactions that waited for their parents
--- for too long.
-pruneOrphans :: BlockStore -> IO ()
-pruneOrphans self = guardMempool self $ do
-  now <- getCurrentTime
-  changePending self (Pending.prune now)
+  -- not fetched again when another peer announces it
+  atomically . modifyTVar' self.forgotten $ \seen ->
+    if HashSet.size seen >= mostForgotten then HashSet.singleton (txHash tx) else HashSet.insert (txHash tx) seen
+  changePending self (Pending.answered (txHash tx))
+  self.config.onTx (fromIntegral (floor (utcTimeToPOSIXSeconds t) :: Integer)) tx
 
 -- | Change the mempool transactions on their way into the database.
 changePending :: BlockStore -> (Pending -> Pending) -> IO ()
@@ -790,14 +738,6 @@ changePending self f = do
 -- | Whether a transaction is queued or was requested recently.
 isPending :: BlockStore -> TxHash -> IO Bool
 isPending self th = Pending.isPending th <$> readTVarIO self.pending
-
--- | Take up to this many queued transactions that have no missing parents, in
--- dependency order, out of the queue.
-pendingTxs :: BlockStore -> Int -> IO [PendingTx]
-pendingTxs self i = do
-  selected <- atomically $ stateTVar self.pending (Pending.takeReady i)
-  setPendingTxs self
-  return selected
 
 -- | Drop queued transactions that are already in the database, and recompute the
 -- missing parents of the others.
@@ -820,7 +760,7 @@ updateOrphans self = do
         Just TxData {deleted = True} -> return False
         Just TxData {deleted = False} -> return True
 
--- | Whether the store has a transaction, or deleted it not long ago: in
+-- | Whether the store has a transaction, or heard it not long ago: in
 -- both cases there is nothing to fetch.
 known :: BlockStore -> TxHash -> IO (Maybe ())
 known self h =
@@ -828,91 +768,10 @@ known self h =
     True -> return (Just ())
     False -> (() <$) <$> getTxData self h
 
--- | Queue a transaction that spends unknown outputs, recording which parents are missing.
-newOrphanTx ::
-  BlockStore ->
-  UTCTime ->
-  Tx ->
-  Writer ->
-  IO ()
-newOrphanTx self time tx wr = do
-  logAt LevelDebug self.config.logger $
-    "Import tx "
-      <> txHashToHex (txHash tx)
-      <> ": Orphan"
-  unspents <- catMaybes <$> mapM (W.getUnspent wr) prevs
-  let have = HashSet.fromList (map (.outpoint) unspents)
-      missing = HashSet.map (.hash) (HashSet.difference (HashSet.fromList prevs) have)
-  atomically . modifyTVar' self.pending $ Pending.received time tx missing
-  where
-    prevs = map (.outpoint) tx.inputs
-
--- | Import a transaction into the mempool. Returns 'True' if imported. A
--- transaction that spends unknown outputs is queued as an orphan; other errors
--- are ignored.
-importMempoolTx :: BlockStore -> UTCTime -> Tx -> Writer -> IO Bool
-importMempoolTx block_read time tx wr =
-  catch new_mempool_tx handle_error
-  where
-    tx_hash = txHash tx
-    handle_error :: ImportException -> IO Bool
-    handle_error Orphan = do
-      newOrphanTx block_read time tx wr
-      return False
-    handle_error _ = return False
-    seconds = floor (utcTimeToPOSIXSeconds time)
-    new_mempool_tx = do
-      t <- newMempoolTx wr tx seconds
-      logAt LevelDebug block_read.config.logger $
-        bool "Already have" "Imported" t
-          <> " tx "
-          <> txHashToHex (txHash tx)
-      when t . atomically . modifyTVar' block_read.pending $ Pending.imported tx_hash
-      return t
-
--- | Import up to 2000 queued transactions.
-processMempool :: BlockStore -> IO ()
-processMempool self = guardMempool self $ do
-  txs <- pendingTxs self 2000
-  let block_read = self
-  unless (null txs) $ import_txs block_read txs
-  where
-    run_import block_read wr p =
-      importMempoolTx block_read p.time p.tx wr
-    import_txs block_read txs =
-      runImportNotify self Nothing (\wr -> mapM (run_import block_read wr) txs) >>= \case
-        Left e -> report_error e
-        Right _ -> return ()
-    report_error e = do
-      logError self $
-        "Error processing mempool: " <> cs (show e)
-      throwIO e
-
--- | Delete up to 1000 mempool transactions older than the configured number of days.
-pruneMempool :: BlockStore -> IO ()
-pruneMempool self =
-  guardMempool self $ do
-    let days = self.config.mempoolTimeout
-    when (days > 0) $ do
-      time <- (floor . utcTimeToPOSIXSeconds) <$> getCurrentTime
-      let thresh = time - (fromIntegral days * 24 * 60 * 60)
-      -- runs on every clock tick: read only the expired entries, oldest
-      -- first, from the index by time
-      let db = self.config.db
-      txs <- map snd <$> (getMempoolBefore db thresh 1000)
-      unless (null txs) $ do
-        logInfo self $
-          "Deleting " <> cs (show (length txs)) <> " old transactions from mempool"
-        runImportNotify self Nothing (\wr -> mapM_ (deleteUnconfirmedTx wr False) txs) >>= \case
-          Left e ->
-            logError self $
-              "Error pruning mempool: " <> cs (show e)
-          Right () -> return ()
-
 -- | Request from a peer the announced transactions that are neither queued,
 -- recently requested nor in the database. Only while in sync.
 processTxs :: BlockStore -> Peer -> [TxHash] -> IO ()
-processTxs self p hs = guardMempool self . guardSync self $ do
+processTxs self p hs = guardSync self $ do
   logDebug self $
     "Received inventory with "
       <> cs (show (length hs))
@@ -1130,8 +989,7 @@ revertToMainChain self = do
     logWarn self $
       "Reverting best block: "
         <> blockHashToHex h
-    now <- floor . utcTimeToPOSIXSeconds <$> getCurrentTime
-    runImport self net (\wr -> revertBlock wr now h) >>= \case
+    runImport self net (\wr -> revertBlock wr h) >>= \case
       Left e -> do
         logError self $
           "Could not revert block "
@@ -1363,14 +1221,15 @@ processBlockStoreMessage self (TxRefAvailable p ts) = do
   processTxs self p ts
 processBlockStoreMessage self (BlockPing r) = do
   logDebug self "Internal clock event"
+  -- a request that no peer answered, as a node does not for a transaction
+  -- that it has not announced to the store, may be made again
+  now <- getCurrentTime
+  changePending self (Pending.prune now)
   setStoreHeight self
   setHeadersHeight self
   setPendingTxs self
   setPeersConnected self
   trySyncing self
-  processMempool self
-  pruneOrphans self
-  pruneMempool self
   checkTime self
   atomically (r ())
 

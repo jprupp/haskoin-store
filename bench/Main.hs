@@ -6,11 +6,13 @@
 --
 -- > haskoin-store-bench PORT BLOCKS [REDIS_URL]
 --
--- Three other things are measured without a server: @haskoin-store-bench
+-- Four other things are measured without a server: @haskoin-store-bench
 -- micro@ times the pure functions that encode a response,
--- @haskoin-store-bench import@ the import of full blocks ("Import"), and
+-- @haskoin-store-bench import@ the import of full blocks ("Import"),
 -- @haskoin-store-bench merge@ what the merge records of those blocks cost
--- the readers of the database ("Merge").
+-- the readers of the database ("Merge"), and @haskoin-store-bench
+-- admission@ how the limit on long requests behaves under load
+-- ("Admission").
 --
 -- Set @BENCH_LOG=1@ to print the log of the store, such as to see why it
 -- does not sync.
@@ -21,14 +23,31 @@
 -- external and change addresses of the benchmark xpub, in turn. Both are
 -- printed once the chain is synced. With 400 blocks or more, the last one
 -- also holds 3,000 transactions that spend outputs of the hot address.
+--
+-- While it serves, the server reads commands from its standard input, each
+-- of which mines blocks on its chain and announces them, to measure how
+-- the store keeps up with what comes after the xpub is cached:
+--
+-- * @idle N@: N blocks with nothing but their coinbase, which touch no
+--   address of the xpub;
+-- * @pay@: a block as those of the chain, which pays nine addresses of the
+--   xpub;
+-- * @addr M I@: a block that pays the address of index I of chain M of the
+--   xpub, once: one past the gap is not seen until a payment within the gap
+--   brings it in.
+--
+-- It prints @mined H@ with the height of the last block once it has
+-- announced them.
 module Main (main) where
 
+import Admission (admissionBench)
 import Conduit
+import Control.Applicative ((<|>))
 import Control.Concurrent.Async (withAsync)
-import Control.Concurrent.STM (TVar, newTVarIO)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.DeepSeq (NFData, force)
 import Control.Exception (evaluate)
-import Control.Monad (forever, unless)
+import Control.Monad (forM_, forever, unless)
 import Data.Aeson (toEncoding)
 import Data.Aeson.Encoding (encodingToLazyByteString)
 import Data.ByteString (ByteString)
@@ -55,7 +74,7 @@ import Merge (mergeBench)
 import NQE
 import Network.Socket (SockAddr (..))
 import System.Environment (getArgs, lookupEnv)
-import System.IO (hFlush, stdout)
+import System.IO (hFlush, isEOF, stdout)
 import System.Random (randomIO)
 
 main :: IO ()
@@ -65,6 +84,7 @@ main = do
     ["micro"] -> micro
     "import" : more -> importBench more
     "merge" : more -> mergeBench more
+    "admission" : more -> admissionBench more
     _ -> server args
 
 server :: [String] -> IO ()
@@ -76,12 +96,22 @@ server args = do
   withSystemTempDirectory "haskoin-store-bench-" $ \dir -> do
     let net = bchRegTest
         blocks = chain net nblocks
-    requests <- newTVarIO []
+    mock <- Mock <$> newTVarIO [] <*> newTVarIO []
     logged <- maybe False (`notElem` ["", "0"]) <$> lookupEnv "BENCH_LOG"
-    -- MAX_REQUESTS: the cap on the requests answered at once; none by default
+    -- MAX_REQUESTS and MIN_REQUESTS: the ceiling and floor of the limit on
+    -- the long requests answered at once; no limit by default.
+    -- TARGET_DELAY: the scheduler's delay, in milliseconds, over which the
+    -- limit comes down; the store's default otherwise.
     capped <- maybe 0 read <$> lookupEnv "MAX_REQUESTS"
+    floored <- maybe 1 read <$> lookupEnv "MIN_REQUESTS"
+    delay <- maybe (def :: WebLimits).targetDelay read <$> lookupEnv "TARGET_DELAY"
+    -- BLOCK_CACHE_MB and WRITE_BUFFER_MB: RocksDB's block cache and write
+    -- buffer, for a store whose reads go to the disk; 1024 MB and RocksDB's
+    -- default otherwise
+    cache <- maybe 1024 read <$> lookupEnv "BLOCK_CACHE_MB"
+    buffer <- fmap read <$> lookupEnv "WRITE_BUFFER_MB"
     let withLog f = if logged then withLogger LevelDebug f else f quiet
-    withLog $ \logger -> withStore (storeConfig net dir redis blocks requests logger) $ \store -> do
+    withLog $ \logger -> withStore (storeConfig net dir redis blocks mock logger cache buffer) $ \store -> do
       withSubscription store.pub $ \sub -> waitHeight store sub nblocks
       T.putStrLn $ "hot address: " <> addrText net hotAddr
       T.putStrLn $ "xpub: " <> xPubExport net benchXPub
@@ -90,7 +120,55 @@ server args = do
       T.putStrLn $ "best block: " <> maybe "" blockHashToHex bh
       putStrLn $ "serving on port " <> show port
       hFlush stdout
-      runWeb ((webConfig store port) {limits = def {maxRequests = capped}} :: WebConfig)
+      let limits = def {maxRequests = capped, minRequests = floored, targetDelay = delay}
+      -- with BENCH_LOG=1 the web server logs each request too
+      withAsync (commands net blocks mock) $ \_ ->
+        runWeb ((webConfig store port) {limits = limits, logger = if logged then logger else quiet} :: WebConfig)
+
+-- | What the mock peers share: the blocks mined after the chain, oldest
+-- first, and where to announce new ones.
+data Mock = Mock
+  { extra :: !(TVar [Block]),
+    peers :: !(TVar [Mailbox ByteString])
+  }
+
+-- | Mine the blocks that the commands on the standard input ask for, on top
+-- of the chain and of those mined before, and announce them to every peer.
+commands :: Network -> [Block] -> Mock -> IO ()
+commands net blocks mock = loop
+  where
+    loop =
+      isEOF >>= \case
+        True -> return ()
+        False -> do
+          ws <- words <$> getLine
+          more <- readTVarIO mock.extra
+          let tip = last (blocks <> more)
+              h0 = length blocks + length more
+              new = case ws of
+                ["idle", n] -> grow tip (h0 + 1) [const [] | _ <- [1 .. read n :: Int]]
+                ["pay"] -> grow tip (h0 + 1) [\h -> spends h (txHash (coinbase (h - 1)))]
+                ["addr", m, i] -> grow tip (h0 + 1) [\h -> [toAddr (read m) (read i) (txHash (coinbase (h - 1)))]]
+                _ -> []
+          unless (null new) $ do
+            atomically $ modifyTVar' mock.extra (<> new)
+            ps <- readTVarIO mock.peers
+            let announce = MHeaders (Headers [(b.header, VarInt (fromIntegral (length b.txs))) | b <- new])
+            forM_ ps $ \s -> runPut (putMessage net announce) `send` s
+            putStrLn ("mined " <> show (h0 + length new))
+            hFlush stdout
+          loop
+    grow _ _ [] = []
+    grow parent h (f : fs) =
+      let b = mine net parent.header (coinbase h : f h)
+       in b : grow b (h + 1) fs
+    toAddr m i cb =
+      Tx
+        1
+        [TxIn (OutPoint cb 0) "" maxBound]
+        [TxOut 400000000 (scriptOf (xpubAddr m i)), TxOut 4500000000 hotScript]
+        []
+        0
 
 addrText :: Network -> Address -> T.Text
 addrText net = fromMaybe (error "address") . addrToText net
@@ -107,9 +185,11 @@ waitHeight store sub n = do
       _ -> Nothing
     waitHeight store sub n
 
+-- | The store of the benchmark, with the megabytes of its block cache and
+-- of its write buffer, if not RocksDB's default.
 storeConfig ::
-  Network -> FilePath -> Maybe String -> [Block] -> TVar [Int] -> Logger -> StoreConfig
-storeConfig net dir redis blocks requests logger =
+  Network -> FilePath -> Maybe String -> [Block] -> Mock -> Logger -> Int -> Maybe Int -> StoreConfig
+storeConfig net dir redis blocks mock logger cache buffer =
   StoreConfig
     { maxPeers = 20,
       -- the mock peer, by name: since haskoin-node 2.5 the seed of a regtest
@@ -121,27 +201,22 @@ storeConfig net dir redis blocks requests logger =
       redis = redis,
       gap = 32,
       initGap = 20,
-      redisMinAddrs = 20,
-      redisMinTxs = 1000,
       redisMaxXPubs = 10000,
-      noMempool = False,
-      wipeMempool = False,
-      fleet = False,
-      syncMempool = False,
+      xpubs = defaultXPubConfig,
       blockWindow = 64,
       mempoolTimeout = 14,
       peerTimeout = 60,
       blockStall = 10,
       blockPing = 5,
       maxPeerLife = 48 * 3600,
-      connect = mockPeer blocks requests net ad,
+      connect = mockPeer blocks mock net ad,
       stats = Nothing,
       bloom = True,
       maxOpenFiles = Nothing,
-      writeBufferSize = Nothing,
+      writeBufferSize = (* (1024 * 1024)) <$> buffer,
       maxWalSize = Nothing,
       backgroundJobs = Nothing,
-      blockCache = Just (1024 * 1024 * 1024),
+      blockCache = Just (cache * 1024 * 1024),
       logger = logger
     }
   where
@@ -161,12 +236,10 @@ webConfig store port =
       minPeers = 0,
       limits = def,
       version = "bench",
-      noMempool = False,
       stats = Nothing,
       tickerRefresh = 90 * 1000 * 1000,
       tickerURL = "",
       priceHistoryURL = "",
-      noXPub = False,
       noBlockchainInfo = False,
       healthCheckInterval = 30,
       accessLog = False,
@@ -200,8 +273,7 @@ scriptOf = fromMaybe (error "script") . addressToScriptBS
 chain :: Network -> Int -> [Block]
 chain net n = go 1 net.genesisHeader
   where
-    hot = scriptOf hotAddr
-    coinbase h = Tx 1 [TxIn nullOutPoint (encode (fromIntegral h :: Word32)) maxBound] [TxOut 5000000000 hot] [] 0
+    hot = hotScript
     -- the transactions of the block at a height, after its coinbase
     regular h
       | h <= 1 = []
@@ -219,18 +291,31 @@ chain net n = go 1 net.genesisHeader
       | h <- [2 .. 335],
         t <- drop 1 (regular h)
       ]
-    spends h cb =
-      let t1 = Tx 1 [TxIn (OutPoint cb 0) "" maxBound] (replicate 9 (TxOut 500000000 hot)) [] 0
-          tk k =
-            let j = fromIntegral (h * 9 + k) :: Word32
-                a = xpubAddr (j `mod` 2) ((j `div` 2) `mod` 50)
-             in Tx
-                  1
-                  [TxIn (OutPoint (txHash t1) (fromIntegral k)) "" maxBound]
-                  [TxOut 400000000 (scriptOf a), TxOut 99000000 hot]
-                  []
-                  0
-       in t1 : map tk [0 .. 8]
+
+-- | The script of the hot address.
+hotScript :: ByteString
+hotScript = scriptOf hotAddr
+
+-- | The coinbase of the block at a height: it pays the hot address.
+coinbase :: Int -> Tx
+coinbase h = Tx 1 [TxIn nullOutPoint (encode (fromIntegral h :: Word32)) maxBound] [TxOut 5000000000 hotScript] [] 0
+
+-- | The transactions of a block at a height but its coinbase, spending a
+-- coinbase: one that splits it in nine, and nine that each pay an address of
+-- the xpub, in turn, and the hot address.
+spends :: Int -> TxHash -> [Tx]
+spends h cb =
+  let t1 = Tx 1 [TxIn (OutPoint cb 0) "" maxBound] (replicate 9 (TxOut 500000000 hotScript)) [] 0
+      tk k =
+        let j = fromIntegral (h * 9 + k) :: Word32
+            a = xpubAddr (j `mod` 2) ((j `div` 2) `mod` 50)
+         in Tx
+              1
+              [TxIn (OutPoint (txHash t1) (fromIntegral k)) "" maxBound]
+              [TxOut 400000000 (scriptOf a), TxOut 99000000 hotScript]
+              []
+              0
+   in t1 : map tk [0 .. 8]
 
 mine :: Network -> BlockHeader -> [Tx] -> Block
 mine net parent txs = Block header txs
@@ -300,11 +385,12 @@ micro = do
 -- Mock peer --
 ---------------
 
-mockPeer :: [Block] -> TVar [Int] -> Network -> NetworkAddress -> SockAddr -> WithConnection
-mockPeer blocks _requests net ad sa f = do
+mockPeer :: [Block] -> Mock -> Network -> NetworkAddress -> SockAddr -> WithConnection
+mockPeer blocks mock net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
+  atomically $ modifyTVar' mock.peers (s' :)
   withAsync (go r s') $ \_ -> do
     let o = conduitMailbox r
         i = repeatMC (receive s)
@@ -322,7 +408,7 @@ mockPeer blocks _requests net ad sa f = do
       runConduit $
         repeatMC (receive r)
           .| inc
-          .| concatMapC react
+          .| concatMapMC (liftIO . react)
           .| mapC (runPut . putMessage net)
           .| conduitMailbox s
     inc = forever $ do
@@ -334,13 +420,20 @@ mockPeer blocks _requests net ad sa f = do
           case runGet (getMessage net) (x <> y) of
             Right m -> yield m
             Left e -> error ("mock peer: " <> e)
-    react (MPing (Ping n)) = [MPong (Pong n)]
-    react (MVersion _) = [MVerAck]
-    react (MGetHeaders (GetHeaders _ locator _)) =
-      let start = fromMaybe 0 (listToMaybe (mapMaybe (`HashMap.lookup` heights) locator))
+    -- the blocks mined after the chain are few: they are looked up in a list
+    react :: Message -> IO [Message]
+    react (MPing (Ping n)) = return [MPong (Pong n)]
+    react (MVersion _) = return [MVerAck]
+    react (MGetHeaders (GetHeaders _ locator _)) = do
+      more <- atomically (readTVar mock.extra)
+      let later = HashMap.fromList (zip (map (headerHash . (.header)) more) [length blocks + 1 ..])
+          at l = HashMap.lookup l heights <|> HashMap.lookup l later
+          start = fromMaybe 0 (listToMaybe (mapMaybe at locator))
           hdr :: Block -> (BlockHeader, VarInt)
           hdr b = (b.header, VarInt (fromIntegral (length b.txs)))
-       in [MHeaders (Headers (map hdr (take 2000 (drop start blocks))))]
-    react (MGetData (GetData ivs)) =
-      [MBlock b | InvVector InvBlock h <- ivs, Just b <- [HashMap.lookup (BlockHash h) byHash]]
-    react _ = []
+      return [MHeaders (Headers (map hdr (take 2000 (drop start (blocks <> more)))))]
+    react (MGetData (GetData ivs)) = do
+      more <- atomically (readTVar mock.extra)
+      let found h = HashMap.lookup h byHash <|> find ((== h) . headerHash . (.header)) more
+      return [MBlock b | InvVector InvBlock h <- ivs, Just b <- [found (BlockHash h)]]
+    react _ = return []

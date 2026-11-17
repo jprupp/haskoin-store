@@ -37,22 +37,20 @@
 --   addresses, and 'StoreRead', the queries of a store as a record of
 --   functions in 'IO'.
 -- * "Haskoin.Store.Database.Reader": opening the RocksDB database.
--- * "Haskoin.Store.Database.Query": queries against RocksDB, as plain
---   functions.
--- * "Haskoin.Store.Database.Mempool", "Haskoin.Store.Database.Migrate",
---   "Haskoin.Store.Logic.Layered" and
---   "Haskoin.Store.Database.Query.Layered": a layout of the database in
---   which the mempool is kept apart from the chain, the migration to it, the
---   rules that import blocks and transactions in it, and its queries. The
---   store does not use them yet; see @docs\/layered-database.md@.
+-- * "Haskoin.Store.Database.Query": queries of the chain in RocksDB, as
+--   plain functions, and "Haskoin.Store.Database.Query.Pooled", which lays
+--   the fleet's pool over them: what the store answers with.
+-- * "Haskoin.Store.Logic": the rules that import and revert blocks, and
+--   "Haskoin.Store.Database.Migrate", which brings an older database to the
+--   layout of the chain alone. The database has no mempool; see
+--   @docs\/one-fleet.md@.
 -- * "Haskoin.Store.Fleet": how stores that share a Redis agree on the block
 --   that they all answer from, as pure decisions, and
 --   "Haskoin.Store.Fleet.Redis", which carries them out.
---   "Haskoin.Store.Fleet.Pool" has the rules of the mempool that they share.
---   Nothing uses them yet.
+--   "Haskoin.Store.Fleet.Pool" has the rules of the mempool that they share,
+--   and "Haskoin.Store.Fleet.Member" is a store as a member of the fleet.
 -- * "Haskoin.Store.Database.Views": the database as it was at each recent
 --   block, for a store that answers from the block its fleet agrees on.
---   Nothing uses it yet.
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.
@@ -98,17 +96,16 @@ module Haskoin.Store
     module Haskoin.Store.Database.Reader,
     module Haskoin.Store.Database.Types,
     module Haskoin.Store.Data,
+    cachePrefix,
 
-    -- * Cache
-    Cache,
-    CacheConfig (..),
-    cacheIsCached,
-    cacheDelete,
-    cacheEvict,
+    -- * Caches of extended public keys
+    XPubConfig (..),
+    defaultXPubConfig,
+    XPubs,
 
     -- * Store Reader
     StoreRead (..),
-    databaseRead,
+    chainRead,
     Limits (..),
     Start (..),
 
@@ -122,12 +119,11 @@ module Haskoin.Store
 where
 
 import Haskoin.Store.BlockStore
-import Haskoin.Store.Cache
 import Haskoin.Store.Common
 import Haskoin.Store.Data
--- the instances of the store classes for the database reader
-import Haskoin.Store.Database.Query (databaseRead)
+import Haskoin.Store.Database.Query.Pooled (chainRead)
 import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
 import Haskoin.Store.Manager
 import Haskoin.Store.Web
+import Haskoin.Store.XPub.Service (XPubConfig (..), XPubs, defaultXPubConfig)
