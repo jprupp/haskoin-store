@@ -110,6 +110,9 @@ answered from the fleet's cache.
     directories for the tests, the benchmark and the stress test.
 
 ### Changed
+- **Indexes and filters stay in memory** with their open table files, outside
+  the block cache, so data blocks can no longer evict them (about 0.34% of the
+  database).
 - **Redis is required, and every store is a member of a fleet**, even a
   fleet of one (`docs/one-fleet.md`). Without Redis, or behind the fleet tip,
   a store is unhealthy: `/health` answers 503, where it was 203 without Redis.

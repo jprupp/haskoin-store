@@ -425,7 +425,7 @@ fleet of one. Every key starts with `hs2:<network>:`.
 | `--write-buffer-mb` | `WRITE_BUFFER_MB` | `256` | Memtables across all column families (0 = unlimited) |
 | `--max-wal-mb` | `MAX_WAL_MB` | `1024` | Write-ahead log size that forces flushes (0 = RocksDB default) |
 | `--background-jobs` | `BACKGROUND_JOBS` | `0` | Threads for flushes and compactions together (0 = RocksDB default of two) |
-| `--block-cache-mb` | `BLOCK_CACHE_MB` | `1024` | Shared block cache, holding index and filter blocks too (0 = RocksDB default) |
+| `--block-cache-mb` | `BLOCK_CACHE_MB` | `1024` | Shared block cache for data blocks; indexes and filters stay in memory outside it (0 = RocksDB default) |
 
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
@@ -441,22 +441,15 @@ needed.
   descriptor and a few kilobytes, so raise the limit on open files of the
   process (`LimitNOFILE` in systemd) above the number of table files:
   about one for each 64 MiB of database.
-- **Why in pieces:** the index and the filter of a file were one block
-  each, one to three mebibytes together on a large database, and a lookup
-  loaded both whole. With more of them than the block cache holds, nearly
-  every lookup loaded megabytes again: 0.8 ms of processor time each on an
-  idle disk, and 18 seconds to import a block of Bitcoin. A lookup now
-  loads two pieces of 4 KiB.
-- **An existing database** keeps the old layout in the files that it has,
-  and gets the new one in the files written from now on. Until most of
-  them are rewritten, give it a block cache that holds its indices and
-  filters: about 1% of the size of the database, 24 GiB for Bitcoin and
-  12 GiB for Bitcoin Cash (`--block-cache-mb`). `/dbstats` and the line
-  `Block cache entry stats` in the `LOG` file of the database say what the
-  cache holds.
-- **Without a block cache** (`--block-cache-mb 0`) neither applies: each
-  open file keeps its whole index and filter in memory, so set
-  `--max-open-files` to bound them.
+- **Indexes and filters stay in memory**, with their open files and
+  outside the block cache, so that data blocks cannot push them out: when
+  they were in the cache and a busy store evicted them, nearly every
+  lookup read megabytes back, 0.8 ms of processor time each and 18 seconds
+  to import a block of Bitcoin. They come to about 0.34% of the database:
+  some 6 GB for Bitcoin and 1.6 GB for Bitcoin Cash. Keep all files open
+  (above) so that they are read once, when the store starts, which takes
+  longer on a large database. The block cache (`--block-cache-mb`) holds
+  data blocks only.
 
 RocksDB flushes and compacts in the background, with two threads by
 default: one for each. `--background-jobs` gives it more, a quarter of them

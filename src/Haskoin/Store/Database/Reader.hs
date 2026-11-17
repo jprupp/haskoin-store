@@ -268,7 +268,7 @@ withReader ::
   (DatabaseReader -> IO a) ->
   IO a
 withReader families check net igap gap dir bloom maxOpenFiles writeBuffers maxWal jobs blockCache stats m =
-  withDBCF dir cfg (families bloom (isJust blockCache)) $ \db -> do
+  withDBCF dir cfg (families bloom False) $ \db -> do
     derived <- newIORef (DerivedCache HashMap.empty HashMap.empty)
     let bdb =
           DatabaseReader
@@ -291,8 +291,11 @@ withReader families check net igap gap dir bloom maxOpenFiles writeBuffers maxWa
           maxTotalWalSize = maxWal,
           maxBackgroundJobs = jobs,
           blockCacheSize = blockCache,
-          cacheIndexAndFilterBlocks = isJust blockCache,
-          partitionIndexAndFilters = isJust blockCache
+          -- index and filter blocks stay with their open tables, outside the
+          -- block cache, where data blocks cannot push them out: about 0.34%
+          -- of the data, held for as long as a table is open
+          cacheIndexAndFilterBlocks = False,
+          partitionIndexAndFilters = False
         }
 
 -- | Memory that RocksDB uses outside the GHC heap, per column family:
