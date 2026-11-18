@@ -320,7 +320,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER` |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
-| `--block-stall` | `BLOCK_STALL` | `10` | Seconds without a block from the syncing peer before another peer is asked for it too |
+| `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
 | `--block-ping` | `BLOCK_PING` | `5` | Seconds that a peer has to answer a ping to be asked for blocks, unless none answers in time |
 | `--max-peer-life` | `MAX_PEER_LIFE` | `172800` | Seconds after which a peer is dropped, so connections rotate |
 | `--block-window` | `BLOCK_WINDOW` | `64` | Blocks to request from the syncing peer at a time |
@@ -597,9 +597,12 @@ peers ──► haskoin-node ──► block store ──► RocksDB ──► w
   longer than `--block-ping` seconds is asked only if none answers in
   time. This costs each new block one round trip to the quickest peer.
 - **A peer that does not deliver is passed over, not waited for.** If the
-  peer that was asked sends nothing for `--block-stall` seconds, another
-  is found the same way and asked for the same blocks, and whichever
-  delivers first is taken. The stall doubles each time, up to
+  peer that was asked sends nothing for four of its recent gaps between
+  blocks, at least two seconds and at most `--block-stall` seconds,
+  another is found the same way and asked for the same blocks, and
+  whichever delivers first is taken. A store that imports hundreds of
+  blocks a second so notices a quiet peer in two seconds, while a peer
+  that takes seconds over each large block is not passed over for it. The stall doubles each time, up to
   `--peer-timeout`, so that a slow link still gets its blocks; a peer that
   still owes blocks after `--peer-timeout` is disconnected.
 - **Reorganisations** are handled by reverting blocks until the best block

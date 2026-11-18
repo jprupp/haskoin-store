@@ -569,7 +569,13 @@ config c = do
     option auto $
       metavar "SECONDS"
         <> long "block-stall"
-        <> helpEnv "BLOCK_STALL" "Ask another peer for blocks that the syncing peer has not delivered for this long"
+        <> helpEnv
+          "BLOCK_STALL"
+          ( unwords
+              [ "Longest wait for a block from the syncing peer before another is asked too;",
+                "shorter for a quick peer"
+              ]
+          )
         <> showDefault
         <> value c.blockStall
   blockPing <-

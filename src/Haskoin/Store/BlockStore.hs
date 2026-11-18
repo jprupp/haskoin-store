@@ -22,7 +22,8 @@
 -- answer is the one, or a late one if none answers within 'blockPing'. Each
 -- block is imported as soon as it arrives. If the best block of the database is no longer in the main chain of
 -- headers, blocks are reverted until it is. A syncing peer that delivers
--- nothing for 'blockStall' is passed over: another is found the same way and
+-- nothing for a few of its recent gaps between blocks, at least two seconds
+-- and at most 'blockStall', is passed over: another is found the same way and
 -- asked for the same blocks, and whichever delivers first is taken. A peer that sends a
 -- block that it was not asked for, cannot find a block, or still owes blocks
 -- after 'peerTimeout' is disconnected. The state of the download, and every rule
@@ -464,8 +465,9 @@ data BlockStoreConfig = BlockStoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
-    -- | ask another peer for the blocks that the syncing peer has not
-    -- delivered for this long ("Haskoin.Store.BlockStore.Sync")
+    -- | the longest that the syncing peer may deliver nothing before another
+    -- peer is asked for its blocks; a quick peer is given less, a few of its
+    -- recent gaps between blocks ("Haskoin.Store.BlockStore.Sync")
     blockStall :: !NominalDiffTime,
     -- | a peer is asked for blocks if it answers a ping within this long,
     -- or if none does ("Haskoin.Store.BlockStore.Sync")

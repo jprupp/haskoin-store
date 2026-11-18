@@ -168,8 +168,16 @@ spec = describe "Block download" $ do
       | (now, s) <- run es
       ]
 
-  prop "is patient for the stall at least, and for the timeout at most" $ \es ->
-    and [patience stall timeout s >= stall && patience stall timeout s <= timeout | (_, s) <- run es]
+  prop "is patient for the floor at least, and for the timeout at most" $ \es ->
+    and [patience stall timeout s >= stallFloor && patience stall timeout s <= timeout | (_, s) <- run es]
+
+  prop "is patient for the stall given until a block is imported, then for at most that" $ \es ->
+    and
+      [ if isNothing s.gap then base == stall else base <= stall
+      | (_, s) <- run es,
+        s.passes == 0,
+        let base = patience stall timeout s
+      ]
 
   prop "times out only a syncing peer when nothing was imported for longer than the timeout" $ \es ->
     and
@@ -232,10 +240,11 @@ spec = describe "Block download" $ do
       -- peer 1 was asked at 11 seconds, and has 20 from then
       stalled stall timeout (at 31) s1 `shouldBe` Nothing
       stalled stall timeout (at 32) s1 `shouldBe` Just 1
-    it "goes back to the first stall when a block is imported" $ do
+    it "goes back to a stall of its own pace when a block is imported" $ do
       let (_, s1) = pass (at 11) 1 asked
           s2 = imported (at 12) (hash 1) (snd (accept 1 (hash 1) s1))
-      patience stall timeout s2 `shouldBe` 10
+      -- one second to deliver: four seconds of patience, no doubling
+      patience stall timeout s2 `shouldBe` 4
     it "is disconnected if it still owes its block after the timeout" $ do
       let (_, s) = pass (at 11) 1 asked
       -- silent since the start, not since it was passed over
@@ -254,6 +263,62 @@ spec = describe "Block download" $ do
       passedPeers s3 `shouldBe` []
       -- the block is not wanted any more: the request went with peer 1
       fst (accept 0 (hash 1) s3) `shouldBe` Late
+
+  describe "a stall that follows the peer's pace" $ do
+    let ms = (/ 1000) . fromIntegral :: Int -> NominalDiffTime
+        later = flip addUTCTime t0
+        started = fromMaybe (idle t0) (start t0 (0 :: Int) (idle t0))
+        -- peer 0 delivers blocks 1 to 99 of 100, one every 10 ms
+        quick =
+          foldl
+            (\s' b -> imported (later (ms (10 * b))) (hash b) (snd (accept 0 (hash b) s')))
+            (request (map hash [1 .. 100]) started)
+            [1 .. 99]
+    it "passes over a quick peer that went quiet after the floor, not the stall" $ do
+      patience stall timeout quick `shouldBe` stallFloor
+      stalled stall timeout (later (ms 990 + stallFloor)) quick `shouldBe` Nothing
+      stalled stall timeout (later (ms 1000 + stallFloor)) quick `shouldBe` Just 0
+    it "gives a slow peer several of its gaps, up to the stall" $ do
+      let slow g =
+            foldl
+              (\s' b -> imported (later (g * fromIntegral b)) (hash b) (snd (accept 0 (hash b) s')))
+              (request (map hash [1 .. 10]) started)
+              [1 .. 9 :: Int]
+      patience stall timeout (slow 1) `shouldBe` 4
+      patience stall timeout (slow 5) `shouldBe` stall
+    it "is not made jumpy by one quick block after slow ones" $ do
+      let s = imported (later 3.1) (hash 3) (snd (accept 0 (hash 3) slow2))
+          slow2 =
+            imported (later 3) (hash 2) . snd . accept 0 (hash 2) $
+              imported (later 1.5) (hash 1) (snd (accept 0 (hash 1) (request (map hash [1 .. 4]) started)))
+      patience stall timeout s `shouldSatisfy` (> stallFloor)
+    it "starts the clock of the next peer when it passes over a quiet one" $ do
+      let (_, s) = pass (later (ms 1000 + stallFloor + 1)) 1 quick
+      -- the next peer gets twice the floor, from when it was asked
+      patience stall timeout s `shouldBe` 2 * stallFloor
+      stalled stall timeout (later (ms 1000 + 3 * stallFloor)) s `shouldBe` Nothing
+
+  describe "a peer that answers a ping while the syncing peer is stalled" $ do
+    let wait = 5 :: NominalDiffTime
+        asked = request [hash 1] (fromMaybe (idle t0) (start t0 (0 :: Int) (idle t0)))
+        -- the tick at 11 seconds finds peer 0 stalled and pings 1 and 2
+        (Just (n, pinged), searching) = ping (at 11) 3 [1, 2] asked
+    it "is chosen at once, and the stalled peer is passed over for it" $ do
+      pinged `shouldBe` [1, 2]
+      stalled stall timeout (at 11) asked `shouldBe` Just 0
+      let (chosen, s) = pong wait (at 11) 2 n searching
+      chosen `shouldBe` True
+      -- the block store passes over when the peer is still stalled
+      stalled stall timeout (at 11) s `shouldBe` Just 0
+      let (told, s') = pass (at 11) 2 s
+      told `shouldBe` Just (0, [hash 1])
+      syncingPeer s' `shouldBe` Just 2
+      probing s' `shouldBe` False
+      overdue wait (at 17) s' `shouldBe` []
+    it "is not chosen if the syncing peer delivered in the meantime" $ do
+      let (_, s) = pong wait (at 11) 2 n searching
+          s' = imported (at 11) (hash 1) (snd (accept 0 (hash 1) s))
+      stalled stall timeout (at 11) s' `shouldBe` Nothing
 
   describe "Looking for a peer to ask" $ do
     let wait = 5 :: NominalDiffTime

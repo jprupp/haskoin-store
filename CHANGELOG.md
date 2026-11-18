@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.16.1] - 2026-11-18
+
+### Changed
+- **The stall follows the syncing peer's pace.** A peer is passed over when
+  it has sent nothing for four of its recent gaps between blocks, at least
+  two seconds, instead of always `--block-stall` seconds, which is now the
+  longest stall. A store that imports hundreds of small blocks a second
+  waited ten seconds on a peer that had gone quiet; it now waits two. The
+  pure rules are in `Haskoin.Store.BlockStore.Sync` (`patience`,
+  `stallFloor`, `stallFactor`, and the new `gap` of `Sync`).
+
+### Fixed
+- **Header sync no longer stalls block sync.** haskoin-node waited for the
+  chain to import each batch of 2,000 headers before it passed on any other
+  peer message, and on Bitcoin Cash a batch took 20 seconds. Blocks and pongs
+  waited behind it, and the store passed over peers that were delivering.
+  haskoin-node 2.6.1 no longer waits, and haskoin-core 2.0.1 connects Bitcoin
+  Cash headers about 60 times as fast. Both are unreleased and pinned by
+  commit.
+
 ## [1.16.0] - 2026-11-18
 
 This release has one design (`docs/one-fleet.md`): Redis is required, every

@@ -182,8 +182,8 @@ data StoreConfig = StoreConfig
     mempoolTimeout :: !Int,
     -- | disconnect peer if message not received for this many seconds
     peerTimeout :: !NominalDiffTime,
-    -- | ask another peer for the blocks that the syncing peer has not
-    -- delivered for this many seconds
+    -- | the longest that the syncing peer may deliver nothing before another
+    -- peer is asked for its blocks; a quick peer is given less
     blockStall :: !NominalDiffTime,
     -- | a peer is asked for blocks if it answers a ping within this long,
     -- or if none does

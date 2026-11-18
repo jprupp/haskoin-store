@@ -26,8 +26,8 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.8.0
   - rocksdb-query-0.7.0
   - nqe-0.7.0
-  - haskoin-core-2.0.0
-  - haskoin-node-2.6.0
+  - haskoin-core-2.0.1
+  - haskoin-node-2.6.1
   - haskoin-store-data-3.0.0
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to
   # 0.3.2, the version in the snapshot, every pause, resume and tickle edits

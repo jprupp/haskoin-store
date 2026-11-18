@@ -48,6 +48,19 @@
 -- no reason to disconnect anyone. Only a peer that has still not delivered
 -- when the long timeout runs out is disconnected, as before.
 --
+-- = How long a stall is
+--
+-- The stall follows the syncing peer's own pace ('patience'): four times
+-- the recent gap between the blocks that it delivered ('gap'), but at least
+-- 'stallFloor' and at most the stall that the store was given. A store that
+-- imports hundreds of small blocks a second sees a peer that has gone quiet
+-- in two seconds, not ten; one that takes seconds over each large block is
+-- given longer. A fixed stall was the alternative: short enough to catch a
+-- quiet peer quickly, it passes over every peer on a slow link, and long
+-- enough for a slow link, it leaves a fast store idle for most of the time.
+-- Until a block is imported, there is no pace to go by, and the stall is
+-- the one given.
+--
 -- The stall doubles each time a peer is passed over, up to the long
 -- timeout, and goes back to its start when a block is imported. A store on
 -- a link that cannot bring a block within the first stall therefore still
@@ -102,6 +115,8 @@ module Haskoin.Store.BlockStore.Sync
     wantsMore,
     needsMoreBlocks,
     patience,
+    stallFloor,
+    stallFactor,
     stalled,
     timedOut,
     expired,
@@ -125,6 +140,9 @@ data Sync p = Sync
     time :: !UTCTime,
     -- | syncing peers passed over since a block was last imported
     passes :: !Int,
+    -- | the recent gap between imported blocks, a moving average, if a
+    -- block was imported: the pace that 'patience' follows
+    gap :: !(Maybe NominalDiffTime),
     -- | peers that were passed over and still owe blocks
     passed :: ![Asked p],
     -- | the peers that were pinged to find the next syncing peer, if one
@@ -164,7 +182,8 @@ data Asked p = Asked
 
 -- | No syncing peer, and nothing wanted.
 idle :: UTCTime -> Sync p
-idle now = Sync {wanted = [], current = Nothing, time = now, passes = 0, passed = [], probe = Nothing}
+idle now =
+  Sync {wanted = [], current = Nothing, time = now, passes = 0, gap = Nothing, passed = [], probe = Nothing}
 
 -- | The syncing peer, if any.
 syncingPeer :: Sync p -> Maybe p
@@ -271,9 +290,15 @@ accept p h s
     verdict = if h `elem` s.wanted then Requested else Late
 
 -- | A block was imported: it is no longer wanted, and the clock and the
--- stall start again.
+-- stall start again. The time since the clock last started goes into the
+-- recent gap between blocks, with a weight of a quarter, so that a few
+-- slow blocks lengthen the stall and a burst of quick ones does not make it
+-- jumpy.
 imported :: UTCTime -> BlockHash -> Sync p -> Sync p
-imported now h s = s {wanted = delete h s.wanted, time = now, passes = 0}
+imported now h s = s {wanted = delete h s.wanted, time = now, passes = 0, gap = Just gap'}
+  where
+    sample = max 0 (now `diffUTCTime` s.time)
+    gap' = maybe sample (\g -> (3 * g + sample) / 4) s.gap
 
 -- | Blocks were requested from the syncing peer. Those already wanted are
 -- not added again. Nothing changes without a syncing peer.
@@ -349,10 +374,26 @@ needsMoreBlocks :: Int -> Int -> Bool
 needsMoreBlocks window n = n < max 1 (window `div` 4)
 
 -- | How long the syncing peer has to deliver a block before another is
--- asked: the stall, doubled for each peer passed over since a block was
+-- asked: 'stallFactor' times the recent gap between blocks, at least
+-- 'stallFloor' and at most the stall given, or the stall given if no block
+-- was imported yet; doubled for each peer passed over since a block was
 -- last imported, and never longer than the timeout.
 patience :: NominalDiffTime -> NominalDiffTime -> Sync p -> NominalDiffTime
-patience stall timeout s = min timeout (stall * 2 ^ min 30 s.passes)
+patience stall timeout s = min timeout (base * 2 ^ min 30 s.passes)
+  where
+    base = maybe stall (\g -> min stall (max stallFloor (stallFactor * g))) s.gap
+
+-- | The shortest stall, however quick the peer was: long enough for a round
+-- trip across the world and the next block of a quick peer, short enough
+-- that a store importing hundreds of blocks a second idles only briefly.
+stallFloor :: NominalDiffTime
+stallFloor = 2
+
+-- | How many of its recent gaps between blocks a peer may be silent before
+-- it is passed over. Blocks come in bursts, so the gap varies; a factor of
+-- four lets a peer take a pause well beyond its usual one.
+stallFactor :: NominalDiffTime
+stallFactor = 4
 
 -- | The peers to ask all the same, best first, if none of those pinged
 -- answered within the wait and none can any more: there is no other
@@ -370,7 +411,10 @@ overdue wait now s = case s.probe of
     late g = isJust g.answered || now `diffUTCTime` g.at > wait
 
 -- | The syncing peer, if blocks are wanted and none was imported for
--- longer than its 'patience': time to ask another peer, with 'pass'.
+-- longer than its 'patience': time to ask another peer, with 'pass'. The
+-- block store asks this both when it starts a search and when a pinged peer
+-- answers, and gets the same answer both times unless a block came in
+-- between.
 stalled :: NominalDiffTime -> NominalDiffTime -> UTCTime -> Sync p -> Maybe p
 stalled stall timeout now s
   | null s.wanted = Nothing
