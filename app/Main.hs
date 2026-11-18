@@ -13,6 +13,7 @@ import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Data.String.Conversions (cs)
 import Data.Text qualified as T
+import GHC.Conc (getNumProcessors)
 import Haskoin
   ( Network (..),
     allNets,
@@ -36,6 +37,7 @@ import Haskoin.Store
     withStore,
   )
 import Haskoin.Store.Common (loopForever)
+import Haskoin.Store.Database.Stalls (defaultBackgroundJobs)
 import Haskoin.Store.Runtime (runtimeMetrics)
 import Haskoin.Store.XPub.Indexer (Settings (..))
 import NQE (receive, withSubscription)
@@ -238,8 +240,11 @@ defConfig = do
     env "WRITE_BUFFER_MB" 256 readMaybe
   maxWalMB <-
     env "MAX_WAL_MB" 1024 readMaybe
+  -- one RocksDB background job a core, from 2 to 16: RocksDB's own two
+  -- let compactions fall behind a fresh sync until it stopped writes
+  processors <- getNumProcessors
   backgroundJobs <-
-    env "BACKGROUND_JOBS" 0 readMaybe
+    env "BACKGROUND_JOBS" (defaultBackgroundJobs processors) readMaybe
   blockCacheMB <-
     env "BLOCK_CACHE_MB" 1024 readMaybe
   return Config {version = False, ..}
@@ -734,7 +739,7 @@ config c = do
           "BACKGROUND_JOBS"
           ( unwords
               [ "RocksDB threads for flushes and compactions together",
-                "(0 = RocksDB default of two)"
+                "(default: one a core, from 2 to 16; 0 = RocksDB default of two)"
               ]
           )
         <> showDefault

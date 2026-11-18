@@ -424,7 +424,7 @@ fleet of one. Every key starts with `hs2:<network>:`.
 | `--max-open-files` | `MAX_OPEN_FILES` | `0` | Table files kept open (0 = all of them) |
 | `--write-buffer-mb` | `WRITE_BUFFER_MB` | `256` | Memtables across all column families (0 = unlimited) |
 | `--max-wal-mb` | `MAX_WAL_MB` | `1024` | Write-ahead log size that forces flushes (0 = RocksDB default) |
-| `--background-jobs` | `BACKGROUND_JOBS` | `0` | Threads for flushes and compactions together (0 = RocksDB default of two) |
+| `--background-jobs` | `BACKGROUND_JOBS` | one a core, 2 to 16 | Threads for flushes and compactions together (0 = RocksDB default of two) |
 | `--block-cache-mb` | `BLOCK_CACHE_MB` | `1024` | Shared block cache for data blocks; indexes and filters stay in memory outside it (0 = RocksDB default) |
 
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
@@ -451,9 +451,23 @@ needed.
   longer on a large database. The block cache (`--block-cache-mb`) holds
   data blocks only.
 
-RocksDB flushes and compacts in the background, with two threads by
-default: one for each. `--background-jobs` gives it more, a quarter of them
-for flushes and the rest for compactions.
+RocksDB flushes and compacts in the background. The store gives it one
+thread a core, at least 2 and at most 16, a quarter of them for flushes
+and the rest for compactions. `--background-jobs` sets another number, and
+0 leaves RocksDB's own default of two: one for each.
+
+- **Why not RocksDB's two:** a fresh sync writes faster than one
+  compaction thread keeps up with. RocksDB then delays writes once 64 GiB
+  of compaction is pending in a column family, and stops them at 256 GiB.
+  A sync of Bitcoin Cash on 24 cores froze at height 436,814 that way, with
+  209 GB pending, and moved again at once with 12 jobs. The store now logs
+  when RocksDB delays or stops writes, and `/health` reports it (see
+  [Health](#health)).
+- **Why not more than 16:** past that the disk is the limit, and more
+  threads only make reads wait longer for it.
+- **Subcompactions** would let one large compaction use several threads,
+  but `rocksdb-haskell-jprupp` 2.8.0 cannot set `max_subcompactions`, so
+  each compaction has one thread.
 
 - **When it helps:** a backlog of compactions on a machine whose disk and
   cores have room: the first sync, or the hours after a migration (see
@@ -465,8 +479,7 @@ for flushes and the rest for compactions.
   75% I/O wait. A second thread there would have made every request wait
   longer for the same disk.
 - **What it costs:** cores and disk that the requests would otherwise have.
-  Leave it at the default on a machine that serves traffic with all its
-  cores.
+  On a slow disk that already limits a store serving traffic, set fewer.
 
 Bloom filters are on by default. They let RocksDB skip the table files that
 cannot have a key, which is most of what a lookup of a transaction, an
@@ -863,6 +876,7 @@ the tests.
 | `Haskoin.Store.Database.Views` | Views of the database at recent blocks, one of them the fleet tip |
 | `Haskoin.Store.Database.Slices` | Stored blocks and transactions read in part, for what an answer needs |
 | `Haskoin.Store.Database.Migrate` | The migrations from versions 20, 21 and 22 |
+| `Haskoin.Store.Database.Stalls` | The default number of RocksDB background jobs, and the watch on write stalls |
 | `Haskoin.Store.XPub` | The vocabulary of the xpub cache: its reads and the budget of a job |
 | `Haskoin.Store.XPub.Indexer` | The threads that read xpubs into the cache, and the queue of their jobs |
 | `Haskoin.Store.XPub.Lock` | The lock in Redis that keeps two stores from reading the same xpub |
@@ -906,6 +920,19 @@ seconds.
 The checks are: how far the index is behind the headers, the age of the
 last block and of the last transaction, the transactions waiting to be
 imported, the connected peers, and Redis (`"redis"` in the JSON).
+
+**Writes to the database** are in `"database"`: `"writes"` is `flowing`,
+`delayed` or `stopped`, with `"pending-compaction-bytes"` and
+`"delayed-write-rate"` (bytes a second, 0 when not delayed). RocksDB
+delays writes and then stops them when its compactions fall behind
+([RocksDB](#rocksdb)); the store reads this every five seconds, and logs a
+warning when writes are delayed or stopped and a line when they recover.
+
+- **Stopped writes make the store unhealthy:** it imports nothing until
+  they flow again.
+- **Delayed writes do not.** RocksDB slows writes for seconds at a time
+  during a sync, and the store answers requests at full speed meanwhile.
+  If the delay makes it fall behind, the check of the blocks says so.
 
 **In a fleet**, a server that does not have the block that the
 fleet answers from can answer any request with 503 and
@@ -996,6 +1023,8 @@ The metrics of the block store:
 | `store.block_apply` | timing | The rules, in memory |
 | `store.block_write` | timing | Writing the batch to RocksDB |
 | `store.last_block_ms`, `store.last_block_prepare_ms`, `store.last_block_prefetch_ms`, `store.last_block_apply_ms`, `store.last_block_write_ms` | gauge | The same times of the latest block, kept until the next one, so that a chart averaging seconds shows them right at any zoom |
+| `db.pending_compaction_bytes` | gauge | Bytes RocksDB has to compact, over every column family, every five seconds |
+| `db.write_delayed` | gauge | Writes to RocksDB: 0 flowing, 1 delayed, 2 stopped |
 
 - **The four stages add up to nearly all of `store.block`.** A slow
   `store.block_prefetch` is the disk or RocksDB's cache, and the four

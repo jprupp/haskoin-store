@@ -6523,6 +6523,34 @@ components:
           properties:
             ok:
               type: boolean
+        database:
+          type: object
+          description: |
+            Whether RocksDB lets writes through. RocksDB delays writes, and then stops
+            them, when its compactions fall behind. Stopped writes make `ok` false and
+            the status 503; delayed writes do not, as the server still answers at full
+            speed, and `blocks` says so if it falls behind. Read every five seconds.
+          required:
+            - ok
+            - writes
+            - pending-compaction-bytes
+            - delayed-write-rate
+          properties:
+            ok:
+              type: boolean
+              description: |
+                False when writes are stopped.
+            writes:
+              type: string
+              enum: [flowing, delayed, stopped]
+            pending-compaction-bytes:
+              type: integer
+              description: |
+                Bytes RocksDB estimates it has to compact, over every column family.
+            delayed-write-rate:
+              type: integer
+              description: |
+                Bytes a second that writes are slowed to; 0 when they are not.
         net:
           type: string
           description: |
@@ -6534,7 +6562,7 @@ components:
         ok:
           type: boolean
           description: |
-            Whether every check passed.
+            Whether every check passed, writes to the database included.
         time:
           type: string
           description: |

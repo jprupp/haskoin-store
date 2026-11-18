@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.16.2] - 2026-11-18
+
+### Changed
+- **RocksDB gets a background job a core**, from 2 to 16, instead of its
+  default of two. `--background-jobs` (`BACKGROUND_JOBS`) still overrides it,
+  and 0 still means RocksDB's default. A fresh sync of Bitcoin Cash froze at
+  height 436,814 because compactions fell behind and RocksDB stopped writes.
+  `max_subcompactions` stays at 1: `rocksdb-haskell-jprupp` 2.8.0 cannot set
+  it.
+
+### Added
+- **Write stalls are visible.** The new `Haskoin.Store.Database.Stalls`
+  polls RocksDB every five seconds and logs a warning when it delays or stops
+  writes, with the bytes of compaction pending, and a line when they recover.
+  `/health` reports it under `"database"`; stopped writes make the store
+  unhealthy, delayed ones do not. StatsD gauges `db.pending_compaction_bytes`
+  and `db.write_delayed`.
+
 ## [1.16.1] - 2026-11-18
 
 ### Changed

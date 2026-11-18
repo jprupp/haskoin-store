@@ -24,7 +24,7 @@ module Haskoin.Store.Manager
 where
 
 import Control.Concurrent.Async (link, withAsync)
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
@@ -90,6 +90,7 @@ import Haskoin.Store.Database.Reader
     createDataMetrics,
     withLayeredReader,
   )
+import Haskoin.Store.Database.Stalls (Stall, noStall, watchStalls)
 import Haskoin.Store.Fleet.Member
   ( Member (..),
     MemberConfig (..),
@@ -145,7 +146,10 @@ data Store = Store
     -- | how the store opens a connection to a node, for those it makes
     -- besides the ones of the peer manager
     -- ("Haskoin.Store.Web.Publish")
-    connect :: !(SockAddr -> WithConnection)
+    connect :: !(SockAddr -> WithConnection),
+    -- | whether RocksDB lets writes through, polled every five seconds
+    -- ("Haskoin.Store.Database.Stalls"); @\/health@ reports it
+    writes :: !(TVar Stall)
   }
 
 -- | Configuration for a 'Store'.
@@ -226,36 +230,48 @@ data StoreConfig = StoreConfig
 -- when the action returns, and an exception in any component is re-thrown in
 -- the calling thread.
 --
--- The database is opened first, then the node, the block store and the cache
--- (if 'redis' is set).
+-- The database is opened first, with a thread that watches it for write
+-- stalls (@withStalls@), then the node, the block store and the cache (if
+-- 'redis' is set).
 withStore ::
   StoreConfig ->
   (Store -> IO a) ->
   IO a
 withStore cfg action =
   connectDB cfg $ \db ->
-    withPublisher $ \pub ->
-      withPublisher $ \node_pub ->
-        withSubscription node_pub $ \node_sub ->
-          withNode (nodeCfg cfg db node_pub) $ \node -> do
-            member <- storeMember cfg db
-            withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
-              withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
-                link fwd
-                withStoreFleet cfg pub member $
-                  withFleetEvents cfg pub member $ \events ->
-                    action $
-                      Store
-                        { peerMgr = node.peerMgr,
-                          chain = node.chain,
-                          block = block_store,
-                          db = db,
-                          fleet = member,
-                          events = events,
-                          pub = pub,
-                          net = cfg.net,
-                          connect = cfg.connect
-                        }
+    withStalls cfg db $ \writes ->
+      withPublisher $ \pub ->
+        withPublisher $ \node_pub ->
+          withSubscription node_pub $ \node_sub ->
+            withNode (nodeCfg cfg db node_pub) $ \node -> do
+              member <- storeMember cfg db
+              withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
+                withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
+                  link fwd
+                  withStoreFleet cfg pub member $
+                    withFleetEvents cfg pub member $ \events ->
+                      action $
+                        Store
+                          { peerMgr = node.peerMgr,
+                            chain = node.chain,
+                            block = block_store,
+                            db = db,
+                            fleet = member,
+                            events = events,
+                            pub = pub,
+                            net = cfg.net,
+                            connect = cfg.connect,
+                            writes = writes
+                          }
+
+-- | Watch RocksDB for write stalls while an action runs
+-- ("Haskoin.Store.Database.Stalls"), and give the action the latest state.
+withStalls :: StoreConfig -> DatabaseReader -> (TVar Stall -> IO a) -> IO a
+withStalls cfg db action = do
+  writes <- newTVarIO noStall
+  withAsync (watchStalls note cfg.stats db.db writes) $ \a -> link a >> action writes
+  where
+    note level = logAt level (withSource "Database" cfg.logger)
 
 -- | What every key of the fleet in Redis starts with.
 cachePrefix :: Network -> ByteString
