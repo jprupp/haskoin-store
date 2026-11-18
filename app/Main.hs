@@ -34,13 +34,16 @@ import Haskoin.Store
     XPubConfig (..),
     defaultXPubConfig,
     runWeb,
+    runWebSocket,
     withStore,
   )
 import Haskoin.Store.Common (loopForever)
 import Haskoin.Store.Database.Stalls (defaultBackgroundJobs)
 import Haskoin.Store.Runtime (runtimeMetrics)
+import Haskoin.Store.Web.Listen (parseMode, systemdSocket, withUnixSocket)
 import Haskoin.Store.XPub.Indexer (Settings (..))
 import NQE (receive, withSubscription)
+import Numeric (showOct)
 import Options.Applicative
   ( Mod,
     Parser,
@@ -55,11 +58,13 @@ import Options.Applicative
     info,
     long,
     many,
+    maybeReader,
     metavar,
     option,
     progDesc,
     short,
     showDefault,
+    showDefaultWith,
     strOption,
     switch,
     value,
@@ -79,6 +84,7 @@ import System.Metrics.StatsD
     defStatConfig,
     withStats,
   )
+import System.Posix.Types (FileMode)
 import Text.Read (readMaybe)
 
 -- | Version of the package, set at build time.
@@ -97,6 +103,8 @@ data Config = Config
   { dir :: !FilePath,
     host :: !String,
     port :: !Int,
+    socketPath :: !FilePath,
+    socketMode :: !FileMode,
     net :: !String,
     discover :: !Bool,
     peers :: ![String],
@@ -158,6 +166,10 @@ defConfig = do
     env "HOST" "*" pure
   port <-
     env "PORT" 3000 readMaybe
+  socketPath <-
+    env "SOCKET" "" pure
+  socketMode <-
+    env "SOCKET_MODE" 0o660 parseMode
   net <-
     env "NET" "bch" pure
   discover <-
@@ -343,6 +355,19 @@ config c = do
         <> helpEnv "PORT" "REST API listening port"
         <> showDefault
         <> value c.port
+  socketPath <-
+    strOption $
+      metavar "PATH"
+        <> long "socket"
+        <> helpEnv "SOCKET" "Listen on a Unix socket at this path instead of host and port"
+        <> value c.socketPath
+  socketMode <-
+    option (maybeReader parseMode) $
+      metavar "MODE"
+        <> long "socket-mode"
+        <> helpEnv "SOCKET_MODE" "Permissions of the Unix socket, in octal"
+        <> showDefaultWith (\m -> '0' : showOct m "")
+        <> value c.socketMode
   net <-
     strOption $
       metavar netNames
@@ -853,32 +878,43 @@ run cfg =
                 else Nothing,
             logger = logger
           }
-    run_web logger stats store =
-      runWeb
-        WebConfig
-          { host = cfg.host,
-            port = cfg.port,
-            store = store,
-            limits = cfg.webLimits,
-            maxPendingTxs = cfg.maxPendingTxs,
-            maxLaggingBlocks = cfg.maxLaggingBlocks,
-            minPeers = cfg.minPeers,
-            version = haskoinStoreVersion,
-            stats = stats,
-            tickerRefresh = cfg.tickerRefresh,
-            tickerURL = cfg.tickerURL,
-            priceHistoryURL = cfg.priceHistoryURL,
-            noBlockchainInfo = cfg.noBlockchainInfo,
-            healthCheckInterval = cfg.healthCheckInterval,
-            accessLog = cfg.accessLog,
-            nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
-            tls = case (cfg.tlsCert, cfg.tlsKey) of
-              ("", "") -> Nothing
-              ("", _) -> error "--tls-key needs --tls-cert"
-              (_, "") -> error "--tls-cert needs --tls-key"
-              (certificate, key) -> Just (certificate, key),
-            logger = withSource "Web" logger
-          }
+    run_web logger stats store = do
+      activated <- systemdSocket
+      case activated of
+        Just sock -> do
+          logInfo logger "Web server on the socket that systemd passed"
+          runWebSocket conf sock
+        Nothing
+          | null cfg.socketPath -> runWeb conf
+          | otherwise -> withUnixSocket cfg.socketPath cfg.socketMode $ \sock -> do
+              logInfo logger $ "Web server on the Unix socket " <> T.pack cfg.socketPath
+              runWebSocket conf sock
+      where
+        conf =
+          WebConfig
+            { host = cfg.host,
+              port = cfg.port,
+              store = store,
+              limits = cfg.webLimits,
+              maxPendingTxs = cfg.maxPendingTxs,
+              maxLaggingBlocks = cfg.maxLaggingBlocks,
+              minPeers = cfg.minPeers,
+              version = haskoinStoreVersion,
+              stats = stats,
+              tickerRefresh = cfg.tickerRefresh,
+              tickerURL = cfg.tickerURL,
+              priceHistoryURL = cfg.priceHistoryURL,
+              noBlockchainInfo = cfg.noBlockchainInfo,
+              healthCheckInterval = cfg.healthCheckInterval,
+              accessLog = cfg.accessLog,
+              nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
+              tls = case (cfg.tlsCert, cfg.tlsKey) of
+                ("", "") -> Nothing
+                ("", _) -> error "--tls-key needs --tls-cert"
+                (_, "") -> error "--tls-cert needs --tls-key"
+                (certificate, key) -> Just (certificate, key),
+              logger = withSource "Web" logger
+            }
     with_stats logger net go
       | cfg.statsd = do
           logInfo (withSource "Main" logger) $

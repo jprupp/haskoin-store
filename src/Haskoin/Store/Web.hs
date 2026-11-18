@@ -322,7 +322,7 @@ import Network.HTTP.Types
     statusIsClientError,
     statusIsServerError,
   )
-import Network.Socket (Socket)
+import Network.Socket (SockAddr (SockAddrUnix), Socket)
 import Network.Wai
   ( Application,
     Middleware,
@@ -752,7 +752,9 @@ runWeb config = serveWeb config $ case config.tls of
 -- | Like 'runWeb', on a socket that already listens; the host and port of the
 -- configuration are ignored. Binding port 0 and passing the socket gives a
 -- free port with no window in which another program can take it, which
--- finding a free port first and binding it later has.
+-- finding a free port first and binding it later has. The socket may also
+-- be a Unix socket, made by the store or passed by systemd
+-- ("Haskoin.Store.Web.Listen").
 runWebSocket :: WebConfig -> Socket -> IO ()
 runWebSocket config sock = serveWeb config $ case config.tls of
   Nothing -> runSettingsSocket defaultSettings sock
@@ -4307,7 +4309,8 @@ listToMaybe' _ = Nothing
 -- It is off by default: a public server has a proxy in front that keeps
 -- such a log, and knows the address of the client, where the server sees
 -- that of the proxy unless the proxy passes it on in @X-Forwarded-For@.
--- It is for a server that is run without one.
+-- It is for a server that is run without one. A client on a Unix socket
+-- ("Haskoin.Store.Web.Listen") has no address and shows as @unix@.
 logIt :: Logger -> Bool -> Word32 -> Middleware
 logIt logger access slow app req respond = do
   start <- getPOSIXTime
@@ -4324,7 +4327,10 @@ logIt logger access slow app req respond = do
           millis = cs (showFFloat (Just 1) (realToFrac took * 1000 :: Double) "")
           client = case lookup "X-Forwarded-For" (requestHeaders req) of
             Just given -> T.strip (T.takeWhile (/= ',') (T.decodeUtf8Lenient given))
-            Nothing -> cs (show (remoteHost req))
+            Nothing -> case remoteHost req of
+              -- a client on a Unix socket has no address
+              SockAddrUnix _ -> "unix"
+              a -> cs (show a)
       if
         | statusIsServerError s && s /= status503 -> logError logger msg
         | access -> logInfo logger (client <> " " <> msg <> ", " <> millis <> " ms")

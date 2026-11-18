@@ -336,6 +336,8 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--host` / `--port` | `HOST` / `PORT` | `*` / `3000` | Address the API listens on |
+| `--socket` | `SOCKET` | none | Listen on a Unix socket at this path instead of `--host` and `--port` ([Unix sockets](#unix-sockets)) |
+| `--socket-mode` | `SOCKET_MODE` | `0660` | Permissions of that socket, in octal |
 | `--noweb` | `NO_WEB` | off | Index only, no API |
 | `--tls-cert` / `--tls-key` | `TLS_CERT` / `TLS_KEY` | none | Serve HTTPS with this certificate chain and private key, both files in PEM |
 | `--no-blockchain-info` | `NO_BLOCKCHAIN_INFO` | off | Disable the `/blockchain/` endpoints and price lookups |
@@ -565,6 +567,45 @@ curl -N localhost:3000/events              # stream of new blocks and txs
   public service usually has a proxy in front that holds the certificate;
   this is for a server by itself. The files are read at start, so a
   renewed certificate takes a restart.
+
+### Unix sockets
+
+A store with its proxy on the same machine needs no TCP port. On a Unix
+socket, who may connect is set by the file's owner and mode, and nothing
+on the network can reach the store by mistake. There are two ways to get
+one:
+
+- **`--socket PATH`**: the store makes the socket, with the mode of
+  `--socket-mode` (`0660` by default: owner and group), and removes it when
+  it stops. A socket left by a store that did not stop cleanly is removed
+  at start if nothing answers on it; a store already listening there, or a
+  file that is not a socket, stops the new one instead. The path may be at
+  most 107 bytes long.
+- **Socket activation by systemd**: a `.socket` unit makes the socket and
+  owns its path and permissions, and the store takes it from systemd
+  (`LISTEN_FDS`). Clients that connect while the store restarts wait
+  instead of failing. A socket from systemd wins over `--socket`, which
+  wins over `--host` and `--port`, so adding the unit needs no change to
+  the store's options. For a user service:
+
+  ```ini
+  # ~/.config/systemd/user/haskoin-store-bch.socket
+  [Socket]
+  ListenStream=%t/haskoin-store/bch.sock
+  SocketMode=0660
+
+  [Install]
+  WantedBy=sockets.target
+  ```
+
+  A `.socket` unit starts the `.service` of the same name.
+
+Test it with `curl --unix-socket /run/user/1000/haskoin-store/bch.sock
+http://localhost/health`. nginx reaches it with
+`server unix:/run/user/1000/haskoin-store/bch.sock;` in an `upstream`. A
+client on a Unix socket has no address, so the access log shows `unix` for
+it unless the proxy sends `X-Forwarded-For`. Nothing else in the store
+looks at the client's address, and WebSocket events work the same.
 
 ### Endpoints at a glance
 
@@ -884,6 +925,7 @@ the tests.
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
+| `Haskoin.Store.Web.Listen` | A Unix socket to listen on, made by the store or passed by systemd |
 | `Haskoin.Store.Web.Admission` | The limit on long requests answered at once, and the line in front of it (CoDel) |
 | `Haskoin.Store.Web.Congestion` | The delay of GHC's scheduler, and the controller that moves the limit with it |
 | `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
@@ -1171,7 +1213,8 @@ What the log says about the server itself, without `--debug`:
 - **Every request**, with `--access-log`, which is off by default:
   `203.0.113.7 GET /block/best HTTP/1.1: 200 OK, 0.4 ms`. A public
   server usually has a proxy in front that keeps this log better. The
-  address is the first of `X-Forwarded-For` when a proxy sent one.
+  address is the first of `X-Forwarded-For` when a proxy sent one, and
+  `unix` for a client on a [Unix socket](#unix-sockets) without one.
 
 An outage of Redis is one warning when it starts, `Could not … Going on
 without`, and one line when it is over, `Can … again`. The attempts in

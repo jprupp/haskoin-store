@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Added
+- **The API can listen on a Unix socket.** `--socket PATH` (`SOCKET`) makes
+  one, with the mode of `--socket-mode` (`SOCKET_MODE`, `0660` by default),
+  removes a stale one at start and refuses a path in use. A socket passed
+  by systemd socket activation (`LISTEN_FDS`) wins over both and over
+  `--host` and `--port`. The new `Haskoin.Store.Web.Listen` has both. The
+  access log shows `unix` for a client on such a socket.
+
 ## [1.16.2] - 2026-11-18
 
 ### Changed
