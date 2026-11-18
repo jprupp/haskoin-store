@@ -649,7 +649,7 @@ Measured with `haskoin-store-bench import`, on four cores of an AMD Ryzen
 9 3900X, with a database of a million unspent outputs on tmpfs and blocks
 of 3,500 transactions, milliseconds a block:
 
-| | 1.15.1 | Now |
+| | 1.15.1 | 1.16.0 |
 | --- | ---: | ---: |
 | Syncing: the mempool is empty | 1,381 | 382 |
 | At the tip: every transaction is in the mempool first | 2,321 | 841 |
