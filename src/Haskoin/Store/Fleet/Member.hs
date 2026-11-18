@@ -584,6 +584,13 @@ report m = do
 -- blocks did, the pool is emptied, and the cache with it: Redis allows that
 -- to a store that is alone, and to any store when the way is too long for
 -- all of them (v'TooFar').
+--
+-- When the block that the stores agree on is no longer on this store's main
+-- chain, because the store moved its chain after it reported the block, the
+-- tip stays until the next turn (v'Unsettled'). Treating that as a way it
+-- does not know emptied the pool of a store that was alone in the middle of
+-- a reorganisation, and lost the transactions of the abandoned blocks that
+-- no node had any more.
 moveTip :: Member -> IO Bool
 moveTip m = do
   seen <- fleetTip m.redis m.keys
@@ -630,6 +637,8 @@ moveTip m = do
             Just moves -> cachePieces m.redis m.keys token (fromMaybe "" seen) moves
             Nothing -> return False
         (Way _, _) -> return False
+        -- the store's chain moved since its report: not this turn
+        (Unsettled, _) -> return False
         _ -> return True
       moved <-
         if not written
@@ -656,6 +665,7 @@ moveTip m = do
           case way of
             Way _ -> ""
             NoWay -> " (this store does not know the way)"
+            Unsettled -> " (the chain of this store moved since its report)"
             TooFar -> " (the way is too long)"
         ]
       case moved of
@@ -723,9 +733,14 @@ blocksBetween views db from to =
 data Way
   = -- | what the blocks between them did
     Way !Between
-  | -- | nothing: it does not have one of the tips, or the second is not
-    -- on its main chain. Another store may know.
+  | -- | nothing: it does not have the first tip, or no view of the
+    -- database at it. Another store may know.
     NoWay
+  | -- | not yet: the second tip is not on its main chain as the database
+    -- has it now. The store reported the tip, and its chain has moved
+    -- since, as when it reverts blocks in a reorganisation; its next report
+    -- says where it is. The tip waits for the next turn.
+    Unsettled
   | -- | it has both, and the way is longer than 'farthest' blocks on one
     -- side of the fork. That is so for every store.
     TooFar
@@ -775,7 +790,8 @@ wayBetween views db from to = withSnapshotReader db $ \r -> do
           down 0 fork bd >>= \case
             Left none -> return none
             Right added -> maybe (return NoWay) (wayWith r bd abandoned added) =<< abandonedBodies (reverse abandoned)
-    _ -> return NoWay
+    -- the store reported the second tip, and has moved on since
+    _ -> return Unsettled
   where
     wayWith r bd abandoned added old = do
       new <- concat <$> mapM (confirmedBy r) (reverse added)

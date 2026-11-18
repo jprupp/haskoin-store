@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.16.4] - 2026-11-18
+
+### Fixed
+- **A reorganisation no longer loses the transactions of the abandoned
+  blocks.** A store alone in its fleet that reverted a block between its
+  report and its move of the fleet tip found the reported block off its
+  main chain, took that as a way it did not know, and moved the tip with an
+  emptied pool. The transactions of the abandoned blocks that no node had
+  any more were lost, and answered 404. Such a store now leaves the tip for
+  its next turn (`Unsettled` in `Haskoin.Store.Fleet.Member`). The
+  transactions still come back only in the commit that moves the tip, so
+  none is ever both confirmed at the tip and in the pool. This was the
+  intermittent failure of the integration test "sends again a payment that
+  the nodes forgot and the store lists"; a test of the fleet's cache now
+  makes the race happen every time.
+
 ## [1.16.3] - 2026-11-18
 
 ### Added

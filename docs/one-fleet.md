@@ -49,6 +49,14 @@ xpub request ──▶ door ──hit──▶ entry in Redis ──▶ answer
   store reports the blocks it has. When all live stores have a newer block,
   one of them moves the tip: the pool, the fleet tip and the xpub entries
   change in one commit.
+- **A reorganisation** gives back the transactions of the abandoned blocks
+  in that same commit, and not before. Until the tip moves, they are
+  confirmed at the tip and not in the pool; after it, they are in the pool
+  and not confirmed. No answer has a transaction both confirmed and
+  unconfirmed. A store whose chain moves between its report and its move
+  of the tip, as it does while it reverts blocks, leaves the tip for its
+  next turn rather than move it with an emptied pool, which would lose what
+  no node has any more.
 - **Requests** pin the fleet tip. A read that finds the tip moved has the
   request answered again from the new tip. No answer mixes two blocks.
 - **Xpubs** are answered only from their entries in Redis. A miss asks the

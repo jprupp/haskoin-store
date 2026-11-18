@@ -19,7 +19,7 @@ import Data.Functor ((<&>))
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (find)
+import Data.List (find, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Serialize (encode)
@@ -106,6 +106,8 @@ spec = do
       it "never answers an entry that a move of the tip is writing" (`withBed` markedTest)
       it "keeps the cache across a reorganisation, as the chain and the pool give it" (`withBed` reorgTest)
       it "fills the pool again after Redis lost its data" (`withBed` refillTest)
+      it "keeps what an abandoned block gave back when the chain moves under a move of the tip" $
+        (`withBed` unsettledTest)
       it "fetches no transaction that another member received" (`withBed` seenTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
@@ -271,6 +273,37 @@ refillTest bed = do
   inPool bed tx `shouldReturn` True
   xpubAsk bed.a.door x `shouldReturn` Indexed
   sameAsChain bed bed.a x
+
+-- | A store alone in its fleet reports a block, and reverts it before it
+-- moves the tip there, as a block store does in a reorganisation while the
+-- member takes its turn. The tip waits for the next report instead of
+-- moving with an emptied pool: a payment of an abandoned block that no
+-- node has any more comes back to the pool, and is never in the pool while
+-- the tip still has it confirmed.
+unsettledTest :: Bed -> IO ()
+unsettledTest bed = do
+  -- the oldest coin, of a block that is not abandoned
+  coin : _ <- sortOn (.block) <$> coins bed
+  let tx = spend [coin] [(script, 100000)]
+      confirmedAtTip = atTip bed $ \q -> maybe False (confirmed . (.block)) <$> q.getTxData (txHash tx)
+  mineBlock bed [tx]
+  settle bed
+  confirmedAtTip `shouldReturn` True
+  -- the other member stops: this one is alone
+  void . Redis.runRedis bed.conn $ do
+    void $ Redis.hdel bed.a.keys.lease ("b" :| [])
+    Redis.hdel bed.a.keys.recent ("b" :| [])
+  -- the block of the payment is reverted, and the store reports its parent
+  revert bed.db >> noted bed
+  report bed.a
+  -- and reverts the parent too before it moves the tip
+  revert bed.db
+  moveTip bed.a `shouldReturn` False
+  confirmedAtTip `shouldReturn` True
+  noted bed
+  replicateM_ 3 (mineBlock bed [])
+  settle bed
+  inPool bed tx `shouldReturn` True
 
 -------------------------------------------------------------------------------
 -- The model test
