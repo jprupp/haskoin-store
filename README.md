@@ -432,9 +432,8 @@ fleet of one. Every key starts with `hs2:<network>:`.
 Memory used by RocksDB is roughly the block cache plus the memtables, on top of
 the Haskell heap. `/dbstats` shows where it goes.
 
-Every table file stays open by default, and the index and the filter of
-each are written in pieces of 4 KiB that the block cache holds as they are
-needed.
+Every table file stays open by default, and keeps its index and its
+filter in memory while it is open.
 
 - **Why all files open:** a lookup in a file that is not open opens it
   first, which reads its footer and properties again. A store of Bitcoin
@@ -447,8 +446,10 @@ needed.
   outside the block cache, so that data blocks cannot push them out: when
   they were in the cache and a busy store evicted them, nearly every
   lookup read megabytes back, 0.8 ms of processor time each and 18 seconds
-  to import a block of Bitcoin. They come to about 0.34% of the database:
-  some 6 GB for Bitcoin and 1.6 GB for Bitcoin Cash. Keep all files open
+  to import a block of Bitcoin. They come to about 0.9% of the database:
+  16 GB for Bitcoin (a database of 1.7 TB) and 4 GB for Bitcoin Cash
+  (461 GB) on api.haskoin.com, on Thu 19 Nov 2026 (`/dbstats`, table
+  readers). Keep all files open
   (above) so that they are read once, when the store starts, which takes
   longer on a large database. The block cache (`--block-cache-mb`) holds
   data blocks only.
@@ -490,9 +491,10 @@ output or a balance would otherwise read.
 - **What has them:** the data that is read by key: transactions, spenders,
   unspent outputs, blocks and balances. The two indices by
   address, which are scanned, do not.
-- **What they cost:** about 1.25 bytes for each key, held in the block
-  cache. On a chain with billions of keys that is gigabytes: size
-  `--block-cache-mb` for it, or turn them off with `--no-bloom`.
+- **What they cost:** about 1.25 bytes for each key, held in memory with
+  the indexes, outside the block cache (above). On a chain with billions
+  of keys that is gigabytes: plan memory for it, or turn them off with
+  `--no-bloom`.
 - **An existing database** gets filters for the table files that are
   written from now on, so their memory comes gradually, as RocksDB
   compacts. The migration to database version 22 rewrites nearly every
@@ -1172,7 +1174,9 @@ RocksDB's own statistics, as text.
 The resident memory of the store is its GHC heap plus RocksDB.
 
 - **RocksDB:** the block cache and memtables fill up to `--block-cache-mb`
-  and `--write-buffer-mb`, then stay there.
+  and `--write-buffer-mb`, then stay there. The indexes and filters of the
+  open table files come on top, about 0.9% of the database (see
+  [RocksDB](#rocksdb)).
 - **The heap** gives memory back to the system as soon as it no longer
   needs it. The executable is built with
   `--disable-delayed-os-memory-return` for that. Without the flag, Linux

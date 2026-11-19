@@ -292,7 +292,7 @@ withReader families check net igap gap dir bloom maxOpenFiles writeBuffers maxWa
           maxBackgroundJobs = jobs,
           blockCacheSize = blockCache,
           -- index and filter blocks stay with their open tables, outside the
-          -- block cache, where data blocks cannot push them out: about 0.34%
+          -- block cache, where data blocks cannot push them out: about 0.9%
           -- of the data, held for as long as a table is open
           cacheIndexAndFilterBlocks = False,
           partitionIndexAndFilters = False

@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+- **README: memory for indexes and filters.** They come to about 0.9% of the
+  database (16 GB for Bitcoin, 4 GB for Bitcoin Cash, measured on
+  api.haskoin.com), not 0.34%; and they, Bloom filters included, are held
+  outside the block cache, not in it.
+
 ### Changed
 - **`hsq --help` fits the terminal.** The usage text is laid out for the
   terminal's width (at most 100 columns): prose reflows, the command and
