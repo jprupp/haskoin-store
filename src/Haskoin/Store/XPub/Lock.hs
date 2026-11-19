@@ -50,8 +50,8 @@
 -- late, it let several stores read the same xpub for requests that came at
 -- the same time.
 --
--- A store without Redis has no fleet to share xpubs with: 'noLock' always
--- gives the lock.
+-- Every store is a member of a fleet and takes its locks in Redis. The
+-- tests of the indexer use 'noLock', which always gives the lock.
 module Haskoin.Store.XPub.Lock
   ( Lock (..),
     Taken (..),
@@ -102,7 +102,7 @@ data Taken
     Held !Int
   deriving (Eq, Show)
 
--- | The lock of a store alone: always given, never held by another.
+-- | A lock that is always given, never held by another: for the tests.
 noLock :: Lock k
 noLock =
   Lock

@@ -5,7 +5,7 @@ and the closure types that grew most between the start and the end of the run.
 A leak shows as a heap that keeps growing and a few closure types that grow
 with it. A flat profile while the process grows means the growth is outside
 the live heap: memory the heap holds but does not use, or memory that is not
-the heap's at all. stress/results/2026-11-09-memory/README.md is an example.
+the heap's at all.
 
 Usage: scripts/heap-profile-summary.py FILE.hp
 """

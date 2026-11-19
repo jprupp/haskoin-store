@@ -12,8 +12,9 @@
 --
 -- 'StoreRead' is the queries that the web server asks about blocks,
 -- transactions, addresses and extended public keys, as a record of functions
--- in 'IO': "Haskoin.Store.Database.Query" gives them for the RocksDB
--- database, and the web server puts the Redis cache in front of some.
+-- in 'IO': "Haskoin.Store.Database.Query.Pooled" gives them for the RocksDB
+-- database with the fleet's pool on top, and the web server puts the cache
+-- of xpubs in front of some.
 --
 -- This module also has helpers for pagination ('Limits'), for deriving
 -- addresses from extended public keys ('scanXPubBals'), for the order of
@@ -252,12 +253,12 @@ data StoreRead = StoreRead
 -- another from one that it mistyped. With this it is told which
 -- transaction won, and in which block.
 --
--- A store keeps it with the chain: written when the block is imported and
--- deleted when it is reverted, for 'replacedKept' blocks. That depends on
--- the mempool that the block found as well, which is each store's own, so
--- the stores of a fleet answer from what the shared pool keeps instead
--- ("Haskoin.Store.Fleet.Pool".'Haskoin.Store.Fleet.Pool.advanceReplacing'),
--- which is the same for all of them.
+-- The pool that the stores of a fleet share keeps it as the tip moves past
+-- the block, for 'replacedKept' blocks, the same for all of them
+-- ("Haskoin.Store.Fleet.Pool".'Haskoin.Store.Fleet.Pool.advanceReplacing').
+-- Stores before version 1.16.0 kept it with the chain, from their own
+-- mempools: nothing writes those records any more, and the import and the
+-- revert of blocks delete them as they did.
 data Replaced = Replaced
   { -- | the transaction of the block that spends what it, or an ancestor,
     -- spent

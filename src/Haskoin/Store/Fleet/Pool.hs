@@ -6,17 +6,17 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- The mempool that stores sharing one Redis answer from, as pure decisions:
--- the second part of "A fleet that answers as one" in
--- @docs\/one-fleet.md@, after the fleet tip of "Haskoin.Store.Fleet".
--- "Haskoin.Store.Fleet.Redis" carries it out.
+-- The mempool that stores sharing one Redis answer from, as pure decisions,
+-- beside the fleet tip of "Haskoin.Store.Fleet". It is described in
+-- @docs\/fleet-mempool.md@, and the design around it in
+-- @docs\/one-fleet.md@. "Haskoin.Store.Fleet.Redis" carries it out.
 --
 -- = The problem
 --
--- Every store has a mempool of its own, filled in the order in which its
--- peers sent it transactions, and no two are the same. Stores that answer
--- from the same block still answer differently if each lays its own mempool
--- on top.
+-- A mempool of each store's own would be filled in the order in which its
+-- peers sent it transactions, and no two would be the same. Stores that
+-- answer from the same block would still answer differently if each laid
+-- its own mempool on top.
 --
 -- = One pool, the mempool as of the fleet tip
 --
@@ -25,9 +25,9 @@
 -- up to that block, and it changes with the tip in the same step, so that
 -- no request sees a block without what it did to the pool.
 --
--- A store's own mempool does not go away. It is what the store offers to
--- the pool and relays to its peers, and what it answers from when Redis is
--- down.
+-- No store keeps a mempool of its own. A store offers the pool what its
+-- peers send it, and while Redis is down it answers 503 rather than from
+-- anything else.
 --
 -- = The rules
 --

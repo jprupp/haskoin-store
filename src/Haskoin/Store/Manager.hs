@@ -6,15 +6,16 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Wires the components of a store together: the RocksDB database, the
--- peer-to-peer node, the block store that imports data, and the optional Redis
--- cache. Node events are forwarded to the block store and turned into
--- 'StoreEvent's, which the cache follows.
+-- Wires the components of a store together: the Redis of its fleet, the
+-- RocksDB database, the peer-to-peer node, the block store that imports
+-- data, and the store's membership of its fleet ("Haskoin.Store.Fleet.Member"),
+-- which keeps the shared mempool and the cache of xpubs in Redis. Node
+-- events are forwarded to the block store and turned into 'StoreEvent's.
 --
 -- Keeping the wiring in one place means each component only knows about the
 -- interfaces it uses: the node does not know about the block store, and the
--- block store does not know about the cache. 'withStore' starts them in dependency order
--- and stops them all together.
+-- block store knows the member only through a few callbacks. 'withStore'
+-- starts them in dependency order and stops them all together.
 module Haskoin.Store.Manager
   ( StoreConfig (..),
     cachePrefix,
@@ -96,7 +97,6 @@ import Haskoin.Store.Fleet.Member
     MemberConfig (..),
     memberCacheLoop,
     memberEvents,
-    memberForget,
     memberLoop,
     memberReceived,
     memberSeen,
@@ -135,10 +135,10 @@ data Store = Store
     -- without Redis, when the store is unhealthy and answers 503
     fleet :: !(Maybe Member),
     -- | what the store tells its clients: new best blocks and changes of
-    -- the mempool. For a store alone they are its own, those that the
-    -- block store publishes.
-    -- For a member of a fleet they are those of the fleet, read from the
-    -- Redis that it shares, so that every server tells the same.
+    -- the mempool, those of the fleet, read from the Redis that it
+    -- shares, so that every server tells the same. Without a fleet, in
+    -- tests of the block store alone, they are those that the block store
+    -- publishes.
     events :: !(Publisher StoreEvent),
     -- | store events are published here
     pub :: !(Publisher StoreEvent),
@@ -201,12 +201,10 @@ data StoreConfig = StoreConfig
     stats :: !(Maybe Stats),
     -- | Bloom filters on the column families that are read by key
     bloom :: !Bool,
-    -- | RocksDB max_open_files ('Nothing' = unlimited, which is what a
-    -- store with a block cache wants: its index and filter blocks are in
-    -- the cache, an open file costs a few kilobytes, and a file that is
-    -- not open has to be opened for every lookup that lands in it. Without
-    -- a block cache every open file keeps its index and filter in memory,
-    -- and the limit is what bounds them)
+    -- | RocksDB max_open_files ('Nothing' = unlimited: a file that is not
+    -- open has to be opened for every lookup that lands in it. Every open
+    -- file keeps its index and filter in memory, outside the block cache,
+    -- about 0.9% of its data, and the limit is what bounds them)
     maxOpenFiles :: !(Maybe Int),
     -- | bytes of RocksDB memtables across all column families ('Nothing' =
     -- unlimited: each column family keeps up to two 64 MiB memtables)
@@ -219,9 +217,9 @@ data StoreConfig = StoreConfig
     -- them shorten a backlog of compactions where the disk and the cores
     -- have room, and take both from the requests where they have not
     backgroundJobs :: !(Maybe Int),
-    -- | bytes of RocksDB block cache shared by all column families, which
-    -- also holds their index and filter blocks ('Nothing' = RocksDB default:
-    -- 32 MiB per column family, index and filter blocks outside it)
+    -- | bytes of RocksDB block cache shared by all column families, for
+    -- data blocks; index and filter blocks stay outside it, with their open
+    -- tables ('Nothing' = RocksDB default: 32 MiB per column family)
     blockCache :: !(Maybe Int),
     -- | log messages here
     logger :: !Logger
@@ -282,9 +280,9 @@ withStalls cfg db action = do
 cachePrefix :: Network -> ByteString
 cachePrefix net = "hs2:" <> C.pack net.name <> ":"
 
--- | The store as a member of a fleet, if the configuration says that it is
--- one and has a Redis to share (connected by 'connectRedis', which checked
--- that it answers): under a name of its own, with a lease of
+-- | The store as a member of its fleet, on the Redis that 'connectRedis'
+-- connected and checked ('Nothing' only without one, in tests): under a
+-- name of its own, with a lease of
 -- ten seconds, views of its last six blocks, and the store's limit on the
 -- age of unconfirmed transactions.
 storeMember :: StoreConfig -> Maybe Redis.Connection -> DatabaseReader -> IO (Maybe Member)
@@ -320,16 +318,15 @@ withStoreFleet _ pub (Just member) action =
     withAsync (memberLoop member (nextBlock sub)) $ \a ->
       withAsync (memberCacheLoop member) $ \b -> link a >> link b >> action
   where
-    -- until the next block, telling the member what the store deletes
+    -- until the next block
     nextBlock sub =
       receive sub >>= \case
         StoreBestBlock _ -> return ()
-        StoreMempoolDelete h -> memberForget member [h] >> nextBlock sub
         _ -> nextBlock sub
 
--- | Run an action with the events that the store tells its clients. A
--- store alone tells its own. A member of a fleet tells those of the
--- fleet, which a thread reads from Redis for as long as the action runs.
+-- | Run an action with the events that the store tells its clients: those
+-- of the fleet, which a thread reads from Redis for as long as the action
+-- runs. Without a fleet, in tests, those that the block store publishes.
 withFleetEvents ::
   StoreConfig ->
   Publisher StoreEvent ->
@@ -351,9 +348,9 @@ withFleetEvents _ _ (Just member) action =
 
 -- | Open the database described by the configuration, bring it to the
 -- layout that the store runs on ('upgradeDatabase'), and run an action with
--- its reader. A database of version 20 has its mempool moved to an area of
--- its own here, once, before anything reads it; older stores refuse the
--- database from then on.
+-- its reader. A database of version 20 has its mempool taken out here,
+-- once, before anything reads it ("Haskoin.Store.Database.Migrate"); older
+-- stores refuse the database from then on.
 connectDB ::
   StoreConfig ->
   (DatabaseReader -> IO a) ->
@@ -376,7 +373,9 @@ connectDB cfg f = do
       done <- upgradeDatabase (logAt LevelInfo (withSource "Database" cfg.logger)) db
       when (done.moved > 0) $
         logAt LevelInfo (withSource "Database" cfg.logger) $
-          "Moved " <> cs (show done.moved) <> " mempool transactions to their own area"
+          "Took "
+            <> cs (show done.moved)
+            <> " mempool transactions out of the chain; the pool gets them again from the peers"
       when (done.rewritten > 0) $
         logAt LevelInfo (withSource "Database" cfg.logger) $
           "Wrote the records of " <> cs (show done.rewritten) <> " confirmed transactions again, to be written once"
@@ -401,7 +400,6 @@ blockStoreCfg cfg node pub db member =
       onTx = maybe (\_ _ -> return ()) memberReceived member,
       seen = maybe (\_ -> return mempty) memberSeen member,
       blockWindow = cfg.blockWindow,
-      mempoolTimeout = cfg.mempoolTimeout,
       peerTimeout = cfg.peerTimeout,
       blockStall = cfg.blockStall,
       blockPing = cfg.blockPing,

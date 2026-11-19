@@ -7,24 +7,23 @@
 -- Portability : POSIX
 --
 -- Tests of the whole store against regtest chains of Bitcoin Core and Bitcoin
--- Cash Node, with a Redis cache, all in Podman containers.
+-- Cash Node, with Redis, all in Podman containers.
 --
 -- The unit tests check pieces against models; these check that the pieces
 -- fit: that the store syncs from a real node, that the xpub endpoints find
 -- the payments a wallet following the gap would find and no others, and that
--- the Redis cache answers exactly like the database. Each chain gets one node,
--- one Redis and one store. The store is served twice, by a web server with
--- the cache and by one without ('cache' set to 'Nothing'), so both read the
--- same database, mempool times included, and every difference between their
--- answers is a difference made by the cache.
+-- two web servers of one store answer alike. Each chain gets one node, one
+-- Redis and one store. The store is served twice: the cache of xpubs cannot
+-- be turned off, so both answer xpubs from it, and both read the same
+-- database and the same pool.
 --
 -- Every test makes its own xpubs from a fixed seed, sends transactions to
 -- chosen derivation paths, mines them, and checks the answers against a
 -- ledger that it keeps itself: balance, transactions, unspent outputs, used
 -- paths and indices. Then it compares the two web servers on every xpub and
 -- Blockchain.info endpoint, with pages, starting points and filters. The cache
--- writer updates Redis in the background, so the comparison is retried for up
--- to 30 seconds before it fails.
+-- is filled in the background, so the comparison is retried for up to 30
+-- seconds before it fails.
 --
 -- The tests are skipped when Podman cannot run containers, or when
 -- @HASKOIN_STORE_NO_PODMAN@ is set. Containers are removed when the tests
@@ -223,9 +222,10 @@ data Env = Env
     node :: !Node,
     net :: !Network,
     store :: !Store,
-    -- | base URL of the web server with the cache
+    -- | base URL of the first web server
     cached :: !String,
-    -- | base URL of the web server without the cache
+    -- | base URL of the second web server of the same store, which answers
+    -- xpubs from the same cache
     plain :: !String,
     -- | address of the wallet of the node, to mine to
     miner :: !Text,
@@ -421,7 +421,7 @@ postForm base path params = do
 body :: BL.ByteString -> Value
 body b = either (const (String (cs b))) id (eitherDecode b)
 
--- | Body of a successful request to the server without the cache.
+-- | Body of a successful request to the second web server.
 plainJSON :: Env -> String -> IO Value
 plainJSON env path = do
   (code, v) <- getJSON env.plain path
@@ -446,7 +446,7 @@ sameAnswers env paths = forM_ paths $ \p -> go p (120 :: Int)
               expectationFailure $
                 "GET "
                   <> p
-                  <> "\nstatus with and without the cache: "
+                  <> "\nstatus of the two web servers: "
                   <> show (fst a, fst b)
                   <> "\nfirst difference: "
                   <> difference "" (snd a) (snd b)

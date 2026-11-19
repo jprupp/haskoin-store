@@ -86,7 +86,7 @@
 --
 -- Every key that a request asks about is cached, and the cache evicts by
 -- GreedyDual ('Haskoin.Store.XPub.greedyLua'): each
--- entry has what it cost to build, at the prices of the token design, a use
+-- entry has what it cost to build ('Haskoin.Store.XPub.indexCost'), a use
 -- gives it the level of the cache plus that cost, and the entry of the
 -- lowest priority goes first, the level rising to it ('cacheEvict'). A
 -- wallet of 40,000 addresses outlives an empty one used as recently, and

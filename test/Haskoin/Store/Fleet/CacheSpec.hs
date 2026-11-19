@@ -31,6 +31,7 @@ import Haskoin
     BlockHash,
     BlockHeader (..),
     BlockNode (..),
+    OutPoint (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
@@ -109,6 +110,8 @@ spec = do
       it "keeps what an abandoned block gave back when the chain moves under a move of the tip" $
         (`withBed` unsettledTest)
       it "fetches no transaction that another member received" (`withBed` seenTest)
+      it "offers again a transaction that left the pool and is sent again" (`withBed` resendTest)
+      it "lets go of an orphan whose parent did not come in twenty minutes" (`withBed` orphanTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
           property $ \steps -> ioProperty (withBed r (\bed -> modelTest bed (take 12 steps)) >> return True)
@@ -248,6 +251,43 @@ seenTest bed = do
   inPool bed tx `shouldReturn` True
   fetch bed.a [txHash tx, other] `shouldReturn` [other]
   fetch bed.b [txHash tx, other] `shouldReturn` [other]
+
+-- | A transaction that a replacement pushed out of the pool, and that a
+-- peer sends again, takes its place back: a member that kept a set of what
+-- it had offered refused it as offered already.
+resendTest :: Bed -> IO ()
+resendTest bed = do
+  coin : _ <- coins bed
+  let first = spend [coin] [(script, 100000)]
+      second = spend [coin] [(script, 200000)]
+  offer bed first
+  settle bed
+  inPool bed first `shouldReturn` True
+  offer bed second
+  settle bed
+  inPool bed second `shouldReturn` True
+  inPool bed first `shouldReturn` False
+  offer bed first
+  settle bed
+  inPool bed first `shouldReturn` True
+  inPool bed second `shouldReturn` False
+
+-- | Orphans wait for their parent for twenty minutes from when the member
+-- heard of them, and are then let go.
+orphanTest :: Bed -> IO ()
+orphanTest bed = do
+  coin : _ <- coins bed
+  now <- round <$> getPOSIXTime
+  let parent = spend [coin] [(script, 100000)]
+      child v = Tx 1 [TxIn (OutPoint (txHash parent) 0) "" maxBound] [TxOut v script] [] 0
+      old = child 1000
+      young = child 2000
+  memberReceived bed.a (now - 1201) old
+  memberReceived bed.a now young
+  settle bed
+  held <- readTVarIO bed.a.waiting
+  HashMap.member (txHash old) held `shouldBe` False
+  HashMap.member (txHash young) held `shouldBe` True
 
 refillTest :: Bed -> IO ()
 refillTest bed = do

@@ -40,8 +40,8 @@ of its database at recent blocks (`tipMoves`): what the abandoned blocks
 did comes out, the outputs that they spent come back, and the new branch
 goes in. A store without a view of the old tip does not move the tip, and
 waits for one that has it. A reorganisation never empties the cache; only a
-restart of the pool does (a way too long, or a store alone that does not
-know it).
+restart of the pool does (a way too long, or the only live store without
+the old tip).
 
 This upkeep cannot share a rule with anything that works from events: it is
 atomic with the pool, and exact by construction, so there is nothing to

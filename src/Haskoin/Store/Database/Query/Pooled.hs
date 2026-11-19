@@ -26,10 +26,11 @@
 --
 -- = What a pool cannot say
 --
--- A transaction that left a mempool unconfirmed is kept by the store that
--- deleted it, and by no other. A fleet cannot answer the same about it from
--- every store, so these queries do not know deleted transactions at all: a
--- page that starts at one is empty.
+-- A transaction that left a mempool unconfirmed is kept nowhere, but for
+-- the bodies that a database of version 20 still has of those that its own
+-- mempool deleted, which no other store has. A fleet cannot answer the same
+-- about them from every store, so these queries do not know deleted
+-- transactions at all: a page that starts at one is empty.
 module Haskoin.Store.Database.Query.Pooled
   ( PoolReads (..),
     pooledRead,

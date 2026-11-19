@@ -74,7 +74,6 @@ module Haskoin.Store.Fleet.Redis
     fleetAdvance,
     fleetCommit,
     fleetRestart,
-    fleetRestarts,
     FleetEvent (..),
     fleetEventsEnd,
     fleetEventsAfter,
@@ -367,19 +366,12 @@ fleetCommit conn keys tsize clock seen target known path token =
 -- other stores live. The length of the way is the same for all of them, so
 -- none would ever say what the blocks did, and the tip would stay where it
 -- is for good: a fleet whose stores came back together after half a day
--- away answered nothing from then on. Emptying the pool costs the stores
--- an offer of their mempools, which they make when they see that the
--- count of 'fleetRestarts' went up.
+-- away answered nothing from then on. Emptying the pool costs the
+-- transactions that were in it: the fleet has seen them, so no store
+-- fetches them again, and they come back only in a block.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
   advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) ([], "")
-
--- | How many times the pool was emptied to move the tip. A store that sees
--- another number than at its last turn offers all of its mempool again:
--- what it offered before is not in the pool any more.
-fleetRestarts :: Connection -> FleetKeys -> IO Integer
-fleetRestarts conn keys =
-  maybe 0 (maybe 0 fst . C.readInteger) <$> run conn (R.get (keys.prefix <> "fleet:restarts"))
 
 -- | The advance of the pool script, with its way of treating the pool: "0"
 -- to change it, "1" and "2" to empty it ('fleetAdvance', 'fleetRestart').
@@ -422,10 +414,11 @@ poolRead conn keys tsize tip what args =
 -- | Something that happened to the fleet, as every store of it tells its
 -- clients.
 --
--- A store alone tells what its own node saw. The stores of a fleet answer
--- from one tip and one pool, and their events have to be those of that tip
--- and that pool: otherwise a client would hear of a transaction from one
--- server and find that the next does not have it. So the script that
+-- Every store is a member of a fleet, even a fleet of one. The stores of a
+-- fleet answer from one tip and one pool, and their events have to be those
+-- of that tip and that pool, not what each store's own node saw: otherwise
+-- a client would hear of a transaction from one server and find that the
+-- next does not have it. So the script that
 -- changes the pool or moves the tip appends what it did to a stream in
 -- Redis, in the same step, and every store reads the stream.
 data FleetEvent

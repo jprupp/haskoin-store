@@ -6,167 +6,79 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Mempool transactions on their way into the database, as a pure value with
--- transitions.
+-- The transactions that the block store asked its peers for and that have
+-- not arrived yet, as a pure value with transitions.
 --
--- A transaction that a peer announces goes through these states:
+-- A transaction that a peer announces is requested once, and not again
+-- while the request is fresh: another peer that announces it meanwhile is
+-- not asked. When it arrives it is no longer a request ('answered'), and
+-- goes on to the pool of the fleet. A request that no peer answers is
+-- forgotten after 'requestTimeout', so that the next announcement asks
+-- again.
 --
--- @
---   announced ──► requested ──► received ──► ready ──► taken for import
---                    │              │  (missing parents arrive)
---                    ▼              ▼
---                forgotten      dropped
---             (after 20 s)   (after an hour)
--- @
---
--- It is requested once, and not again while the request is fresh. Once
--- received, it waits until no parent is missing, and is then taken for
--- import together with other ready transactions, parents first.
+-- The block store holds no transaction here: what arrives is offered to
+-- the pool at once, and what waits for its parents waits in the fleet
+-- member ("Haskoin.Store.Fleet.Member").
 --
 -- = Why a pure value
 --
--- The block store kept the queue and the recent requests in two variables,
--- changed by several functions, and forgot each request in a thread of its
--- own that slept for twenty seconds: one thread per transaction requested.
--- Here every change is a function, the clock is an argument, and requests
--- are forgotten by 'prune' on the clock tick of the block store, like the
--- transactions that waited too long.
+-- The block store kept the recent requests in a variable changed by
+-- several functions, and forgot each request in a thread of its own that
+-- slept for twenty seconds: one thread per transaction requested. Here
+-- every change is a function, the clock is an argument, and requests are
+-- forgotten by 'prune' on the clock tick of the block store.
 module Haskoin.Store.BlockStore.Pending
   ( -- * State
     Pending,
-    PendingTx (..),
     empty,
     isPending,
-    queued,
     size,
-    waiting,
 
     -- * Transitions
     requested,
     answered,
-    received,
-    takeReady,
-    imported,
-    refresh,
     prune,
 
     -- * Timeouts
     requestTimeout,
-    orphanTimeout,
   )
 where
 
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
-import Data.HashSet (HashSet)
-import Data.HashSet qualified as HashSet
-import Data.Maybe (mapMaybe)
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime)
-import Haskoin (Tx, TxHash, txHash)
-import Haskoin.Store.Common (sortTxs)
+import Haskoin (TxHash)
 
--- | Transaction received from a peer and waiting to be imported.
-data PendingTx = PendingTx
-  { -- | when it was received
-    time :: !UTCTime,
-    -- | the transaction
-    tx :: !Tx,
-    -- | parent transactions that are missing; empty if it can be imported
-    deps :: !(HashSet TxHash)
-  }
-  deriving stock (Show, Eq, Ord)
-
--- | Transactions requested from peers and received from them.
-data Pending = Pending
-  { -- | received, by hash
-    txs :: !(HashMap TxHash PendingTx),
-    -- | requested and not received yet, with when
-    asked :: !(HashMap TxHash UTCTime)
-  }
+-- | Transactions requested from peers and not received yet, with when.
+newtype Pending = Pending (HashMap TxHash UTCTime)
   deriving stock (Show, Eq)
 
 -- | How long a request keeps the transaction from being requested again.
 requestTimeout :: NominalDiffTime
 requestTimeout = 20
 
--- | How long a transaction waits for missing parents.
-orphanTimeout :: NominalDiffTime
-orphanTimeout = 3600
-
--- | Nothing requested or received.
+-- | Nothing requested.
 empty :: Pending
-empty = Pending HashMap.empty HashMap.empty
+empty = Pending HashMap.empty
 
--- | Whether a transaction is received or requested, so that it is not
+-- | Whether a transaction was requested recently, so that it is not
 -- requested again.
 isPending :: TxHash -> Pending -> Bool
-isPending h p = HashMap.member h p.txs || HashMap.member h p.asked
+isPending h (Pending asked) = HashMap.member h asked
 
--- | How many transactions are received and not taken for import yet.
-queued :: Pending -> Int
-queued p = HashMap.size p.txs
-
--- | How many transactions are received or requested.
+-- | How many transactions are requested and not received yet.
 size :: Pending -> Int
-size p = HashMap.size (HashMap.union (() <$ p.txs) (() <$ p.asked))
-
--- | Received transactions that have missing parents.
-waiting :: Pending -> [PendingTx]
-waiting p = filter (not . null . (.deps)) (HashMap.elems p.txs)
+size (Pending asked) = HashMap.size asked
 
 -- | Transactions were requested.
 requested :: UTCTime -> [TxHash] -> Pending -> Pending
-requested now hs p = p {asked = HashMap.union (HashMap.fromList [(h, now) | h <- hs]) p.asked}
+requested now hs (Pending asked) = Pending (HashMap.union (HashMap.fromList [(h, now) | h <- hs]) asked)
 
 -- | A transaction that was requested arrived, to be offered to the pool
 -- of the fleet: it is no longer a request.
 answered :: TxHash -> Pending -> Pending
-answered h p = p {asked = HashMap.delete h p.asked}
+answered h (Pending asked) = Pending (HashMap.delete h asked)
 
--- | A transaction was received, with the parents that it spends and the
--- database does not have. It is no longer a request.
-received :: UTCTime -> Tx -> HashSet TxHash -> Pending -> Pending
-received now tx deps p =
-  Pending
-    { txs = HashMap.insert h (PendingTx now tx deps) p.txs,
-      asked = HashMap.delete h p.asked
-    }
-  where
-    h = txHash tx
-
--- | Take up to this many transactions with no missing parents, parents
--- before children.
-takeReady :: Int -> Pending -> ([PendingTx], Pending)
-takeReady n p = (taken, p {txs = foldr (HashMap.delete . txHash . (.tx)) p.txs taken})
-  where
-    ready = HashMap.filter (null . (.deps)) p.txs
-    taken =
-      take n $
-        mapMaybe ((`HashMap.lookup` ready) . txHash . snd) (sortTxs (map (.tx) (HashMap.elems ready)))
-
--- | A transaction is in the database: transactions waiting for it no longer
--- miss it.
-imported :: TxHash -> Pending -> Pending
-imported h p = p {txs = HashMap.map (\t -> t {deps = HashSet.delete h t.deps}) p.txs}
-
--- | After a block, give each waiting transaction what the database now
--- says about it: 'Nothing' if it is in the database already, so it is
--- dropped, or the parents that it still misses.
-refresh :: HashMap TxHash (Maybe (HashSet TxHash)) -> Pending -> Pending
-refresh updates p = p {txs = HashMap.mapMaybeWithKey update p.txs}
-  where
-    update h t = case HashMap.lookup h updates of
-      Nothing -> Just t
-      Just Nothing -> Nothing
-      Just (Just deps) -> Just t {deps = deps}
-
--- | Forget requests older than 'requestTimeout', and drop transactions
--- received longer than 'orphanTimeout' ago.
+-- | Forget requests older than 'requestTimeout'.
 prune :: UTCTime -> Pending -> Pending
-prune now p =
-  Pending
-    { txs = HashMap.filter (\t -> age t.time <= orphanTimeout) p.txs,
-      asked = HashMap.filter (\t -> age t <= requestTimeout) p.asked
-    }
-  where
-    age t = now `diffUTCTime` t
+prune now (Pending asked) = Pending (HashMap.filter (\t -> now `diffUTCTime` t <= requestTimeout) asked)

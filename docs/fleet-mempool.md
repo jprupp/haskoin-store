@@ -4,14 +4,12 @@ How the servers of a fleet keep one mempool in Redis, and why the design
 holds. The architecture around it is in [one-fleet.md](one-fleet.md). It
 describes the code; it is not part of the package.
 
-## The short answer
+## In short
 
-The design is sound for what it promises: every server answers from the
-same mempool, that mempool is valid on top of the block the fleet answers
-from, and the two always change together. Each rule is a Lua script that
-Redis runs in one step, and the tests hold the scripts to a pure model.
-
-It has weak points, listed at the end.
+Every server answers from the same mempool, that mempool is valid on top
+of the block the fleet answers from, and the two always change together.
+Each rule is a Lua script that Redis runs in one step, and the tests hold
+the scripts to a pure model. The weak points are listed at the end.
 
 ## The problem
 
@@ -74,8 +72,8 @@ What the server does with each answer:
 
 | Answer | What the server does |
 | --- | --- |
-| Taken, or already known | Marks it offered, and never offers it again |
-| Orphan | Keeps it waiting, and tries again next round |
+| Taken, or already known | Lets it go; the fleet has seen it, so no server fetches it again |
+| Orphan | Keeps it waiting, and tries again next round, for 20 minutes at most |
 | Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place |
 | Late | Stops; the next round offers it again at the new tip |
 
@@ -103,7 +101,10 @@ what spends it now spends a confirmed output.
 
 A server has no mempool of its own, so there is nothing for it to
 withdraw. What it heard and has not offered yet waits in memory, with the
-orphans, and is offered again at the next turn.
+orphans, and is offered again at the next turn. An orphan is let go 20
+minutes after the server heard of it, as Bitcoin Core lets go of its own:
+a parent that has not come by then is not coming, and orphans kept for
+ever would fill every round.
 
 ## When the tip moves
 
@@ -111,7 +112,7 @@ A server whose turn finds that all live servers have a newer block in
 common moves the tip there (`moveTip`). It reads from its views of its
 database what the blocks between the old tip and the new one did, and
 hands the script all of it in one call, with the xpub entries
-(`docs/xpub-indexing.md`):
+([xpub-indexing.md](xpub-indexing.md)):
 
 - the transactions they confirmed, which leave quietly;
 - the outputs they spent, whose spenders in the pool leave with their
@@ -160,18 +161,18 @@ A server goes through 50 blocks at most. Two cases are past that:
 - **The way is longer than 50 blocks.** That is true for every server, so
   any of them may empty the pool and move the tip.
 
-Either way the script adds one to the restart counter, and empties the
-xpub cache, whose pool layer is gone. Every server checks that counter each
-turn (`noteRestarts`), and when it changed, forgets what it offered. The
-pool fills again from what the peers announce.
+Either way the script also empties the xpub cache, whose pool layer is
+gone. The pool then holds only what peers announce from then on: the
+transactions of the emptied pool are in the fleet's seen set, so no server
+fetches them again, and they come back only in a block.
 
 ## When Redis loses its data
 
 Redis keeps a random epoch (`fleet:epoch`, set if missing). A server that
-finds it gone or changed at its turn (`noteEpoch`) forgets what it offered
-and its tip, and is unhealthy until the fleet has a tip again; the first
-turn sets one, since every live server reports. Then it asks every peer
-for its mempool again, and with `--node-rpc` reads its node's
+finds it gone or changed at its turn (`noteEpoch`) forgets its tip, and is
+unhealthy until the fleet has a tip again; the first turn sets one, since
+every live server reports. Then it asks every peer for its mempool again,
+and with `--node-rpc` reads its node's
 (`getrawmempool`, then `getrawtransaction`), 2,000 transactions every two
 seconds. Each goes through the offer as if a peer had sent it.
 

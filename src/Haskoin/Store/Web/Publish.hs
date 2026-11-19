@@ -47,9 +47,9 @@
 --
 -- = Why it is this way
 --
--- * __No waiting for the echo.__ Until 1.12.1 the request waited, up to
---   @--publish-timeout@, for a node to announce the transaction back, and
---   said what came of it. The wait was arbitrary, Bitcoin Core does not say
+-- * __No waiting for the echo.__ The request could wait for a node to
+--   announce the transaction back, and say what came of it. But any limit
+--   on that wait would be arbitrary, Bitcoin Core does not say
 --   when it refuses, and the store cannot see the network: a transaction
 --   that one node refuses may be taken by others. The client is told what
 --   the store knows, that it was handed over, and finds out the rest the
@@ -66,7 +66,7 @@
 --   close its connections to the sender, and Bitcoin Cash Node closes them
 --   all. So the store sends a peer only what it verified, and checks the
 --   rules whose breach was measured to cost it its connections: the form of
---   the input scripts and the tokens ("docs/publishing.md" has what was
+--   the input scripts and the tokens (@docs\/publishing.md@ has what was
 --   measured). A transaction that only breaks a rule of relay, such as one
 --   that pays too little, is refused by the nodes without harm.
 --

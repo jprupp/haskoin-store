@@ -24,5 +24,3 @@ TAGS
 .idea/
 *.iml
 
-# output of scripts/stress-cache.sh
-stress-*/

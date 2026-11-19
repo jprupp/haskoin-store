@@ -13,12 +13,12 @@
 -- A 'Writer' records every change in in-memory hash tables, and its reads look
 -- in those tables first and fall back to the database. When the function given
 -- to 'runWriter' returns, all the changes are written to RocksDB in a single
--- atomic batch. A block or a set of transactions is thus either fully imported
--- or not at all.
+-- atomic batch. A block is thus either fully imported or not at all.
 --
 -- The writer is a plain handle passed to plain functions in 'IO' ('getTxData',
 -- 'insertTx', ...), rather than a monad transformer with class instances: the
 -- import logic says which writer it uses, and needs nothing but 'IO' to run.
+--
 -- = Why buffer writes
 --
 -- Importing a block touches thousands of keys, and many of them several times:
@@ -140,7 +140,6 @@ module Haskoin.Store.Database.Writer
     deleteSpender,
 
     -- * Transactions that blocks replaced
-    insertReplaced,
     deleteReplaced,
     getReplacedAt,
   )
@@ -1209,10 +1208,6 @@ getChainSpenders w h outputs = do
   -- the first of the union wins: what the batch adds comes before what
   -- the database has, and no group is both whole and added to
   return (IntMap.unions (added <> (kept : map snd changed)))
-
--- | Keep what a block replaced.
-insertReplaced :: Writer -> TxHash -> Replaced -> IO ()
-insertReplaced w h r = T.insert w.memory.replacedTable h (Just r)
 
 -- | Forget what was kept of a replaced transaction.
 deleteReplaced :: Writer -> TxHash -> IO ()

@@ -99,7 +99,6 @@ local osize = tsize + 4
 local key = {
   tip = prefix .. 'fleet:tip',
   moves = prefix .. 'fleet:moves',
-  restarts = prefix .. 'fleet:restarts',
   events = prefix .. 'fleet:events',
   lease = prefix .. 'fleet:lease',
   recent = prefix .. 'fleet:recent',
@@ -561,7 +560,6 @@ if ARGV[8] == '1' or ARGV[8] == '2' then
   if ARGV[8] == '1' and #live ~= 1 then
     return {'raced'}
   end
-  redis.call('INCR', key.restarts)
   for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do
     redis.call('DEL', k)
   end

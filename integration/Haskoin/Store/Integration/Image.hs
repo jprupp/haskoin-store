@@ -11,7 +11,7 @@
 --
 -- The tests use no third-party images. The image starts from the official
 -- Ubuntu 26.04 image, pinned by the digest of its multi-architecture index,
--- installs Valkey (the Redis-compatible server Ubuntu ships) and wrk from the
+-- installs Valkey (the Redis-compatible server Ubuntu ships) from the
 -- Ubuntu archive at a fixed snapshot date (apt checks the signatures of the
 -- archive; the certificates needed to reach the snapshot service over HTTPS
 -- come from the regular archive first), and downloads Bitcoin Core and
@@ -38,7 +38,6 @@ module Haskoin.Store.Integration.Image
     coreBin,
     bchnBin,
     valkeyBin,
-    wrkBin,
   )
 where
 
@@ -86,23 +85,18 @@ bchnBin = "/opt/bitcoin-cash-node/bin/bitcoind"
 valkeyBin :: String
 valkeyBin = "/usr/bin/valkey-server"
 
--- | The HTTP load generator wrk in the image, for the stress test of the
--- cache.
-wrkBin :: String
-wrkBin = "/usr/bin/wrk"
-
 -- | Recipe of the image.
 --
 -- Every download is its own layer, ordered from the one that changes least
 -- often: the packages of the snapshot, then Bitcoin Core, then Bitcoin Cash
--- Node, then wrk for the stress test, which came last. Podman keeps the
+-- Node. Podman keeps the
 -- layers it builds and reuses each one whose instruction, and those before
 -- it, did not change, so moving one node to a new release downloads only
 -- that release. Nothing in the image depends on the time it is built.
 --
 -- The recipe stays here rather than in a Containerfile of its own: it is
 -- made from the versions and hashes defined in this module, and the tag of
--- the image is a hash of it, so the tests and the stress program, which may
+-- the image is a hash of it, so the tests, which may
 -- run from any directory, need no file to find. It is written one
 -- instruction and one shell command per line.
 containerfile :: String
@@ -142,10 +136,6 @@ containerfile =
         )
         bchnAmd64
         bchnArm64
-      <> [ "RUN apt-get update --error-on=any --snapshot " <> snapshot <> " \\",
-           " && apt-get install -y --no-install-recommends --snapshot " <> snapshot <> " wrk \\",
-           " && rm -rf /var/lib/apt/lists/*"
-         ]
   where
     -- download a release for the architecture of the image, check its hash,
     -- and unpack it; @$a@ in the URL stands for the architecture

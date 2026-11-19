@@ -21,6 +21,7 @@
 --
 -- Limits on the size of responses are set with 'WebLimits'. Errors are
 -- returned as JSON with an HTTP status that depends on the 'Except'.
+--
 -- = Design of the API
 --
 -- * __One encoding.__ The API speaks JSON, which any language reads, and
@@ -452,8 +453,8 @@ data WebConfig = WebConfig
     -- | blocks that the database may lag behind the headers before the store
     -- is reported unhealthy
     maxLaggingBlocks :: !Int,
-    -- | transactions that may be waiting to be imported before the store is
-    -- reported unhealthy
+    -- | transactions that may be requested from peers and not received yet
+    -- before the store is reported unhealthy
     maxPendingTxs :: !Int,
     -- | fewest peers before the store is reported unhealthy
     minPeers :: !Int,
@@ -518,7 +519,7 @@ data WebState = WebState
     -- | the limit on the long requests answered at once
     admission :: !Admission,
     -- | the reads of the caches of xpubs for this request, each xpub of one
-    -- version, and the check that ends it ('xpubSession'); outside of a
+    -- version, and the check that ends it ('Haskoin.Store.Fleet.Member.fleetSession'); outside of a
     -- request, reads of no request
     reading :: !Door.Session
   }
@@ -583,7 +584,7 @@ data WebMetrics = WebMetrics
     serverErrors :: StatCounter,
     clientErrors :: StatCounter,
     -- | requests answered again because an entry of a cache that they read
-    -- changed meanwhile (@web.reruns@, 'xpubSession')
+    -- changed meanwhile (@web.reruns@, 'Haskoin.Store.Fleet.Member.fleetSession')
     reruns :: StatCounter,
     -- Admission
     refused :: StatCounter,
@@ -803,8 +804,8 @@ serveWeb config serve = do
           patience = fromIntegral config.limits.requestWait * 1000000
         }
   let db = config.store.db
-      -- the door to the fleet's cache of xpubs; a store without Redis has
-      -- none, and answers about no xpub
+      -- the door to the fleet's cache of xpubs; only a store without Redis,
+      -- in tests, has none, and answers about no xpub
       xpubDoor = (.door) <$> config.store.fleet
       stateOf out sess q =
         WebState
@@ -1171,7 +1172,7 @@ reportControl (Just m) r = do
 
 -- | A route whose handler, once it has its response and before the response
 -- is sent, checks that every cached xpub that the request read is still of
--- the version that it read ('xpubSession'): if one is not, it throws
+-- the version that it read ('Haskoin.Store.Fleet.Member.fleetSession'): if one is not, it throws
 -- v'EntryMoved', and the request is answered again. The routes of xpubs read
 -- the caches only before they respond.
 settled :: WebState -> Route -> Route
@@ -2044,7 +2045,7 @@ sendNode st url tx =
 --
 -- The peers are those of the store that take transactions. A transaction
 -- that was handed over is asked for again after the answer
--- ('askingLoop'), unless the store keeps no mempool.
+-- ('askingLoop'), until the store has it in the chain or the pool.
 publishing :: WebState -> Publish.Publishing
 publishing st =
   Publish.Publishing
@@ -2386,10 +2387,11 @@ eventsStart st = \case
 -- runs, each transaction that enters with what the database has of it
 -- ('seenOf'), for the clients that choose what they hear about.
 --
--- A store alone writes what it publishes. A member of a fleet writes what
--- the fleet tells ('memberEvents'), from the start of what Redis keeps, so
+-- A member of a fleet, as every store is, writes what the fleet tells
+-- ('memberEvents'), from the start of what Redis keeps, so
 -- that the logs of all the servers of a fleet hold the same events and a
--- client can take up on any of them.
+-- client can take up on any of them. Without a fleet, in tests, it writes
+-- what the block store publishes.
 feedEvents :: WebState -> IO ()
 feedEvents st = case own.fleet of
   Just member -> memberEvents member True (mapM_ happened . fleet)
@@ -3922,7 +3924,7 @@ handleHealth st _ =
   withMetrics st (.health) $ do
     h <- readTVarIO st.health
     up <- readTVarIO st.cacheUp
-    -- a store without a cache has no Redis to be without
+    -- Redis is mandatory: the answer always says whether it answers
     let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
     return HealthCheck {redis = Just up, ..}
 
@@ -3971,7 +3973,7 @@ lastTxHealthCheck WebConfig {store = store', limits} = do
   where
     ch = store'.chain
 
--- | Transactions waiting to be imported and the maximum allowed.
+-- | Transactions requested from peers and not received yet, and the maximum allowed.
 pendingTxsHealthCheck :: WebConfig -> IO MaxHealth
 pendingTxsHealthCheck cfg = do
   n <- blockStorePendingTxs cfg.store.block
@@ -4191,7 +4193,7 @@ xpubQuery gate out sess base =
     cached ask = ask >>= maybe (throwIO EntryMoved) return
     balances x = r.balances x >>= maybe (asked x (2 :: Int)) return
     -- once indexed, the cache, read at one version as every read of the
-    -- request ('xpubSession'); an xpub evicted at once is asked for again
+    -- request ('Haskoin.Store.Fleet.Member.fleetSession'); an xpub evicted at once is asked for again
     asked x tries = case gate of
       Nothing -> throwIO JobBroke
       Just xs -> do
@@ -4364,7 +4366,7 @@ ailments h =
     [ [shown (h.blocks.headers - h.blocks.blocks) <> " blocks behind the headers" | not (isOK h.blocks)],
       [shown h.lastBlock.age <> " seconds since the last block" | not (isOK h.lastBlock)],
       [shown h.lastTx.age <> " seconds since the last transaction" | not (isOK h.lastTx)],
-      [shown h.pendingTxs.count <> " transactions waiting to be imported" | not (isOK h.pendingTxs)],
+      [shown h.pendingTxs.count <> " transactions requested from peers and not received" | not (isOK h.pendingTxs)],
       [shown h.peers.count <> " peers" | not (isOK h.peers)]
     ]
   where

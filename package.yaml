@@ -3,12 +3,12 @@ version: 1.16.5
 synopsis: Storage and index for Bitcoin and Bitcoin Cash
 description: |
   An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
-  transactions from the peer-to-peer network, indexes them in RocksDB, and
-  serves a REST API with balances, transactions and unspent outputs of
-  addresses and extended public keys, a Blockchain.info compatible API, and
-  events over WebSockets. An optional Redis cache, shared by several stores,
-  keeps large wallets fast. See the README for installation and
-  configuration.
+  transactions from the peer-to-peer network, indexes the chain in RocksDB and
+  the mempool in Redis, and serves a REST API with balances, transactions and
+  unspent outputs of addresses and extended public keys, a Blockchain.info
+  compatible API, and events over WebSockets. Redis also holds the balances of
+  extended public keys, and lets several stores answer as one. See the README
+  for installation and configuration.
 category: Bitcoin, Finance, Network
 author: JP Rupp
 maintainer: jprupp@protonmail.ch
@@ -21,10 +21,8 @@ bug-reports: https://github.com/jprupp/haskoin-store/issues
 tested-with: GHC == 9.12.4
 extra-source-files:
   - cbits/haskoin_store_merge.h
-  - src/Haskoin/Store/Cache/lua/*.lua
   - src/Haskoin/Store/Fleet/lua/*.lua
   - src/Haskoin/Store/XPub/lua/*.lua
-  - stress/wrk.lua
   - swagger.yaml
 extra-doc-files:
   - README.md
@@ -109,9 +107,8 @@ library:
   include-dirs: cbits
   cc-options: -Wall
 internal-libraries:
-  # Regtest nodes and Valkey in Podman containers, for the integration tests
-  # and the stress test of the cache, and temporary directories, for every
-  # test and the benchmark.
+  # Regtest nodes and Valkey in Podman containers, for the integration tests,
+  # and temporary directories, for every test and the benchmark.
   integration:
     source-dirs: integration
     dependencies:
@@ -127,7 +124,7 @@ executables:
     # needs back to the system at once (MADV_DONTNEED), rather than marking it
     # free for the kernel to take when it runs short (MADV_FREE), which keeps
     # it counted as resident. With the default, the heap of a busy store looked
-    # like it grew without end in the stress test, from 45 to 260 MiB in six
+    # like it grew without end under load, from 45 to 260 MiB in six
     # minutes with 10 MiB live, most of it given back already; with the flag
     # it stayed between 50 and 90 MiB, and memory figures mean what they say.
     # -T: keep the statistics of the garbage collector, for the rts.* metrics
@@ -189,20 +186,3 @@ benchmarks:
       - filepath ^>= 1.5.5.0
       - integration
       - vector ^>= 0.13.2.0
-  # Stress test of the Redis cache: regtest chain and Valkey in Podman, a
-  # haskoin-store server, hundreds of thousands of transactions between a
-  # few wallets, and wrk on their xpubs. Run it with scripts/stress-cache.sh.
-  haskoin-store-stress:
-    main: Main.hs
-    source-dirs: stress
-    ghc-options:
-      - -threaded
-      - -rtsopts
-      - -with-rtsopts=-N2
-    dependencies:
-      - haskoin-store
-      - directory ^>= 1.3.10.1
-      - integration
-      - process ^>= 1.6.26.1
-      - optparse-applicative ^>= 0.19.0.0
-      - unix ^>= 2.8.8.0

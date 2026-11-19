@@ -8,9 +8,10 @@
 #   scripts/bench-web.sh [BLOCKS] [DURATION] [CONNECTIONS] [-- RTS flags]
 #
 # The server runs on CPUs 0-2 and wrk on CPU 3, so that they do not compete
-# for the same cores. Set REDIS_URL to run with the Redis cache; set
-# ENDPOINTS to a regular expression to run only matching endpoint names,
-# and BIN to run a given server binary.
+# for the same cores. Set REDIS_URL to the Redis that the server needs:
+# without one it answers 503 to everything, and the script waits for it in
+# vain. Set ENDPOINTS to a regular expression to run only matching endpoint
+# names, and BIN to run a given server binary.
 #
 # Compare builds by the CPU time per request. Requests per second depend on
 # how the GHC scheduler behaves on the host: on a KVM guest with -N3, a bare
@@ -62,7 +63,7 @@ XPUB=$(sed -n 's/^xpub: //p' "$OUT")
 BEST=$(sed -n 's/^best block: //p' "$OUT")
 TXID=$(curl -s "http://127.0.0.1:$PORT/address/$HOT/transactions?limit=1" |
   python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["txid"])')
-# The xpub goes into the cache, Redis or else memory, on its first query.
+# The xpub goes into the cache in Redis on its first query.
 # Until the indexer has it, the server may answer 429, which curl -f fails on.
 until curl -sf "http://127.0.0.1:$PORT/xpub/$XPUB" >/dev/null; do sleep 1; done
 

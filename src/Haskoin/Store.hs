@@ -10,16 +10,18 @@
 --
 -- Haskoin Store connects to the peer-to-peer network with
 -- <https://hackage.haskell.org/package/haskoin-node haskoin-node>, downloads
--- blocks and mempool transactions, and indexes them in RocksDB. The indices
--- answer questions about blocks, transactions, address balances, unspent
--- outputs and extended public keys. A REST API built on these indices is in
--- "Haskoin.Store.Web". (The Redis cache of extended public keys is being
--- rewritten; until it is back, every query reads the database.)
+-- blocks and mempool transactions, and indexes the chain in RocksDB. The
+-- mempool is one pool in Redis, shared by every store of a fleet, even a
+-- fleet of one, and so are the entries of extended public keys
+-- (@docs\/one-fleet.md@). The indices answer questions about blocks,
+-- transactions, address balances, unspent outputs and extended public keys.
+-- A REST API built on them is in "Haskoin.Store.Web".
 --
 -- = Running a store
 --
--- 'withStore' starts everything from a 'StoreConfig': the database, the node
--- and the block store that imports data. The 'Store' it returns has a
+-- 'withStore' starts everything from a 'StoreConfig': the connection to
+-- Redis, the database, the node, the block store that imports data, and the
+-- store's membership of its fleet. The 'Store' it returns has a
 -- 'DatabaseReader'; query it with the functions of
 -- "Haskoin.Store.Database.Query", which take the reader and run in 'IO'.
 --
@@ -54,6 +56,7 @@
 -- * "Haskoin.Store.BlockStore": the process that imports blocks and
 --   transactions.
 -- * "Haskoin.Store.Web": the REST API server.
+--
 -- = Purpose
 --
 -- A block chain is easy to append to and hard to query. Bitcoin nodes store
@@ -68,23 +71,23 @@
 -- * __No full node required.__ The store talks to the peer-to-peer network itself
 --   through haskoin-node, so a deployment is one program and a database.
 --
--- * __Every import is atomic.__ A block or a batch of mempool transactions is
---   applied as one RocksDB write. A crash leaves the database at the previous
---   block, never half-way through one, so there is no recovery step.
+-- * __Every import is atomic.__ A block is applied as one RocksDB write. A
+--   crash leaves the database at the previous block, never half-way through
+--   one, so there is no recovery step.
 --
 -- * __Indices are designed around reads.__ Keys are laid out so that every API
 --   query is a seek and a short scan, newest first; see
 --   "Haskoin.Store.Database.Types".
 --
 -- * __Plain functions in 'IO'.__ Queries take the database reader, or a
---   'StoreRead' record of them, which the web server builds with the Redis
---   cache in front of the queries about xpubs. Nothing runs in a stack of
+--   'StoreRead' record of them, which the web server builds with the
+--   fleet's entries of xpubs in Redis in front of the queries about them. Nothing runs in a stack of
 --   monad transformers, except the conduits that merge sorted streams. The
 --   web server runs on WAI with a router of its own.
 --
 -- * __The mempool is a first-class citizen.__ Unconfirmed transactions are indexed
---   like confirmed ones, ordered before them, and kept across restarts, because
---   wallets care about them most.
+--   like confirmed ones, in the pool in Redis, ordered before them, and kept
+--   across restarts of a store, because wallets care about them most.
 module Haskoin.Store
   ( -- * Store
     Store (..),

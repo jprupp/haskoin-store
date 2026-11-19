@@ -7,10 +7,58 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ### Fixed
+- **A store no longer keeps every transaction it ever offered in memory.**
+  The fleet member kept a set of what it had offered to the pool, emptied
+  only when the pool was started again or Redis lost its data: about half
+  a million transactions a day on Bitcoin. It also made the store refuse,
+  silently, a transaction that left the pool and was sent again, such as
+  one that a replacement pushed out. The set is gone: the fleet's seen set
+  in Redis already keeps stores from fetching what the pool decided on.
+- **Orphans no longer stop the store from offering transactions.** A
+  transaction whose parent never came waited in memory for ever, and a
+  round offers the 2,000 oldest that wait: once that many orphans had piled
+  up, nothing else was offered. An orphan is now let go 20 minutes after
+  the store heard of it, as Bitcoin Core does.
+- **A restart of the pool no longer drops what the store was about to
+  offer.**
 - **README: memory for indexes and filters.** They come to about 0.9% of the
   database (16 GB for Bitcoin, 4 GB for Bitcoin Cash, measured on
   api.haskoin.com), not 0.34%; and they, Bloom filters included, are held
-  outside the block cache, not in it.
+  outside the block cache, not in it. The `--block-cache-mb` help said the
+  same wrong thing and is fixed too.
+- **Documentation brought up to date with Redis being required.** The
+  package description, the README's Docker quick start (it started the
+  store without Redis, which cannot work), the help of `/health` in
+  `swagger.yaml` (the `redis` and `database` fields are always there; a
+  store without Redis answers 503), and comments throughout the code that
+  still described an optional Redis, a store's own mempool, the token
+  design or functions that no longer exist.
+- **`swagger.yaml`**: version 1.16.5; `request-too-large` (413) is sent;
+  the health check runs every second and at each block, not every 30
+  seconds; the 202 body of `POST /transactions` has a `message`.
+- **README**: `nocache` is accepted and ignored on xpub routes; `stack.yaml`
+  may pin git commits; the integration image is under `integration/`; the
+  code map lists every module; links point at the document that has what
+  they promise.
+- **Messages about pending transactions** (the `/health` log, the help of
+  `--max-pending-txs`, the reference): they count transactions requested
+  from peers and not received yet, not transactions waiting to be imported.
+  The log line of the migration from version 20 says the transactions were
+  taken out of the chain, not moved.
+
+### Removed
+- **The stress test of the cache** (`stress/`, `scripts/stress-cache.sh`,
+  `scripts/stress-report.py`, the `haskoin-store-stress` benchmark, and
+  wrk in the test image). It no longer ran against the current server and
+  measured a cache that no longer exists. `scripts/heap-profile-summary.py`
+  stays; the README says how to use it on its own.
+- **The StatsD gauge `store.queued_txs`**: it counted transactions waiting
+  to be imported, which the block store no longer holds, and was always 0.
+- **Dead code**: the restart counter of the pool (`fleet:restarts`), which
+  nothing read; what the block store kept of transactions received from
+  peers, which nothing put there (`Haskoin.Store.BlockStore.Pending` now
+  holds only the requests); `insertReplaced`; `BlockStoreConfig`'s
+  `mempoolTimeout`; and unused fields of the fleet member.
 
 ### Changed
 - **`hsq --help` fits the terminal.** The usage text is laid out for the

@@ -5,7 +5,8 @@ part of the package.
 
 ## The design in five rules
 
-1. **Redis is mandatory.** The store does not start without `--redis`.
+1. **Redis is mandatory.** The store does not start without the Redis of
+   `--redis-url` (default `redis://localhost:6379`).
 2. **Every store is a member of a fleet**, even a fleet of one. A fleet is
    the stores that share one Redis.
 3. **The mempool lives only in Redis**, in one pool that the fleet shares.
@@ -75,8 +76,8 @@ what a fleet is there to prevent.
 ## When Redis loses its data
 
 Redis keeps a random epoch key. A store that finds it gone or changed
-forgets what it offered and its tip, and is unhealthy until the fleet has a
-tip again. Its next turn sets one. The pool then fills again from what the
+forgets its tip, and is unhealthy until the fleet has a tip again. Its next
+turn sets one. The pool then fills again from what the
 peers announce, and from the node's own mempool over RPC where the store
 has `--node-rpc`. Xpub entries are built again on demand.
 

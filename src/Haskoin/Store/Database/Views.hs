@@ -7,9 +7,9 @@
 -- Portability : POSIX
 --
 -- The database as it was at each of its recent blocks: a RocksDB snapshot
--- for each, kept until it is no longer needed. Nothing in the store uses
--- this yet. It is the first part of the store's side of "A fleet that
--- answers as one" in @docs\/one-fleet.md@.
+-- for each, kept until it is no longer needed. The member of the fleet
+-- keeps them ("Haskoin.Store.Fleet.Member"), and a request is answered from
+-- the one at the fleet tip (@docs\/one-fleet.md@).
 --
 -- = Why
 --

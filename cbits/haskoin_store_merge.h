@@ -24,7 +24,7 @@
  * else about such input.
  *
  * Haskoin.Store.Database.Merge gives them to RocksDB, and
- * docs/layered-database.md has the reasons.
+ * docs/block-import.md has the reasons.
  */
 
 #ifndef HASKOIN_STORE_MERGE_H

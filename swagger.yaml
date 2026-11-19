@@ -11,7 +11,7 @@ servers:
   - url: './'
 
 info:
-  version: &version 1.16.0
+  version: &version 1.16.5
   title: Haskoin
   contact:
     name: JP Rupp
@@ -131,6 +131,7 @@ info:
     | 404 | `not-found-or-invalid-arg` | The thing does not exist, or a value in the path is not valid. |
     | 409 | `multiple-tx-index` | A short transaction number matches several transactions. |
     | 410 | `replaced` | A transaction asked for by its id was replaced by one that a block confirmed; `replaced-by` and `height` say which and where. |
+    | 413 | `request-too-large` | The body of `POST /transactions` is longer than a transaction can be. |
     | 429 | `server-busy` | A wallet asked for is not in the cache yet, and the server cannot have it there soon. Try again after the seconds of its `Retry-After` header. Any endpoint of wallets may answer it; `/events` only for an `xpub` to watch. |
     | 429 | `server-busy` | The server has more long requests (lists, whole blocks, wallets) than it can answer now. Try again after a second, or ask another server. |
     | 500 | `server-error` | Something went wrong on the server; it is logged there. |
@@ -148,8 +149,8 @@ info:
     A 409 comes only from the Blockchain.info endpoints, which can name a
     transaction by a short number; the error lists the matching ids in `txids`.
 
-    The codes `server-timeout` and `request-too-large` are part of the format, for
-    clients that decode it, but this version of the server does not send them.
+    The code `server-timeout` is part of the format, for clients that decode
+    it, but this version of the server does not send it.
 
     ## Unconfirmed transactions
 
@@ -355,8 +356,8 @@ paths:
         body: Redis holds the mempool and the cache of extended public keys
         that every server of the fleet answers from.
 
-        The checks are run in the background every 30 seconds (unless the operator
-        changed it), and this endpoint returns the latest result. It does no work of
+        The checks are run in the background every second (unless the operator
+        changed it) and at each new block, and this endpoint returns the latest result. It does no work of
         its own, so it is safe to call as often as a load balancer likes.
       operationId: healthCheck
       responses:
@@ -392,6 +393,13 @@ paths:
                   ok: true
                   count: 20
                   min: 1
+                redis:
+                  ok: true
+                database:
+                  ok: true
+                  writes: flowing
+                  pending-compaction-bytes: 0
+                  delayed-write-rate: 0
                 time: '2021-06-14 10:21:43 UTC'
         '503':
           description: unavailable
@@ -425,6 +433,13 @@ paths:
                   ok: false
                   count: 0
                   min: 1
+                redis:
+                  ok: true
+                database:
+                  ok: true
+                  writes: flowing
+                  pending-compaction-bytes: 0
+                  delayed-write-rate: 0
                 time: '2021-06-14 10:21:43 UTC'
 
   '/address/{address}/transactions':
@@ -2072,8 +2087,8 @@ paths:
                 $ref: '#/components/schemas/Error'
         '413':
           description: |
-            The body is longer than a transaction of the network can be in
-            hexadecimal: 8,000,000 characters on networks with SegWit and
+            `request-too-large`: the body is longer than a transaction of the
+            network can be in hexadecimal: 8,000,000 characters on networks with SegWit and
             2,000,000 on Bitcoin Cash, and some white space.
           content:
             application/json:
@@ -6481,6 +6496,8 @@ components:
         - last-tx
         - pending-txs
         - peers
+        - redis
+        - database
         - net
         - version
         - ok
@@ -6504,7 +6521,7 @@ components:
             - $ref: '#/components/schemas/TimeHealth'
         pending-txs:
           description: |
-            Transactions received but not imported yet.
+            Transactions requested from peers and not received yet.
           allOf:
             - $ref: '#/components/schemas/MaxHealth'
         peers:
@@ -6515,9 +6532,10 @@ components:
         redis:
           type: object
           description: |
-            Whether the Redis cache answers. Only for a server that has one. It does
-            not count towards `ok`: a server without its Redis still answers every
-            request, from its own database, and `/health` gives 203.
+            Whether the Redis of the fleet answers. It does not count towards `ok`,
+            but a server without its Redis answers `/health` with 503 and the header
+            `Haskoin-Degraded: redis`, as it has no mempool and no cache of
+            extended public keys to answer from.
           required:
             - ok
           properties:
@@ -6597,6 +6615,11 @@ components:
           type: string
           description: |
             Transaction id.
+        message:
+          type: string
+          description: |
+            For a transaction that was handed over (202), to whom: a full node
+            over RPC, or how many peers took it.
 
     BinfoTxIdHash:
       type: string

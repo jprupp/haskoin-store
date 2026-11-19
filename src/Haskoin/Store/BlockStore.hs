@@ -50,6 +50,7 @@
 -- The block store does not listen to the node by itself.
 -- "Haskoin.Store.Manager" forwards node events to it with the
 -- @blockStore*@ functions of this module.
+--
 -- = Why it works this way
 --
 -- * __Blocks come from one peer at a time.__ Blocks must be imported in order,
@@ -159,11 +160,9 @@ import Haskoin
     InvVector (..),
     Message (..),
     Network (..),
-    OutPoint (..),
     Ping (..),
     Tx (..),
     TxHash (..),
-    TxIn (..),
     Version (..),
     blockHashToHex,
     headerHash,
@@ -192,7 +191,7 @@ import Haskoin.Node
     reservePeer,
     sendMessage,
   )
-import Haskoin.Store.BlockStore.Pending (Pending, PendingTx (..))
+import Haskoin.Store.BlockStore.Pending (Pending)
 import Haskoin.Store.BlockStore.Pending qualified as Pending
 import Haskoin.Store.BlockStore.Sync
   ( Accept (..),
@@ -277,7 +276,7 @@ data BlockStore = BlockStore
     config :: !BlockStoreConfig,
     -- | state of the block download ("Haskoin.Store.BlockStore.Sync")
     sync :: !(TVar (Sync Peer)),
-    -- | transactions received and waiting to be imported
+    -- | transactions requested from peers
     -- ("Haskoin.Store.BlockStore.Pending")
     pending :: !(TVar Pending),
     -- | StatsD metrics, if enabled
@@ -314,8 +313,6 @@ data StoreMetrics = StoreMetrics
     blocks :: !StatGauge,
     -- | height of the best header (@store.headers@)
     headers :: !StatGauge,
-    -- | transactions waiting to be imported (@store.queued_txs@)
-    queuedTxs :: !StatGauge,
     -- | online peers (@store.peers@)
     peers :: !StatGauge,
     -- | milliseconds to import a block (@store.block@)
@@ -365,7 +362,6 @@ newStoreMetrics cfg =
     p <- getPeers cfg.peerMgr
     blocks <- g s "blocks" (fromIntegral b)
     headers <- g s "headers" (fromIntegral h.height)
-    queuedTxs <- g s "queued_txs" 0
     peers <- g s "peers" (length p)
     block <- t s "block"
     blockPrepare <- t s "block_prepare"
@@ -400,13 +396,6 @@ setHeadersHeight self =
   forM_ self.metrics $ \m -> do
     n <- chainGetBest self.config.chain
     setGauge m.headers (fromIntegral n.height)
-
--- | Update the gauge of transactions waiting to be imported.
-setPendingTxs :: BlockStore -> IO ()
-setPendingTxs self =
-  forM_ self.metrics $ \m -> do
-    p <- readTVarIO self.pending
-    setGauge m.queuedTxs (Pending.queued p)
 
 -- | Update the gauge of online peers.
 setPeersConnected :: BlockStore -> IO ()
@@ -461,8 +450,6 @@ data BlockStoreConfig = BlockStoreConfig
     seen :: !([TxHash] -> IO (HashSet TxHash)),
     -- | blocks to request from the syncing peer in one batch
     blockWindow :: !Int,
-    -- | delete transactions older than this number of days from mempool
-    mempoolTimeout :: !Int,
     -- | disconnect syncing peer if inactive for this long
     peerTimeout :: !NominalDiffTime,
     -- | the longest that the syncing peer may deliver nothing before another
@@ -540,10 +527,6 @@ getBlock self = Q.getBlock self.config.db
 -- | Data of a confirmed transaction in the database.
 getTxData :: BlockStore -> TxHash -> IO (Maybe TxData)
 getTxData self = Q.getTxData self.config.db
-
--- | Unspent output of the chain in the database.
-getUnspent :: BlockStore -> OutPoint -> IO (Maybe Unspent)
-getUnspent self = Q.getUnspent self.config.db
 
 -- | Network of the block store.
 getNetwork :: BlockStore -> IO Network
@@ -697,9 +680,7 @@ processBlock self peer block =
       transition self $ \st -> ((), Sync.imported now blockhash st)
       isInSync self >>= \case
         False -> syncMe self
-        True -> do
-          updateOrphans self
-          syncMempool self peer
+        True -> syncMempool self peer
     failure e = do
       logError self $
         "Error importing block "
@@ -736,7 +717,7 @@ processNoBlocks self p hs = do
         <> p.label
   killPeer p
 
--- | Queue a transaction received from a peer for import.
+-- | A transaction that a peer sent: no longer a request, and on to the fleet member to offer to the pool.
 processTx :: BlockStore -> Peer -> Tx -> IO ()
 processTx self p tx = do
   t <- getCurrentTime
@@ -748,36 +729,13 @@ processTx self p tx = do
   changePending self (Pending.answered (txHash tx))
   self.config.onTx (fromIntegral (floor (utcTimeToPOSIXSeconds t) :: Integer)) tx
 
--- | Change the mempool transactions on their way into the database.
+-- | Change the transactions on their way to the pool of the fleet.
 changePending :: BlockStore -> (Pending -> Pending) -> IO ()
-changePending self f = do
-  atomically $ modifyTVar' self.pending f
-  setPendingTxs self
+changePending self f = atomically $ modifyTVar' self.pending f
 
--- | Whether a transaction is queued or was requested recently.
+-- | Whether a transaction was requested recently.
 isPending :: BlockStore -> TxHash -> IO Bool
 isPending self th = Pending.isPending th <$> readTVarIO self.pending
-
--- | Drop queued transactions that are already in the database, and recompute the
--- missing parents of the others.
-updateOrphans :: BlockStore -> IO ()
-updateOrphans self = do
-  orphans <- Pending.waiting <$> readTVarIO self.pending
-  updates <- forM orphans $ \p -> do
-    let h = txHash p.tx
-    exists h >>= \case
-      True -> return (h, Nothing)
-      False -> do
-        found <- catMaybes <$> mapM (getUnspent self . (.outpoint)) p.tx.inputs
-        let have = HashSet.fromList (map (.outpoint.hash) found)
-        return (h, Just (HashSet.difference p.deps have))
-  changePending self (Pending.refresh (HashMap.fromList updates))
-  where
-    exists th =
-      getTxData self th >>= \case
-        Nothing -> return False
-        Just TxData {deleted = True} -> return False
-        Just TxData {deleted = False} -> return True
 
 -- | Of the transactions that a peer announced, those to fetch: given
 -- whether one is queued or was requested lately, which of them the fleet
@@ -1214,7 +1172,6 @@ processBlockStoreMessage self (BlockPing r) = do
   changePending self (Pending.prune now)
   setStoreHeight self
   setHeadersHeight self
-  setPendingTxs self
   setPeersConnected self
   trySyncing self
   checkTime self

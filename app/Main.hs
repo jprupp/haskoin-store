@@ -404,7 +404,9 @@ config c = do
     option auto $
       metavar "COUNT"
         <> long "max-pending-txs"
-        <> helpEnv "MAX_PENDING_TXS" "Maximum pending txs to fail health check"
+        <> helpEnv
+          "MAX_PENDING_TXS"
+          "Most transactions requested from peers and not received yet, or the health check fails"
         <> showDefault
         <> value c.maxPendingTxs
   maxLaggingBlocks <-
@@ -779,9 +781,9 @@ config c = do
         <> helpEnv
           "BLOCK_CACHE_MB"
           ( unwords
-              [ "RocksDB block cache in MiB, shared by all column families,",
-                "holding index and filter blocks too (0 = RocksDB default of",
-                "32 MiB per column family)"
+              [ "RocksDB block cache of data blocks in MiB, shared by all column",
+                "families; index and filter blocks stay outside it with their open",
+                "tables (0 = RocksDB default of 32 MiB per column family)"
               ]
           )
         <> showDefault

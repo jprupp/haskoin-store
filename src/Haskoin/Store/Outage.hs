@@ -9,8 +9,8 @@
 -- Saying once that something the store depends on stopped working, and
 -- once that it works again.
 --
--- The store goes on without Redis: it answers from its database and tries
--- again. Several loops try every second or two, and each used to log every
+-- The store keeps running without Redis: it answers 503 until Redis is
+-- back, and tries again. Several loops try every second or two, and each used to log every
 -- failure, so an outage of an hour was thousands of lines that said the
 -- same, and nothing said when it was over. Here a failure is logged as a
 -- warning when it is the first after things worked, for debugging while

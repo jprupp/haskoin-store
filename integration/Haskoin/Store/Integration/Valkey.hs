@@ -6,7 +6,7 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- A Redis server for the integration tests and the stress test: Valkey, the
+-- A Redis server for the integration tests: Valkey, the
 -- Redis-compatible server that Ubuntu ships, from the test image.
 module Haskoin.Store.Integration.Valkey
   ( redisContainer,

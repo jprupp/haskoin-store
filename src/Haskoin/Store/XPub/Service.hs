@@ -69,8 +69,7 @@ data Session = Session
     settle :: IO ()
   }
 
--- | No reads: every read is a miss. Outside of a request, and for a store
--- without Redis, which answers about no xpub.
+-- | No reads: every read is a miss. For the queries outside of a request.
 unpinned :: Session
 unpinned =
   Session

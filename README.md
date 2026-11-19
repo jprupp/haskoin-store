@@ -105,15 +105,18 @@ With [Docker](https://www.docker.com/):
 git clone https://github.com/jprupp/haskoin-store.git
 cd haskoin-store
 docker build -t haskoin-store .
-docker run -d --name haskoin-store -p 3000:3000 \
-  -e NET=btc -e DISCOVER=true \
+docker network create haskoin
+docker run -d --name valkey --network haskoin valkey/valkey
+docker run -d --name haskoin-store --network haskoin -p 3000:3000 \
+  -e NET=btc -e DISCOVER=true -e REDIS_URL=redis://valkey:6379 \
   -v haskoin-store-data:/home/haskoin/.haskoin-store \
   haskoin-store
 curl -s 'http://localhost:3000/block/best' | jq
 ```
 
-The first sync downloads and indexes the whole chain, which takes a long
-time and a lot of disk. The API answers while it syncs; `/health` reports
+The store needs a Redis or Valkey server, here in a container of its own:
+without one it does not start. The first sync downloads and indexes the
+whole chain, which takes a long time and a lot of disk. The API answers while it syncs; `/health` reports
 whether the node is in sync.
 
 ## Building from source
@@ -160,6 +163,10 @@ haskoin-store --net btc --discover
 Give it either `--discover` or at least one `--peer`; with neither it turns
 discovery on by itself. Data goes in a directory named after the network inside
 `--dir`, so one data directory can hold several networks.
+
+It needs a Redis or Valkey server, at `redis://localhost:6379` unless
+`--redis-url` names another, and stops at start with a message if there is
+none ([Redis: the fleet](#redis-the-fleet)).
 
 For a big public deployment, also set `MALLOC_ARENA_MAX=2` (the Docker image
 does) to keep glibc from fragmenting RocksDB's memory.
@@ -300,7 +307,8 @@ block and the shared mempool.
   answers 429 with `Retry-After`, the same on every store: ask again then.
 - **The cache keeps the costly ones longest**, up to `--redis-max-xpubs`.
   The cache cannot be turned off; that option sets only its size, at least
-  1. There is no `nocache`: an answer from the cache is always exact.
+  1. `nocache` is accepted and ignored: an answer from the cache is always
+  exact.
 
 `docs/xpub-indexing.md` has the details.
 
@@ -386,7 +394,7 @@ fleet of one. Every key starts with `hs2:<network>:`.
   unhealthy, and stops counting after ten seconds without a report, so
   that it holds nobody up.
 - **When Redis loses its data**, the stores notice it by an epoch key that
-  is gone or changed. Each forgets what it offered, reports unhealthy until
+  is gone or changed. Each forgets the fleet tip, reports unhealthy until
   the fleet has a tip again, and asks its peers for their mempools again;
   with `--node-rpc` it also reads the node's mempool (`getrawmempool`),
   2,000 transactions every two seconds. Xpub entries are built again as
@@ -400,7 +408,7 @@ fleet of one. Every key starts with `hs2:<network>:`.
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--max-lagging-blocks` | `MAX_LAGGING_BLOCKS` | `3` | Most blocks the index may lag behind the headers |
-| `--max-pending-txs` | `MAX_PENDING_TXS` | `10000` | Most transactions waiting to be imported |
+| `--max-pending-txs` | `MAX_PENDING_TXS` | `10000` | Most transactions requested from peers and not received yet |
 | `--min-peers` | `MIN_PEERS` | `1` | Fewest connected peers |
 | `--block-timeout` | `BLOCK_TIMEOUT` | `14400` | Most seconds since the last block |
 | `--tx-timeout` | `TX_TIMEOUT` | `1800` | Most seconds since the last transaction |
@@ -794,7 +802,8 @@ RocksDB holds the chain alone. The mempool is the fleet's pool in Redis.
 - **Each request reads one snapshot** of the database, at the fleet tip, so
   everything in an answer is of the same moment.
 
-`docs/one-fleet.md` has the reasons, the measurements and the tests.
+`docs/one-fleet.md` has the reasons, and `docs/fleet-mempool.md` the pool
+in detail and its tests.
 The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
@@ -850,7 +859,7 @@ change, and nearly all do.
 What changed for clients in version 23: nothing in the answers. A balance
 or the spenders of a transaction that recent blocks changed take a few
 microseconds more to read until RocksDB has compacted them:
-`docs/one-fleet.md` has the figures.
+`docs/block-import.md` explains why.
 
 What changed for clients in version 22:
 
@@ -902,19 +911,21 @@ views of its database at recent blocks: it never empties the cache.
 
 An entry also holds a gap's worth of addresses after the window, derived
 ahead of time, so a payment to the next address of a wallet is in its
-entry as soon as the pool takes it. `docs/one-fleet.md` has the design and
-the tests.
+entry as soon as the pool takes it. `docs/xpub-indexing.md` has the design.
 
 ### Where the code is
 
 | Module | What it does |
 | --- | --- |
 | `Haskoin.Store.BlockStore` | Downloads and imports blocks, and hands transactions from peers to the fleet's pool |
+| `Haskoin.Store.BlockStore.Sync` | The state of the block download, as a pure state machine |
+| `Haskoin.Store.BlockStore.Pending` | Transactions that peers announce, on their way to the pool |
 | `Haskoin.Store.Logic` | The rules that import and revert blocks |
 | `Haskoin.Store.Database.Writer` | A batch of writes, with its read cache and its reads ahead |
 | `Haskoin.Store.Database.Table` | The hash tables of a batch, whose keys are hashed quickly |
 | `Haskoin.Store.Database.Merge` | The merge operators of balances and spenders, which are C functions (`cbits/`) |
 | `Haskoin.Store.Database.Query` | The queries of the chain's column families |
+| `Haskoin.Store.Database.Reader` | Opening the database, with its migration, column families and metrics |
 | `Haskoin.Store.Database.Query.Pooled` | The queries of the chain with the fleet's pool on top |
 | `Haskoin.Store.Database.Views` | Views of the database at recent blocks, one of them the fleet tip |
 | `Haskoin.Store.Database.Slices` | Stored blocks and transactions read in part, for what an answer needs |
@@ -925,13 +936,20 @@ the tests.
 | `Haskoin.Store.XPub.Lock` | The lock in Redis that keeps two stores from reading the same xpub |
 | `Haskoin.Store.XPub.Service` | The door to the fleet's cache of xpubs: a hit answers, a miss asks the indexer |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
+| `Haskoin.Store.Fleet`, `Haskoin.Store.Fleet.Pool` | The rules of the fleet tip and of the pool, as pure decisions |
+| `Haskoin.Store.Fleet.Redis` | Those rules carried out in Redis, one Lua script per step |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
+| `Haskoin.Store.Web.Router` | Routing of requests to handlers, directly over WAI |
+| `Haskoin.Store.Web.Docs` | The API reference that the server serves at its root |
 | `Haskoin.Store.Web.Pieces` | Answers that are sent while they are read |
 | `Haskoin.Store.Web.Listen` | A Unix socket to listen on, made by the store or passed by systemd |
 | `Haskoin.Store.Web.Admission` | The limit on long requests answered at once, and the line in front of it (CoDel) |
 | `Haskoin.Store.Web.Congestion` | The delay of GHC's scheduler, and the controller that moves the limit with it |
 | `Haskoin.Store.Runtime` | GHC's garbage collector, as StatsD metrics |
 | `Haskoin.Store.Exception` | Handlers that let a thread be stopped, and cleanups that cannot be cut short |
+| `Haskoin.Store.Manager` | Wires a store together: Redis, RocksDB, the node, the block store and the fleet |
+| `Haskoin.Store.Startup` | Errors that stop the store from starting, said so an operator can act |
+| `Haskoin.Store.Outage` | Logs once that Redis or another dependency stopped working, and once that it is back |
 | `Haskoin.Store.Web.Publish` | Checking a transaction and handing it to the peers, or to a full node over RPC |
 
 The tests hold the cache to the queries of `Query.Pooled` at the fleet tip
@@ -1063,7 +1081,6 @@ The metrics of the block store:
 | `store.blocks` | gauge | Height of the best block |
 | `store.headers` | gauge | Height of the best header |
 | `store.peers` | gauge | Peers online |
-| `store.queued_txs` | gauge | Transactions waiting to be imported |
 | `store.block` | timing | Milliseconds to import a block, with publishing its events |
 | `store.block_prepare` | timing | Of those, working out what the import needs of the block |
 | `store.block_prefetch` | timing | Reading ahead what the rules will read |
@@ -1294,12 +1311,13 @@ scripts/format                 # ormolu, the code style used here
 scripts/bench-web.sh           # load-test the API with wrk
 stack bench haskoin-store:bench:haskoin-store-bench \
   --ba 'import +RTS -N4 -A64m' # time the import of full blocks
-scripts/stress-cache.sh        # stress the Redis cache, with a report
+scripts/heap-profile-summary.py FILE.hp  # what grew in a heap profile
 scripts/check-local-deps.sh    # what CI checks: no local paths in stack.yaml
 scripts/install-system-libraries.sh  # the C libraries, on Ubuntu or Debian
 ```
 
-`stack.yaml` must pin released versions of every dependency. Pointing
+`stack.yaml` must pin released versions, or git commits, of every
+dependency. Pointing
 `extra-deps` at a sibling checkout such as `../haskoin-core` is fine for
 local testing, but CI rejects it.
 
@@ -1315,7 +1333,7 @@ and that the cache answers exactly like the database on every xpub endpoint.
 - The first run builds the image `localhost/haskoin-store-test`, which needs
   network access: Ubuntu 26.04 pinned by digest, Valkey from a fixed snapshot of
   the Ubuntu archive, and the release tarballs of both nodes, checked against
-  SHA-256 hashes pinned in `test/Haskoin/Store/Integration/Image.hs`. No
+  SHA-256 hashes pinned in `integration/Haskoin/Store/Integration/Image.hs`. No
   third-party image is used.
 - Containers are removed when the tests end, data lives in tmpfs mounts and
   under `/dev/shm`, and every container has a memory limit.
@@ -1328,53 +1346,12 @@ runaway test fails instead of exhausting the machine.
 than `haskoin-store.cabal`, which
 [hpack](https://github.com/sol/hpack) generates.
 
-### Stress test of the cache
+### Looking for a leak
 
-`scripts/stress-cache.sh [OUT_DIR] [-- OPTIONS]` measures the cache while it
-works hard.
-
-What it runs:
-
-1. A regtest chain of Bitcoin Core, Valkey and wrk, in Podman containers
-   from the test image, and the `haskoin-store` binary with the cache on.
-2. A few wallets, whose keys the stress program (`stress/Main.hs`) holds,
-   make hundreds of thousands of transactions between them. The program
-   signs them and sends them to the node in batches, with a block after
-   each batch.
-3. Every transaction changes two cached xpubs, so the cache reloads them
-   over and over. Meanwhile wrk asks the server about the xpubs on five
-   endpoints: summary, balances, transactions, unspent outputs and
-   multiaddr.
-4. At the end it compares the cached answers with those of the database.
-
-`scripts/stress-report.py` then writes `OUT_DIR/report.md`, with:
-
-- how fast the transactions went in, and how far the server fell behind;
-- how many reloads the cache did, how many read the whole xpub, and how
-  long they took as the xpubs grew;
-- the CPU and memory of the server, and the memory of Valkey;
-- the commands that blocked Redis for 10 ms or more, from its slow log;
-- the latencies of each endpoint over time.
-
-- The defaults are 200,000 transactions between 4 wallets of 200 receiving
-  and 200 change addresses, 2,000 per block; pass `-- --help` for the
-  options, and `-- --txs 20000` for a run of a few minutes. A default run
-  takes about half an hour and up to about 7 GiB of memory.
-- The raw measurements stay in `OUT_DIR` as JSON lines (`rounds.jsonl`,
-  `samples.jsonl`, `wrk.jsonl`), with `summary.json` and the log of the
-  server.
-- No container is left behind, even if the script is interrupted or
-  killed: the program removes its containers when it ends, and the script
-  removes any that carry its label and stops the server.
-- To look for a leak, run the server with a heap profile by type, which needs
-  no profiling build, and summarise it: the live heap over time and the types
-  of closure that grew most.
-
-  ```sh
-  scripts/stress-cache.sh /tmp/run -- --txs 60000 \
-    --server-rts '-N4 -M2g -T -hT -i10 -po/tmp/heap'
-  scripts/heap-profile-summary.py /tmp/heap.hp
-  ```
+Run the server with a heap profile by type, which needs no profiling build,
+for example `haskoin-store ... +RTS -hT -i10 -po/tmp/heap`, and summarise it
+with `scripts/heap-profile-summary.py /tmp/heap.hp`: the live heap over time,
+and the types of closure that grew most.
 
 ### Measurements for importing blocks
 
@@ -1410,8 +1387,9 @@ Pull requests are welcome.
 - Format the code with `scripts/format` (Ormolu), and keep every line of
   code shorter than 120 columns.
 - Put scripts in files of their own rather than embedding them: Lua for
-  Redis under `src/Haskoin/Store/Fleet/lua/`, shell under `scripts/`, called
-  from CI rather than written into the workflow.
+  Redis under `src/Haskoin/Store/Fleet/lua/` or `src/Haskoin/Store/XPub/lua/`,
+  shell under `scripts/`, called from CI rather than written into the
+  workflow.
 - Catch any error with `catchAny`, `handleAny` or `tryAny` of
   `Haskoin.Store.Exception`, and clean up with its `bracket`, `finally` and
   `onException`, not with those of `Control.Exception`. A request that

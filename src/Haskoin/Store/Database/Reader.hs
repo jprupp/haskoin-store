@@ -52,7 +52,6 @@ module Haskoin.Store.Database.Reader
     DataMetrics (..),
     Derived (..),
     derivedAddrs,
-    derivedAddrsCached,
     createDataMetrics,
     withLayeredReader,
     withReader,
@@ -82,7 +81,7 @@ import Data.Default (def)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
@@ -131,14 +130,7 @@ derivedCacheSize = 512
 
 -- | Addresses of an xpub, from the cache or a new lazy derivation.
 derivedAddrs :: DatabaseReader -> XPubSpec -> IO Derived
-derivedAddrs r xpub = fst <$> derivedAddrsCached r xpub
-
--- | Addresses of an xpub, from the cache or a new lazy derivation, and
--- whether the cache had them. A request pays for deriving the addresses of
--- an xpub only when it did not ("Haskoin.Store.Web.Tokens"): those that
--- the cache has were derived for an earlier request, as far as it needed.
-derivedAddrsCached :: DatabaseReader -> XPubSpec -> IO (Derived, Bool)
-derivedAddrsCached r xpub = do
+derivedAddrs r xpub = do
   let ref = r.derived
       fresh =
         let addrs m =
@@ -149,14 +141,14 @@ derivedAddrsCached r xpub = do
          in Derived (addrs 0) (addrs 1)
   atomicModifyIORef' ref $ \c ->
     case HashMap.lookup xpub c.newer of
-      Just d -> (c, (d, True))
+      Just d -> (c, d)
       Nothing ->
-        let (d, hit) = maybe (fresh, False) (,True) (HashMap.lookup xpub c.older)
+        let d = fromMaybe fresh (HashMap.lookup xpub c.older)
             c'
               | HashMap.size c.newer >= derivedCacheSize =
                   DerivedCache {newer = HashMap.singleton xpub d, older = c.newer}
               | otherwise = c {newer = HashMap.insert xpub d c.newer}
-         in (c', (d, hit))
+         in (c', d)
 
 -- | StatsD metrics of database reads. Counters count the items read.
 data DataMetrics = DataMetrics

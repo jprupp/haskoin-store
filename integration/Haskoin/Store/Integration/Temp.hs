@@ -6,7 +6,7 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- Temporary directories for the tests, the benchmark and the stress test:
+-- Temporary directories for the tests and the benchmark:
 -- made for an action, and removed with all that is in them when it ends.
 --
 -- These are the functions of the same name of "System.IO.Temp", with one

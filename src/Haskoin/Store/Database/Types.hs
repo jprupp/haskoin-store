@@ -400,8 +400,9 @@ instance KeyValue MigrationKey Word32
 
 -- | Key of what is kept of a mempool transaction that a block replaced
 -- ('Replaced'), in the @block@ column family, since haskoin-store 1.13.0.
--- It is part of the chain: written and deleted only by the import and the
--- revert of blocks.
+-- It is part of the chain: written by the import of blocks until version
+-- 1.16.0, when the shared pool took this over, and deleted by the import
+-- and the revert of blocks.
 data ReplacedKey = ReplacedKey !TxHash
   deriving (Show, Read, Eq, Ord, Generic, Hashable)
 

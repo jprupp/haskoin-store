@@ -85,10 +85,10 @@ store that is really behind uses its cores to the full.
 The limit stays between a floor (two a core) and a ceiling (sixteen a
 core). A floor equal to the ceiling is a fixed cap.
 
-The first controller added one slot a step and cut whenever the delay was
-over the target. On two cores of a production store it answered a fifth to
-a third fewer requests than no limit to sixteen clients that asked one
-after the other: each cut left the cores idle, and one slot a step took
+Adding one slot a step, and cutting whenever the delay is over the target,
+does worse. On two cores of a production store that controller answered a
+fifth to a third fewer requests than no limit to sixteen clients that asked
+one after the other: each cut left the cores idle, and one slot a step took
 seconds to fill them again.
 
 The target cannot be much lower than GHC's time slice of 20 ms: a thread
@@ -203,10 +203,10 @@ database dropped from the page cache every 50 ms, and 3,500 reads a second:
 | Overload: simple p50 / p99 | 30–32 / 144–152 ms | 85–88 / 318–487 ms |
 | Overload: heavy answered | 24–26/s, plus 6–7 refusals a second | 26–27/s |
 
-The heavy load waited `Retry-After` on each 429. Before the delay needed
-busy cores to cut and CoDel waited for the limit to rise, the disk-bound
-closed loop answered 33–42/s, with the cores at 63%: the limit was under
-the number of clients a third of the time, and the line refused about two
+The heavy load waited `Retry-After` on each 429. With the delay alone
+cutting, and CoDel not waiting for the limit to rise, the disk-bound closed
+loop answered 33–42/s, with the cores at 63%: the limit was under the
+number of clients a third of the time, and the line refused about two
 requests a second, each of which kept its client away for a second.
 
 ## Further reading
