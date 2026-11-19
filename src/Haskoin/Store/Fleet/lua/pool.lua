@@ -218,8 +218,11 @@ local function pooled(z, m)
   return s and tonumber(s) < 0
 end
 
+-- add to a field of the summary of an address; the + 0 turns -0, which taking
+-- out an output of value 0 gives, into 0: Redis reads '-0' as no integer, and
+-- the error would stop the whole script half way
 local function add(a, field, by)
-  redis.call('HINCRBY', key.asum .. a, field, string.format('%.0f', by))
+  redis.call('HINCRBY', key.asum .. a, field, string.format('%.0f', by + 0))
 end
 
 -- put the entries of a transaction in, with sign 1, or take them out, with

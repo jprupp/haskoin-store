@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ### Fixed
+- **The pool no longer stops at a transaction that pays an output of value
+  0.** Taking such an output out of an address's summary added `-0`, which
+  Redis does not read as an integer. The script failed at every turn of the
+  fleet, and the pool took in nothing more until the next restart of the
+  pool. Pay-to-anchor outputs, which Bitcoin Core relays since version 29,
+  have value 0. Since Redis keeps what a failed script wrote before its
+  error, the summaries of the addresses that the stuck turn touched could
+  drift; emptying the pool clears them.
 - **A store no longer keeps every transaction it ever offered in memory.**
   The fleet member kept a set of what it had offered to the pool, emptied
   only when the pool was started again or Redis lost its data: about half

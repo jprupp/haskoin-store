@@ -108,6 +108,14 @@ spec = do
         fleetTrimSeen conn keys 40 `shouldReturn` 33
         fleetTrimSeen conn keys 20 `shouldReturn` 20
         drop 10 <$> fleetSeen conn keys (map block [100 .. 129]) `shouldReturn` replicate 20 True
+      it "takes out a transaction that pays an output of value 0, as an anchor does" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
+        fleetMove conn keys Nothing Nothing `shouldReturn` MovedTo (block 1)
+        let anchor = (txOf 7 [out 0 0]) {entries = [PoolTouches "anchor", PoolPays "anchor" (out 7 0) 0 "script"]}
+        poolOffer conn keys 4 (Just (block 1)) anchor [True] [] `shouldReturn` Taken
+        poolWithdraw conn keys 4 [block 7] `shouldReturn` [block 7]
+        poolBody conn keys (block 7) `shouldReturn` Nothing
       it "tells what happens to the pool and to the tip, in the order in which it happens" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
