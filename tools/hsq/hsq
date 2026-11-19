@@ -1,42 +1,10 @@
 #!/usr/bin/python3
 """hsq: query a haskoin-store server, with readable, coloured output.
 
-Part of haskoin-store (tools/hsq); docs/hsq.md explains it. Python 3.11 or later, standard library only.
-
-  hsq [-n NET]                  status summary (sync, peers, mempool, database, cache)
-  hsq [-n NET] -w [SECONDS]     keep refreshing the summary (default every 5 s; Ctrl-C stops)
-  hsq [-n NET] PATH             GET any API path and pretty-print the JSON, e.g.
-                                  hsq /block/best
-                                  hsq -n btc /transaction/<txid>
-                                  hsq -n bchtest4 '/address/<addr>/balance'
-  hsq [-n NET] --raw PATH       the same, without colours or formatting
-  hsq --servers                 list the networks and the server each one uses
-  hsq --init                    write a commented configuration file (if there is none)
-
-  -n NET        network: btc, bch, btctest, btctest4, bchtest, bchtest4, btcreg, bchreg
-  -s SOCKET     use this Unix socket for this run
-  -u URL        use this URL for this run (http:// or https://, with an optional path prefix)
-
-Configuration: /etc/hsq/config.toml (for everyone), then ~/.config/hsq/config.toml (yours; its
-settings override the global ones, network by network and key by key; $HSQ_CONFIG replaces your
-file). If you have no file, hsq creates a commented one on first use (`hsq --init` does so too).
-One network is the default; each network can have a url, a socket, or both (the socket is used when
-both are set, unless -u is given), and the systemd unit of a local store (`unit`, by default
-haskoin-store-<net>), whose log gives the speed of a sync. Networks not in the file use
-https://api.haskoin.com/<net>.
-
-  network = "bch"
-
-  [bch]
-  socket = "/run/user/1000/haskoin-store/bch.sock"
-  url    = "https://api.haskoin.com/bch"
-
-  [btc]
-  url = "https://api.haskoin.com/btc"
-
-Environment: HSQ_NET, HSQ_URL, HSQ_SOCKET override the file; NO_COLOR (or a pipe) turns colours off.
+Part of haskoin-store (tools/hsq); docs/hsq.md explains it. Python 3.11 or later, standard
+library only. `hsq --help` prints the usage, laid out for the width of the terminal (HELP below).
 """
-import http.client, json, os, socket, ssl, subprocess, sys, time, tomllib
+import http.client, json, os, shutil, socket, ssl, subprocess, sys, textwrap, time, tomllib
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -336,6 +304,81 @@ def summary(net, srv, unit):
         print()
         print("  " + red("Not OK: ") + ", ".join(bad))
 
+# ---------- help ----------
+
+# The usage text, as blocks: ("p", prose), reflowed to the terminal; ("dl", [(term, text,
+# [examples])]), a definition list, aligned when the terminal is wide enough and stacked when not;
+# ("pre", text), printed as it is (sample configuration).
+HELP = [
+    ("p", "hsq: query a haskoin-store server, with readable, coloured output."),
+    ("p", "Part of haskoin-store (tools/hsq); docs/hsq.md explains it."),
+    ("dl", [
+        ("hsq [-n NET]", "status summary (sync, peers, mempool, database, cache)", []),
+        ("hsq [-n NET] -w [SECONDS]", "keep refreshing the summary (default every 5\u00a0s; Ctrl-C stops)", []),
+        ("hsq [-n NET] PATH", "GET any API path and pretty-print the JSON, e.g.",
+         ["hsq /block/best", "hsq -n btc /transaction/<txid>", "hsq -n bchtest4 '/address/<addr>/balance'"]),
+        ("hsq [-n NET] --raw PATH", "the same, without colours or formatting", []),
+        ("hsq --servers", "list the networks and the server each one uses", []),
+        ("hsq --init", "write a commented configuration file (if there is none)", []),
+    ]),
+    ("dl", [
+        ("-n NET", "network: " + ", ".join(NETWORKS), []),
+        ("-s SOCKET", "use this Unix socket for this run", []),
+        ("-u URL", "use this URL for this run (http:// or https://, with an optional path prefix)", []),
+    ]),
+    ("p", f"Configuration: {GLOBAL_CONFIG} (for everyone), then ~/.config/hsq/config.toml (yours; "
+          "its settings override the global ones, network by network and key by key; $HSQ_CONFIG "
+          "replaces your file). If you have no file, hsq creates a commented one on first use "
+          "(`hsq --init` does so too)."),
+    ("p", "One network is the default; each network can have a url, a socket, or both (the socket is "
+          "used when both are set, unless -u is given), and the systemd unit of a local store (`unit`, "
+          "by default haskoin-store-<net>), whose log gives the speed of a sync. Networks not in the "
+          "file use " + PUBLIC.format(net="<net>") + "."),
+    ("pre", 'network = "bch"\n'
+            '\n'
+            '[bch]\n'
+            'socket = "/run/user/1000/haskoin-store/bch.sock"\n'
+            'url    = "https://api.haskoin.com/bch"\n'
+            '\n'
+            '[btc]\n'
+            'url = "https://api.haskoin.com/btc"'),
+    ("p", "Environment: HSQ_NET, HSQ_URL, HSQ_SOCKET override the file; NO_COLOR (or a pipe) turns "
+          "colours off."),
+]
+
+def help_text(width=None):
+    """HELP laid out for `width` columns (default: the terminal, or $COLUMNS, or 80; at most 100)."""
+    if width is None:
+        width = min(shutil.get_terminal_size((80, 24)).columns, 100)
+    width = max(width, 20)
+    wrap = lambda text, first, rest: textwrap.wrap(
+        text, width, initial_indent=first, subsequent_indent=rest,
+        break_long_words=False, break_on_hyphens=False) or [first.rstrip()]
+    # Examples move left when they don't fit, never below column 0.
+    lit = lambda line, indent: " " * max(0, min(indent, width - len(line))) + line
+    out = []
+    for kind, body in HELP:
+        if out:
+            out.append("")
+        if kind == "p":
+            out += wrap(body, "", "")
+        elif kind == "pre":
+            lines = body.split("\n")             # the block moves left as one
+            pad = " " * max(0, min(2, width - max(map(len, lines))))
+            out += [pad + l if l else "" for l in lines]
+        else:
+            col = 2 + max(len(t) for t, _, _ in body) + 2
+            aligned = width - col >= 30           # room for the text beside the terms?
+            for term, text, examples in body:
+                if aligned:
+                    out += wrap(text, "  " + term.ljust(col - 2), " " * col)
+                    out += [lit(e, col + 2) for e in examples]
+                else:
+                    out.append("  " + term)
+                    out += wrap(text, " " * 6, " " * 6)
+                    out += [lit(e, 8) for e in examples]
+    return "\n".join(out).replace("\u00a0", " ")   # no-break spaces only hold words together
+
 # ---------- command line ----------
 
 def main():
@@ -347,7 +390,7 @@ def main():
     while args:
         a = args.pop(0)
         if a in ("-h", "--help"):
-            print(__doc__.strip()); return
+            print(help_text()); return
         elif a in ("-n", "--net"):
             if not args: die("-n needs a network")
             net = args.pop(0)

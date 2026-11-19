@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+- **`hsq --help` fits the terminal.** The usage text is laid out for the
+  terminal's width (at most 100 columns): prose reflows, the command and
+  option lists stay aligned when there is room and stack when there is
+  not, and examples and the sample configuration are kept as written.
+
 ## [1.16.5] - 2026-11-19
 
 ### Added
