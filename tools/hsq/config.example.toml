@@ -1,0 +1,26 @@
+# hsq configuration for a server that runs haskoin-store for several networks
+# under systemd, each with a socket unit (see "Unix sockets" in the README).
+# Install it as /etc/hsq/config.toml for everyone; each user can override any
+# of it in ~/.config/hsq/config.toml. The sockets need membership of the group
+# that owns them; others can use `hsq -u URL`, or the url.
+
+# the network when -n is not given
+network = "btc"
+
+[btc]
+socket = "/run/haskoin-store/btc.sock"
+url    = "https://api.haskoin.com/btc"
+# the systemd unit whose log gives the speed of a sync (this is the default)
+# unit = "haskoin-store-btc"
+
+[bch]
+socket = "/run/haskoin-store/bch.sock"
+url    = "https://api.haskoin.com/bch"
+
+[btctest4]
+socket = "/run/haskoin-store/btctest4.sock"
+url    = "https://api.haskoin.com/btctest4"
+
+[bchtest4]
+socket = "/run/haskoin-store/bchtest4.sock"
+url    = "https://api.haskoin.com/bchtest4"

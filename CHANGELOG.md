@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [1.16.5] - 2026-11-19
+
+### Added
+- **`hsq`, a command-line client for people** (`tools/hsq/hsq`, Python,
+  standard library only): a coloured summary of `/health`, refreshed with
+  `-w`, and any API path as laid-out JSON, over a Unix socket, HTTP or
+  HTTPS, with a configuration per network. `docs/hsq.md` explains it. It is
+  not part of the Haskell package.
+
+### Changed
+- **Clear messages when the store cannot start.** A new module,
+  `Haskoin.Store.Startup`, turns each usual failure into one line that
+  says what is wrong and what to do, printed without a backtrace, with
+  exit status 1: no Redis or Valkey listening, an unknown Redis host, a
+  Redis that wants a password or another one (it used to start and answer
+  503 to everything), a URL that is not Redis's, a data directory that
+  cannot be made, a database held by another store, a port in use or below
+  1024, a host that is not this machine's, a Unix socket in use, missing
+  HTTPS files, and an unknown `--net`. Redis is now connected first, before
+  the database opens, and with a timeout of five seconds.
+- **The warning when Redis stops answering gives the reason**, and says
+  that the store answers 503 until Redis is back (it said, wrongly, that
+  the store answered from the database).
+- **"Not synchronized with the network"**: the message of the 503 that a
+  store answers without the block to answer from, with haskoin-store-data
+  3.0.1, which it now requires. The code stays `behind-fleet`.
+
 ## [1.16.4] - 2026-11-18
 
 ### Fixed

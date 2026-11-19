@@ -5,7 +5,8 @@
 module Main (main) where
 
 import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.Async (ExceptionInLinkedThread (..), withAsync)
+import Control.Exception (SomeException, fromException, handle, throwIO)
 import Control.Monad (when)
 import Data.Char (toLower)
 import Data.Default (Default (..))
@@ -40,6 +41,7 @@ import Haskoin.Store
 import Haskoin.Store.Common (loopForever)
 import Haskoin.Store.Database.Stalls (defaultBackgroundJobs)
 import Haskoin.Store.Runtime (runtimeMetrics)
+import Haskoin.Store.Startup (StartupError (..), checkReadable, makeDataDirectory)
 import Haskoin.Store.Web.Listen (parseMode, systemdSocket, withUnixSocket)
 import Haskoin.Store.XPub.Indexer (Settings (..))
 import NQE (receive, withSubscription)
@@ -69,10 +71,11 @@ import Options.Applicative
     switch,
     value,
   )
-import System.Directory (createDirectoryIfMissing, getAppUserDataDirectory)
+import System.Directory (getAppUserDataDirectory)
 import System.Environment (lookupEnv)
-import System.Exit (exitSuccess)
+import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 import System.Metrics.StatsD
   ( StatConfig
       ( namespace,
@@ -790,23 +793,46 @@ networkReader :: String -> Either String Network
 networkReader s =
   case netByName s of
     Just net -> Right net
-    Nothing -> Left "Network name invalid"
+    Nothing -> Left ("--net " <> s <> ": unknown network; use one of " <> intercalate ", " (map (.name) allNets))
 
 -- | Parse the command line and run the store. If no peers are given and discovery
 -- is off, discovery is turned on.
+--
+-- A mistake of configuration, or something that the store needs and does
+-- not find (Redis, a free port, a database that no other store holds), is
+-- printed as one message that says what to do, and the program exits with
+-- status 1 ("Haskoin.Store.Startup").
 main :: IO ()
-main = do
+main = handle startupError $ do
   c <- execParser . opts =<< defConfig
   when c.version $ do
     putStrLn haskoinStoreVersion
     exitSuccess
   -- the cache of xpubs cannot be turned off: its size is all that is set
   when (c.redisMaxXPubs < 1) $
-    error "--redis-max-xpubs must be at least 1"
+    misconfigured "--redis-max-xpubs (or REDIS_MAX_XPUBS) must be at least 1"
+  case (c.tlsCert, c.tlsKey) of
+    ("", "") -> return ()
+    ("", _) -> misconfigured "--tls-key needs --tls-cert: give both, or neither for plain HTTP"
+    (_, "") -> misconfigured "--tls-cert needs --tls-key: give both, or neither for plain HTTP"
+    (certificate, key) -> checkReadable "--tls-cert" certificate >> checkReadable "--tls-key" key
   if null c.peers && not c.discover
     then run $ let Config {..} = c in Config {discover = True, ..}
     else run c
   where
+    misconfigured = throwIO . StartupError
+    -- also from a thread linked to this one, which wraps what it throws
+    startupError e = case startupOf e of
+      Just (StartupError msg) -> do
+        hPutStrLn stderr ("haskoin-store: " <> T.unpack msg)
+        exitWith (ExitFailure 1)
+      Nothing -> throwIO e
+    startupOf :: SomeException -> Maybe StartupError
+    startupOf e = case fromException e of
+      Just s -> Just s
+      Nothing -> case fromException e of
+        Just (ExceptionInLinkedThread _ inner) -> startupOf inner
+        Nothing -> Nothing
     opts c =
       info (helper <*> config c) $
         fullDesc
@@ -819,12 +845,12 @@ main = do
 run :: Config -> IO ()
 run cfg =
   withLogger level $ \logger -> do
-    net <- either error return $ networkReader cfg.net
+    net <- either (throwIO . StartupError . T.pack) return $ networkReader cfg.net
     with_stats logger net $ \stats -> do
       let dir = cfg.dir </> net.name
       logInfo (withSource "haskoin-store" logger) $
         "Creating working directory (if not found): " <> cs dir
-      createDirectoryIfMissing True dir
+      makeDataDirectory dir
       run_store logger net stats dir $ \store ->
         if cfg.noWeb
           then withSubscription store.pub $ \sub ->
@@ -908,10 +934,10 @@ run cfg =
               healthCheckInterval = cfg.healthCheckInterval,
               accessLog = cfg.accessLog,
               nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
+              -- both or neither, which 'main' checked
               tls = case (cfg.tlsCert, cfg.tlsKey) of
-                ("", "") -> Nothing
-                ("", _) -> error "--tls-key needs --tls-cert"
-                (_, "") -> error "--tls-cert needs --tls-key"
+                ("", _) -> Nothing
+                (_, "") -> Nothing
                 (certificate, key) -> Just (certificate, key),
               logger = withSource "Web" logger
             }

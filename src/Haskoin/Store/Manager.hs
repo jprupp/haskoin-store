@@ -104,6 +104,7 @@ import Haskoin.Store.Fleet.Member
     noteBest,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
+import Haskoin.Store.Startup (connectRedis, explainDatabase)
 import Haskoin.Store.XPub.Service (XPubConfig (..))
 import NQE
   ( Inbox,
@@ -230,21 +231,25 @@ data StoreConfig = StoreConfig
 -- when the action returns, and an exception in any component is re-thrown in
 -- the calling thread.
 --
--- The database is opened first, with a thread that watches it for write
--- stalls (@withStalls@), then the node, the block store and the cache (if
--- 'redis' is set).
+-- Redis is connected first (if 'redis' is set), and a store that cannot
+-- reach it stops there with a 'StartupError' that says why. Then the
+-- database is opened, with a thread that watches it for write stalls
+-- (@withStalls@), then the node, the block store and the cache.
 withStore ::
   StoreConfig ->
   (Store -> IO a) ->
   IO a
-withStore cfg action =
-  connectDB cfg $ \db ->
+withStore cfg action = do
+  -- Redis first: a store cannot run without it, and finding out after the
+  -- database opened and the node started only takes longer
+  redis <- mapM connectRedis cfg.redis
+  explainDatabase cfg.db (connectDB cfg) $ \db ->
     withStalls cfg db $ \writes ->
       withPublisher $ \pub ->
         withPublisher $ \node_pub ->
           withSubscription node_pub $ \node_sub ->
             withNode (nodeCfg cfg db node_pub) $ \node -> do
-              member <- storeMember cfg db
+              member <- storeMember cfg redis db
               withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
                 withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                   link fwd
@@ -278,17 +283,13 @@ cachePrefix :: Network -> ByteString
 cachePrefix net = "hs2:" <> C.pack net.name <> ":"
 
 -- | The store as a member of a fleet, if the configuration says that it is
--- one and has a Redis to share: under a name of its own, with a lease of
+-- one and has a Redis to share (connected by 'connectRedis', which checked
+-- that it answers): under a name of its own, with a lease of
 -- ten seconds, views of its last six blocks, and the store's limit on the
 -- age of unconfirmed transactions.
-storeMember :: StoreConfig -> DatabaseReader -> IO (Maybe Member)
-storeMember cfg db = case cfg.redis of
-  Just url -> do
-    info <-
-      if null url
-        then return Redis.defaultConnectInfo
-        else either fail return (Redis.parseConnectInfo url)
-    conn <- Redis.checkedConnect info
+storeMember :: StoreConfig -> Maybe Redis.Connection -> DatabaseReader -> IO (Maybe Member)
+storeMember cfg redis db = case redis of
+  Just conn -> do
     name <- C.pack . show <$> (randomIO :: IO Word64)
     Just
       <$> newMember

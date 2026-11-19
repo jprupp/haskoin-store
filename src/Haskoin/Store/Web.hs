@@ -182,6 +182,7 @@ import Data.Maybe
     fromJust,
     fromMaybe,
     isJust,
+    isNothing,
     listToMaybe,
     mapMaybe,
     maybeToList,
@@ -256,6 +257,7 @@ import Haskoin.Store.Fleet.Member
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
+import Haskoin.Store.Startup (explainListen, redisProblem)
 import Haskoin.Store.Web.Admission
   ( Admission,
     Aside (..),
@@ -343,6 +345,7 @@ import Network.Wai.Handler.Warp
   ( defaultSettings,
     runSettings,
     runSettingsSocket,
+    setBeforeMainLoop,
     setHost,
     setPort,
   )
@@ -742,12 +745,22 @@ withMetrics st df go =
 -- servers; this is for a server by itself, and for links between machines
 -- that should not be in the clear. The files are read when the server
 -- starts, so a renewed certificate takes a restart.
+--
+-- A port that cannot be bound stops the program with a 'StartupError'
+-- that says why ('explainListen').
 runWeb :: WebConfig -> IO ()
-runWeb config = serveWeb config $ case config.tls of
-  Nothing -> runSettings settings
-  Just (certificate, key) -> runTLS (tlsSettings certificate key) settings
+runWeb config = serveWeb config $ \app ->
+  explainListen address $ \listening ->
+    let settings =
+          setBeforeMainLoop listening
+            . setPort config.port
+            . setHost (fromString config.host)
+            $ defaultSettings
+     in case config.tls of
+          Nothing -> runSettings settings app
+          Just (certificate, key) -> runTLS (tlsSettings certificate key) settings app
   where
-    settings = setPort config.port . setHost (fromString config.host) $ defaultSettings
+    address = T.pack config.host <> ":" <> T.pack (show config.port)
 
 -- | Like 'runWeb', on a socket that already listens; the host and port of the
 -- configuration are ignored. Binding port 0 and passing the socket gives a
@@ -935,6 +948,8 @@ serveWeb config serve = do
           config.tickerRefresh
     runHealthCheck = healthCheck config
     cacheCheck = maybe (return False) memberAlive config.store.fleet
+    -- what is wrong with Redis, if anything, for the log
+    redisCheck = maybe (return (Just "the store has no Redis")) (redisProblem . (.redis)) config.store.fleet
     -- The check is run every second by default, and at once when the
     -- store has a new best block, which is when its answer changes most:
     -- /health answers from the last result, and a load balancer or a
@@ -968,9 +983,9 @@ serveWeb config serve = do
           last' <- readIORef pinged
           when (now - last' >= 5) $ do
             writeIORef pinged now
-            redis <- cacheCheck
-            atomically (writeTVar up redis)
-            tellRedis saidRedis redis
+            problem <- redisCheck
+            atomically (writeTVar up (isNothing problem))
+            tellRedis saidRedis problem
     heard newBlock = \case
       StoreBestBlock _ -> writeTVar newBlock True
       _ -> return ()
@@ -988,14 +1003,17 @@ serveWeb config serve = do
         (Just False, True) -> logInfo health' "Healthy again"
         (Nothing, True) -> logInfo health' "Healthy"
         _ -> return ()
-    -- the same for the Redis that a store with a cache answers through;
-    -- /health says 503 without it
-    tellRedis said redis = do
+    -- the same for the Redis that the store answers through, with the
+    -- reason that it does not answer (such as a password that it wants);
+    -- without it the store answers 503 and /health says so
+    tellRedis said problem = do
       before <- readIORef said
-      writeIORef said redis
-      case (before, redis) of
-        (True, False) -> logWarn health' "Redis does not answer: answering from the database"
-        (False, True) -> logInfo health' "Redis answers again"
+      writeIORef said (isNothing problem)
+      case (before, problem) of
+        (True, Just why) ->
+          logWarn health' $
+            "Redis does not answer (" <> why <> "): answering 503 to requests until it does"
+        (False, Nothing) -> logInfo health' "Redis answers again"
         _ -> return ()
     -- what a browser asks before a request from another site that is not
     -- of the plainest kind: which methods and headers it may use. Without

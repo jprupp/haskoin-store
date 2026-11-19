@@ -68,12 +68,12 @@ packages:
   original:
     hackage: haskoin-node-2.6.1
 - completed:
-    hackage: haskoin-store-data-3.0.0@sha256:d61e8b3aeaea76d876201bca432487f41fc58e256f1f4ce2a206e57b388fb6d9,3914
+    hackage: haskoin-store-data-3.0.1@sha256:7b4bb105cc5e8c6a27389f07cf0e15d8091f0299b35e4116fa5483dc95166b0b,3914
     pantry-tree:
-      sha256: a85d1dea6668e0cca2dbcecb2dcdaaba013021d40e900f869a9f976e2fda6801
+      sha256: 589fe11976f63baf0896080c8c629903ebdecd099fd3d3348e68e176285572f5
       size: 837
   original:
-    hackage: haskoin-store-data-3.0.0
+    hackage: haskoin-store-data-3.0.1
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550
     pantry-tree:

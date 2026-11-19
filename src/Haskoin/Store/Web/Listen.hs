@@ -47,7 +47,9 @@ where
 
 import Control.Exception (bracket, bracketOnError, throwIO, try)
 import Control.Monad (unless, when)
+import Data.Text qualified as T
 import Foreign.C.String (peekCAString)
+import Haskoin.Store.Startup (StartupError (..), explainListen)
 import Network.Socket
   ( Family (AF_UNIX),
     SockAddr (SockAddrUnix),
@@ -114,11 +116,10 @@ withUnixSocket path mode act = do
   -- the kernel keeps the path in 108 bytes, ending in a zero; the length is
   -- that of the path's bytes in the encoding of the file system
   pathBytes <- withFilePath path (fmap length . peekCAString)
-  when (pathBytes > 107) . throwIO . userError $
-    "The path of the Unix socket is longer than 107 bytes, which the system allows: "
-      <> path
+  when (pathBytes > 107) . throwIO . StartupError . T.pack $
+    "--socket " <> path <> ": the path is longer than the 107 bytes that the system allows; use a shorter one"
   removeStale path
-  bracket open (\s -> close s >> removeFile path) act
+  bracket (explainListen (T.pack path) (\ok -> open <* ok)) (\s -> close s >> removeFile path) act
   where
     open = bracketOnError (socket AF_UNIX Stream defaultProtocol) close $ \s -> do
       bind s (SockAddrUnix path)
@@ -135,14 +136,17 @@ removeStale path =
       | otherwise -> throwIO e
     Right st -> do
       unless (isSocket st) $
-        throwIO . userError $
-          path <> " exists and is not a socket"
+        throwIO . StartupError . T.pack $
+          "--socket " <> path <> ": a file that is not a socket is there; remove it, or choose another path"
       live <- bracket (socket AF_UNIX Stream defaultProtocol) close $ \s ->
         either (const False) (const True)
           <$> (try (connect s (SockAddrUnix path)) :: IO (Either IOError ()))
       when live $
-        throwIO . userError $
-          path <> " is in use by another server"
+        throwIO . StartupError . T.pack $
+          "--socket "
+            <> path
+            <> ": another server is listening on it, perhaps another haskoin-store; "
+            <> "stop it, or choose another path"
       removeFile path
 
 -- | Read a file mode written in octal, such as @0660@ or @660@.

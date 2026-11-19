@@ -938,6 +938,10 @@ histories of payments, blocks, reorganisations and builds.
 
 ## Monitoring
 
+`tools/hsq/hsq` is a small client for people: `hsq` prints a summary of a
+store's health, and `hsq /block/best` any answer of the API, laid out and
+coloured, over a Unix socket, HTTP or HTTPS. See `docs/hsq.md`.
+
 ### Health
 
 A store is unhealthy when Redis does not answer within two seconds, when
@@ -976,10 +980,12 @@ warning when writes are delayed or stopped and a line when they recover.
   during a sync, and the store answers requests at full speed meanwhile.
   If the delay makes it fall behind, the check of the blocks says so.
 
-**In a fleet**, a server that does not have the block that the
-fleet answers from can answer any request with 503 and
-`{"error": "behind-fleet"}`. Have the load balancer try another server, and
-alert if one keeps saying it: its `/health` will say why.
+**A server that is not synchronized with the network**, because it does
+not have the block to answer from yet or cannot reach its Redis, answers
+any request with 503 and `{"error": "behind-fleet"}`, with the message
+"This server is not synchronized with the network". Have the load balancer
+try another server, and alert if one keeps saying it: its `/health` and
+its log will say why.
 
 ### Overload
 

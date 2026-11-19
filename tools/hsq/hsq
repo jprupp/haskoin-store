@@ -1,0 +1,417 @@
+#!/usr/bin/python3
+"""hsq: query a haskoin-store server, with readable, coloured output.
+
+Part of haskoin-store (tools/hsq); docs/hsq.md explains it. Python 3.11 or later, standard library only.
+
+  hsq [-n NET]                  status summary (sync, peers, mempool, database, cache)
+  hsq [-n NET] -w [SECONDS]     keep refreshing the summary (default every 5 s; Ctrl-C stops)
+  hsq [-n NET] PATH             GET any API path and pretty-print the JSON, e.g.
+                                  hsq /block/best
+                                  hsq -n btc /transaction/<txid>
+                                  hsq -n bchtest4 '/address/<addr>/balance'
+  hsq [-n NET] --raw PATH       the same, without colours or formatting
+  hsq --servers                 list the networks and the server each one uses
+  hsq --init                    write a commented configuration file (if there is none)
+
+  -n NET        network: btc, bch, btctest, btctest4, bchtest, bchtest4, btcreg, bchreg
+  -s SOCKET     use this Unix socket for this run
+  -u URL        use this URL for this run (http:// or https://, with an optional path prefix)
+
+Configuration: /etc/hsq/config.toml (for everyone), then ~/.config/hsq/config.toml (yours; its
+settings override the global ones, network by network and key by key; $HSQ_CONFIG replaces your
+file). If you have no file, hsq creates a commented one on first use (`hsq --init` does so too).
+One network is the default; each network can have a url, a socket, or both (the socket is used when
+both are set, unless -u is given), and the systemd unit of a local store (`unit`, by default
+haskoin-store-<net>), whose log gives the speed of a sync. Networks not in the file use
+https://api.haskoin.com/<net>.
+
+  network = "bch"
+
+  [bch]
+  socket = "/run/user/1000/haskoin-store/bch.sock"
+  url    = "https://api.haskoin.com/bch"
+
+  [btc]
+  url = "https://api.haskoin.com/btc"
+
+Environment: HSQ_NET, HSQ_URL, HSQ_SOCKET override the file; NO_COLOR (or a pipe) turns colours off.
+"""
+import http.client, json, os, socket, ssl, subprocess, sys, time, tomllib
+from datetime import datetime
+from urllib.parse import urlsplit
+
+NETWORKS = ["btc", "bch", "btctest", "btctest4", "bchtest", "bchtest4", "btcreg", "bchreg"]
+PUBLIC = "https://api.haskoin.com/{net}"
+GLOBAL_CONFIG = "/etc/hsq/config.toml"
+CONFIG = os.path.expanduser(os.environ.get("HSQ_CONFIG", "~/.config/hsq/config.toml"))
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if COLOR else str(s)
+bold   = lambda s: c("1", s)
+dim    = lambda s: c("2", s)
+red    = lambda s: c("31", s)
+green  = lambda s: c("32", s)
+yellow = lambda s: c("33", s)
+blue   = lambda s: c("34", s)
+cyan   = lambda s: c("36", s)
+mag    = lambda s: c("35", s)
+
+def die(msg, code=1):
+    print(red("✗ ") + msg, file=sys.stderr)
+    sys.exit(code)
+
+# ---------- configuration ----------
+
+SAMPLE = f'''# hsq configuration (see `hsq --help`).
+
+# Network used when -n is not given: {", ".join(NETWORKS)}
+network = "bch"
+
+# One section per network, with a url, a socket, or both (the socket wins unless -u is given).
+# Networks without a section use https://api.haskoin.com/<net>.
+
+[bch]
+url = "https://api.haskoin.com/bch"
+# A local store's Unix socket, used instead of the url when set:
+# socket = "/run/user/{os.getuid()}/haskoin-store/bch.sock"
+
+# [btc]
+# url = "https://api.haskoin.com/btc"
+
+# [btctest4]
+# url = "http://192.168.1.2:3004"
+'''
+
+SAMPLE_UNDER_GLOBAL = f'''# Your hsq settings (see `hsq --help`). They override {GLOBAL_CONFIG}
+# network by network and key by key; anything left commented out keeps the global value.
+# `hsq --servers` shows what is in effect.
+
+# network = "btc"
+
+# [bch]
+# socket = "/run/haskoin-store/bch.sock"
+# url    = "https://api.haskoin.com/bch"
+'''
+
+def write_user_config(announce):
+    """Create the user's file: a commented one under a global file, else a working example."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "x") as f:
+            f.write(SAMPLE_UNDER_GLOBAL if os.path.exists(GLOBAL_CONFIG) else SAMPLE)
+    except FileExistsError:
+        return False
+    except OSError as e:                     # no writable home (system users): carry on without one
+        if announce:
+            die(f"cannot create {CONFIG}: {e}")
+        return False
+    print(dim(f"created {CONFIG} (edit it to set your default network and servers)"), file=sys.stderr)
+    return True
+
+def read_toml(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        die(f"cannot read {path}: {e}")
+
+def load_config():
+    """The global file, then the user's on top: top-level keys replace, network sections merge key by key."""
+    if "HSQ_CONFIG" not in os.environ and not os.path.exists(CONFIG):
+        write_user_config(announce=False)
+    cfg = read_toml(GLOBAL_CONFIG)
+    for k, v in read_toml(CONFIG).items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k] = {**cfg[k], **v}
+        else:
+            cfg[k] = v
+    return cfg
+
+def server_for(cfg, net, url=None, sock=None):
+    """(kind, where) for NET: a run's -s/-u first, then the environment, then the file, then the public API."""
+    if sock: return "socket", sock
+    if url: return "url", url
+    if os.environ.get("HSQ_SOCKET"): return "socket", os.environ["HSQ_SOCKET"]
+    if os.environ.get("HSQ_URL"): return "url", os.environ["HSQ_URL"]
+    sec = cfg.get(net, {})
+    if not isinstance(sec, dict):
+        die(f"configuration: [{net}] must be a section with url and/or socket")
+    if sec.get("socket"): return "socket", os.path.expanduser(sec["socket"])
+    if sec.get("url"): return "url", sec["url"]
+    return "url", PUBLIC.format(net=net)
+
+# ---------- HTTP over TCP, TLS or a Unix socket ----------
+
+class UnixConn(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.sock_path = path
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.sock_path)
+
+class Server:
+    def __init__(self, kind, where):
+        self.kind = kind
+        self.prefix = ""
+        if kind == "socket":
+            self.sock = where
+        else:
+            u = urlsplit(where)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                die(f"unsupported URL {where!r}: use http://host[:port][/prefix] or https://…")
+            self.scheme, self.host, self.port = u.scheme, u.hostname, u.port
+            self.prefix = u.path.rstrip("/")
+            self.url = where
+
+    def describe(self):
+        return f"socket {self.sock}" if self.kind == "socket" else self.url
+
+    def get(self, path, timeout=20):
+        if self.kind == "socket":
+            conn = UnixConn(self.sock, timeout)
+        elif self.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=timeout, context=ssl.create_default_context()
+            )
+        else:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        try:
+            conn.request("GET", self.prefix + path, headers={"Accept": "application/json", "User-Agent": "hsq"})
+            r = conn.getresponse()
+            return r.status, r.read()
+        except FileNotFoundError:
+            die(f"no socket at {self.sock}: is the store's socket unit running?")
+        except PermissionError:
+            die(f"no permission to open {self.sock}: join the socket's group, or use -u URL")
+        except ConnectionRefusedError:
+            die(f"{self.describe()} refused the connection")
+        except (socket.timeout, TimeoutError):
+            die(f"{self.describe()} did not answer within {timeout} s")
+        except (socket.gaierror, ssl.SSLError, OSError) as e:
+            die(f"{self.describe()}: {e}")
+        finally:
+            conn.close()
+
+# ---------- pretty JSON ----------
+
+def pj(v, ind=0):
+    sp = "  " * ind
+    if isinstance(v, dict):
+        if not v:
+            return "{}"
+        items = [f"{sp}  {blue(json.dumps(k))}: {pj(x, ind + 1)}" for k, x in v.items()]
+        return "{\n" + ",\n".join(items) + f"\n{sp}}}"
+    if isinstance(v, list):
+        if not v:
+            return "[]"
+        if all(not isinstance(x, (dict, list)) for x in v) and len(json.dumps(v)) < 80:
+            return "[" + ", ".join(pj(x) for x in v) + "]"
+        return "[\n" + ",\n".join(f"{sp}  {pj(x, ind + 1)}" for x in v) + f"\n{sp}]"
+    if isinstance(v, bool):
+        return yellow(str(v).lower())
+    if v is None:
+        return dim("null")
+    if isinstance(v, (int, float)):
+        return cyan(v)
+    return green(json.dumps(v))
+
+# ---------- summary ----------
+
+def ago(sec):
+    sec = int(sec)
+    if sec < 60: return f"{sec} s"
+    if sec < 3600: return f"{sec // 60} min {sec % 60} s"
+    if sec < 86400: return f"{sec // 3600} h {sec % 3600 // 60} min"
+    return f"{sec // 86400} d {sec % 86400 // 3600} h"
+
+def gb(b):
+    return f"{b / 1e9:.1f} GB" if b >= 1e9 else f"{b / 1e6:.0f} MB"
+
+def bar(frac, width=32):
+    frac = max(0.0, min(1.0, frac))
+    full = int(frac * width)
+    s = "█" * full + ("▌" if frac * width - full >= 0.5 else "")
+    return (green if frac >= 0.999 else yellow)(s.ljust(width, "·"))
+
+def mark(ok):
+    return green("●") if ok else red("●")
+
+def local_rate(unit):
+    """Blocks and bytes per second over the last 2 minutes, from the "Best block:" lines in the
+    journal of the local store's systemd unit: a user unit first, then a system one."""
+    out = ""
+    for scope in (["--user"], []):
+        try:
+            out = subprocess.run(
+                ["journalctl", *scope, "-u", unit, "--since", "-2min", "-o", "cat"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            out = ""
+        if "Best block:" in out:
+            break
+    n = b = 0
+    for l in out.splitlines():
+        if "Best block:" in l:
+            try:
+                b += int(l.split(" | ")[3].split()[0]); n += 1
+            except (IndexError, ValueError):
+                pass
+    return (n / 120, b / 120) if n else None
+
+def summary(net, srv, unit):
+    st, body = srv.get("/health")
+    try:
+        h = json.loads(body)
+    except ValueError:
+        die(f"{srv.describe()} answered HTTP {st} without JSON: {body[:120]!r}")
+    if "blocks" not in h:
+        die(f"{srv.describe()} answered HTTP {st}: {h}")
+    b = h["blocks"]; height, headers = b["blocks"], b["headers"]
+    behind = headers - height
+    synced = behind <= b.get("max", 3)
+    status = green("● healthy") if h.get("ok") else (yellow("● syncing") if not synced else red("● unhealthy"))
+
+    print(f"{bold('haskoin-store')} {mag(h.get('version', '?'))}  {dim('·')}  "
+          f"{bold(h.get('net', net).upper())}  {dim('·')}  "
+          + status + dim(f"   {datetime.now():%a %d %b %H:%M:%S}"))
+    print(dim(f"  {srv.describe()}"))
+    print()
+
+    frac = height / headers if headers else 0
+    print(f"  {bold('Sync')}      {bar(frac)} {bold(f'{frac * 100:5.1f}%')}")
+    print(f"            height {cyan(f'{height:,}')} of {cyan(f'{headers:,}')}"
+          + (f"   {yellow(f'{behind:,} blocks behind')}" if not synced else f"   {green('at the tip')}"))
+    # the unit's journal on this machine, whatever the transport: a store reached
+    # by its URL may run here too, and one that does not has no lines to read
+    if not synced:
+        rate = local_rate(unit)
+        if rate:
+            # a rough time left, by the count of blocks: block sizes vary a lot over a
+            # chain's history, so it can be far off either way
+            bps, byps = rate
+            eta = dim(f"   ~{ago(behind / bps)} left at this rate") if bps else ""
+            print(f"            {cyan(f'{bps:.1f}')} blocks/s, {cyan(f'{byps / 1e6:.2f}')} MB/s"
+                  " over the last 2 min" + eta)
+    lb = h.get("last-block", {})
+    if lb and synced:
+        print(f"            last block {ago(lb.get('age', 0))} ago " + mark(lb.get("ok", False)))
+
+    p = h.get("peers", {})
+    if p:
+        print(f"  {bold('Peers')}     {mark(p.get('ok', False))} {cyan(p.get('count', 0))} connected"
+              + dim(f"   (minimum {p.get('min', '?')})"))
+
+    pt = h.get("pending-txs", {}); lt = h.get("last-tx", {})
+    if pt or lt:
+        s = f"  {bold('Mempool')}   {mark(pt.get('ok', True))} {cyan(pt.get('count', 0))} pending txs"
+        if lt and synced:
+            s += f", last tx {ago(lt.get('age', 0))} ago"
+        print(s)
+
+    d = h.get("database")
+    if d:
+        w = d.get("writes", "?")
+        wc = green if w == "flowing" else (yellow if w in ("delayed", "slowed") else red)
+        pend = d.get("pending-compaction-bytes", 0)
+        pc = green if pend < 16e9 else (yellow if pend < 64e9 else red)
+        s = f"  {bold('Database')}  {mark(d.get('ok', False))} writes {wc(w)}, compaction backlog {pc(gb(pend))}"
+        if d.get("delayed-write-rate"):
+            s += red(f", throttled to {d['delayed-write-rate'] / 1e6:.0f} MB/s")
+        print(s)
+
+    r = h.get("redis")
+    if r is not None:
+        state = green("reachable") if r.get("ok") else red("unreachable")
+        print(f"  {bold('Cache')}     {mark(r.get('ok', False))} " + state)
+
+    expected = set() if synced else {"blocks", "last-block", "last-tx"}
+    bad = [k for k, v in h.items() if isinstance(v, dict) and v.get("ok") is False and k not in expected]
+    if bad:
+        print()
+        print("  " + red("Not OK: ") + ", ".join(bad))
+
+# ---------- command line ----------
+
+def main():
+    cfg = load_config()
+    args = sys.argv[1:]
+    net = os.environ.get("HSQ_NET") or cfg.get("network") or "bch"
+    url = sock = None
+    watch = None; raw = False; path = None
+    while args:
+        a = args.pop(0)
+        if a in ("-h", "--help"):
+            print(__doc__.strip()); return
+        elif a in ("-n", "--net"):
+            if not args: die("-n needs a network")
+            net = args.pop(0)
+        elif a in ("-s", "--socket"):
+            if not args: die("-s needs a socket path")
+            sock = args.pop(0)
+        elif a in ("-u", "--url"):
+            if not args: die("-u needs a URL")
+            url = args.pop(0)
+        elif a in ("-w", "--watch"):
+            watch = 5.0
+            if args and args[0].replace(".", "", 1).isdigit():
+                watch = float(args.pop(0))
+        elif a == "--raw":
+            raw = True
+        elif a == "--servers":
+            for label, f in (("global", GLOBAL_CONFIG), ("user", CONFIG)):
+                print(dim(f"{label} configuration: {f}" + ("" if os.path.exists(f) else " (none)")))
+            for n in NETWORKS:
+                mark_ = bold("▶ ") if n == net else "  "
+                kind, where = server_for(cfg, n)
+                print(f"{mark_}{bold(n.ljust(9))} {dim(kind.ljust(6))} {where}")
+            return
+        elif a == "--init":
+            if os.path.exists(CONFIG):
+                print(dim(f"{CONFIG} already exists")); return
+            write_user_config(announce=True); return
+        elif a.startswith("-") and a != "-":
+            die(f"unknown option {a} (see hsq --help)")
+        else:
+            path = a
+    if net not in NETWORKS:
+        die(f"unknown network {net!r}; one of: {', '.join(NETWORKS)}")
+    srv = Server(*server_for(cfg, net, url, sock))
+    sec = cfg.get(net, {})
+    unit = sec.get("unit", f"haskoin-store-{net}") if isinstance(sec, dict) else f"haskoin-store-{net}"
+
+    if path is None:
+        if watch:
+            try:
+                while True:
+                    print("\033[H\033[2J", end="")
+                    summary(net, srv, unit)
+                    print(dim(f"\n  refreshing every {watch:g} s · Ctrl-C to stop"))
+                    time.sleep(watch)
+            except KeyboardInterrupt:
+                print()
+            return
+        summary(net, srv, unit); return
+
+    if not path.startswith("/"):
+        path = "/" + path
+    st, body = srv.get(path, timeout=120)
+    if raw:
+        sys.stdout.buffer.write(body)
+        sys.exit(0 if st < 400 else 1)
+    try:
+        out = pj(json.loads(body))
+    except ValueError:
+        out = body.decode(errors="replace")
+    if st >= 400:
+        print(red(f"HTTP {st}"), file=sys.stderr)
+    print(out)
+    sys.exit(0 if st < 400 else 1)
+
+if __name__ == "__main__":
+    main()
