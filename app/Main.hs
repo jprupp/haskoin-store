@@ -711,7 +711,7 @@ config c = do
           "NODE_RPC"
           ( unwords
               [ "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails;",
-                "fill the shared mempool from it again after Redis loses its data"
+                "fill the shared mempool from it again after it is emptied"
               ]
           )
         <> value c.nodeRpc

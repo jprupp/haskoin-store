@@ -27,7 +27,8 @@
 --   which transactions they confirmed and which outputs they spent, and
 --   across a reorganisation which transactions come back. Across more
 --   blocks than a store goes through ('farthest'), it moves the tip and
---   starts the pool again ('wayBetween').
+--   starts the pool again ('wayBetween'), which every store then fills
+--   again ('noteRestarts').
 --
 -- * __It offers to the shared pool what its peers send it__ ('memberReceived',
 --   'offerMempool'), each
@@ -332,8 +333,11 @@ data Member = Member
     outage :: !Outage,
     -- | the epoch of Redis at the last turn ('noteEpoch')
     epoch :: !(TVar (Maybe ByteString)),
-    -- | how many times this store found that Redis had lost its data: the
-    -- web server fills the pool again each time ('Haskoin.Store.Web')
+    -- | the count of restarts of the pool at the last turn ('noteRestarts')
+    restarts :: !(TVar (Maybe Integer)),
+    -- | how many times this store found the pool emptied, because Redis
+    -- lost its data or the pool started again: the web server fills the
+    -- pool again each time ('Haskoin.Store.Web')
     refills :: !(TVar Int),
     -- | the last tip that Redis was seen to have, and when, by the clock of
     -- 'getMonotonicTimeNSec': a request that read nothing of the pool
@@ -363,6 +367,7 @@ newMember config redis db = do
   outage <- newOutage
   built <- newTVarIO HashMap.empty
   epoch <- newTVarIO Nothing
+  restarts <- newTVarIO Nothing
   refills <- newTVarIO 0
   seen <- newIORef ("", 0)
   lock <- redisLock (defaultLockConfig (config.prefix <> "fleet:") config.name) redis xpubId
@@ -418,6 +423,7 @@ memberAlive m =
 memberTick :: Member -> IO ()
 memberTick m = do
   noteEpoch m
+  noteRestarts m
   report m
   moved <- moveTip m
   -- the tip is read after the report, as the rule of 'F.keep' asks
@@ -453,6 +459,8 @@ noteEpoch m = do
     let lost = isJust before && before /= now
     when lost $ do
       writeTVar m.tip Nothing
+      -- the count of restarts went with the rest: not a second refill
+      writeTVar m.restarts Nothing
       modifyTVar' m.refills (+ 1)
     return lost
   when lost . m.config.note LevelWarn $
@@ -461,6 +469,23 @@ noteEpoch m = do
     key = m.keys.prefix <> "fleet:epoch"
     redis' :: R.Redis (Either R.Reply a) -> IO a
     redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
+
+-- | Find out whether the pool was emptied since this store's last turn
+-- ('fleetRestarts'), and if so count a refill, as 'noteEpoch' does for a
+-- loss of Redis. The pool forgot with it what the fleet had seen, so what
+-- the peers announce from then on is fetched again; the refill brings
+-- back what they announced before. The first turn only notes the count.
+noteRestarts :: Member -> IO ()
+noteRestarts m = do
+  now <- fleetRestarts m.redis m.keys
+  restarted <- atomically $ do
+    before <- readTVar m.restarts
+    writeTVar m.restarts (Just now)
+    let restarted = maybe False (/= now) before
+    when restarted $ modifyTVar' m.refills (+ 1)
+    return restarted
+  when restarted . m.config.note LevelInfo $
+    "The pool started again: it fills again from the node and the peers"
 
 -- | Take a turn as a member every two seconds, and at once when an action
 -- that waits for the next best block returns, for as long as the store's

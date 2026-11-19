@@ -358,7 +358,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--target-delay` | `TARGET_DELAY` | `25` | Milliseconds that a thread ready to run may wait for a core before the limit comes down |
 | `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 429 |
 | `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
-| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after Redis loses its data; without it, or when it does not answer, transactions go to the peers |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after it is emptied; without it, or when it does not answer, transactions go to the peers |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -395,10 +395,15 @@ fleet of one. Every key starts with `hs2:<network>:`.
   that it holds nobody up.
 - **When Redis loses its data**, the stores notice it by an epoch key that
   is gone or changed. Each forgets the fleet tip, reports unhealthy until
-  the fleet has a tip again, and asks its peers for their mempools again;
-  with `--node-rpc` it also reads the node's mempool (`getrawmempool`),
-  2,000 transactions every two seconds. Xpub entries are built again as
-  requests ask for them.
+  the fleet has a tip again, and fills the pool again. Xpub entries are
+  built again as requests ask for them.
+- **When the pool starts again**, after a reorganisation deeper than 50
+  blocks, the stores fill it again too.
+- **Filling the pool again** works best with `--node-rpc`: each store reads
+  its node's mempool (`getrawmempool`), 2,000 transactions every two
+  seconds. Each also asks its peers for their mempools, once. Bitcoin Cash
+  Node answers; Bitcoin Core answers only a store it whitelists, and
+  disconnects any other that asks (`docs/fleet-mempool.md`).
 - **`/events` is the same stream on every store**, written to Redis with
   each change of the pool and each move of the tip.
 - **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).

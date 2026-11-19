@@ -36,8 +36,8 @@
 -- that peers announce and that no store of the fleet has seen ('toFetch'):
 -- what the fleet saw is a set in Redis, the same for every store and kept
 -- across restarts, so a transaction is fetched about once for the fleet.
--- It asks peers for their whole mempools only to fill
--- the pool again after Redis lost it ('blockStoreRefill'): the pool outlives
+-- It asks peers for their whole mempools only to fill the pool again
+-- after it was emptied ('blockStoreRefill'): the pool outlives
 -- the store, so a store that starts has nothing to ask for. A transaction
 -- that arrives goes to 'onTx': the member of the fleet offers it to the
 -- pool that the fleet shares in Redis, which is the mempool
@@ -102,7 +102,6 @@ import Control.Concurrent.STM
   ( STM,
     TVar,
     atomically,
-    modifyTVar,
     modifyTVar',
     newTVarIO,
     readTVar,
@@ -281,11 +280,9 @@ data BlockStore = BlockStore
     pending :: !(TVar Pending),
     -- | StatsD metrics, if enabled
     metrics :: !(Maybe StoreMetrics),
-    -- | labels of the peers whose mempool was already requested
-    syncedMempool :: !(TVar (HashSet Text)),
-    -- | whether to ask peers for their mempools: from the first refill of
-    -- the pool on ('blockStoreRefill')
-    refilling :: !(TVar Bool),
+    -- | whether a refill of the pool waits to ask the peers for their
+    -- mempools ('blockStoreRefill')
+    refill :: !(TVar Bool),
     -- | what each peer said that it has, by its label: a peer is asked
     -- only for blocks that it announced
     knows :: !(TVar (HashMap Text Known)),
@@ -540,8 +537,7 @@ withBlockStore ::
 withBlockStore cfg action = do
   pb <- newTVarIO . Sync.idle =<< getCurrentTime
   ts <- newTVarIO Pending.empty
-  sy <- newTVarIO HashSet.empty
-  refilling <- newTVarIO False
+  refill <- newTVarIO False
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
@@ -553,8 +549,7 @@ withBlockStore cfg action = do
             sync = pb,
             pending = ts,
             metrics = metrics,
-            syncedMempool = sy,
-            refilling = refilling,
+            refill = refill,
             knows = knows,
             owner = owner
           }
@@ -604,31 +599,42 @@ isInSync self =
 guardSync :: BlockStore -> IO () -> IO ()
 guardSync self f = isInSync self >>= \s -> when s f
 
--- | Ask a peer for its mempool, once per peer, if in sync and the pool is
--- being filled again ('blockStoreRefill').
-syncMempool :: BlockStore -> Peer -> IO ()
-syncMempool self p =
+-- | Ask the peers connected now for their mempools, if a refill waits for
+-- it ('blockStoreRefill') and the database is in sync; with no peer, the
+-- refill waits for the first one. Called again on each block imported in
+-- sync and each peer that connects.
+syncMempool :: BlockStore -> IO ()
+syncMempool self =
   guardSync self $ do
-    s <- readTVarIO self.refilling
-    let m = self.syncedMempool
-    y <- not . HashSet.member p.label <$> readTVarIO m
-    when (s && y) $ do
-      logDebug self $
-        "Requesting mempool from peer: " <> p.label
-      atomically . modifyTVar m $ HashSet.insert p.label
-      MMempool `sendMessage` p
+    peers <- getPeers self.config.peerMgr
+    asking <- atomically $ do
+      waits <- readTVar self.refill
+      when (waits && not (null peers)) $ writeTVar self.refill False
+      return (waits && not (null peers))
+    when asking $ do
+      logInfo self $ "Asking " <> cs (show (length peers)) <> " peers for their mempools"
+      forM_ peers $ \op -> MMempool `sendMessage` op.mailbox
 
--- | Ask every peer for its mempool again, and fetch every transaction that
--- it announces and the fleet has not seen: for when Redis lost its data,
--- the pool with it, and what the fleet had seen
--- ('Haskoin.Store.Fleet.Member.noteEpoch').
--- The transactions go to 'onTx', which offers them to the pool again.
+-- | Ask the peers for their mempools, once, and fetch every transaction
+-- that they announce and the fleet has not seen: for when the pool was
+-- emptied, because Redis lost its data
+-- ('Haskoin.Store.Fleet.Member.noteEpoch') or the pool started again
+-- ('Haskoin.Store.Fleet.Member.noteRestarts'). What the fleet had seen
+-- went with it, so all of it is fetched. The transactions go to 'onTx',
+-- which offers them to the pool again.
+--
+-- Only the peers connected at that time are asked, and only once. Bitcoin
+-- Core closes the connection of a peer that asks for its mempool unless it
+-- serves bloom filters (@-peerbloomfilters@, off by default) or it
+-- whitelists that peer; Bitcoin Cash Node serves bloom filters by default
+-- and answers. Asking every peer that connects, as the store once did,
+-- lost its public Bitcoin Core peers one after the other for as long as
+-- it ran. A node that the store has over RPC (@--node-rpc@) answers in any
+-- case ('Haskoin.Store.Web.refillLoop').
 blockStoreRefill :: BlockStore -> IO ()
 blockStoreRefill self = do
-  atomically $ do
-    writeTVar self.syncedMempool HashSet.empty
-    writeTVar self.refilling True
-  getPeers self.config.peerMgr >>= mapM_ (syncMempool self . (.mailbox))
+  atomically $ writeTVar self.refill True
+  syncMempool self
 
 -- | Import a block from the syncing peer, then ask for more blocks or, if now in
 -- sync, sync the mempool. Disconnects the peer if it is not the syncing peer, if
@@ -680,7 +686,7 @@ processBlock self peer block =
       transition self $ \st -> ((), Sync.imported now blockhash st)
       isInSync self >>= \case
         False -> syncMe self
-        True -> syncMempool self peer
+        True -> syncMempool self
     failure e = do
       logError self $
         "Error importing block "
@@ -1063,14 +1069,13 @@ findAncestor self height target = do
           <> cs (show target.height)
       throwIO $ AncestorNotInChain height h
 
--- | Forget a peer: release it if it was the syncing peer, and forget that its mempool was requested.
+-- | Forget a peer: release it if it was the syncing peer.
 finishPeer :: BlockStore -> Peer -> IO ()
 finishPeer self p = do
   released <- transition self (Sync.release p)
   when released $ do
     logDebug self $ "Releasing peer: " <> p.label
     void (releasePeer self.owner p)
-  atomically $ modifyTVar self.syncedMempool $ HashSet.delete p.label
 
 -- | Make a peer the syncing peer if there is none and the peer is not busy.
 trySetPeer :: BlockStore -> Peer -> IO Bool
@@ -1101,7 +1106,8 @@ trySyncing self =
         False -> revertToMainChain self >> search self []
 
 -- | Note the height that a newly connected peer gave, then start syncing if
--- needed, or request its mempool if in sync.
+-- needed, or, if in sync, ask the peers for their mempools if a refill
+-- waits for a peer ('syncMempool').
 trySyncingPeer :: BlockStore -> Peer -> IO ()
 trySyncingPeer self p = do
   online <- getOnlinePeer self.config.peerMgr p
@@ -1109,7 +1115,7 @@ trySyncingPeer self p = do
   atomically . modifyTVar' self.knows $
     HashMap.insertWith (\_ k -> Known (max height k.height) k.tip) p.label (Known height Nothing)
   isInSync self >>= \case
-    True -> syncMempool self p
+    True -> syncMempool self
     False -> trySyncing self
 
 -- | Release the syncing peer, if any.

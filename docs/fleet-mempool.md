@@ -162,19 +162,38 @@ A server goes through 50 blocks at most. Two cases are past that:
   any of them may empty the pool and move the tip.
 
 Either way the script also empties the xpub cache, whose pool layer is
-gone. The pool then holds only what peers announce from then on: the
-transactions of the emptied pool are in the fleet's seen set, so no server
-fetches them again, and they come back only in a block.
+gone, and the fleet's seen set, since what the pool decided on is gone
+too, and counts the restart (`fleet:restarts`). Each server sees the count
+change at its turn (`noteRestarts`) and fills the pool again as after a
+loss of Redis, below.
 
 ## When Redis loses its data
 
 Redis keeps a random epoch (`fleet:epoch`, set if missing). A server that
 finds it gone or changed at its turn (`noteEpoch`) forgets its tip, and is
 unhealthy until the fleet has a tip again; the first turn sets one, since
-every live server reports. Then it asks every peer for its mempool again,
-and with `--node-rpc` reads its node's
-(`getrawmempool`, then `getrawtransaction`), 2,000 transactions every two
-seconds. Each goes through the offer as if a peer had sent it.
+every live server reports. Then it fills the pool again.
+
+## Filling the pool again
+
+After a loss of Redis or a restart of the pool, each server:
+
+- **reads its node's mempool over RPC**, with `--node-rpc`
+  (`getrawmempool`, then `getrawtransaction`), 2,000 transactions every
+  two seconds. Each goes through the offer as if a peer had sent it. This
+  always works.
+- **asks its peers for their mempools**, once, the peers connected at that
+  time (`blockStoreRefill`), and fetches what they announce. Bitcoin Cash
+  Node answers by default. Bitcoin Core answers only a peer that it
+  whitelists, or when it serves bloom filters (`-peerbloomfilters`, off by
+  default); any other peer that asks, it disconnects. So a store asks only
+  once per refill, and loses at worst one connection to each public Core
+  peer, which it replaces.
+
+A Bitcoin fleet without `--node-rpc` and without a node that whitelists
+it gets back only what its peers announce from then on: new transactions,
+and those wallets broadcast again. The seen set was emptied with the pool,
+so none of those is skipped.
 
 ## Reading
 
@@ -289,8 +308,8 @@ uses, and cannot be better without knowing what miners will do.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 
-Not tested: Redis evicting keys, more than two servers, a refill from a
-real node over RPC, and a pool of real size.
+Not tested: Redis evicting keys, more than two servers, and a pool of real
+size.
 
 ## Where the code is
 

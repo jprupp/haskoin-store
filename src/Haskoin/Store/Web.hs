@@ -2093,14 +2093,17 @@ askingLoop st = forever $ do
         Nothing -> maybe (return False) (\m -> isJust <$> memberPoolBody m h) own.fleet
     ask h = getPeers own.peerMgr >>= mapM_ (\op -> blockStoreTxHash op.mailbox [h] own.block)
 
--- | Fill the pool again each time the member finds that Redis lost its
--- data ('Haskoin.Store.Fleet.Member.noteEpoch'): ask every peer for its
--- mempool ('blockStoreRefill'), and with the RPC of the store's node
--- (@--node-rpc@), read the node's whole mempool, 'refillBatch'
--- transactions every two seconds, a turn of the member, each given to the
--- member as if a peer had sent it ('memberReceived'). The peers alone may
--- not answer: a node answers a request for its mempool only from a peer
--- that it allows to use bloom filters.
+-- | Fill the pool again each time the member finds it emptied, because
+-- Redis lost its data ('Haskoin.Store.Fleet.Member.noteEpoch') or the pool
+-- started again ('Haskoin.Store.Fleet.Member.noteRestarts'): ask the peers
+-- for their mempools, once ('blockStoreRefill'), and with the RPC of the
+-- store's node (@--node-rpc@), read the node's whole mempool,
+-- 'refillBatch' transactions every two seconds, a turn of the member, each
+-- given to the member as if a peer had sent it ('memberReceived'). The
+-- peers alone may not answer: Bitcoin Core answers only a peer that it
+-- whitelists or when it serves bloom filters, which it does not by
+-- default. The RPC answers in any case, and its transactions are offered
+-- whether the fleet has seen them or not.
 refillLoop :: WebState -> IO ()
 refillLoop st = forM_ own.fleet $ \m -> go m 0
   where

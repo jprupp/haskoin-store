@@ -74,6 +74,7 @@ module Haskoin.Store.Fleet.Redis
     fleetAdvance,
     fleetCommit,
     fleetRestart,
+    fleetRestarts,
     FleetEvent (..),
     fleetEventsEnd,
     fleetEventsAfter,
@@ -367,11 +368,22 @@ fleetCommit conn keys tsize clock seen target known path token =
 -- none would ever say what the blocks did, and the tip would stay where it
 -- is for good: a fleet whose stores came back together after half a day
 -- away answered nothing from then on. Emptying the pool costs the
--- transactions that were in it: the fleet has seen them, so no store
--- fetches them again, and they come back only in a block.
+-- transactions that were in it until the stores fill it again: what the
+-- fleet has seen is forgotten with it, and the count of 'fleetRestarts'
+-- goes up, so that each store reads the mempool of its node and asks its
+-- peers for theirs.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
   advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) ([], "")
+
+-- | How many times the pool was emptied, by 'fleetRestart' or by a store
+-- alone that did not have the old tip. A store that sees another number
+-- than at its last turn fills the pool again, as after Redis lost its
+-- data: the emptied pool is shared, so every store sees the same count
+-- and any of them that can read a mempool helps.
+fleetRestarts :: Connection -> FleetKeys -> IO Integer
+fleetRestarts conn keys =
+  maybe 0 (maybe 0 fst . C.readInteger) <$> run conn (R.get (keys.prefix <> "fleet:restarts"))
 
 -- | The advance of the pool script, with its way of treating the pool: "0"
 -- to change it, "1" and "2" to empty it ('fleetAdvance', 'fleetRestart').

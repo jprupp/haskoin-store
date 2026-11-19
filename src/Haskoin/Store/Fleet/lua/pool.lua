@@ -64,8 +64,9 @@
 -- otherwise, since another store may know. With '2' the store has both
 -- tips and the way between them is longer than a store goes through: that
 -- is so for every store, so any of them may, or the tip would never move
--- again. Each time the pool is emptied a counter goes up, next to the
--- tip, which tells the stores to offer their mempools again.
+-- again. Each time the pool is emptied, what the fleet has seen is
+-- forgotten, since what it decided on is gone, and a counter goes up,
+-- next to the tip, which tells the stores to fill the pool again.
 --
 -- What the pool holds for each address, kept in step with its transactions:
 -- its transactions and the outputs paid to it, both ordered newest first,
@@ -123,6 +124,7 @@ local key = {
   lostby = prefix .. 'pool:lostby:',
   lostat = prefix .. 'pool:lostat',
   seen = prefix .. 'fleet:seen',
+  restarts = prefix .. 'fleet:restarts',
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:',
   xtip = prefix .. 'fx:tip',
@@ -562,6 +564,14 @@ if ARGV[8] == '1' or ARGV[8] == '2' then
   end
   for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do
     redis.call('DEL', k)
+  end
+  -- what the pool decided on is gone: the stores fetch it again when it
+  -- is announced, and fill the pool again when the counter goes up. The
+  -- first tip of a fleet, or the first after Redis lost its data, empties
+  -- nothing, and the loss is a refill of its own (noteEpoch).
+  redis.call('DEL', key.seen)
+  if tip ~= '' then
+    redis.call('INCR', key.restarts)
   end
   -- the entries have the pool's layer of the pool that is gone
   settle(true)

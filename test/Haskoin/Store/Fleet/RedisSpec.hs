@@ -150,11 +150,13 @@ spec = do
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
-      it "empties the pool for any store when the way is too long" $ \(conn, fresh) -> do
+      it "empties the pool and what the fleet saw for any store when the way is too long" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
         fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
+        fleetSeen conn keys [block 7] `shouldReturn` [True]
+        fleetRestarts conn keys `shouldReturn` 0
         -- two stores that both have a view of the tip, so both are live,
         -- at a block that neither will say the way to
         fleetReport conn keys (Just 0) 10 "a" [block 2] [block 2, block 1] `shouldReturn` True
@@ -169,6 +171,9 @@ spec = do
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
+        -- the stores fetch its transactions again, and fill it again
+        fleetSeen conn keys [block 7] `shouldReturn` [False]
+        fleetRestarts conn keys `shouldReturn` 1
         -- still only to the block that the live stores agree on, and only
         -- from the tip that the store saw
         fleetRestart conn keys 4 (Just 0) (Just (block 2)) (block 3) `shouldReturn` Raced

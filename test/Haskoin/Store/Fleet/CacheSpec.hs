@@ -107,6 +107,7 @@ spec = do
       it "never answers an entry that a move of the tip is writing" (`withBed` markedTest)
       it "keeps the cache across a reorganisation, as the chain and the pool give it" (`withBed` reorgTest)
       it "fills the pool again after Redis lost its data" (`withBed` refillTest)
+      it "fills the pool again after it started again, once after Redis lost its data" (`withBed` restartTest)
       it "keeps what an abandoned block gave back when the chain moves under a move of the tip" $
         (`withBed` unsettledTest)
       it "fetches no transaction that another member received" (`withBed` seenTest)
@@ -288,6 +289,24 @@ orphanTest bed = do
   held <- readTVarIO bed.a.waiting
   HashMap.member (txHash old) held `shouldBe` False
   HashMap.member (txHash young) held `shouldBe` True
+
+-- | Each member counts a refill when the pool starts again, which the count
+-- of restarts says; and one only, not two, when Redis loses its data with
+-- that count in it.
+restartTest :: Bed -> IO ()
+restartTest bed = do
+  settle bed
+  readTVarIO bed.a.refills `shouldReturn` 0
+  -- what a restart of the pool does to the count
+  void (Redis.runRedis bed.conn (Redis.incr (bed.prefix <> "fleet:restarts")))
+  settle bed
+  readTVarIO bed.a.refills `shouldReturn` 1
+  readTVarIO bed.b.refills `shouldReturn` 1
+  lost <- Redis.runRedis bed.conn (Redis.keys (bed.prefix <> "*"))
+  forM_ (either (const []) id lost) $ \k -> void (Redis.runRedis bed.conn (Redis.del (k :| [])))
+  settle bed
+  readTVarIO bed.a.refills `shouldReturn` 2
+  readTVarIO bed.b.refills `shouldReturn` 2
 
 refillTest :: Bed -> IO ()
 refillTest bed = do

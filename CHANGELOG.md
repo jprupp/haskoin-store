@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the store heard of it, as Bitcoin Core does.
 - **A restart of the pool no longer drops what the store was about to
   offer.**
+- **A restart of the pool fills it again.** After a reorganisation deeper
+  than 50 blocks, the pool was emptied and its transactions came back only
+  in a block, since the fleet had seen them and no store fetched them
+  again. The restart now empties the seen set too, and every store reads
+  its node's mempool over RPC (`--node-rpc`) and asks its peers for theirs,
+  as after a loss of Redis.
+- **A store no longer loses its Bitcoin Core peers after Redis loses its
+  data.** From the first refill on, the store asked every peer that
+  connected for its mempool. Bitcoin Core disconnects a peer that asks
+  unless it whitelists it or serves bloom filters, which it does not by
+  default; so the store lost its public Core peers one after the other.
+  It now asks only the peers connected at the refill, once.
 - **README: memory for indexes and filters.** They come to about 0.9% of the
   database (16 GB for Bitcoin, 4 GB for Bitcoin Cash, measured on
   api.haskoin.com), not 0.34%; and they, Bloom filters included, are held
@@ -54,8 +66,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   stays; the README says how to use it on its own.
 - **The StatsD gauge `store.queued_txs`**: it counted transactions waiting
   to be imported, which the block store no longer holds, and was always 0.
-- **Dead code**: the restart counter of the pool (`fleet:restarts`), which
-  nothing read; what the block store kept of transactions received from
+- **Dead code**: what the block store kept of transactions received from
   peers, which nothing put there (`Haskoin.Store.BlockStore.Pending` now
   holds only the requests); `insertReplaced`; `BlockStoreConfig`'s
   `mempoolTimeout`; and unused fields of the fleet member.
