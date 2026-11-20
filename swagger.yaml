@@ -11,7 +11,7 @@ servers:
   - url: './'
 
 info:
-  version: &version 1.16.7
+  version: &version 2.0.0
   title: Haskoin
   contact:
     name: JP Rupp
@@ -2683,6 +2683,16 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/TokenBalance'
+              example:
+                # from a regtest chain of Bitcoin Cash Node
+                - address: bchreg:qzpdpp48htve8dsl5w2009xts33gvz44ts853ucllm
+                  category: 084c120da82f5235b0f9b5ba5851e62d0dcad3febaf0620fdae8bd3aeeb893ae
+                  confirmed: '1000'
+                  unconfirmed: '0'
+                  nfts: 0
+                  utxo: 1
+                  txs: 2
+                  received: '2000'
         '404':
           description: Invalid address.
           content:
@@ -2713,6 +2723,16 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/TokenBalance'
+              example:
+                # from a regtest chain of Bitcoin Cash Node
+                - address: bchreg:qzpdpp48htve8dsl5w2009xts33gvz44ts853ucllm
+                  category: 084c120da82f5235b0f9b5ba5851e62d0dcad3febaf0620fdae8bd3aeeb893ae
+                  confirmed: '1000'
+                  unconfirmed: '0'
+                  nfts: 0
+                  utxo: 1
+                  txs: 2
+                  received: '2000'
 
   '/token/{category}/unspent':
     get:
@@ -2738,6 +2758,20 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Unspent'
+              example:
+                # from a regtest chain of Bitcoin Cash Node
+                - address: bchreg:qzpdpp48htve8dsl5w2009xts33gvz44ts853ucllm
+                  block:
+                    height: 151
+                    position: 2
+                  txid: d74025d2a71dd0de1e721bf3323d2d5b86aae867713c18cb0971fce46e2f6b7f
+                  index: 0
+                  pkscript: "efae93b8ee3abde8da0f62f0bafed3ca0d2de65158bab5f9b035522fa80d124c\
+                    0810fde80376a91482d086a7bad993b61fa394f794cb8462860ab55c88ac"
+                  value: 4999800000
+                  token:
+                    category: 084c120da82f5235b0f9b5ba5851e62d0dcad3febaf0620fdae8bd3aeeb893ae
+                    amount: '1000'
 
   '/token/{category}/transactions':
     get:
@@ -2762,6 +2796,16 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/TxRef'
+              example:
+                # from a regtest chain of Bitcoin Cash Node
+                - txid: d74025d2a71dd0de1e721bf3323d2d5b86aae867713c18cb0971fce46e2f6b7f
+                  block:
+                    height: 151
+                    position: 2
+                - txid: 178e6d219b4d96166fdf243ad74341b89da84eaa5f970a4eeea9860aea3c37ff
+                  block:
+                    height: 151
+                    position: 1
 
   '/xpub/{xpub}':
     get:

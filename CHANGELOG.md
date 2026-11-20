@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-22
+
+This release brings the tokens of Bitcoin Cash (CashTokens,
+`docs/cashtokens.md`): the store reads the tokens of every output, keeps the
+token balance of every address and category, indexes each category, and
+answers four new endpoints, counting the mempool. Outputs with tokens now
+have their addresses, so the history and the balances of those addresses
+are whole.
+
+Before upgrading, take a copy of the database: the migration to version 24
+cannot be undone, and on Bitcoin Cash it reads every block since May 2023,
+which takes hours. Upgrade every store of a fleet together, since the
+scripts of the shared pool take token entries. It needs haskoin-core 3.0,
+haskoin-store-data 4.0 and haskoin-node 2.7.
+
 ### Added
 - **Tokens of Bitcoin Cash (CashTokens).** Outputs that hold tokens have
   their addresses now, with haskoin-core 3.0, and so are in the history,
@@ -29,7 +44,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   address in its version message, where haskoin-core's `sockToHostAddress`
   stopped on it.
 
+- **Documentation of the tokens.** The README has a section on the token
+  endpoints, with their answers and what each field means, one on how the
+  store keeps tokens, notes on upgrading to 2.0.0, and an example of the
+  Haskell client for tokens. `swagger.yaml` has an example answer of each
+  token endpoint, taken from a regtest chain.
+
 ### Changed
+- **The test of tokens queries the four endpoints** through the client of
+  haskoin-store-data, with the transactions in the mempool and then
+  confirmed: the balance of the address, the holders, the unspent outputs
+  and the transactions of the category, and the amounts as strings in the
+  JSON.
+- **The example of the client in the README compiles**: it needed
+  `OverloadedStrings` for the text of its address.
 - **The integration tests run their containers through
   [podman-test](https://github.com/jprupp/podman-test)**, in place of the
   code of their own in `integration/`: each environment is a pod with

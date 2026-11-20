@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.16.7
+version:        2.0.0
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes the chain in RocksDB and
@@ -125,7 +125,7 @@ library
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=3.0.0 && <3.1
-    , haskoin-node >=2.6.1 && <2.7
+    , haskoin-node >=2.7.0 && <2.8
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
     , http-client >=0.7.19 && <0.8
@@ -193,7 +193,7 @@ library integration
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=3.0.0 && <3.1
-    , haskoin-node >=2.6.1 && <2.7
+    , haskoin-node >=2.7.0 && <2.8
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
@@ -262,7 +262,7 @@ executable haskoin-store
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=3.0.0 && <3.1
-    , haskoin-node >=2.6.1 && <2.7
+    , haskoin-node >=2.7.0 && <2.8
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
@@ -364,7 +364,7 @@ test-suite spec
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=3.0.0 && <3.1
-    , haskoin-node >=2.6.1 && <2.7
+    , haskoin-node >=2.7.0 && <2.8
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
@@ -439,7 +439,7 @@ benchmark haskoin-store-bench
     , hashable >=1.5.1.0 && <1.6
     , hashtables >=1.4.2 && <1.5
     , haskoin-core >=3.0.0 && <3.1
-    , haskoin-node >=2.6.1 && <2.7
+    , haskoin-node >=2.7.0 && <2.8
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17

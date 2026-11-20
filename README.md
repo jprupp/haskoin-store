@@ -642,6 +642,85 @@ looks at the client's address, and WebSocket events work the same.
 Turn off the Blockchain.info endpoints with `--no-blockchain-info`. The xpub
 endpoints are always on: they answer from the fleet's cache in Redis.
 
+### Tokens of Bitcoin Cash
+
+Since May 2023 an output on Bitcoin Cash can hold tokens (CashTokens): a
+fungible amount of one category, a non-fungible token, or both. The store
+reads them from every output, keeps a token balance for each address and
+category, and indexes each category. On Bitcoin there are no tokens: the
+token endpoints answer with empty lists, and the JSON has no `token` field.
+
+The token balances of an address, one per category:
+
+```sh
+curl http://localhost:3000/address/bitcoincash:qz.../tokens
+```
+
+```json
+[
+  {
+    "address": "bitcoincash:qz...",
+    "category": "084c...93ae",
+    "confirmed": "1000",
+    "unconfirmed": "0",
+    "nfts": 0,
+    "utxo": 1,
+    "txs": 2,
+    "received": "2000"
+  }
+]
+```
+
+- **Amounts are strings**, since a category can have up to 2^63 − 1 tokens,
+  more than a JSON number holds exactly in many languages.
+- **They count the mempool**, as the balance of an address does: `confirmed`
+  is what blocks hold and the mempool does not spend, and `unconfirmed` what
+  the mempool adds. Their sum is what the address holds now.
+- **`nfts`** is the number of non-fungible tokens, **`utxo`** the number of
+  unspent outputs that hold the category, **`txs`** the number of
+  transactions that moved it to or from the address, and **`received`**
+  every fungible token that the address ever received, spent ones included.
+
+The category is the id of the transaction whose output 0 the first
+transaction of the tokens spent. Its endpoints:
+
+```sh
+curl 'http://localhost:3000/token/084c...93ae/holders?limit=10&offset=0'
+curl 'http://localhost:3000/token/084c...93ae/unspent?limit=10'
+curl 'http://localhost:3000/token/084c...93ae/transactions?limit=10'
+```
+
+- **`/holders`**: a token balance for each address that holds the
+  category, in the order of the addresses' bytes, a page at a time with
+  `limit` and `offset`. Tokens in outputs without an address are in no
+  one's balance.
+- **`/unspent`**: the unspent outputs that hold it, newest first: those of
+  the mempool, then those of blocks that the mempool does not spend. Pages
+  as an address's unspent outputs, with `limit`, `offset` and `height`.
+- **`/transactions`**: the transactions that created, moved or burned it,
+  newest first, those of the mempool first, paged the same way.
+
+Every output, input (the output it spends) and unspent output has a `token`
+field on Bitcoin Cash: `null` without tokens, and otherwise the tokens as the
+CashTokens test vectors and Bitcoin Cash Node's RPC write them:
+
+```json
+"token": {
+  "category": "084c...93ae",
+  "amount": "1000",
+  "nft": {"capability": "minting", "commitment": "01"}
+}
+```
+
+`nft` is there only for an output that holds a non-fungible token. The
+tokens are written at the front of an output's script, so its `pkscript`
+has them too. The Haskell client of
+[haskoin-store-data](https://github.com/jprupp/haskoin-store-data) has a
+request for each endpoint (`GetAddrTokens`, `GetTokenHolders`,
+`GetTokenUnspent` and `GetTokenTxs`), and `scriptTokens` reads the tokens of
+a script. `swagger.yaml` describes every field, with an example of each
+answer.
+
 ## How it works
 
 ```
@@ -821,6 +900,18 @@ This is version 24 of the database. The store migrates an older database
 the first time it opens it. **There is no way back**: an older store
 cannot open the database afterwards, so take a copy first.
 
+**Upgrading to 2.0.0**, which brings the tokens of Bitcoin Cash:
+
+- **Take a copy of the database first.** The migration from version 23 is
+  the one below; on Bitcoin Cash it reads every block since May 2023, which
+  takes hours, and carries on where it was if it is stopped.
+- **Upgrade every store of a fleet together.** The scripts of the shared
+  pool in Redis take token entries, which an older store's scripts do not
+  know. The transactions that are in the pool at the upgrade have no token
+  entries: their tokens count once a block confirms them.
+- **Clients** that do not know the `token` field ignore it; on Bitcoin the
+  JSON is as it was.
+
 | From | What the migration does | How long |
 | --- | --- | --- |
 | 18, 19 | Not migrated: sync again | |
@@ -887,6 +978,20 @@ What changed for clients in version 22:
 - Reading one confirmed transaction in full takes a second key: 18
   microseconds where it took 11.5. Lists by address and by xpub cost the
   same as before.
+
+### Tokens
+
+An output with tokens has the address of its locking script, read by
+haskoin-core 3.0 after it takes off the token prefix, so the coins of one
+script stay under one address with or without tokens. Importing a block
+writes what its transactions do to tokens next to what they do to coins:
+the token balance of each address and category, and for each category its
+transactions and its unspent outputs, in column families of their own. The
+holders of a category are a second key of the same balances, so that
+listing them reads no other address. The shared mempool in Redis keeps the
+same token entries for the transactions of the pool, which the endpoints
+lay over those of the blocks. `docs/cashtokens.md` has the details, and why
+each part is built as it is.
 
 ### Extended public keys
 
@@ -1276,6 +1381,8 @@ public network, and are logged for debugging.
 Query a running server with `haskoin-store-data`:
 
 ```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
 import Data.Default (def)
 import Haskoin (btc, textToAddr)
 import Haskoin.Store.WebClient
@@ -1291,6 +1398,30 @@ main = do
 `apiCall` answers `Right` the result or `Left` an error. `apiEvents`
 listens to `/events`, and `apiEventsAfter` takes up from an event.
 
+The tokens of Bitcoin Cash, by address and by category:
+
+```haskell
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+import Data.Default (def)
+import Haskoin (bch, hexToTxHash, textToAddr)
+import Haskoin.Store.Data (SerialList (..), TokenBalance (..))
+import Haskoin.Store.WebClient
+
+main :: IO ()
+main = do
+  let cfg = def {net = bch}
+      Just addr = textToAddr bch "bitcoincash:qz…"
+      Just category = hexToTxHash "084c…93ae"
+  -- the fungible tokens of each category that the address holds now
+  Right (SerialList balances) <- apiCall cfg (GetAddrTokens addr)
+  mapM_ (\b -> print (b.category, b.confirmedTokens + b.unconfirmedTokens)) balances
+  -- the first page of the holders of a category
+  Right (SerialList holders) <- apiCall cfg (GetTokenHolders category Nothing (OffsetParam 0))
+  print (length holders)
+```
+
 The client appends the network name to `host`, as in the layout of
 api.haskoin.com. To reach your own server, put it behind a proxy that maps
 `/btc/` (or the name of your network) to it.
@@ -1302,6 +1433,9 @@ Or embed the indexer in your own program with `haskoin-store`:
 - The functions of `Haskoin.Store.Database.Query` query the chain in its
   database in `IO`, such as `getBalance store.db addr`, and `chainRead`
   gives them as a `StoreRead`.
+- The token queries of a `StoreRead` (`getAddressTokens`,
+  `getTokenHolders`, `getTokenTxs` and `getTokenUnspents`) answer for the
+  tokens of Bitcoin Cash.
 - Subscribe to `Store.pub` to receive `StoreEvent`s.
 
 Every module has Haddock documentation; build it with `stack haddock`.

@@ -149,9 +149,8 @@ the token entries.
 
 ## Where it stands
 
-Done, on the master branches of haskoin-core (3.0), haskoin-store-data
-(4.0), haskoin-node and this repository, each pinned to a commit of the
-one below:
+All of it ships in **haskoin-store 2.0.0**, with haskoin-core 3.0,
+haskoin-store-data 4.0 and haskoin-node 2.7:
 
 - the `token` field of the JSON, and `TokenBalance` and the requests of the
   new endpoints, in haskoin-store-data 4.0;
@@ -164,12 +163,14 @@ one below:
   finds every column family of the two the same;
 - the publishing checks on haskoin-core's parser;
 - the shared mempool: the token entries of the pool in Redis, their reads,
-  and the endpoints with the pool on top.
+  and the endpoints with the pool on top. The test of the pool holds the
+  script to a model over random histories, and an integration test on a
+  regtest chain of Bitcoin Cash Node asks the four endpoints through the
+  client of haskoin-store-data, with the transactions in the mempool and
+  then confirmed.
 
-Still to do:
-
-- haskoin-core 3.0, haskoin-store-data 4.0 and haskoin-node on Hackage,
-  and the pins back to Hackage versions.
+Until those releases are on Hackage, each package pins a commit of the one
+below on GitHub.
 
 ## Not done
 

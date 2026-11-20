@@ -76,6 +76,7 @@ import Haskoin
     BloomFlags (..),
     Network (..),
     OutPoint (..),
+    TokenData (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
@@ -97,6 +98,7 @@ import Haskoin
     prvSubKey,
     pubSubKey,
     sha256,
+    textToAddr,
     txHash,
     txHashToHex,
     xPrvWif,
@@ -133,10 +135,13 @@ import Haskoin.Store.Data
     RawResult (..),
     SerialList (..),
     Spender (..),
+    TokenBalance (..),
     Transaction (..),
     TxData (..),
     TxRef (..),
+    Unspent (..),
     XPubBal (..),
+    scriptTokens,
   )
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Exception (bracket, tryAny)
@@ -149,7 +154,7 @@ import Haskoin.Store.Integration.Valkey (redisContainer)
 import Haskoin.Store.Integration.Valkey qualified as Valkey
 import Haskoin.Store.Startup (redisConnectInfo)
 import Haskoin.Store.WebClient qualified as Client
-import Haskoin.Store.WebCommon (ApiResource, NoCache (..), NoTx (..))
+import Haskoin.Store.WebCommon (ApiResource, LimitsParam (..), NoCache (..), NoTx (..), OffsetParam (..))
 import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
 import Haskoin.Store.XPub.Indexer (Settings (..))
 import Haskoin.Store.XPub.Service (XPubConfig (..))
@@ -2012,6 +2017,13 @@ multisigTest env = do
 -- tokens, and one that spends the output that holds them, are published:
 -- the store verifies their signatures, which cover the tokens, and does
 -- not take them for forged. A forged spend of the tokens is refused.
+--
+-- Then the four endpoints of tokens answer, through the client of
+-- haskoin-store-data: the token balance of the address that holds them,
+-- the holders, the unspent outputs and the transactions of the category,
+-- first with both transactions in the mempool, then confirmed by a block.
+-- Both outputs hold 1000 tokens at the same address, so its balance has
+-- 1000 tokens in one output and two transactions, and has received 2000.
 tokenTest :: Env -> IO ()
 tokenTest env = do
   coins <- arr <$> rpc env.node "listunspent" []
@@ -2045,6 +2057,41 @@ tokenTest env = do
     code `shouldBe` 400
     fmap (T.isInfixOf "does not verify") (textField "message" v) `shouldBe` Just True
   published spend
+  category <- case coin ! "txid" of
+    String t | Just c <- hexToTxHash t -> return c
+    other -> fail ("Not a category: " <> show other)
+  owner <- maybe (fail "Not an address") return (textToAddr env.net to)
+  let conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain}
+      call :: (ApiResource a b) => a -> IO b
+      call r = Client.apiCall conf r >>= either (fail . show) return
+      everything = LimitsParam Nothing (OffsetParam 0) Nothing
+      catPath = "/token/" <> cs (txHashToHex category)
+      endpoints confirmed unconfirmed = do
+        let expected =
+              TokenBalance
+                { address = owner,
+                  category,
+                  confirmedTokens = confirmed,
+                  unconfirmedTokens = unconfirmed,
+                  nfts = 0,
+                  tokenUtxo = 1,
+                  tokenTxs = 2,
+                  receivedTokens = 2000
+                }
+        call (Client.GetAddrTokens owner) `shouldReturn` SerialList [expected]
+        call (Client.GetTokenHolders category Nothing (OffsetParam 0)) `shouldReturn` SerialList [expected]
+        SerialList outs <- call (Client.GetTokenUnspent category everything)
+        map (.outpoint) outs `shouldBe` [OutPoint (txHash spend) 0]
+        map (fmap (\t -> (t.category, t.amount)) . scriptTokens env.net . (.script)) outs
+          `shouldBe` [Just (category, 1000)]
+        SerialList refs <- call (Client.GetTokenTxs category everything)
+        map (.txid) refs `shouldMatchList` [txHash genesis, txHash spend]
+        -- the JSON gives the amounts as strings, as the API reference says
+        (_, holders) <- getJSON env.plain (catPath <> "/holders")
+        map (field "confirmed") (arr holders) `shouldBe` [Just (String (cs (show confirmed)))]
+  endpoints 0 1000
+  void (mine env 1)
+  endpoints 1000 0
 
 -- | The events of the server over a WebSocket. A client that says nothing
 -- hears of every transaction; one that names an extended public key, an
