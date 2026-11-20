@@ -12,8 +12,11 @@
   be on the `PATH`. Its settings for this package are in `haskell-dev.toml`.
   A change to the script itself is a change to jprupp/tools.
 - `stack build`, `stack test`, `stack haddock` and `stack bench` are the
-  release build. Do not mix them with `haskell-dev` in one session: each
-  switch compiles everything again.
+  release build. Do not mix them with `haskell-dev` in one session. With
+  no source changed, Stack keeps the objects of the other flags, so a
+  `stack build` or `stack test` right after `haskell-dev build` runs code
+  without optimisation; the next change to a source compiles everything
+  again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
 - The tests take about 65 seconds in eight processes, against 140 to 210

@@ -1336,27 +1336,57 @@ scripts/install-system-libraries.sh  # the C libraries, on Ubuntu or Debian
 haskell-release --dry-run      # build and check a release, upload nothing
 ```
 
-`haskell-format`, `check-stack-paths` and `haskell-release` are in
-[jprupp/tools](https://github.com/jprupp/tools), the scripts shared by the
-Haskell packages of this family: clone it and put it on your `PATH`.
-
-The Stack commands build the store as it is released, with optimisation.
-For the time between two commits there is a faster loop, `haskell-dev`,
-from jprupp/tools too:
+`haskell-format`, `check-stack-paths`, `haskell-release` and `haskell-dev`
+are scripts of [jprupp/tools](https://github.com/jprupp/tools), shared by the
+Haskell packages of this family. Clone that repository once and put its
+folder on your `PATH`, for example in `~/.bashrc`; a terminal opened before
+the change needs `source ~/.bashrc`.
 
 ```sh
-haskell-dev build              # build without optimisation
-haskell-dev test               # the tests in eight processes: 65 s, not 4 min
-haskell-dev test Fleet.Redis   # the specs whose module name has a word
-haskell-dev docs               # build the documentation and check its comments
+git clone https://github.com/jprupp/tools.git ~/Source/tools
+echo 'export PATH="$HOME/Source/tools:$PATH"' >> ~/.bashrc
 ```
 
-`haskell-dev.toml` names the slow spec module, `Haskoin.Store.Integration`
-(`test/Haskoin/Store/IntegrationSpec.hs`), whose five environments then run
-at the same time, each with its own node, Valkey and store in Podman. Do not
-mix the two kinds of build in one folder: the flags differ, so each switch
-compiles everything again. Never time the
-store with `haskell-dev`: the benchmarks run with `stack bench`.
+The Stack commands build the store as it is released, with optimisation,
+which takes minutes. For the time between two commits there is a faster
+loop, `haskell-dev`. Run it from the top folder of haskoin-store:
+
+```sh
+haskell-dev test                     # build, then run all the tests
+haskell-dev test Fleet.Redis         # the specs with Fleet.Redis in their module name
+haskell-dev test Fleet.Redis Web     # the specs of several modules
+haskell-dev test --match "/Haskoin.Store.Integration/Regtest Bitcoin Core/"
+                                     # one path, in one process
+haskell-dev test --seed 12345        # run a failure again
+haskell-dev test --jobs 4            # fewer processes, to save memory
+haskell-dev build                    # build without optimisation
+haskell-dev docs                     # build the documentation and check its comments
+```
+
+`test` builds first, so a separate `build` is not needed. A run of all the
+tests takes about 65 seconds in eight processes, against about four minutes
+for `stack test`. `haskell-dev.toml` names the slow spec module,
+`Haskoin.Store.Integration` (`test/Haskoin/Store/IntegrationSpec.hs`), whose
+five environments then run at the same time, each with its own node, Valkey
+and store in Podman. When a test fails, the output gives the seed: run the
+test again alone with `--seed` and `--match` on its path, which prints the
+usual output of hspec.
+
+The integration tests, and those of the fleet, need rootless Podman (see
+below); without it they are pending, and the others run. Now and then a test
+fails with `InsecureConnectionDenied`, an exception of the HTTP client, and
+passes when run again with the same seed: its cause is not known yet, so run
+such a failure again before taking it for a fault of a change.
+
+Do not mix the two kinds of build in one folder. When no source has changed,
+Stack does not see that the flags have, and keeps the objects of the other
+build: a plain `stack build` or `stack test` right after `haskell-dev build`
+uses code without optimisation. Only what runs from this folder uses it, such
+as the tests and `stack exec haskoin-store`: a package that depends on
+haskoin-store builds its own copy. After the next change to a source,
+everything compiles again. `stack bench` configures the package again and
+compiles it with optimisation. Never time the store with `haskell-dev`: the
+benchmarks run with `stack bench`.
 
 A release is made with `haskell-release`, once the version in
 `package.yaml` is bumped, its CHANGELOG entry written and the commit pushed.
