@@ -12,6 +12,7 @@ import Data.Char (toLower)
 import Data.Default (Default (..))
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Text qualified as T
 import GHC.Conc (getNumProcessors)
@@ -22,6 +23,7 @@ import Haskoin
   )
 import Haskoin.Node
   ( LogLevel (..),
+    Permission (..),
     logInfo,
     withConnection,
     withLogger,
@@ -111,6 +113,7 @@ data Config = Config
     net :: !String,
     discover :: !Bool,
     peers :: ![String],
+    peerPermissions :: ![Permission],
     version :: !Bool,
     debug :: !Bool,
     maxPendingTxs :: !Int,
@@ -180,6 +183,8 @@ defConfig = do
     env "DISCOVER" False parseBool
   peers <-
     env "PEER" [] (pure . words)
+  peerPermissions <-
+    env "PEER_PERMISSIONS" [] (mapM parsePermission . words . map (\x -> if x == ',' then ' ' else x))
   debug <-
     env "DEBUG" False parseBool
   maxPendingTxs <-
@@ -330,6 +335,19 @@ parseBool str = case map toLower str of
   "0" -> Just False
   _ -> Nothing
 
+-- | A permission that a node grants with @-whitelist@ or @-whitebind@, by
+-- the name that Bitcoin Core and Bitcoin Cash Node give it there.
+parsePermission :: String -> Maybe Permission
+parsePermission str = case map toLower str of
+  "bloomfilter" -> Just PermBloomFilter
+  "relay" -> Just PermRelay
+  "forcerelay" -> Just PermForceRelay
+  "download" -> Just PermDownload
+  "noban" -> Just PermNoBan
+  "mempool" -> Just PermMempool
+  "addr" -> Just PermAddr
+  _ -> Nothing
+
 -- | The help of an option, with the environment variable that sets its
 -- default: every option has one, and someone who runs the store in a
 -- container reads the help to find its name.
@@ -396,8 +414,21 @@ config c = do
             <> helpEnv
               "PEER"
               ( unwords
-                  [ "Network peer (as many as required); on Bitcoin, only these are asked for their mempools",
-                    "when the pool fills again, so whitelist the store on them"
+                  [ "Network peer (as many as required); a node that whitelists the store here says so",
+                    "with --peer-permission"
+                  ]
+              )
+  peerPermissions <-
+    fmap (mappend c.peerPermissions) $
+      many $
+        option (maybeReader parsePermission) $
+          metavar "PERMISSION"
+            <> long "peer-permission"
+            <> helpEnv
+              "PEER_PERMISSIONS"
+              ( unwords
+                  [ "A permission that the nodes of --peer grant the store with -whitelist or -whitebind,",
+                    "as they name it (as many as they grant): mempool to ask them for their mempools"
                   ]
               )
   version <-
@@ -881,6 +912,7 @@ run cfg =
         StoreConfig
           { maxPeers = cfg.maxPeers,
             initPeers = cfg.peers,
+            peerPermissions = Set.fromList cfg.peerPermissions,
             discover = cfg.discover,
             db = dir </> "db",
             net = net,

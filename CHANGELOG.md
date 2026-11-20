@@ -19,7 +19,10 @@ Before upgrading, take a copy of the database: the migration to version 24
 cannot be undone, and on Bitcoin Cash it reads every block since May 2023,
 which takes hours. Upgrade every store of a fleet together, since the
 scripts of the shared pool take token entries. It needs haskoin-core 3.0,
-haskoin-store-data 4.0 and haskoin-node 2.7.
+haskoin-store-data 4.0 and haskoin-node 2.7. A store whose `--peer` nodes
+whitelist it must now say what they grant (`--peer-permission`, or
+`PEER_PERMISSIONS=mempool,noban` for `whitebind=mempool,noban@…`): without
+`mempool` there, a Bitcoin store no longer asks them for their mempools.
 
 ### Added
 - **Tokens of Bitcoin Cash (CashTokens).** Outputs that hold tokens have
@@ -43,6 +46,25 @@ haskoin-store-data 4.0 and haskoin-node 2.7.
   socat. The courier of a published transaction gives such a peer the zero
   address in its version message, where haskoin-core's `sockToHostAddress`
   stopped on it.
+
+- **The store asks what each peer's node allows.** With haskoin-node 2.7,
+  every peer runs a model of its node: the state machine of Bitcoin Core
+  32.1 or Bitcoin Cash Node 29.2.0 that haskoin-core translates from their
+  source. A message that the node would punish is not sent, and the log
+  says why, with the upstream line. When the pool fills again, the store
+  asks for the mempool only the peers whose node takes the request: one
+  that serves Bloom filters, as its version message says, or one that
+  whitelists the store with `mempool`. That replaces a rule of the store's
+  own, which asked every peer on Bitcoin Cash and only the `--peer` peers
+  on Bitcoin. That rule lost a Bitcoin Cash peer that served no Bloom
+  filters, and assumed that every `--peer` node whitelisted the store.
+  `--peer-permission` (`PEER_PERMISSIONS`) says what the nodes of `--peer`
+  grant, by the names of `-whitelist`.
+- **The courier knows which nodes say when they refuse.** The model of the
+  node says whether it answers a refused transaction with a `reject`. A
+  `pong` with no `reject` before it now means that a Bitcoin Cash Node kept
+  the transaction (`Kept`), and still only that a Bitcoin Core node is done
+  with it (`Took`).
 
 - **Documentation of the tokens.** The README has a section on the token
   endpoints, with their answers and what each field means, one on how the
@@ -72,9 +94,9 @@ haskoin-store-data 4.0 and haskoin-node 2.7.
   to sockets, and the store reaches all three through them, so the pod has
   no network. The tests are skipped with `PODMAN_TEST_SKIP`, in place of
   `HASKOIN_STORE_NO_PODMAN`. The Bitcoin Core node that does not whitelist the
-  store now gives it its mempool, the one permission that the store asks
-  of a `--peer` on Bitcoin: without it the node closed the store's
-  connection over the request, now and then during a test. The test of
+  store now gives it its mempool, and the store is told so: without it the
+  node closed the store's connection over the request, now and then during
+  a test. The test of
   the Haskell client mines a block at each look until the client hears
   one, where it mined one and waited: a client whose stream opened after
   that block heard nothing.

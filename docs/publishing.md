@@ -76,7 +76,11 @@ script of any other kind is satisfied. So:
 5. **Answer.** 202 with the id and a message, once a peer took it. Bitcoin
    Cash Node says when it refuses (`reject`), and when every peer that
    answered refused the transaction, the answer is 400 with the first
-   reason. Bitcoin Core refuses without a word.
+   reason. Bitcoin Core refuses without a word. The courier knows which
+   node does which from the model of the node (`expectsReject` of
+   haskoin-node), so a `pong` with no `reject` before it means that a
+   Bitcoin Cash Node kept the transaction, and only that a Bitcoin Core
+   node is done with it.
 6. **It comes back.** The connections that the store syncs from never had
    the transaction. A node that took it announces it there, and the block
    store asks for it and offers it to the pool as any other. In case none
@@ -245,8 +249,9 @@ With a program that speaks the peer-to-peer protocol:
   and a check against it would refuse some transactions the node takes.
 
 **Whitelist the store on the nodes you run it next to** (`-whitelist` in
-Bitcoin Core and Bitcoin Cash Node). The node then announces without
-delay, and never closes the store's connections over a transaction.
+Bitcoin Core and Bitcoin Cash Node), and say what they grant with
+`--peer-permission`. The node then announces without delay, and never
+closes the store's connections over a transaction.
 
 ## What was not chosen
 

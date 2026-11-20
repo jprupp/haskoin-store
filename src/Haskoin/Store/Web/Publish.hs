@@ -150,6 +150,7 @@ import Haskoin
     TxIn (..),
     TxOut (..),
     VarString (..),
+    genesisNode,
     isMinimalPush,
     isPushOp,
     nullOutPoint,
@@ -165,13 +166,14 @@ import Haskoin.Node
     PeerEvent (..),
     WithConnection,
     buildVersion,
+    expectsReject,
+    newPeer,
     peer,
     peerMessageDone,
     sendMessage,
-    wrapPeer,
   )
-import Haskoin.Node.Address (peerHostAddress)
-import Haskoin.Node.Peer.Lock (Lock (..))
+import Haskoin.Node.Address (peerHostAddress, seenAs)
+import Haskoin.Node.Peer.Remote (newRemote)
 import Haskoin.Store.Common (StoreRead (..))
 import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), isCoinbaseTx)
 import NQE (newMailbox, receive, withPublisher, withSubscription)
@@ -520,7 +522,7 @@ publish p tx =
               Nothing -> do
                 addresses <- p.peers
                 delivered <- mapConcurrently (\a -> p.courier a tx) addresses
-                let handed = length [() | d <- delivered, d `elem` [Took, NoAnswer]]
+                let handed = length [() | d <- delivered, d `elem` [Took, Kept, NoAnswer]]
                     reasons = [why | Rejected why <- delivered]
                 if
                   | handed > 0 -> do
@@ -685,8 +687,12 @@ tokenRules tx spent = do
 -- | What a node did with a transaction handed to it.
 data Delivery
   = -- | it answered the ping that followed: it is done with the
-    -- transaction, and said nothing against it
+    -- transaction, and said nothing against it, as Bitcoin Core never does
     Took
+  | -- | it answered the ping that followed without a @reject@, and it is a
+    -- node that answers a transaction it refuses with one, as Bitcoin Cash
+    -- Node does: it did not refuse it
+    Kept
   | -- | it sent a @reject@ message for the transaction, with this reason
     Rejected !Text
   | -- | it closed the connection after getting the transaction and
@@ -712,33 +718,43 @@ data Courier = Courier
 -- node answers until its @pong@.
 --
 -- The connection is a peer of "Haskoin.Node.Peer" with a publisher of its
--- own, so nothing of it reaches the peer manager or the block store.
+-- own, so nothing of it reaches the peer manager or the block store. It has
+-- a model of the node, as every peer does ("Haskoin.Node.Peer.Remote"),
+-- which judges each message before it goes. The model also says whether the
+-- node answers a refusal with a @reject@ ('expectsReject'): if it does, a
+-- @pong@ with no @reject@ before it means that the node kept the
+-- transaction ('Kept'); if it never does, only that the node is done with
+-- it ('Took').
 deliver :: Courier -> SockAddr -> Tx -> IO Delivery
 deliver c sa tx =
   withPublisher $ \pub -> withSubscription pub $ \sub -> do
     (inbox, mailbox) <- newMailbox
-    busy <- newTVarIO Free
-    pending <- newTVarIO 0
     sent <- newTVarIO False
     refused <- newTVarIO Nothing
     nonce <- randomIO
     token <- randomIO
+    seed <- randomIO
     now <- getCurrentTime
-    let config =
+    let (addrNet, local) = seenAs sa
+        opened = floor (utcTimeToPOSIXSeconds now * 1000000)
+        config =
           PeerConfig
             { pub = pub,
               net = c.net,
               label = "courier " <> cs (show sa),
               connect = c.connect sa,
               logger = c.logger,
-              lookupBlock = const (return Nothing)
+              lookupBlock = const (return Nothing),
+              bestBlock = return (genesisNode c.net),
+              remote = newRemote c.net mempty addrNet local opened seed
             }
-        node = wrapPeer config busy pending mailbox
         nowhere = NetworkAddress 0 (sockToHostAddress (SockAddrInet 0 0))
         -- the zero address for a peer on a Unix socket, which has none
         there = NetworkAddress 0 (peerHostAddress sa)
         version = buildVersion c.net nonce 0 nowhere there (floor (utcTimeToPOSIXSeconds now))
-        next =
+        took = if expectsReject c.net version then Kept else Took
+    node <- newPeer config mailbox
+    let next =
           receive sub >>= \case
             PeerMessage _ m -> peerMessageDone node >> return m
             _ -> next
@@ -772,7 +788,7 @@ deliver c sa tx =
       why <- readTVarIO refused
       return $ case (why, r) of
         (Just reason, _) -> Rejected reason
-        (Nothing, Just (Right ())) -> Took
+        (Nothing, Just (Right ())) -> took
         (Nothing, Just (Left ())) -> if was then Closed else NoConnection
         (Nothing, Nothing) -> if was then NoAnswer else NoConnection
 

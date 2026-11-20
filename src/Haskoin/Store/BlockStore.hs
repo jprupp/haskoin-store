@@ -92,7 +92,6 @@ module Haskoin.Store.BlockStore
     blockStorePendingTxsSTM,
     needsMoreBlocks,
     blockStoreRefill,
-    asksMempool,
     toFetch,
   )
 where
@@ -110,7 +109,7 @@ import Control.Concurrent.STM
     stateTVar,
     writeTVar,
   )
-import Control.Exception (Exception, SomeException, catch, throwIO, try)
+import Control.Exception (Exception, throwIO, try)
 import Control.Monad
   ( filterM,
     forM,
@@ -171,6 +170,7 @@ import Haskoin
   )
 import Haskoin.Node
   ( Chain,
+    Judgement (..),
     LogLevel (..),
     Logger,
     OnlinePeer (..),
@@ -184,13 +184,14 @@ import Haskoin.Node
     chainGetParents,
     getOnlinePeer,
     getPeers,
+    judgeMessage,
+    judgementText,
     killPeer,
     logAt,
     newOwner,
     releasePeer,
     reservePeer,
     sendMessage,
-    toSockAddr,
   )
 import Haskoin.Store.BlockStore.Pending (Pending)
 import Haskoin.Store.BlockStore.Pending qualified as Pending
@@ -230,7 +231,6 @@ import NQE
     send,
     sendSTM,
   )
-import Network.Socket (SockAddr)
 import System.Metrics.StatsD
 import System.Random (randomIO, randomRIO)
 
@@ -431,11 +431,6 @@ data BlockStoreConfig = BlockStoreConfig
     db :: !DatabaseReader,
     -- | network constants
     net :: !Network,
-    -- | the peers given on the command line or in the environment, as
-    -- @host:port@: on Bitcoin, only these are asked for their mempools,
-    -- since a node whitelists the store there or disconnects it
-    -- ('blockStoreRefill')
-    explicitPeers :: ![String],
     -- | what to do with the best block right after it changes, and when the
     -- store starts, before anything else is written to the database: a
     -- member of a fleet takes a view of the database for the block here
@@ -623,27 +618,20 @@ syncMempool self =
       logInfo self $ "Asking " <> cs (show (length peers)) <> " peers for their mempools"
       forM_ peers $ \op -> MMempool `sendMessage` op.mailbox
 
--- | Of the connected peers, those that answer a request for their mempool
--- ('asksMempool'), with 'explicitPeers' resolved to their addresses. A name
--- that does not resolve leaves its peer out.
+-- | Of the connected peers, those that answer a request for their mempool:
+-- those whose model says that their node takes it
+-- ('Haskoin.Node.judgeMessage'). A node answers if it offers Bloom
+-- filters, as its version message says, or if it whitelisted the store
+-- with the permission @mempool@, which the operator configures
+-- (@--peer-permission@). Any other closes the connection of a peer that
+-- asks. The others are left out, and the log says why.
 mempoolPeers :: BlockStore -> [OnlinePeer] -> IO [OnlinePeer]
-mempoolPeers self peers = do
-  explicit <-
-    if isJust self.config.net.cashAddrPrefix
-      then return []
-      else concat <$> mapM resolve self.config.explicitPeers
-  return [p | p <- peers, asksMempool self.config.net explicit p.address]
-  where
-    resolve s = toSockAddr self.config.net s `catch` \(_ :: SomeException) -> return []
-
--- | Whether to ask a peer at an address for its mempool, given the
--- addresses of the peers given explicitly. On Bitcoin Cash, always: Bitcoin
--- Cash Node serves bloom filters by default, and so answers anyone. On
--- Bitcoin, only a peer given explicitly: Bitcoin Core disconnects any peer
--- that asks unless it whitelists it, which an operator does for the peers
--- that the store is told to use, and not for seeds or discovered peers.
-asksMempool :: Network -> [SockAddr] -> SockAddr -> Bool
-asksMempool net explicit a = isJust net.cashAddrPrefix || a `elem` explicit
+mempoolPeers self = filterM $ \p ->
+  judgeMessage p.mailbox MMempool >>= \case
+    Allowed -> return True
+    j -> do
+      logDebug self $ "Not asking " <> cs (show p.address) <> " for its mempool: " <> judgementText j
+      return False
 
 -- | Ask the peers for their mempools, once, and fetch every transaction
 -- that they announce and the fleet has not seen: for when the pool was
@@ -654,17 +642,17 @@ asksMempool net explicit a = isJust net.cashAddrPrefix || a `elem` explicit
 -- which offers them to the pool again.
 --
 -- Only the peers connected at that time are asked, and only once, and of
--- those only the ones that answer ('asksMempool'). Bitcoin Core closes the
--- connection of a peer that asks for its mempool unless it serves bloom
--- filters (@-peerbloomfilters@, off by default) or it whitelists that peer;
--- Bitcoin Cash Node serves bloom filters by default and answers anyone. So
--- on Bitcoin only the peers given with @--peer@ are asked, since an
--- operator whitelists those: asking the others, seeds and discovered peers,
--- only loses them, all at once, and with them the health of the store.
--- Asking every peer that connects, as the store once did, lost its public
--- Bitcoin Core peers one after the other for as long as it ran. A node
--- that the store has over RPC (@--node-rpc@) answers in any case
--- ('Haskoin.Store.Web.refillLoop').
+-- those only the ones whose node answers (@mempoolPeers@). Both Bitcoin Core
+-- and Bitcoin Cash Node close the connection of a peer that asks for their
+-- mempool unless they serve Bloom filters (@-peerbloomfilters@, off by
+-- default on Bitcoin Core, on by default on Bitcoin Cash Node) or whitelist
+-- that peer with the permission @mempool@. Asking every peer that connects,
+-- as the store once did, lost its public Bitcoin Core peers one after the
+-- other for as long as it ran. The model of each peer (from haskoin-node and
+-- haskoin-core) knows the rule, the services of its node from its version
+-- message, and the permissions that the operator says the nodes of
+-- @--peer@ grant (@--peer-permission@). A node that the store has over RPC
+-- (@--node-rpc@) answers in any case ('Haskoin.Store.Web.refillLoop').
 blockStoreRefill :: BlockStore -> IO ()
 blockStoreRefill self = do
   atomically $ writeTVar self.refill True

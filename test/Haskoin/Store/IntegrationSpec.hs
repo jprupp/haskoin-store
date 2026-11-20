@@ -66,6 +66,7 @@ import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Sequence qualified as Seq
 import Data.Serialize (decode, encode)
+import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -110,7 +111,7 @@ import Haskoin
     xPubWitnessAddr,
   )
 import Haskoin qualified as H
-import Haskoin.Node (LogLevel (..), Logger (..), getPeers, withConnection, withLogger)
+import Haskoin.Node (LogLevel (..), Logger (..), Permission (..), Permissions, getPeers, withConnection, withLogger)
 import Haskoin.Store
   ( DeriveType (..),
     Store (..),
@@ -303,7 +304,8 @@ withEnvAt whitelisted ago kind go = do
     void $ generateTo node 150 miner
     withRamDir $ \dir -> withTestLog $ \logger logTail -> do
       let net = nodeNetwork kind
-          cfg = storeConfig net logger dir redisURL node.peer
+          granted = grantedBy whitelisted kind
+          cfg = storeConfig net logger dir redisURL node.peer granted
       withStore cfg $ \store -> do
         listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
           let web s = runWebSocket (webConfig logger s)
@@ -324,8 +326,8 @@ withEnvAt whitelisted ago kind go = do
                         plain = "http://127.0.0.1:" <> show plainPort,
                         miner = miner,
                         redis = conn,
-                        configIn = \d -> storeConfig net logger d redisURL node.peer,
-                        memberIn = \d -> storeConfig net logger d redisURL node.peer,
+                        configIn = \d -> storeConfig net logger d redisURL node.peer granted,
+                        memberIn = \d -> storeConfig net logger d redisURL node.peer granted,
                         logTail
                       }
               waitSynced env
@@ -393,17 +395,29 @@ withTestLog f = do
           padded = replicate (3 - length (show millis)) '0' <> show millis
       return (toLogStr (show seconds <> "." <> padded <> " "))
 
+-- | The permissions that the node of an environment grants the store, as
+-- its operator would tell the store with @--peer-permission@: a bare
+-- @-whitelist@ gives @noban@, @mempool@ and @relay@ ('nodeContainer'), and
+-- the node that does not whitelist the store gives Bitcoin Core's
+-- @mempool@ alone ('strangerContainer').
+grantedBy :: Bool -> NodeKind -> Permissions
+grantedBy whitelisted kind
+  | whitelisted = Set.fromList [PermNoBan, PermMempool, PermRelay]
+  | kind == BitcoinCore = Set.singleton PermMempool
+  | otherwise = Set.empty
+
 -- | How many of the last lines of the log of a store a test keeps.
 tailLines :: Int
 tailLines = 400
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
 -- buffers and caches.
-storeConfig :: Network -> Logger -> FilePath -> String -> String -> StoreConfig
-storeConfig net logger dir redisURL peer =
+storeConfig :: Network -> Logger -> FilePath -> String -> String -> Permissions -> StoreConfig
+storeConfig net logger dir redisURL peer granted =
   StoreConfig
     { maxPeers = 1,
       initPeers = [peer],
+      peerPermissions = granted,
       discover = False,
       db = dir,
       net = net,

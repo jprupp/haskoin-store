@@ -326,7 +326,8 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, or a test network (see `--help`) |
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
-| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER`. On Bitcoin, only these peers are asked for their mempools when the pool fills again: whitelist the store on them (`whitebind=mempool@…`) |
+| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER` |
+| `--peer-permission` | `PEER_PERMISSIONS` | none | A permission that the nodes of `--peer` grant the store with `-whitelist` or `-whitebind`, by its name there: `mempool`, `noban`, `relay`, `forcerelay`, `download`, `bloomfilter`, `addr`; repeat for more, comma- or space-separated in `PEER_PERMISSIONS`. With `mempool`, the store asks them for their mempools when the pool fills again |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
@@ -403,10 +404,12 @@ fleet of one. Every key starts with `hs2:<network>:`.
   blocks, the stores fill it again too.
 - **Filling the pool again** works best with `--node-rpc`: each store reads
   its node's mempool (`getrawmempool`), 2,000 transactions every two
-  seconds. Each also asks its peers for their mempools, once: every peer on
-  Bitcoin Cash, whose nodes answer anyone, and on Bitcoin only the peers
-  given with `--peer`, since Bitcoin Core disconnects a store that asks
-  unless it whitelists it (`docs/fleet-mempool.md`).
+  seconds. Each also asks its peers for their mempools, once: the peers
+  whose node takes the request, which a node closes the connection over
+  unless it offers Bloom filters or whitelists the store with `mempool`.
+  The store knows which from a model of each peer's node
+  (`docs/fleet-mempool.md`): tell it what your nodes grant with
+  `--peer-permission`.
 - **`/events` is the same stream on every store**, written to Redis with
   each change of the pool and each move of the tip.
 - **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).
@@ -863,7 +866,8 @@ never confirm. It is handed over, and comes in when a node announces it.
   unless there is an RPC to send it over; and so are the transactions that
   were measured to cost the store its connections.
 - **Whitelist the store on your nodes** (`-whitelist` in Bitcoin Core and
-  Bitcoin Cash Node). A node announces to a whitelisted peer without
+  Bitcoin Cash Node), and tell the store what they grant
+  (`--peer-permission`). A node announces to a whitelisted peer without
   delay, so the transaction shows in the store at once; otherwise Bitcoin
   Core takes five seconds on average. And a node never closes the
   connections of a whitelisted peer.

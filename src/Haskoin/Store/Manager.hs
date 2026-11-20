@@ -62,6 +62,7 @@ import Haskoin.Node
     NodeEvent (..),
     PeerEvent (..),
     PeerMgr,
+    Permissions,
     WithConnection,
     logAt,
     withNode,
@@ -159,6 +160,10 @@ data StoreConfig = StoreConfig
     maxPeers :: !Int,
     -- | static set of peers to connect to
     initPeers :: ![String],
+    -- | the permissions that the nodes of 'initPeers' grant the store with
+    -- @-whitelist@ or @-whitebind@, such as 'Haskoin.Node.PermMempool', which lets the
+    -- store ask them for their mempools ('Haskoin.Node.NodeConfig')
+    peerPermissions :: !Permissions,
     -- | discover new peers
     discover :: !Bool,
     -- | RocksDB database path
@@ -396,7 +401,6 @@ blockStoreCfg cfg node pub db member =
       pub = pub,
       db = db,
       net = cfg.net,
-      explicitPeers = cfg.initPeers,
       onBest = maybe (\_ -> return ()) noteBest member,
       onTx = maybe (\_ _ -> return ()) memberReceived member,
       seen = maybe (\_ -> return mempty) memberSeen member,
@@ -431,7 +435,8 @@ nodeCfg cfg db pub =
       timeout = cfg.peerTimeout,
       maxPeerLife = cfg.maxPeerLife,
       connect = cfg.connect,
-      logger = cfg.logger
+      logger = cfg.logger,
+      permissions = cfg.peerPermissions
     }
 
 -- | Forward every node event to the block store and the store publisher, forever.

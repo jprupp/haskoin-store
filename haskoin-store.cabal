@@ -302,7 +302,6 @@ test-suite spec
   other-modules:
       Haskoin.Store.BlockStore.PendingSpec
       Haskoin.Store.BlockStore.SyncSpec
-      Haskoin.Store.BlockStoreSpec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Database.MergeSpec
       Haskoin.Store.Database.MigrateSpec

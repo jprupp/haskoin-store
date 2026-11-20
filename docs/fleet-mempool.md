@@ -188,20 +188,24 @@ After a loss of Redis or a restart of the pool, each server:
   two seconds. Each goes through the offer as if a peer had sent it. This
   always works.
 - **asks its peers for their mempools**, once, the peers connected at that
-  time (`blockStoreRefill`), and fetches what they announce. Bitcoin Cash
-  Node serves bloom filters by default, and so answers anyone: on Bitcoin
-  Cash every peer is asked. Bitcoin Core answers only a peer that it
-  whitelists, or when it serves bloom filters (`-peerbloomfilters`, off by
-  default); any other peer that asks, it disconnects. So on Bitcoin only
-  the peers given with `--peer` are asked, on the assumption that the
-  operator whitelists those (`whitebind=mempool@…`). Asking the seeds and
-  the discovered peers only lost them: a store with no other peers dropped
-  to none, all at once, and answered 503 until it found new ones.
+  time (`blockStoreRefill`), and fetches what they announce. Both nodes
+  answer a peer that they whitelist with the permission `mempool`, or any
+  peer when they serve Bloom filters (`-peerbloomfilters`, off by default
+  on Bitcoin Core, on by default on Bitcoin Cash Node). Any other peer that
+  asks, they disconnect. Asking the seeds and the discovered peers of
+  Bitcoin once lost them all: a store with no other peers dropped to none,
+  all at once, and answered 503 until it found new ones. So only a peer
+  whose node takes the request is asked. Every peer runs a model of its
+  node (haskoin-node's `Haskoin.Node.Peer.Remote`, on the state machines
+  that haskoin-core translates from both nodes). The model reads from the
+  version message of the node whether it serves Bloom filters, and has the
+  permissions that the operator says the nodes of `--peer` grant
+  (`--peer-permission mempool`, as `whitebind=mempool@…` grants).
 
-A Bitcoin fleet without `--node-rpc` and without a `--peer` that
-whitelists it gets back only what its peers announce from then on: new
-transactions, and those wallets broadcast again. The seen set was emptied
-with the pool, so none of those is skipped.
+A fleet without `--node-rpc`, and without a peer that serves Bloom filters
+or a `--peer` that grants `mempool`, gets back only what its peers announce
+from then on: new transactions, and those wallets broadcast again. The seen
+set was emptied with the pool, so none of those is skipped.
 
 ## Reading
 

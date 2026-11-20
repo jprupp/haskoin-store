@@ -165,11 +165,12 @@ nodeContainer kind =
 -- invalid transaction.
 --
 -- Bitcoin Core gives the store its mempool and nothing more (the permission
--- @mempool@), as the store asks of a peer that it is given with @--peer@ on
--- Bitcoin: once the pool fills, the store asks such a peer for its
--- mempool, and a node that does not allow it closes the connection, with
+-- @mempool@), which the tests tell the store (@peerPermissions@): once the
+-- pool fills, the store asks the peers whose node allows it for their
+-- mempools, and a node that does not allow it closes the connection, with
 -- what it had in its mempool then never announced again. Bitcoin Cash Node
--- has no such permission, and answers the request of any peer.
+-- gets no permission: it serves Bloom filters, and answers the request of
+-- any peer.
 strangerContainer :: NodeKind -> ContainerSpec
 strangerContainer kind =
   spec
