@@ -32,7 +32,8 @@
 --
 -- To move to new releases, change the versions and hashes below after
 -- checking them the same way. The tag of the image is a hash of the whole
--- recipe, so a change builds a new image and the old one is no longer used.
+-- recipe ("Test.Podman.Image"), so a change builds a new image and the old
+-- one is no longer used.
 module Haskoin.Store.Integration.Image
   ( testImage,
     coreBin,
@@ -42,13 +43,7 @@ module Haskoin.Store.Integration.Image
 where
 
 import Data.ByteString.Char8 qualified as C8
-import Data.List (intercalate)
-import Data.Serialize (encode)
-import Data.Text qualified as T
-import Haskoin (encodeHex, sha256)
-import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
-import System.Exit (ExitCode (..))
-import System.Process (readProcessWithExitCode)
+import Test.Podman (Image (..), ImageSpec (..))
 
 -- | Ubuntu 26.04, by the digest of its multi-architecture index.
 base :: String
@@ -153,34 +148,17 @@ containerfile =
         " rm /tmp/release.tar.gz"
       ]
 
--- | Tag of the image: a hash of its recipe.
-tag :: String
-tag =
-  "localhost/haskoin-store-test:"
-    <> take 16 (T.unpack (encodeHex (encode (sha256 (C8.pack containerfile)))))
-
--- | Build the image unless it exists already, and return its tag. The first
--- build downloads the base image, the packages and the two releases, and may
--- take a few minutes; later builds of a changed recipe reuse the layers that
--- did not change (see the recipe above). Images and layers are never removed by
--- the tests. The build may use 1 GiB of memory.
-testImage :: IO String
-testImage = do
-  (exists, _, _) <- readProcessWithExitCode "podman" ["image", "exists", tag] ""
-  case exists of
-    ExitSuccess -> return tag
-    _ -> withSystemTempDirectory "haskoin-store-image" $ \ctx -> do
-      (code, out, err) <-
-        readProcessWithExitCode
-          "podman"
-          ["build", "--layers", "--memory", "1g", "--tag", tag, "--file", "-", ctx]
-          containerfile
-      case code of
-        ExitSuccess -> return tag
-        _ ->
-          fail $
-            intercalate
-              "\n"
-              ["Could not build the test image " <> tag <> ":", lastLines out, lastLines err]
-  where
-    lastLines = unlines . reverse . take 30 . reverse . lines
+-- | The image, built from the recipe by podman-test the first time a test
+-- needs it, and tagged by a hash of the recipe. The first build downloads
+-- the base image, the packages and the two releases, and may take a few
+-- minutes; later builds of a changed recipe reuse the layers that did not
+-- change (see the recipe above). Test processes that start together build
+-- it once. Images and layers are never removed by the tests.
+testImage :: Image
+testImage =
+  Built
+    ImageSpec
+      { name = "haskoin-store-test",
+        containerfile = C8.pack containerfile,
+        files = []
+      }

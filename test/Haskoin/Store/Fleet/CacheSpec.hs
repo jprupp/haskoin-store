@@ -89,7 +89,6 @@ import Haskoin.Store.Fleet.XPub
     xpubId,
   )
 import Haskoin.Store.Histories (openLayered, revert, run, startChain)
-import Haskoin.Store.Integration.Podman (podmanUsable)
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic (importBlock)
 import Haskoin.Store.TestBlocks (script)
@@ -99,6 +98,7 @@ import Haskoin.Store.XPub.Lock (Lock (..), LockConfig (..), Taken (..), defaultL
 import Haskoin.Store.XPub.Service (Session (..), xpubAsk)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
+import Test.Podman (podmanUsable)
 import Test.QuickCheck
 
 spec :: Spec

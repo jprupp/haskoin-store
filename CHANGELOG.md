@@ -19,7 +19,27 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   a token balance. Every store of a fleet must run this version, since
   the pool's scripts take token entries.
 
+- **Unix sockets for Redis, the node and its RPC.** `--redis-url
+  unix:PATH` reaches a Redis on a Unix socket; a peer written `unix:PATH`
+  is a Unix socket, with haskoin-node's peers on sockets; and
+  `--node-rpc-socket` sends the requests of `--node-rpc` through a Unix
+  socket, with the user and password of its URL. Neither node listens on a
+  socket itself, so it is something that joins one to the node, such as
+  socat. The courier of a published transaction gives such a peer the zero
+  address in its version message, where haskoin-core's `sockToHostAddress`
+  stopped on it.
+
 ### Changed
+- **The integration tests run their containers through
+  [podman-test](https://github.com/jprupp/podman-test)**, in place of the
+  code of their own in `integration/`: each environment is a pod with
+  Valkey on a Unix socket and the node's RPC and peer-to-peer ports bridged
+  to sockets, and the store reaches all three through them, so the pod has
+  no network. The tests are skipped with `PODMAN_TEST_SKIP`, in place of
+  `HASKOIN_STORE_NO_PODMAN`. The Bitcoin Core node that does not whitelist the
+  store now gives it its mempool, the one permission that the store asks
+  of a `--peer` on Bitcoin: without it the node closed the store's
+  connection over the request, now and then during a test.
 - **Database version 24.** On Bitcoin Cash the migration from version 23
   indexes the outputs that hold tokens since the upgrade of May 2023: hours,
   once, and it carries on where it was if stopped. On Bitcoin it writes the

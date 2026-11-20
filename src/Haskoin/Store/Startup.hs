@@ -53,6 +53,7 @@ module Haskoin.Store.Startup
 
     -- * Redis
     connectRedis,
+    redisConnectInfo,
     redisProblem,
 
     -- * Files and directories
@@ -107,8 +108,26 @@ redisHint =
       "at a running one with --redis-url or REDIS_URL (redis://[:password@]host:port[/db])."
     ]
 
+-- | How to connect to the Redis of a URL: the default Redis,
+-- @redis:\/\/localhost:6379@, for an empty one; the Unix socket at PATH for
+-- @unix:PATH@, as haskoin-node writes a peer on a socket; and what hedis
+-- reads of a @redis:\/\/@ URL otherwise, or why it cannot.
+--
+-- A socket takes no password and no database in the URL: a Redis that
+-- listens on a socket is one of the machine, which its permissions guard.
+-- The tests reach theirs that way, so that tests that run at once each have
+-- their own without a port of the machine.
+redisConnectInfo :: String -> Either String R.ConnectInfo
+redisConnectInfo = \case
+  "" -> Right R.defaultConnectInfo
+  'u' : 'n' : 'i' : 'x' : ':' : path
+    | null path -> Left "a Unix socket needs a path"
+    | otherwise -> Right R.defaultConnectInfo {R.connectAddr = R.ConnectAddrUnixSocket path}
+  url -> R.parseConnectInfo url
+
 -- | Connect to the Redis of the fleet at this URL (empty for the default,
--- @redis:\/\/localhost:6379@), and make sure that it answers: a ping must
+-- @redis:\/\/localhost:6379@, and @unix:PATH@ for a Unix socket, as
+-- 'redisConnectInfo' reads it), and make sure that it answers: a ping must
 -- come back as @PONG@. Throws a 'StartupError' that says what went wrong:
 -- the URL is not one of Redis, nothing listens there, the name of the host
 -- is unknown, Redis wants a password or another one, or it does not answer
@@ -121,10 +140,7 @@ redisHint =
 -- \"Redis does not answer\".
 connectRedis :: String -> IO R.Connection
 connectRedis url = do
-  info <-
-    if null url
-      then return R.defaultConnectInfo
-      else either badURL return (R.parseConnectInfo url)
+  info <- either badURL return (redisConnectInfo url)
   -- hedis waits for ever by default for a host that drops the packets
   let info' = info {R.connectTimeout = Just (fromMaybe 5 info.connectTimeout)}
   conn <- R.connect info' `catch` \(e :: IOException) -> unreachable (show e)
@@ -148,7 +164,8 @@ connectRedis url = do
           T.pack (show url),
           "is not a Redis URL:",
           T.pack why <> ".",
-          "It should look like redis://localhost:6379, or redis://:password@host:port/db."
+          "It should look like redis://localhost:6379, redis://:password@host:port/db,",
+          "or unix:/path/to/redis.sock."
         ]
     unreachable :: String -> IO b
     unreachable why

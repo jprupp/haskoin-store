@@ -170,6 +170,7 @@ import Haskoin.Node
     sendMessage,
     wrapPeer,
   )
+import Haskoin.Node.Address (peerHostAddress)
 import Haskoin.Node.Peer.Lock (Lock (..))
 import Haskoin.Store.Common (StoreRead (..))
 import Haskoin.Store.Data (BlockRef (..), Spender (..), TxData (..), isCoinbaseTx)
@@ -734,7 +735,8 @@ deliver c sa tx =
             }
         node = wrapPeer config busy pending mailbox
         nowhere = NetworkAddress 0 (sockToHostAddress (SockAddrInet 0 0))
-        there = NetworkAddress 0 (sockToHostAddress sa)
+        -- the zero address for a peer on a Unix socket, which has none
+        there = NetworkAddress 0 (peerHostAddress sa)
         version = buildVersion c.net nonce 0 nowhere there (floor (utcTimeToPOSIXSeconds now))
         next =
           receive sub >>= \case

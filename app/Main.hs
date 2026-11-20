@@ -143,6 +143,7 @@ data Config = Config
     healthCheckInterval :: !Int,
     accessLog :: !Bool,
     nodeRpc :: !String,
+    nodeRpcSocket :: !String,
     tlsCert :: !String,
     tlsKey :: !String,
     bloom :: !Bool,
@@ -241,6 +242,8 @@ defConfig = do
     env "ACCESS_LOG" False parseBool
   nodeRpc <-
     env "NODE_RPC" "" pure
+  nodeRpcSocket <-
+    env "NODE_RPC_SOCKET" "" pure
   bloom <-
     env "BLOOM" True parseBool
   noWeb <-
@@ -721,6 +724,14 @@ config c = do
               ]
           )
         <> value c.nodeRpc
+  nodeRpcSocket <-
+    strOption $
+      metavar "PATH"
+        <> long "node-rpc-socket"
+        <> helpEnv
+          "NODE_RPC_SOCKET"
+          "Send the requests of --node-rpc through this Unix socket, in place of the host and port of its URL"
+        <> value c.nodeRpcSocket
   tlsCert <-
     strOption $
       metavar "FILE"
@@ -942,6 +953,7 @@ run cfg =
               healthCheckInterval = cfg.healthCheckInterval,
               accessLog = cfg.accessLog,
               nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
+              nodeRpcSocket = if null cfg.nodeRpcSocket then Nothing else Just cfg.nodeRpcSocket,
               -- both or neither, which 'main' checked
               tls = case (cfg.tlsCert, cfg.tlsKey) of
                 ("", _) -> Nothing

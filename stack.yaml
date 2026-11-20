@@ -28,8 +28,10 @@ extra-deps:
   - nqe-0.7.0
   - git: https://github.com/jprupp/haskoin-core.git
     commit: ce2f58c7388e2bc88674f260559a4b50cce935d0
+  - git: https://github.com/jprupp/podman-test.git
+    commit: f5a07fcb676f4a99eee02e0be28b2a174b0af308
   - git: https://github.com/jprupp/haskoin-node.git
-    commit: 1cec994c7c8e98bf8f853a37decc3dd2dafcf6be
+    commit: 172c180663ed44df7f3c192eae9da1a6a22d5226
   - git: https://github.com/jprupp/haskoin-store-data.git
     commit: c412e62d435d0dd3692f03669e3d7f8273c27a56
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to

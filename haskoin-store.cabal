@@ -128,6 +128,7 @@ library
     , haskoin-node >=2.6.1 && <2.7
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
+    , http-client >=0.7.19 && <0.8
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
     , monad-control >=1.0.3.1 && <1.1
@@ -160,7 +161,6 @@ library integration
   exposed-modules:
       Haskoin.Store.Integration.Image
       Haskoin.Store.Integration.Node
-      Haskoin.Store.Integration.Podman
       Haskoin.Store.Integration.Temp
       Haskoin.Store.Integration.Valkey
   other-modules:
@@ -197,12 +197,14 @@ library integration
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
+    , http-client
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
     , monad-control >=1.0.3.1 && <1.1
     , mtl >=2.3.2 && <2.4
     , network >=3.2.12.0 && <3.3
     , nqe >=0.7.0 && <0.8
+    , podman-test >=0.1.0 && <0.2
     , process >=1.6.26.1 && <1.7
     , random >=1.3.1 && <1.4
     , rocksdb-haskell-jprupp >=2.8.0 && <2.9
@@ -264,6 +266,7 @@ executable haskoin-store
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
+    , http-client >=0.7.19 && <0.8
     , http-types >=0.12.6 && <0.13
     , lens >=5.3.6 && <5.4
     , monad-control >=1.0.3.1 && <1.1
@@ -366,6 +369,7 @@ test-suite spec
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
     , hspec >=2.11.18 && <2.12
+    , http-client >=0.7.19 && <0.8
     , http-types >=0.12.6 && <0.13
     , integration
     , lens >=5.3.6 && <5.4
@@ -373,6 +377,7 @@ test-suite spec
     , mtl >=2.3.2 && <2.4
     , network >=3.2.12.0 && <3.3
     , nqe >=0.7.0 && <0.8
+    , podman-test
     , process >=1.6.26.1 && <1.7
     , random >=1.3.1 && <1.4
     , rocksdb-haskell-jprupp >=2.8.0 && <2.9
@@ -438,6 +443,7 @@ benchmark haskoin-store-bench
     , haskoin-store
     , haskoin-store-data >=4.0.0 && <4.1
     , hedis >=0.16.4 && <0.17
+    , http-client >=0.7.19 && <0.8
     , http-types >=0.12.6 && <0.13
     , integration
     , lens >=5.3.6 && <5.4

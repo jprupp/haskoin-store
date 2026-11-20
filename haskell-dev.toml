@@ -4,9 +4,9 @@
 # The spec modules that take most of the time of the tests. Each of their
 # groups is run apart, so that the test processes share them evenly.
 #
-# Haskoin.Store.Integration: each group is an environment of its own, a
-# regtest node, a Redis and a store in Podman, with containers named after
-# the process and ports picked at random, so the groups run at the same time.
+# Haskoin.Store.Integration: each group is an environment of its own, a pod
+# of podman-test with a regtest node and a Redis, reached through Unix
+# sockets of the pod, and a store, so the groups run at the same time.
 slow-specs = [
   "Haskoin.Store.Integration",
 ]

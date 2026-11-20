@@ -65,15 +65,26 @@ packages:
     commit: ce2f58c7388e2bc88674f260559a4b50cce935d0
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
-    commit: 1cec994c7c8e98bf8f853a37decc3dd2dafcf6be
+    commit: f5a07fcb676f4a99eee02e0be28b2a174b0af308
+    git: https://github.com/jprupp/podman-test.git
+    name: podman-test
+    pantry-tree:
+      sha256: 59e685b2694979fc019ac7e77945b163e575981f7599f8de7b02d95dc1c942e8
+      size: 958
+    version: 0.1.0
+  original:
+    commit: f5a07fcb676f4a99eee02e0be28b2a174b0af308
+    git: https://github.com/jprupp/podman-test.git
+- completed:
+    commit: 172c180663ed44df7f3c192eae9da1a6a22d5226
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: 70334095ec22d61a7d00595ddfb26f861fb7fa3fa54f9bb95f996bf3da8fa042
-      size: 3081
+      sha256: da05f5d9005da886c1062f53fc8324ce11c6e840a113b885915c82a26c9b3f88
+      size: 3154
     version: 2.6.1
   original:
-    commit: 1cec994c7c8e98bf8f853a37decc3dd2dafcf6be
+    commit: 172c180663ed44df7f3c192eae9da1a6a22d5226
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
     commit: c412e62d435d0dd3692f03669e3d7f8273c27a56

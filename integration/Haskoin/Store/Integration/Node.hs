@@ -16,6 +16,12 @@
 -- test connects to the node over the peer-to-peer protocol, as it would to
 -- the real networks.
 --
+-- The node runs in a container of podman-test ("Test.Podman"), whose bridge
+-- joins its RPC and peer-to-peer ports to Unix sockets of its pod: the
+-- tests call the RPC through one ('Haskoin.Store.Web.unixSocketManager'),
+-- and the store connects to the node as the peer @unix:PATH@. Neither node
+-- listens on a socket itself.
+--
 -- Only RPC calls that both nodes have are used. Bitcoin Cash Node has no
 -- @generateblock@, so the reorganisation test is built on coinbase maturity
 -- instead (see "Haskoin.Store.IntegrationSpec").
@@ -24,6 +30,7 @@ module Haskoin.Store.Integration.Node
     Node (..),
     nodeContainer,
     strangerContainer,
+    nodeOf,
     nodeNetwork,
     RpcError (..),
     rpc,
@@ -45,7 +52,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (Exception, throwIO)
-import Control.Lens ((&), (?~), (^.))
+import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (void)
 import Data.Aeson (Value (..), eitherDecode, object, (.=))
 import Data.Aeson.Key qualified as Key
@@ -56,9 +63,11 @@ import Data.Text qualified as T
 import Data.Word (Word64)
 import Haskoin (Network, bchRegTest, btcRegTest)
 import Haskoin.Store.Exception (tryAny)
-import Haskoin.Store.Integration.Image (bchnBin, coreBin)
-import Haskoin.Store.Integration.Podman (ContainerSpec (..))
+import Haskoin.Store.Integration.Image (bchnBin, coreBin, testImage)
+import Haskoin.Store.Web (unixSocketManager)
+import Network.HTTP.Client (Manager, newManager)
 import Network.Wreq qualified as Wreq
+import Test.Podman (Address (..), ContainerSpec (..), Endpoint (..), Pod, address, container)
 
 -- | Which node software.
 data NodeKind = BitcoinCore | BitcoinCashNode
@@ -67,11 +76,36 @@ data NodeKind = BitcoinCore | BitcoinCashNode
 -- | A node and how to reach it.
 data Node = Node
   { kind :: !NodeKind,
-    -- | URL of the JSON-RPC interface
+    -- | URL of the JSON-RPC interface, with its user and password; its
+    -- host is not used, since every request goes through 'rpcSocket'
     url :: !String,
-    -- | port of the peer-to-peer interface on 127.0.0.1
-    p2p :: !Int
+    -- | the Unix socket of the JSON-RPC interface
+    rpcSocket :: !FilePath,
+    -- | an HTTP client whose connections go to 'rpcSocket'
+    manager :: !Manager,
+    -- | the peer of the store: the Unix socket of the peer-to-peer
+    -- interface, as @unix:PATH@
+    peer :: !String
   }
+
+-- | The node of a pod that runs 'nodeContainer' or 'strangerContainer'.
+nodeOf :: NodeKind -> Pod -> IO Node
+nodeOf kind p = do
+  rpcSocket <- socketOf "rpc"
+  p2pSocket <- socketOf "p2p"
+  manager <- newManager (unixSocketManager rpcSocket)
+  return
+    Node
+      { kind,
+        url = "http://test:test@localhost/",
+        rpcSocket,
+        manager,
+        peer = "unix:" <> p2pSocket
+      }
+  where
+    socketOf e = case address p e of
+      UnixSocket path -> return path
+      a -> fail ("The endpoint " <> e <> " of the node is not a socket: " <> show a)
 
 -- | Network constants of the regtest chain of a node.
 nodeNetwork :: NodeKind -> Network
@@ -81,26 +115,25 @@ nodeNetwork BitcoinCashNode = bchRegTest
 -- | Container of a regtest node, from the test image
 -- ("Haskoin.Store.Integration.Image"): its chain is in a tmpfs of 512 MiB,
 -- it may use 1 GiB of memory, and its caches and mempool are kept small.
+-- Its RPC and peer-to-peer ports are bridged to the sockets @rpc@ and
+-- @p2p@ of its pod.
 --
 -- Every peer is whitelisted, so that the store may ask for the mempool and
 -- gets transactions relayed without delay.
-nodeContainer :: NodeKind -> String -> ContainerSpec
-nodeContainer kind image =
-  ContainerSpec
-    { name = case kind of
-        BitcoinCore -> "bitcoin-core"
-        BitcoinCashNode -> "bitcoin-cash-node",
-      image = image,
-      options =
-        [ "--memory",
-          "1g",
-          "--tmpfs",
-          "/chain:rw,size=512m,mode=1777",
-          "--entrypoint",
-          case kind of
-            BitcoinCore -> coreBin
-            BitcoinCashNode -> bchnBin
-        ],
+nodeContainer :: NodeKind -> ContainerSpec
+nodeContainer kind =
+  ( container
+      ( case kind of
+          BitcoinCore -> "bitcoin-core"
+          BitcoinCashNode -> "bitcoin-cash-node"
+      )
+      testImage
+  )
+    { entrypoint = Just $ case kind of
+        BitcoinCore -> coreBin
+        BitcoinCashNode -> bchnBin,
+      memory = Just "1g",
+      tmpfs = [("/chain", "512m")],
       command =
         [ "-regtest",
           "-datadir=/chain",
@@ -123,18 +156,31 @@ nodeContainer kind image =
             -- after they come out unless told not to
             BitcoinCashNode -> ["-expire=0"]
             BitcoinCore -> [],
-      ports = [18443, 18444]
+      endpoints = [Bridged "rpc" 18443, Bridged "p2p" 18444]
     }
 
 -- | The same node without the whitelist: it treats the store as it treats
 -- any peer that connected to it. It announces transactions on its timer
--- and not at once, does not answer a request for its mempool, and may
--- close the connections of a peer that sends it an invalid transaction.
-strangerContainer :: NodeKind -> String -> ContainerSpec
-strangerContainer kind image =
-  spec {name = spec.name <> "-stranger", command = filter (/= "-whitelist=0.0.0.0/0") spec.command}
+-- and not at once, and may close the connections of a peer that sends it an
+-- invalid transaction.
+--
+-- Bitcoin Core gives the store its mempool and nothing more (the permission
+-- @mempool@), as the store asks of a peer that it is given with @--peer@ on
+-- Bitcoin: once the pool fills, the store asks such a peer for its
+-- mempool, and a node that does not allow it closes the connection, with
+-- what it had in its mempool then never announced again. Bitcoin Cash Node
+-- has no such permission, and answers the request of any peer.
+strangerContainer :: NodeKind -> ContainerSpec
+strangerContainer kind =
+  spec
+    { name = spec.name <> "-stranger",
+      command = filter (/= "-whitelist=0.0.0.0/0") spec.command <> mempoolOnly
+    }
   where
-    spec = nodeContainer kind image
+    spec = nodeContainer kind
+    mempoolOnly = case kind of
+      BitcoinCore -> ["-whitelist=mempool@0.0.0.0/0"]
+      BitcoinCashNode -> []
 
 -- | Error returned by a node.
 data RpcError = RpcError !Text !Value
@@ -149,6 +195,7 @@ rpc node method params = do
         Wreq.defaults
           & Wreq.auth ?~ Wreq.basicAuth "test" "test"
           & Wreq.checkResponse ?~ (\_ _ -> return ())
+          & Wreq.manager .~ Right node.manager
       body =
         object
           [ "jsonrpc" .= ("1.0" :: Text),

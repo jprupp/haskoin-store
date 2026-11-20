@@ -77,6 +77,7 @@ module Haskoin.Store.Web
     WebLimits (..),
     runWeb,
     runWebSocket,
+    unixSocketManager,
 
     -- * Request parsing
     decodeTxBody,
@@ -303,6 +304,8 @@ import NQE
   ( subscribe,
     unsubscribe,
   )
+import Network.HTTP.Client (ManagerSettings (..), defaultManagerSettings)
+import Network.HTTP.Client.Internal (socketConnection)
 import Network.HTTP.Types
   ( ResponseHeaders,
     Status (..),
@@ -325,7 +328,8 @@ import Network.HTTP.Types
     statusIsClientError,
     statusIsServerError,
   )
-import Network.Socket (SockAddr (SockAddrUnix), Socket)
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream))
+import Network.Socket qualified as Socket
 import Network.Wai
   ( Application,
     Middleware,
@@ -481,6 +485,9 @@ data WebConfig = WebConfig
     -- password, to publish transactions through ('sendNode'); 'Nothing'
     -- to publish through peers only
     nodeRpc :: !(Maybe String),
+    -- | a Unix socket to send the requests of 'nodeRpc' through, in place of
+    -- the host and port of its URL, which are not used then
+    nodeRpcSocket :: !(Maybe FilePath),
     -- | a certificate and its private key, in files in PEM format, to
     -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
     -- default
@@ -499,6 +506,9 @@ data WebState = WebState
     metrics :: !(Maybe WebMetrics),
     -- | HTTP session for price requests
     session :: !Wreq.Session,
+    -- | HTTP session for the RPC of the node: 'session', or one that goes
+    -- through 'nodeRpcSocket'
+    nodeSession :: !Wreq.Session,
     -- | result of the latest health check
     health :: !(TVar HealthCheck),
     -- | the queries to answer with, the cache included ('xpubQuery'): those
@@ -783,6 +793,9 @@ serveWeb config serve = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
   session <- Wreq.Session.newAPISession
+  nodeSession <- case config.nodeRpcSocket of
+    Nothing -> return session
+    Just path -> Wreq.Session.newSessionControl Nothing (unixSocketManager path)
   first <- runHealthCheck
   health <- newTVarIO first
   -- A member of a fleet takes no turn before its store is known to be
@@ -2014,7 +2027,7 @@ chainRules st = do
 -- transaction that the node has already was sent.
 sendNode :: WebState -> String -> Tx -> IO Publish.Direct
 sendNode st url tx =
-  tryAny (Wreq.Session.postWith opts st.session url body) >>= \case
+  tryAny (Wreq.Session.postWith opts st.nodeSession url body) >>= \case
     Left e -> unheard (cs (show e))
     Right r -> case A.decode (r ^. Wreq.responseBody) >>= answer of
       Nothing -> unheard ("HTTP " <> cs (show (r ^. Wreq.responseStatus . Wreq.statusCode)))
@@ -2044,6 +2057,21 @@ sendNode st url tx =
         (withSource "Publish" st.config.logger)
         ("The node did not take a transaction over RPC, which goes to a peer if it is verified: " <> why)
       return Publish.Unavailable
+
+-- | Settings of an HTTP client whose every connection goes to a Unix
+-- socket, whatever host and port the URL names: for the RPC of a node that
+-- is reached through a socket (@--node-rpc-socket@). Neither Bitcoin Core
+-- nor Bitcoin Cash Node listens on one, so the socket is something that
+-- joins it to the node, such as socat, or the bridge of a test in a
+-- container. The URL still carries the user and the password of the RPC.
+unixSocketManager :: FilePath -> ManagerSettings
+unixSocketManager path =
+  defaultManagerSettings
+    { managerRawConnection = return $ \_ _ _ -> do
+        s <- Socket.socket AF_UNIX Stream Socket.defaultProtocol
+        Socket.connect s (SockAddrUnix path) `onException` Socket.close s
+        socketConnection s 8192
+    }
 
 -- | What "Haskoin.Store.Web.Publish" needs, for a request.
 --
@@ -2154,7 +2182,7 @@ refillFromNode st m url = do
 -- their order: 'Nothing' for one that failed.
 nodeCalls :: WebState -> String -> [(Text, [A.Value])] -> IO [Maybe A.Value]
 nodeCalls st url calls = do
-  r <- Wreq.Session.postWith opts st.session url (A.toJSON (zipWith call [0 :: Int ..] calls))
+  r <- Wreq.Session.postWith opts st.nodeSession url (A.toJSON (zipWith call [0 :: Int ..] calls))
   let answers = case A.decode (r ^. Wreq.responseBody) of
         Just (A.Array a) ->
           HashMap.fromList

@@ -82,6 +82,7 @@ dependencies:
   - time-manager >= 0.4.2 && < 0.5
   - warp-tls ^>= 3.4.14
   - websockets ^>= 0.13.0.0
+  - http-client ^>= 0.7.19
   - wreq ^>= 0.5.4.5
   - lens ^>= 5.3.6
 # hpack writes these on one line of haskoin-store.cabal, which is generated
@@ -113,6 +114,8 @@ internal-libraries:
     source-dirs: integration
     dependencies:
       - haskoin-store
+      - http-client
+      - podman-test ^>= 0.1.0
       - directory ^>= 1.3.10.1
       - process ^>= 1.6.26.1
       - temporary ^>= 1.3
@@ -168,6 +171,7 @@ tests:
       - fast-logger ^>= 3.2.9
       - filepath ^>= 1.5.5.0
       - integration
+      - podman-test
       - process ^>= 1.6.26.1
 benchmarks:
   # Load-test server: syncs a synthetic chain and serves the web API on it.

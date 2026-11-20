@@ -326,7 +326,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, or a test network (see `--help`) |
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
-| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER`. On Bitcoin, only these peers are asked for their mempools when the pool fills again: whitelist the store on them (`whitebind=mempool@…`) |
+| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER`. On Bitcoin, only these peers are asked for their mempools when the pool fills again: whitelist the store on them (`whitebind=mempool@…`) |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
@@ -360,6 +360,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 429 |
 | `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
 | `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after it is emptied; without it, or when it does not answer, transactions go to the peers |
+| `--node-rpc-socket` | `NODE_RPC_SOCKET` | none | Unix socket to send the requests of `--node-rpc` through, in place of the host and port of its URL; the URL still gives the user and password. Neither node listens on one itself: it is something that joins it to the node, such as socat |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -380,7 +381,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--redis-url` | `REDIS_URL` | `redis://localhost:6379` | Redis of the fleet, which every store needs: its tip, mempool and xpub cache |
+| `--redis-url` | `REDIS_URL` | `redis://localhost:6379` | Redis of the fleet, which every store needs: its tip, mempool and xpub cache; `unix:PATH` for a Redis on a Unix socket |
 | `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Size of the xpub cache, at least 1; evicted by cost to index again and by use |
 
 Redis is how stores agree, and every store is a member of a fleet, even a
@@ -1345,15 +1346,16 @@ from jprupp/tools too:
 
 ```sh
 haskell-dev build              # build without optimisation
-haskell-dev test               # the tests in eight processes: 75 s, not 4 min
+haskell-dev test               # the tests in eight processes: 65 s, not 4 min
 haskell-dev test Fleet.Redis   # the specs whose module name has a word
 haskell-dev docs               # build the documentation and check its comments
 ```
 
 `haskell-dev.toml` names the slow spec module, `Haskoin.Store.Integration`
 (`test/Haskoin/Store/IntegrationSpec.hs`), whose five environments then run
-at the same time, each with its own node, Valkey and store in Podman. Do not mix the two kinds of build in one folder:
-the flags differ, so each switch compiles everything again. Never time the
+at the same time, each with its own node, Valkey and store in Podman. Do not
+mix the two kinds of build in one folder: the flags differ, so each switch
+compiles everything again. Never time the
 store with `haskell-dev`: the benchmarks run with `stack bench`.
 
 A release is made with `haskell-release`, once the version in
@@ -1378,15 +1380,22 @@ chains of Bitcoin Core and Bitcoin Cash Node, and Valkey, in
 exact gap, spends and change, mempool order, multiaddr counts, reorganisations,
 and that the cache answers exactly like the database on every xpub endpoint.
 
+- The containers run through
+  [podman-test](https://github.com/jprupp/podman-test), in a pod for each
+  environment. The store reaches Valkey, the RPC of the node and the node
+  itself through Unix sockets of the pod (`--redis-url unix:PATH`,
+  `--node-rpc-socket` and the peer `unix:PATH`), so the pod has no network,
+  and environments that run at once never meet.
 - They are skipped if Podman cannot run containers, or if
-  `HASKOIN_STORE_NO_PODMAN` is set.
+  `PODMAN_TEST_SKIP` is set.
 - The first run builds the image `localhost/haskoin-store-test`, which needs
   network access: Ubuntu 26.04 pinned by digest, Valkey from a fixed snapshot of
   the Ubuntu archive, and the release tarballs of both nodes, checked against
   SHA-256 hashes pinned in `integration/Haskoin/Store/Integration/Image.hs`. No
   third-party image is used.
-- Containers are removed when the tests end, data lives in tmpfs mounts and
-  under `/dev/shm`, and every container has a memory limit.
+- Pods are removed when the tests end, and those of a run that was killed
+  by the next run. Data lives in tmpfs mounts and under `/dev/shm`, and every
+  container has a memory limit.
 - Set `HASKOIN_TEST_LOG=1` to print the log of the store under test.
 
 The test suite runs with at most four cores and a 4 GiB heap, so that a

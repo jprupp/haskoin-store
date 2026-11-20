@@ -16,11 +16,11 @@
   switch compiles everything again.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 75 seconds in eight processes, against 140 to 210
+- The tests take about 65 seconds in eight processes, against 140 to 210
   with every spec module in a process of its own. Most of it is
   `Haskoin.Store.IntegrationSpec`, whose five environments are groups at the
   top of the module, so that each runs in its own process; keep a new
-  environment at the top too. The longest, Bitcoin Cash Node, takes about 74
+  environment at the top too. The longest, Bitcoin Cash Node, takes about 64
   seconds. Eight processes at once use about 1.2 GB more than one, with the
   containers.
 - In one run of four, a test failed with `InsecureConnectionDenied`, an

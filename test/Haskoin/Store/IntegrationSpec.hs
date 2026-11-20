@@ -25,11 +25,18 @@
 -- is filled in the background, so the comparison is retried for up to 30
 -- seconds before it fails.
 --
+-- Each environment is a pod of podman-test ("Test.Podman"): Valkey on a Unix
+-- socket of its own, and the node with its RPC and peer-to-peer ports
+-- bridged to sockets. The store reaches all three through the sockets,
+-- with @--redis-url unix:PATH@, the peer @unix:PATH@ and
+-- @--node-rpc-socket@, so the pod has no network and environments that run
+-- at once never meet.
+--
 -- The tests are skipped when Podman cannot run containers, or when
--- @HASKOIN_STORE_NO_PODMAN@ is set. Containers are removed when the tests
--- end, data is kept in tmpfs mounts and in a temporary directory under
--- @\/dev\/shm@ (or @$XDG_RUNTIME_DIR@), and every container has a memory
--- limit. Set @HASKOIN_TEST_LOG@ to see the log of the store.
+-- @PODMAN_TEST_SKIP@ is set. Pods are removed when the tests end, data is
+-- kept in tmpfs mounts and in a temporary directory under @\/dev\/shm@ (or
+-- @$XDG_RUNTIME_DIR@), and every container has a memory limit. Set
+-- @HASKOIN_TEST_LOG@ to see the log of the store.
 module Haskoin.Store.IntegrationSpec (spec) where
 
 import Control.Concurrent (threadDelay)
@@ -136,11 +143,11 @@ import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Fleet.Member (memberTip)
 import Haskoin.Store.Fleet.Redis (fleetKeys)
 import Haskoin.Store.Fleet.XPub (cacheHave, xpubId)
-import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
-import Haskoin.Store.Integration.Podman
-import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
-import Haskoin.Store.Integration.Valkey
+import Haskoin.Store.Integration.Temp (withRamDir, withSystemTempDirectory)
+import Haskoin.Store.Integration.Valkey (redisContainer)
+import Haskoin.Store.Integration.Valkey qualified as Valkey
+import Haskoin.Store.Startup (redisConnectInfo)
 import Haskoin.Store.WebClient qualified as Client
 import Haskoin.Store.WebCommon (ApiResource, NoCache (..), NoTx (..))
 import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
@@ -157,6 +164,7 @@ import System.Exit (ExitCode (..))
 import System.Log.FastLogger (toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
+import Test.Podman (PodSpec (..), pod, podmanUsable, withPod)
 import Text.Read (readMaybe)
 
 -- | Each environment, a node, a Redis and a store of its own, is a group at
@@ -263,60 +271,54 @@ withEnvOf whitelisted = withEnvAt whitelisted Nothing
 -- the node's clock is set back for them with @setmocktime@, and left so.
 withEnvAt :: Bool -> Maybe Int -> NodeKind -> (Env -> IO ()) -> IO ()
 withEnvAt whitelisted ago kind go = do
-  image <- testImage
-  withContainer (redisContainer image) $ \redis -> do
-    redisPort <- hostPort redis 6379
-    let redisURL = "redis://127.0.0.1:" <> show redisPort
-    waitRedis redisURL
+  -- Valkey and the node in one pod, reached through sockets of the pod:
+  -- tests that run at once each have their own, and no port of the
+  -- machine is taken
+  let nodeSpec = (if whitelisted then nodeContainer else strangerContainer) kind
+      envPod = (pod "env" [redisContainer, nodeSpec]) {readyWithin = 120}
+  withPod envPod $ \p -> do
+    let redisURL = Valkey.redisURL p
     writeOldKeys redisURL
-    withContainer ((if whitelisted then nodeContainer else strangerContainer) kind image) $ \c -> do
-      rpcPort <- hostPort c 18443
-      p2pPort <- hostPort c 18444
-      let node =
-            Node
-              { kind = kind,
-                url = "http://127.0.0.1:" <> show rpcPort <> "/",
-                p2p = p2pPort
-              }
-      waitRpc node
-      -- before the wallet is made: a wallet does not look at blocks older
-      -- than itself
-      forM_ ago $ \secs -> do
-        now <- round <$> getPOSIXTime
-        void $ rpc node "setmocktime" [Number (fromIntegral (now - secs :: Int))]
-      ensureWallet node
-      miner <- getNewAddress node
-      -- enough mature coinbases for the wallet to fund every test without
-      -- long chains of unconfirmed change
-      void $ generateTo node 150 miner
-      withRamDir $ \dir -> withTestLogger $ \logger -> do
-        let net = nodeNetwork kind
-            cfg = storeConfig net logger dir redisURL p2pPort
-        withStore cfg $ \store -> do
-          listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
-            let web s = runWebSocket (webConfig logger s)
-            conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo redisURL))
-            withAsync (web store cachedSock) $ \a1 ->
-              -- a second server of the same store: the cache cannot be
-              -- turned off, so both answer xpubs from it
-              withAsync (web store plainSock) $ \a2 -> do
-                link a1
-                link a2
-                let env =
-                      Env
-                        { kind = kind,
-                          node = node,
-                          net = net,
-                          store = store,
-                          cached = "http://127.0.0.1:" <> show cachedPort,
-                          plain = "http://127.0.0.1:" <> show plainPort,
-                          miner = miner,
-                          redis = conn,
-                          configIn = \d -> storeConfig net logger d redisURL p2pPort,
-                          memberIn = \d -> storeConfig net logger d redisURL p2pPort
-                        }
-                waitSynced env
-                go env
+    node <- nodeOf kind p
+    waitRpc node
+    -- before the wallet is made: a wallet does not look at blocks older
+    -- than itself
+    forM_ ago $ \secs -> do
+      now <- round <$> getPOSIXTime
+      void $ rpc node "setmocktime" [Number (fromIntegral (now - secs :: Int))]
+    ensureWallet node
+    miner <- getNewAddress node
+    -- enough mature coinbases for the wallet to fund every test without
+    -- long chains of unconfirmed change
+    void $ generateTo node 150 miner
+    withRamDir $ \dir -> withTestLogger $ \logger -> do
+      let net = nodeNetwork kind
+          cfg = storeConfig net logger dir redisURL node.peer
+      withStore cfg $ \store -> do
+        listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
+          let web s = runWebSocket (webConfig logger s)
+          conn <- Redis.checkedConnect (either error id (redisConnectInfo redisURL))
+          withAsync (web store cachedSock) $ \a1 ->
+            -- a second server of the same store: the cache cannot be
+            -- turned off, so both answer xpubs from it
+            withAsync (web store plainSock) $ \a2 -> do
+              link a1
+              link a2
+              let env =
+                    Env
+                      { kind = kind,
+                        node = node,
+                        net = net,
+                        store = store,
+                        cached = "http://127.0.0.1:" <> show cachedPort,
+                        plain = "http://127.0.0.1:" <> show plainPort,
+                        miner = miner,
+                        redis = conn,
+                        configIn = \d -> storeConfig net logger d redisURL node.peer,
+                        memberIn = \d -> storeConfig net logger d redisURL node.peer
+                      }
+              waitSynced env
+              go env
 
 -- | A logger that prints the log of the store if @HASKOIN_TEST_LOG@ is set,
 -- and discards it otherwise. Each line starts with the time it was logged
@@ -337,11 +339,11 @@ withTestLogger f =
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
 -- buffers and caches.
-storeConfig :: Network -> Logger -> FilePath -> String -> Int -> StoreConfig
-storeConfig net logger dir redisURL p2pPort =
+storeConfig :: Network -> Logger -> FilePath -> String -> String -> StoreConfig
+storeConfig net logger dir redisURL peer =
   StoreConfig
     { maxPeers = 1,
-      initPeers = ["127.0.0.1:" <> show p2pPort],
+      initPeers = [peer],
       discover = False,
       db = dir,
       net = net,
@@ -388,6 +390,7 @@ webConfig logger store =
       healthCheckInterval = 5,
       accessLog = False,
       nodeRpc = Nothing,
+      nodeRpcSocket = Nothing,
       tls = Nothing,
       logger = logger
     }
@@ -1450,7 +1453,7 @@ oldKeys =
 
 writeOldKeys :: String -> IO ()
 writeOldKeys url = do
-  conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo url))
+  conn <- Redis.checkedConnect (either error id (redisConnectInfo url))
   void . Redis.runRedis conn $ mapM_ (uncurry Redis.set) oldKeys
   Redis.disconnect conn
 
@@ -1831,8 +1834,10 @@ inflatedTokens env = do
 -- answered 202.
 askTest :: Env -> IO ()
 askTest env = withTestLogger $ \logger -> listening $ \(sock, port) -> listening $ \(deaf, deafPort) -> do
-  let rpcURL = "http://test:test@" <> drop (length ("http://" :: String)) env.node.url
-      config url = (webConfig logger env.store) {nodeRpc = Just url} :: WebConfig
+  let rpcURL = env.node.url
+      config url
+        | url == rpcURL = (webConfig logger env.store) {nodeRpc = Just url, nodeRpcSocket = Just env.node.rpcSocket}
+        | otherwise = (webConfig logger env.store) {nodeRpc = Just url} :: WebConfig
       asking = env {plain = "http://127.0.0.1:" <> show port} :: Env
       unanswered = env {plain = "http://127.0.0.1:" <> show deafPort} :: Env
       up e = (== 200) . fst <$> getJSON e.plain "/block/best?notx=true"

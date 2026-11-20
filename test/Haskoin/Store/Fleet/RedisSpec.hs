@@ -17,11 +17,11 @@ import Haskoin.Store.Fleet (Time, empty, live, mayReport, move, report)
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Pool qualified as P
 import Haskoin.Store.Fleet.Redis
-import Haskoin.Store.Integration.Image (testImage)
-import Haskoin.Store.Integration.Podman (hostPort, podmanUsable, withContainer)
-import Haskoin.Store.Integration.Valkey (redisContainer, waitRedis)
+import Haskoin.Store.Integration.Valkey (redisContainer, redisURL)
+import Haskoin.Store.Startup (redisConnectInfo)
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess)
+import Test.Podman (podmanUsable, withContainer)
 import Test.QuickCheck
 
 -- | A step of a fleet of three stores with blocks numbered from 0 to 9.
@@ -655,15 +655,11 @@ instance Arbitrary PoolStep where
       few :: Gen a -> Gen [a]
       few one = choose (0, 3) >>= (`vectorOf` one)
 
--- | A Redis in a container, and a way to get the keys of a fleet that no
--- test has used.
+-- | A Redis in a container, reached through a socket of its pod, and a way
+-- to get the keys of a fleet that no test has used.
 withRedis :: ((Redis.Connection, IO FleetKeys) -> IO ()) -> IO ()
-withRedis go = do
-  image <- testImage
-  withContainer (redisContainer image) $ \c -> do
-    port <- hostPort c 6379
-    let url = "redis://127.0.0.1:" <> show port
-    waitRedis url
-    conn <- Redis.checkedConnect (either error id (Redis.parseConnectInfo url))
+withRedis go =
+  withContainer redisContainer $ \p -> do
+    conn <- Redis.checkedConnect (either error id (redisConnectInfo (redisURL p)))
     counter <- newIORef (0 :: Int)
     go (conn, (\n -> fleetKeys (C.pack ("t" <> show n <> ":")) 4) <$> atomicModifyIORef' counter (\n -> (n + 1, n)))
