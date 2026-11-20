@@ -26,6 +26,11 @@
   environment at the top too. The longest, Bitcoin Cash Node, takes about 64
   seconds. Eight processes at once use about 1.2 GB more than one, with the
   containers.
+- A store that does not sync with its node in time, which happened a
+  few times on Bitcoin Cash Node without being understood yet, prints what
+  the node and the store say of their sync and the last 400 lines of the
+  log of the store, whatever `HASKOIN_TEST_LOG` says (`syncDiagnostics`).
+  Read them before running such a failure again.
 - In one run of four, a test failed with `InsecureConnectionDenied`, an
   exception of the HTTP client, and passed when run again with the same
   seed. Its cause is not known. Run it again before taking such a failure

@@ -45,6 +45,7 @@ import Control.Exception (throwIO, try)
 import Control.Lens ((&), (.~), (?~), (^.))
 import Control.Monad (forM_, forever, replicateM_, unless, void, when)
 import Data.Aeson (Value (..), eitherDecode, object, toJSON, (.=))
+import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as C8
@@ -56,13 +57,14 @@ import Data.Either (isRight)
 import Data.Foldable (toList)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (nub, sort, sortOn)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Ord (Down (..))
+import Data.Sequence qualified as Seq
 import Data.Serialize (decode, encode)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
@@ -166,7 +168,8 @@ import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.Log.FastLogger (toLogStr)
+import System.IO (hPutStrLn, stderr)
+import System.Log.FastLogger (fromLogStr, toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
 import Test.Podman (PodSpec (..), pod, podmanUsable, withPod)
@@ -254,7 +257,9 @@ data Env = Env
     -- directory, to start another one
     configIn :: FilePath -> StoreConfig,
     -- | the same for a store that is a member of a fleet
-    memberIn :: FilePath -> StoreConfig
+    memberIn :: FilePath -> StoreConfig,
+    -- | the last lines of the log of the store ('withTestLog')
+    logTail :: IO [String]
   }
 
 -- | Initial gap and gap of the store under test, the defaults.
@@ -296,7 +301,7 @@ withEnvAt whitelisted ago kind go = do
     -- enough mature coinbases for the wallet to fund every test without
     -- long chains of unconfirmed change
     void $ generateTo node 150 miner
-    withRamDir $ \dir -> withTestLogger $ \logger -> do
+    withRamDir $ \dir -> withTestLog $ \logger logTail -> do
       let net = nodeNetwork kind
           cfg = storeConfig net logger dir redisURL node.peer
       withStore cfg $ \store -> do
@@ -320,27 +325,77 @@ withEnvAt whitelisted ago kind go = do
                         miner = miner,
                         redis = conn,
                         configIn = \d -> storeConfig net logger d redisURL node.peer,
-                        memberIn = \d -> storeConfig net logger d redisURL node.peer
+                        memberIn = \d -> storeConfig net logger d redisURL node.peer,
+                        logTail
                       }
               waitSynced env
               go env
+
+-- | Print what the node and the store say of their sync, and the last lines
+-- of the log of the store, to the standard error: for a store that did not
+-- sync in time. The node gives its chain and, for each peer, the height it
+-- started at and the headers and blocks that it knows the peer has; the
+-- store gives its health, which has its blocks and headers, and its peers;
+-- and the log of its block store says which blocks it asked for, which came,
+-- and which peer it let go and why.
+syncDiagnostics :: Env -> IO ()
+syncDiagnostics env = do
+  say "--- the store did not sync: what the node and the store say"
+  report "the node's chain" (rpc env.node "getblockchaininfo" [])
+  report "the node's peers" (rpc env.node "getpeerinfo" [])
+  report "the store's health" (snd <$> getJSON env.plain "/health")
+  report "the store's peers" (snd <$> getJSON env.plain "/peers")
+  recent <- env.logTail
+  say ("--- the last " <> show (length recent) <> " lines of the log of the store")
+  mapM_ say recent
+  say "--- end of the diagnostics"
+  where
+    say = hPutStrLn stderr
+    report what get =
+      tryAny get >>= \case
+        Right v -> say (what <> ": " <> cs (BL.toStrict (Aeson.encode v)))
+        Left e -> say (what <> ": could not be read: " <> show e)
 
 -- | A logger that prints the log of the store if @HASKOIN_TEST_LOG@ is set,
 -- and discards it otherwise. Each line starts with the time it was logged
 -- at, as seconds of the hour to the millisecond: what several stores do at
 -- once can only be put in order, and a wait told from a hang, by the time.
 withTestLogger :: (Logger -> IO a) -> IO a
-withTestLogger f =
+withTestLogger f = withTestLog (\logger _ -> f logger)
+
+-- | 'withTestLogger' that also keeps the last 'tailLines' lines of the log,
+-- at the level of debugging whether it prints them or not, and gives them
+-- to the action: what a test prints when the store does something it should
+-- not, such as stop syncing, which happens too seldom to be run again with
+-- the log on ('syncDiagnostics').
+withTestLog :: (Logger -> IO [String] -> IO a) -> IO a
+withTestLog f = do
+  kept <- newIORef Seq.empty
+  let keep line = atomicModifyIORef' kept $ \q -> (Seq.drop (Seq.length q + 1 - tailLines) (q Seq.|> line), ())
+      recent = toList <$> readIORef kept
+      recording printed =
+        Logger
+          { level = LevelDebug,
+            source = "",
+            push = \line -> do
+              at <- stamp
+              let stamped = at <> line
+              keep (cs (fromLogStr stamped))
+              printed stamped
+          }
   lookupEnv "HASKOIN_TEST_LOG" >>= \case
-    Just v | v `notElem` ["", "0"] -> withLogger LevelDebug (f . timed)
-    _ -> f Logger {level = LevelError, source = "", push = \_ -> return ()}
+    Just v | v `notElem` ["", "0"] -> withLogger LevelDebug $ \l -> f (recording l.push) recent
+    _ -> f (recording (\_ -> return ())) recent
   where
-    timed l = l {push = \line -> stamp >>= \at -> l.push (at <> line)} :: Logger
     stamp = do
       now <- getPOSIXTime
       let (seconds, millis) = (floor (now * 1000) `mod` 3600000 :: Int) `divMod` 1000
           padded = replicate (3 - length (show millis)) '0' <> show millis
       return (toLogStr (show seconds <> "." <> padded <> " "))
+
+-- | How many of the last lines of the log of a store a test keeps.
+tailLines :: Int
+tailLines = 400
 
 -- | Store with the default gaps, caching every used xpub, with small RocksDB
 -- buffers and caches.
@@ -509,6 +564,7 @@ waitSynced env = go (240 :: Int)
               (_, b) <- getJSON env.plain "/block/best?notx=true"
               (_, m) <- getJSON env.plain "/mempool"
               let ours = [t | String t <- arr m]
+              syncDiagnostics env
               expectationFailure $
                 "The store did not sync to block "
                   <> cs best

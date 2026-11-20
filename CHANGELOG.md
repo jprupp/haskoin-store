@@ -56,6 +56,13 @@ haskoin-store-data 4.0 and haskoin-node 2.7.
   confirmed: the balance of the address, the holders, the unspent outputs
   and the transactions of the category, and the amounts as strings in the
   JSON.
+- **A store that does not sync in the integration tests explains
+  itself.** The tests keep the last 400 lines of the log of each store,
+  whether they print it or not, and when a store does not reach the best
+  block of its node in time they print them, with what the node says of its
+  chain and of its peers and what the store says of its health and peers.
+  A store stopped short of its node a few times on Bitcoin Cash Node, too
+  seldom to be run again with its log.
 - **The example of the client in the README compiles**: it needed
   `OverloadedStrings` for the text of its address.
 - **The integration tests run their containers through
