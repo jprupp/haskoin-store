@@ -23,6 +23,28 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   new version. Four new column families keep older stores out.
 - The checks of a published transaction read the token prefix with
   haskoin-core's parser.
+- **Releasing and formatting moved to
+  [jprupp/tools](https://github.com/jprupp/tools)**, shared by the Haskell
+  packages of this family. `haskell-release` builds and tests the package,
+  builds the source and documentation archives, then tags the commit,
+  pushes the tag and uploads both to Hackage. It leaves out the
+  documentation of the internal library `integration`, whose file
+  `haskoin-store:integration.txt` made Hackage refuse the archive, so a
+  release needs no step by hand. `haskell-format` replaces `scripts/format`.
+- **CI runs through the workflow that the packages share** in jprupp/tools,
+  which also keeps the cache of the Nix build per release of nixpkgs.
+  `check-stack-paths` from there replaces `scripts/check-local-deps.sh`.
+
+## [1.16.7] - 2026-11-20
+
+### Fixed
+- **A Bitcoin store no longer loses its peers when the pool fills again.**
+  A refill asked every connected peer for its mempool, and Bitcoin Core
+  disconnects a peer that asks unless it whitelists it: on groot the btc
+  store lost its three peers at once and answered 503 for seven seconds.
+  On Bitcoin only the peers given with `--peer` are asked now, since an
+  operator whitelists those; on Bitcoin Cash every peer still is, since
+  Bitcoin Cash Node answers anyone.
 
 ## [1.16.6] - 2026-11-19
 

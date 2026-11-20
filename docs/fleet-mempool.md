@@ -184,16 +184,19 @@ After a loss of Redis or a restart of the pool, each server:
   always works.
 - **asks its peers for their mempools**, once, the peers connected at that
   time (`blockStoreRefill`), and fetches what they announce. Bitcoin Cash
-  Node answers by default. Bitcoin Core answers only a peer that it
+  Node serves bloom filters by default, and so answers anyone: on Bitcoin
+  Cash every peer is asked. Bitcoin Core answers only a peer that it
   whitelists, or when it serves bloom filters (`-peerbloomfilters`, off by
-  default); any other peer that asks, it disconnects. So a store asks only
-  once per refill, and loses at worst one connection to each public Core
-  peer, which it replaces.
+  default); any other peer that asks, it disconnects. So on Bitcoin only
+  the peers given with `--peer` are asked, on the assumption that the
+  operator whitelists those (`whitebind=mempool@…`). Asking the seeds and
+  the discovered peers only lost them: a store with no other peers dropped
+  to none, all at once, and answered 503 until it found new ones.
 
-A Bitcoin fleet without `--node-rpc` and without a node that whitelists
-it gets back only what its peers announce from then on: new transactions,
-and those wallets broadcast again. The seen set was emptied with the pool,
-so none of those is skipped.
+A Bitcoin fleet without `--node-rpc` and without a `--peer` that
+whitelists it gets back only what its peers announce from then on: new
+transactions, and those wallets broadcast again. The seen set was emptied
+with the pool, so none of those is skipped.
 
 ## Reading
 

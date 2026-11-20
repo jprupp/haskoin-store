@@ -390,7 +390,13 @@ config c = do
           metavar "HOSTNAME[:PORT]"
             <> long "peer"
             <> short 'p'
-            <> helpEnv "PEER" "Network peer (as many as required)"
+            <> helpEnv
+              "PEER"
+              ( unwords
+                  [ "Network peer (as many as required); on Bitcoin, only these are asked for their mempools",
+                    "when the pool fills again, so whitelist the store on them"
+                  ]
+              )
   version <-
     switch $
       long "version"

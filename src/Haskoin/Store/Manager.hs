@@ -396,6 +396,7 @@ blockStoreCfg cfg node pub db member =
       pub = pub,
       db = db,
       net = cfg.net,
+      explicitPeers = cfg.initPeers,
       onBest = maybe (\_ -> return ()) noteBest member,
       onTx = maybe (\_ _ -> return ()) memberReceived member,
       seen = maybe (\_ -> return mempty) memberSeen member,

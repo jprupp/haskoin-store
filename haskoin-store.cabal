@@ -5,7 +5,7 @@ cabal-version: 2.0
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-store
-version:        1.16.6
+version:        1.16.7
 synopsis:       Storage and index for Bitcoin and Bitcoin Cash
 description:    An indexer for Bitcoin and Bitcoin Cash. It downloads blocks and mempool
                 transactions from the peer-to-peer network, indexes the chain in RocksDB and
@@ -299,6 +299,7 @@ test-suite spec
   other-modules:
       Haskoin.Store.BlockStore.PendingSpec
       Haskoin.Store.BlockStore.SyncSpec
+      Haskoin.Store.BlockStoreSpec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Database.MergeSpec
       Haskoin.Store.Database.MigrateSpec

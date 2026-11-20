@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Format every Haskell file with ormolu.
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-find app bench integration src test -type f -name '*.hs' -print0 \
-  | xargs -0 ormolu -i
