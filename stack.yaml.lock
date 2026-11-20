@@ -54,26 +54,38 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    hackage: haskoin-core-2.0.1@sha256:1a12d9a856296425ad182fbc7ce9296507f4c9e608ee54f3c450ab36ce646909,7331
+    commit: 008ca8aa2a9faf9929b4868c4d7aa58bb3efbbba
+    git: https://github.com/jprupp/haskoin-core.git
+    name: haskoin-core
     pantry-tree:
-      sha256: 6472ab9dc8f6452ced8d0779cc88ed02566b0afcad270dc8691543aa660f9282
-      size: 8127
+      sha256: 8774dbc07c2e0646587963efa03bbd63bbbce3520d395f5da90d60f3fa6f6453
+      size: 9305
+    version: 2.1.0
   original:
-    hackage: haskoin-core-2.0.1
+    commit: 008ca8aa2a9faf9929b4868c4d7aa58bb3efbbba
+    git: https://github.com/jprupp/haskoin-core.git
 - completed:
-    hackage: haskoin-node-2.6.1@sha256:e78b40a4f894df4e6ea64e45e634522b514546f03b857f107f790e6f0374491c,4780
+    commit: ebdc995d8d81bc7ef589f87bc51a21065ecba0a7
+    git: https://github.com/jprupp/haskoin-node.git
+    name: haskoin-node
     pantry-tree:
-      sha256: 9ed17732e6083c1c118e14156128dd0f5f9d5afe0cf0e77632036db932705aa1
-      size: 2631
+      sha256: 3e07a588a45aabd10dddd00997e4902486490ed8991f1105a40cc7adc773a349
+      size: 3148
+    version: 2.6.1
   original:
-    hackage: haskoin-node-2.6.1
+    commit: ebdc995d8d81bc7ef589f87bc51a21065ecba0a7
+    git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    hackage: haskoin-store-data-3.0.1@sha256:7b4bb105cc5e8c6a27389f07cf0e15d8091f0299b35e4116fa5483dc95166b0b,3914
+    commit: 20c57966f488c128cb344909eecec0e6e820f77e
+    git: https://github.com/jprupp/haskoin-store-data.git
+    name: haskoin-store-data
     pantry-tree:
-      sha256: 589fe11976f63baf0896080c8c629903ebdecd099fd3d3348e68e176285572f5
-      size: 837
+      sha256: 10d0d2b237c9c36e428c799c3c037fa7e0495cd1b542334e41849bcd0acd8eca
+      size: 1261
+    version: 3.1.0
   original:
-    hackage: haskoin-store-data-3.0.1
+    commit: 20c57966f488c128cb344909eecec0e6e820f77e
+    git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550
     pantry-tree:

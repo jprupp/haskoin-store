@@ -82,6 +82,7 @@ Bitcoin Cash APIs such as api.haskoin.com.
 | Networks        | Bitcoin and Bitcoin Cash: mainnet, testnets and regtest                                     |
 | Addresses       | Balances, transactions and unspent outputs (UTXO) of any address, alone or many at once      |
 | Xpubs           | Balances, transactions and UTXO of extended public keys, for legacy, nested SegWit and native SegWit addresses, from the fleet's cache in Redis |
+| Tokens          | CashTokens on Bitcoin Cash: the tokens of every output, token balances of addresses, and the holders, transactions and UTXO of each category |
 | Blocks and txs  | Lookup by hash, height or time; raw serialized forms; transactions of a block               |
 | Mempool         | One pool in Redis shared by the fleet, by arrival time, with replace-by-fee on BTC and expiry |
 | Formats         | JSON                                                                                         |
@@ -631,6 +632,7 @@ looks at the client's address, and WebSocket events work the same.
 | Mempool | `/mempool` |
 | Addresses | `/address/:addr/{transactions,transactions/full,balance,unspent}` and the multi-address forms `/address/{transactions,transactions/full,balances,unspent}?addresses=…` |
 | Xpubs | `/xpub/:xpub`, `/xpub/:xpub/{transactions,transactions/full,balances,unspent}`, `DELETE /xpub/:xpub` (drop from cache); `derive=legacy\|compat\|segwit` picks the address type (`normal`, the old name of `legacy`, still works) |
+| Tokens | `/address/:addr/tokens`, `/token/:category/{holders,unspent,transactions}`; outputs, inputs and UTXO have a `token` field on Bitcoin Cash (`docs/cashtokens.md`) |
 | Network | `/peers`, `/health` (503 when unhealthy, Redis included), `/dbstats` |
 | Events | `/events`, as JSON lines over HTTP or as a WebSocket; `after=` resumes, and a WebSocket client can filter by address, xpub or Bloom filter |
 | Blockchain.info | `/blockchain/multiaddr`, `/blockchain/balance`, `/blockchain/rawaddr/:addr`, `/blockchain/unspent`, `/blockchain/rawtx/:txid`, `/blockchain/rawblock/:hash`, `/blockchain/latestblock`, `/blockchain/unconfirmed-transactions`, `/blockchain/export-history`, `/blockchain/q/…` |
@@ -813,7 +815,7 @@ The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
 
-This is version 23 of the database. The store migrates an older database
+This is version 24 of the database. The store migrates an older database
 the first time it opens it. **There is no way back**: an older store
 cannot open the database afterwards, so take a copy first.
 
@@ -823,6 +825,16 @@ cannot open the database afterwards, so take a copy first.
 | 20 | Takes the unconfirmed transactions out of the chain's indices; the pool gets them again from the peers | Seconds to minutes |
 | 21 | Reads every transaction and writes nearly every one again | Many hours for Bitcoin |
 | 22 | Writes the new version | At once |
+| 23 | Bitcoin Cash: indexes the outputs that hold tokens, under their addresses and in the token indexes, from the upgrade of May 2023 (`docs/cashtokens.md`). Others: writes the new version | Bitcoin Cash: hours, it reads every transaction since then. Others: at once |
+
+**From 23 to 24 on Bitcoin Cash, outputs with tokens get their
+addresses.** Until version 24 an output that holds tokens had no address,
+so the addresses that held tokens were missing their history and part of
+their balance. The migration walks the blocks since CashTokens began and
+adds them, with the token balances and the indexes of each category. It
+works in batches of 200 blocks, each written at once with its place, so
+it can be stopped and carries on where it was. The four new column
+families keep an older store out, as `merge-operators` does.
 
 **From 22 to 23 nothing in the database changes, and it is still one
 way.** From version 23 a block writes the balances of its addresses and

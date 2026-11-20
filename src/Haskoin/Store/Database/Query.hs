@@ -47,6 +47,11 @@ module Haskoin.Store.Database.Query
 
     -- * Addresses
     getBalance,
+    getTokBal,
+    getAddressTokens,
+    getCategoryHolders,
+    getCategoryTxs,
+    getCategoryUnspents,
     getBalances,
     getUnspent,
     getAddressTxs,
@@ -80,6 +85,7 @@ where
 import Conduit
   ( ConduitT,
     concatC,
+    concatMapC,
     dropWhileC,
     lift,
     liftIO,
@@ -128,6 +134,8 @@ import Haskoin
     OutPoint (..),
     Tx (..),
     TxHash,
+    eitherToMaybe,
+    scriptToAddressBS,
   )
 import Haskoin.Store.Common
   ( Limits (..),
@@ -326,6 +334,11 @@ getSpender r op =
 -- Addresses
 -------------------------------------------------------------------------------
 
+-- | The tokens of a category that an address holds in the chain, if it
+-- ever held any (CashTokens).
+getTokBal :: DatabaseReader -> Address -> TxHash -> IO (Maybe TokBalVal)
+getTokBal r a c = retrieveCF r.db (tokBalCF r.db) (TokBalKey a c)
+
 -- | Balance of an address, if it was ever used.
 getBalance :: DatabaseReader -> Address -> IO (Maybe Balance)
 getBalance r a = do
@@ -452,6 +465,62 @@ unspentConduit r a s it =
              in scanFrom it (AddrOutKeyA a) (AddrOutKeyB a b)
                   .| (dropWhileC before >> mapC id)
           Nothing -> return ()
+
+-------------------------------------------------------------------------------
+-- Tokens of Bitcoin Cash
+-------------------------------------------------------------------------------
+
+-- | The token balances of an address in the chain, one per category, in
+-- the order of the categories' bytes.
+getAddressTokens :: DatabaseReader -> Address -> IO [(TxHash, TokBalVal)]
+getAddressTokens r a =
+  withIterCFStat r (tokBalCF r.db) (TokBalKeyA a) $ \it ->
+    runConduit $ scan it (TokBalKeyA a) .| concatMapC (\case (TokBalKey _ c, v) -> [(c, v)]; _ -> []) .| sinkList
+
+-- | The holders of a category in the chain, one token balance per address,
+-- in the order of the addresses' bytes, with an offset and a limit.
+getCategoryHolders :: DatabaseReader -> TxHash -> Limits -> IO [(Address, TokBalVal)]
+getCategoryHolders r c limits =
+  withIterCFStat r (holderCF r.db) (HolderKeyC c) $ \it ->
+    runConduit $
+      scan it (HolderKeyC c)
+        .| concatMapC (\case (HolderKey _ a, v) -> [(a, v)]; _ -> [])
+        .| applyLimitsC limits
+        .| sinkList
+
+-- | Transactions that moved tokens of a category, in the chain, newest
+-- first, from a block or a transaction as for an address.
+getCategoryTxs :: DatabaseReader -> TxHash -> Limits -> IO [TxRef]
+getCategoryTxs r c limits =
+  withIterCFStat r (catTxCF r.db) (CatTxKeyC c) $ \it ->
+    runConduit $
+      from it .| concatMapC (\case (CatTxKey _ t, ()) -> [t]; _ -> []) .| applyLimitsC limits .| sinkList
+  where
+    from it = case limits.start of
+      Nothing -> scan it (CatTxKeyC c)
+      Just (AtBlock bh) -> scanFrom it (CatTxKeyC c) (CatTxKeyB c (BlockRef bh maxBound))
+      Just (AtTx txh) ->
+        lift (getTxRecord r txh) >>= \case
+          Just TxData {block = b@BlockRef {}} -> scanFrom it (CatTxKeyC c) (CatTxKeyB c b)
+          _ -> return ()
+
+-- | Unspent outputs that hold tokens of a category, in the chain, newest
+-- first, from a block or a transaction as for an address.
+getCategoryUnspents :: DatabaseReader -> TxHash -> Limits -> IO [Unspent]
+getCategoryUnspents r c limits =
+  withIterCFStat r (catOutCF r.db) (CatOutKeyC c) $ \it ->
+    runConduit $
+      from it .| concatMapC (\case (CatOutKey _ b p, v) -> [unspent b p v]; _ -> []) .| applyLimitsC limits .| sinkList
+  where
+    unspent block outpoint (OutVal value script) =
+      Unspent {block, outpoint, value, script, address = eitherToMaybe (scriptToAddressBS r.net script)}
+    from it = case limits.start of
+      Nothing -> scan it (CatOutKeyC c)
+      Just (AtBlock bh) -> scanFrom it (CatOutKeyC c) (CatOutKeyB c (BlockRef bh maxBound))
+      Just (AtTx txh) ->
+        lift (getTxRecord r txh) >>= \case
+          Just TxData {block = b@BlockRef {}} -> scanFrom it (CatOutKeyC c) (CatOutKeyB c b)
+          _ -> return ()
 
 -------------------------------------------------------------------------------
 -- Extended public keys

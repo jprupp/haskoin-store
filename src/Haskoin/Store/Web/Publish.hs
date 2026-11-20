@@ -117,7 +117,6 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race, waitCatch, withAsync)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, stateTVar, writeTVar)
 import Control.Monad (forM_, forever, unless, when)
-import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.HashMap.Strict (HashMap)
@@ -137,6 +136,7 @@ import Haskoin
     InputVerdict (..),
     Message (..),
     MessageCommand (..),
+    NFToken (..),
     Network (..),
     NetworkAddress (..),
     OutPoint (..),
@@ -144,6 +144,7 @@ import Haskoin
     Pong (..),
     Reject (..),
     Script (..),
+    TokenData (..),
     Tx (..),
     TxHash,
     TxIn (..),
@@ -153,7 +154,7 @@ import Haskoin
     isPushOp,
     nullOutPoint,
     sockToHostAddress,
-    splitTokenPrefix,
+    splitTokenData,
     txHash,
     txHashToHex,
   )
@@ -612,39 +613,22 @@ data Tokens = Tokens
   }
 
 -- | The tokens at the front of the script of an output, if it has any, or
--- 'Left' if they are not written as tokens are ('splitTokenPrefix').
+-- 'Left' if they are not written as tokens are, as haskoin-core reads them
+-- ('splitTokenData'). The category is in the order of its bytes in the
+-- transaction, as the rules compare it with the outpoints of the inputs.
 readTokens :: ByteString -> Either () (Maybe Tokens)
-readTokens script = case splitTokenPrefix script of
-  Nothing -> Left ()
-  Just (prefix, _)
-    | B.null prefix -> Right Nothing
-    | otherwise -> Right (Just (parse prefix))
-  where
-    -- the prefix is well formed: 'splitTokenPrefix' said so
-    parse prefix =
-      let flags = B.index prefix 33
-          rest0 = B.drop 34 prefix
-          (commitment, rest1)
-            | flags .&. 0x40 /= 0 = let (n, r) = compact rest0 in B.splitAt (fromIntegral n) r
-            | otherwise = (B.empty, rest0)
-          held
-            | flags .&. 0x10 /= 0 = fst (compact rest1)
-            | otherwise = 0
-       in Tokens
-            { category = B.take 32 (B.drop 1 prefix),
-              nft = if flags .&. 0x20 /= 0 then Just (flags .&. 0x0f, commitment) else Nothing,
-              amount = held
-            }
-    compact :: ByteString -> (Word64, ByteString)
-    compact b = case B.uncons b of
-      Just (w, r)
-        | w < 0xfd -> (fromIntegral w, r)
-        | w == 0xfd -> sized 2 r
-        | w == 0xfe -> sized 4 r
-        | otherwise -> sized 8 r
-      Nothing -> (0, B.empty)
-    sized :: Int -> ByteString -> (Word64, ByteString)
-    sized k r = (B.foldr (\w acc -> acc `shiftL` 8 .|. fromIntegral w) 0 (B.take k r), B.drop k r)
+readTokens script = case splitTokenData script of
+  Left _ -> Left ()
+  Right (Nothing, _) -> Right Nothing
+  Right (Just t, _) ->
+    Right . Just $
+      Tokens
+        { category = encode t.category,
+          -- capabilities: 0 none, 1 mutable, 2 minting, in the order of
+          -- the constructors
+          nft = (\n -> (fromIntegral (fromEnum n.capability), n.commitment)) <$> t.nft,
+          amount = t.amount
+        }
 
 -- | The rules of the tokens of Bitcoin Cash (CashTokens, since May 2023),
 -- given the outputs that the inputs spend, in order. A node drops every

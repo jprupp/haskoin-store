@@ -196,9 +196,9 @@ spec = describe "the merge operators of the database" $ do
           agree
           compactRange db.db (Just cf) Nothing Nothing
           agree
-      it "has the two operators on their column families, and the one that keeps older stores out" $
+      it "has the operators on their column families, the one that keeps older stores out, and those of the tokens" $
         withDB $
-          \db -> length (columnFamilies db.db) `shouldBe` 11
+          \db -> length (columnFamilies db.db) `shouldBe` 15
 
 -------------------------------------------------------------------------------
 -- Calling the operators as RocksDB does

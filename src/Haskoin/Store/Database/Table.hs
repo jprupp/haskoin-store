@@ -106,6 +106,18 @@ instance TableKey (Address, TxRef) where
 instance TableKey (Address, BlockRef, OutPoint) where
   tableHash salt (a, _, p) = tableHash (tableHash salt a) p
 
+-- | The address and the category of a token balance.
+instance TableKey (Address, TxHash) where
+  tableHash salt (a, c) = tableHash salt a `hashWithSalt` c
+
+-- | The category and the hash of the transaction, as for an address.
+instance TableKey (TxHash, TxRef) where
+  tableHash salt (c, t) = salt `hashWithSalt` c `hashWithSalt` t.txid
+
+-- | The category and the output, as for an address.
+instance TableKey (TxHash, BlockRef, OutPoint) where
+  tableHash salt (c, _, p) = tableHash (salt `hashWithSalt` c) p
+
 -- | An empty table.
 new :: IO (Table k v)
 new = Table <$> H.new

@@ -104,6 +104,7 @@ import Haskoin.Store.Data
     BlockRef (..),
     DeriveType (..),
     Spender,
+    TokenBalance (..),
     Transaction (..),
     TxData (..),
     TxRef (..),
@@ -238,6 +239,14 @@ data StoreRead = StoreRead
     -- | number of distinct transactions of a set of addresses, counted
     -- without reading them
     getAddressesTxCount :: [Address] -> IO Word32,
+    -- | the token balances of an address, one per category (CashTokens)
+    getAddressTokens :: Address -> IO [TokenBalance],
+    -- | the holders of a category, one token balance per address
+    getTokenHolders :: TxHash -> Limits -> IO [TokenBalance],
+    -- | transactions that moved tokens of a category, newest first
+    getTokenTxs :: TxHash -> Limits -> IO [TxRef],
+    -- | unspent outputs that hold tokens of a category, newest first
+    getTokenUnspents :: TxHash -> Limits -> IO [Unspent],
     -- | what is kept of a transaction that a block of the main chain
     -- replaced, if it did in the last 'replacedKept' blocks
     getReplaced :: TxHash -> IO (Maybe Replaced)

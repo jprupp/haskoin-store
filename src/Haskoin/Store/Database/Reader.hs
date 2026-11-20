@@ -57,6 +57,7 @@ module Haskoin.Store.Database.Reader
     withReader,
     columnFamilyConfig,
     layeredFamilyConfig,
+    tokenFamilyConfig,
     mergeGuardFamily,
     memoryReport,
     addrTxCF,
@@ -68,6 +69,10 @@ module Haskoin.Store.Database.Reader
     heightCF,
     balanceCF,
     mempoolCF,
+    tokBalCF,
+    holderCF,
+    catTxCF,
+    catOutCF,
 
     -- * Snapshots
     snapshotReader,
@@ -402,6 +407,7 @@ layeredFamilyConfig :: Bool -> Bool -> [(String, Config)]
 layeredFamilyConfig bloom cached =
   map mempool (columnFamilyConfig bloom cached)
     <> [("mempool-addr", c (Just 22)), (mergeGuardFamily, def)]
+    <> tokenFamilyConfig bloom cached
   where
     c p =
       def
@@ -413,6 +419,32 @@ layeredFamilyConfig bloom cached =
     mempool (name, cfg)
       | name == "mempool" = (name, c Nothing)
       | otherwise = (name, cfg)
+
+-- | The column families of the tokens of Bitcoin Cash, since database
+-- version 24 (@docs\/cashtokens.md@): token balances by address and by
+-- category, with the merge operator of the balances, since their values are
+-- five numbers too; and the transactions and the unspent outputs of each
+-- category. Every network has them, empty where there are no tokens, so
+-- that a database has one layout. Like 'mergeGuardFamily', they keep a
+-- store that does not know them from opening a database that has them.
+tokenFamilyConfig :: Bool -> Bool -> [(String, Config)]
+tokenFamilyConfig bloom cached =
+  [ ("tok-bal", (c (Just 22)) {mergeOperator = Just balanceOperator}),
+    ("holder", (c (Just 33)) {mergeOperator = Just balanceOperator}),
+    ("cat-tx", scanned (Just 33)),
+    ("cat-out", scanned (Just 33))
+  ]
+  where
+    -- the balances are read one key at a time too, when a block is taken
+    -- out, as the balances of the addresses are
+    c p =
+      def
+        { prefixLength = p,
+          bloomFilter = bloom,
+          cacheIndexAndFilterBlocks = cached,
+          partitionIndexAndFilters = cached
+        }
+    scanned p = (c p) {bloomFilter = False}
 
 -- | The name of the column family that has nothing in it, and is there so
 -- that a store older than database version 23 cannot open the database:
@@ -458,6 +490,22 @@ balanceCF db = columnFamilies db !! 7
 -- 20 ('MemTxKey'), which only its migration reads.
 mempoolCF :: DB -> ColumnFamily
 mempoolCF db = columnFamilies db !! 8
+
+-- | Column family of the token balances by address ('TokBalKey').
+tokBalCF :: DB -> ColumnFamily
+tokBalCF db = columnFamilies db !! 11
+
+-- | Column family of the token balances by category ('HolderKey').
+holderCF :: DB -> ColumnFamily
+holderCF db = columnFamilies db !! 12
+
+-- | Column family of the transactions of each category ('CatTxKey').
+catTxCF :: DB -> ColumnFamily
+catTxCF db = columnFamilies db !! 13
+
+-- | Column family of the unspent outputs of each category ('CatOutKey').
+catOutCF :: DB -> ColumnFamily
+catOutCF db = columnFamilies db !! 14
 
 -- | A reader of a snapshot of the database of another reader: the same
 -- in everything, but that it reads the snapshot.

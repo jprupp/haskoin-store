@@ -106,6 +106,7 @@ module Haskoin.Store.Database.Migrate
     migrateRecords,
     layeredVersion,
     recordsVersion,
+    mergesVersion,
     Migration (..),
     MigrationError (..),
     MigrationOptions (..),
@@ -154,6 +155,7 @@ import Database.RocksDB.Query
 import Haskoin
   ( Address,
     BlockHeader (..),
+    Network (..),
     OutPoint (..),
     Tx (..),
     TxHash,
@@ -176,6 +178,7 @@ import Haskoin.Store.Data
     UnixTime,
     confirmed,
   )
+import Haskoin.Store.Database.Migrate.Tokens (migrateTokens, tokenActivation)
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
@@ -216,11 +219,16 @@ layeredVersion = 21
 recordsVersion :: Word32
 recordsVersion = 22
 
--- | Version that the store runs on: that of 'recordsVersion', in which the
--- import of a block writes merge records for balances and spenders
--- ("Haskoin.Store.Database.Merge").
+-- | Version of 'recordsVersion' in which the import of a block writes merge
+-- records for balances and spenders ("Haskoin.Store.Database.Merge").
+mergesVersion :: Word32
+mergesVersion = 23
+
+-- | Version that the store runs on: that of 'mergesVersion', with the
+-- outputs that hold tokens of Bitcoin Cash under their addresses, and the
+-- token balances and categories indexed (@docs\/cashtokens.md@).
 currentVersion :: Word32
-currentVersion = 23
+currentVersion = 24
 
 -- | Version that the migration starts from.
 mixedVersion :: Word32
@@ -339,17 +347,21 @@ upgradeDatabase report r = do
       | v == currentVersion && marker == Nothing -> return nothing
       -- no migration leaves its marker with this version
       | v >= currentVersion -> throwIO (UnknownVersion version)
-      | v == recordsVersion && marker == Nothing -> merges nothing
+      | v == mergesVersion && marker == Nothing -> tokens nothing
+      -- the tokens were being indexed when the store last stopped
+      | v == mergesVersion && isJust r.net.cashAddrPrefix -> tokens nothing
+      | v == mergesVersion -> throwIO (UnknownVersion version)
+      | v == recordsVersion && marker == Nothing -> merges nothing >>= tokens
       -- the times were being set when the store last stopped
-      | v == recordsVersion && marker == Just layeredVersion -> times nothing >>= merges
+      | v == recordsVersion && marker == Just layeredVersion -> times nothing >>= merges >>= tokens
       | v == recordsVersion -> throwIO (UnknownVersion version)
       -- versions 18 and 19 have the chain of version 20, and a mempool that
       -- the migration to the layered layout reads where it is
       | v == 18 || v == 19 -> do
           report $ "Upgrading the database from version " <> cs (show v)
           writeBatch r.db [insertOp VersionKey mixedVersion]
-          layered >>= times >>= merges
-    Just (_ :: Word32) -> layered >>= times >>= merges
+          layered >>= times >>= merges >>= tokens
+    Just (_ :: Word32) -> layered >>= times >>= merges >>= tokens
   where
     nothing = Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
     layered = migrateLayeredWith defaultMigrationOptions {report = report} r
@@ -362,10 +374,30 @@ upgradeDatabase report r = do
         "Upgrading the database from version "
           <> cs (show recordsVersion)
           <> " to "
-          <> cs (show currentVersion)
+          <> cs (show mergesVersion)
           <> ": blocks will write merge records, which no older haskoin-store can read"
-      writeBatch r.db [insertOp VersionKey currentVersion]
+      writeBatch r.db [insertOp VersionKey mergesVersion]
       return done
+    -- from 'mergesVersion': a network without tokens has nothing to add;
+    -- one of Bitcoin Cash indexes them, or carries that on
+    -- ("Haskoin.Store.Database.Migrate.Tokens")
+    tokens done
+      | isJust r.net.cashAddrPrefix = do
+          marker <- retrieve r.db MigrationKey :: IO (Maybe Word32)
+          start <- maybe (tokenActivation r) return marker
+          _ <- migrateTokens report start r
+          writeBatch r.db [insertOp VersionKey currentVersion, deleteOp MigrationKey]
+          report $ "The tokens are indexed: the database is now of version " <> cs (show currentVersion)
+          return done
+      | otherwise = do
+          report $
+            "Upgrading the database from version "
+              <> cs (show mergesVersion)
+              <> " to "
+              <> cs (show currentVersion)
+              <> ": this network has no tokens, so nothing else changes"
+          writeBatch r.db [insertOp VersionKey currentVersion]
+          return done
 
 -- | Bring the records of the confirmed transactions of a database of
 -- version 21 to what version 22 writes, and make the database one of that

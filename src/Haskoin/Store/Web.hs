@@ -1389,6 +1389,10 @@ handlePaths st cfg =
     plainList limits (\r -> GetAddrTxs <$> cap r <*> lim r) (handleAddrTxs st),
     marshalled [] (\r -> GetAddrBalance <$> cap r) (handleAddrBalance st),
     marshalledList limits (\r -> GetAddrUnspent <$> cap r <*> lim r) (handleAddrUnspent st),
+    marshalledList [] (\r -> GetAddrTokens <$> cap r) (handleAddrTokens st),
+    marshalledList ["limit", "offset"] (\r -> GetTokenHolders <$> cap r <*> opt r <*> off r) (handleTokenHolders st),
+    marshalledList limits (\r -> GetTokenUnspent <$> cap r <*> lim r) (handleTokenUnspent st),
+    plainList limits (\r -> GetTokenTxs <$> cap r <*> lim r) (handleTokenTxs st),
     lightly (plainList [] (\_ -> return GetPeers) (handlePeers st)),
     lightly (pathHealth st),
     plainList ["limit", "offset"] (\r -> GetMempool <$> opt r <*> off r) (handleMempool st),
@@ -2509,6 +2513,36 @@ handleAddrsUnspent ::
 handleAddrsUnspent st (GetAddrsUnspent addrs pLimits) =
   withMetrics st (.addressUnspent) $
     st.query.getAddressesUnspents addrs =<< paramToLimits st False pLimits
+
+-- GET Tokens --
+
+-- | Handler for @GET \/address\/:address\/tokens@: the token balances of an
+-- address, one per category (CashTokens). Empty on Bitcoin.
+handleAddrTokens :: WebState -> GetAddrTokens -> IO [TokenBalance]
+handleAddrTokens st (GetAddrTokens addr) =
+  withMetrics st (.addressBalance) $ st.query.getAddressTokens addr
+
+-- | Handler for @GET \/token\/:category\/holders@: the token balances of a
+-- category, one per address, in the order of the addresses' bytes.
+handleTokenHolders :: WebState -> GetTokenHolders -> IO [TokenBalance]
+handleTokenHolders st (GetTokenHolders category limit offset) =
+  withMetrics st (.addressBalance) $ do
+    limits <- paramToLimits st False (LimitsParam limit offset Nothing)
+    st.query.getTokenHolders category limits
+
+-- | Handler for @GET \/token\/:category\/unspent@: unspent outputs that
+-- hold tokens of a category, newest first.
+handleTokenUnspent :: WebState -> GetTokenUnspent -> IO [Unspent]
+handleTokenUnspent st (GetTokenUnspent category pLimits) =
+  withMetrics st (.addressUnspent) $
+    st.query.getTokenUnspents category =<< paramToLimits st False pLimits
+
+-- | Handler for @GET \/token\/:category\/transactions@: transactions that
+-- moved tokens of a category, newest first.
+handleTokenTxs :: WebState -> GetTokenTxs -> IO [TxRef]
+handleTokenTxs st (GetTokenTxs category pLimits) =
+  withMetrics st (.addressTx) $
+    st.query.getTokenTxs category =<< paramToLimits st False pLimits
 
 -- GET XPubs --
 

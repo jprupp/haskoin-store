@@ -2,24 +2,33 @@ module Haskoin.Store.LogicSpec (spec) where
 
 import Control.Monad (forM)
 import Data.ByteString qualified as B
+import Data.Maybe (fromJust)
 import Data.Serialize (encode)
 import Database.RocksDB (columnFamilies)
 import Haskoin
   ( Block (..),
+    NFToken (..),
     Network (..),
     OutPoint (..),
+    TokenCapability (..),
+    TokenData (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
     TxOut (..),
+    bchRegTest,
     btcRegTest,
+    eitherToMaybe,
+    encodeTokenPrefix,
+    scriptToAddressBS,
     sha256,
     txHash,
   )
 import Haskoin.Store.Common (sortTxs)
 import Haskoin.Store.Data (BlockData (..))
 import Haskoin.Store.Database.Query qualified as Q
-import Haskoin.Store.Database.Reader (DatabaseReader (..))
+import Haskoin.Store.Database.Reader (DatabaseReader (..), catOutCF, catTxCF, holderCF, tokBalCF)
+import Haskoin.Store.Database.Types (TokBalVal (..))
 import Haskoin.Store.Histories
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic (PreparedBlock (..), PreparedTx (..), prepareBlock)
@@ -56,6 +65,61 @@ spec = describe "the rules of the chain" $ do
         Q.getTxData db (txHash spend) >>= (`shouldBe` Nothing) . fmap (const ())
         chainFamilies db `shouldReturn` kept
 
+  it "index the tokens of Bitcoin Cash, and take out with a revert exactly what they put in" $
+    withSystemTempDirectory "haskoin-store-tokens-" $ \dir ->
+      openLayered bchRegTest dir $ \db -> do
+        startChain db
+        first <- mine db []
+        coinbase <-
+          Q.getBlock db first >>= \case
+            Just bd | h : _ <- bd.txs -> return h
+            _ -> fail "no coinbase"
+        kept <- tokenFamilies db
+        before <- chainFamilies db
+        -- the first input spends output 0 of the coinbase, so the category
+        -- is the coinbase's id: 1000 tokens and a minting token to one
+        -- address, the coins to another
+        let category = coinbase
+            minted = TokenData category 1000 (Just (NFToken MintingCapability "\x01"))
+            alice = "\x76\xa9\x14" <> B.replicate 20 0x11 <> "\x88\xac"
+            bob = "\x76\xa9\x14" <> B.replicate 20 0x22 <> "\x88\xac"
+            holding t lock = fromJust (encodeTokenPrefix t) <> lock
+            genesis =
+              Tx
+                1
+                [TxIn (OutPoint coinbase 0) "" maxBound]
+                [TxOut 1000 (holding minted alice), TxOut 2000 bob]
+                []
+                0
+            -- 400 tokens go to bob, the rest and the minting token stay
+            move =
+              Tx
+                1
+                [TxIn (OutPoint (txHash genesis) 0) "" maxBound]
+                [ TxOut 600 (holding (TokenData category 400 Nothing) bob),
+                  TxOut 400 (holding minted {amount = 600} alice)
+                ]
+                []
+                0
+            [a, b] = map (fromJust . eitherToMaybe . scriptToAddressBS bchRegTest) [alice, bob]
+        second <- mine db [genesis]
+        Q.getTokBal db a category `shouldReturn` Just (TokBalVal 1000 1 1 1 1000)
+        _ <- mine db [move]
+        Q.getTokBal db a category `shouldReturn` Just (TokBalVal 600 1 1 2 1600)
+        Q.getTokBal db b category `shouldReturn` Just (TokBalVal 400 0 1 1 400)
+        -- under the category too, the two holders, two transactions and two
+        -- unspent outputs
+        [holders, txs, outs] <- mapM (fmap length . dump db) [holderCF db.db, catTxCF db.db, catOutCF db.db]
+        (holders, txs, outs) `shouldBe` (2, 2, 2)
+        revert db
+        Q.getTokBal db a category `shouldReturn` Just (TokBalVal 1000 1 1 1 1000)
+        Q.getTokBal db b category `shouldReturn` Nothing
+        revert db
+        Q.getBestBlock db `shouldReturn` Just first
+        fmap (.main) <$> Q.getBlock db second `shouldReturn` Just False
+        tokenFamilies db `shouldReturn` kept
+        chainFamilies db `shouldReturn` before
+
   describe "prepareBlock" $
     modifyMaxSuccess (const 50) $
       it "gives the hash of each transaction, the order of sortTxs, and the size and weight of the block" $
@@ -73,6 +137,9 @@ spec = describe "the rules of the chain" $ do
     -- takes out: addresses, outputs, transactions, unspent outputs,
     -- spenders and balances
     chainFamilies db = forM [0, 1, 2, 3, 4, 7] $ \i -> dump db (columnFamilies db.db !! i)
+    -- the column families of the tokens: balances by address and by
+    -- category, transactions and unspent outputs of the categories
+    tokenFamilies db = mapM (dump db . ($ db.db)) [tokBalCF, holderCF, catTxCF, catOutCF]
 
 -- | Transactions that spend one another and some coins, some with a
 -- witness, in a random order.

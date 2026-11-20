@@ -132,6 +132,18 @@ module Haskoin.Store.Database.Writer
     deleteTxData,
     deleteBalance,
 
+    -- * Tokens of Bitcoin Cash
+    insertCatTx,
+    deleteCatTx,
+    insertCatUnspent,
+    deleteCatUnspent,
+    mergeTokBal,
+    getTokBal,
+    setTokBal,
+
+    -- * Other keys
+    writeRaw,
+
     -- * Spenders of the chain
     getChainSpender,
     getChainSpenders,
@@ -149,7 +161,7 @@ import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.Async (wait, withAsyncOn)
 import Control.DeepSeq (NFData, force)
 import Control.Exception (evaluate)
-import Control.Monad (filterM, forM, when)
+import Control.Monad (filterM, forM, mfilter, when)
 import Data.ByteString qualified as B
 import Data.ByteString.Builder.Extra (Next (..), runBuilder)
 import Data.ByteString.Internal (ByteString (BS))
@@ -274,6 +286,19 @@ type AddrTxTable = Table (Address, TxRef) (Maybe ())
 -- | Changed address unspent outputs: 'Nothing' for a deletion.
 type AddrOutTable = Table (Address, BlockRef, OutPoint) (Maybe OutVal)
 
+-- | Token balances that the batch has as whole values, by address and
+-- category: 'Nothing' for one to delete.
+type TokBalTable = Table (Address, TxHash) (Maybe TokBalVal)
+
+-- | Differences to token balances that are not in a t'TokBalTable'.
+type TokBalMergeTable = Table (Address, TxHash) TokBalVal
+
+-- | Transactions of each category.
+type CatTxTable = Table (TxHash, TxRef) (Maybe ())
+
+-- | Unspent outputs of each category.
+type CatOutTable = Table (TxHash, BlockRef, OutPoint) (Maybe OutVal)
+
 -- | Changed groups of spenders of outputs in the chain.
 type SpenderTable = Table (TxHash, Word32) (IntMap Spender)
 
@@ -320,6 +345,14 @@ data Memory = Memory
     addressTable :: !AddrTxTable,
     -- | address unspent outputs
     outputTable :: !AddrOutTable,
+    -- | token balances that the batch has as whole values
+    tokBalTable :: !TokBalTable,
+    -- | differences to the token balances that are not in 'tokBalTable'
+    tokBalMerges :: !TokBalMergeTable,
+    -- | transactions of each category of tokens
+    catTxTable :: !CatTxTable,
+    -- | unspent outputs of each category of tokens
+    catOutTable :: !CatOutTable,
     -- | inputs of blocks that spend outputs, by group of outputs
     -- as t'SpenderKey' says, each group as the batch leaves it: empty for one
     -- that has no spent output left
@@ -329,6 +362,8 @@ data Memory = Memory
     spenderMerges :: !SpenderTable,
     -- | what is kept of transactions that blocks replaced
     replacedTable :: !ReplacedTable,
+    -- | writes of keys that no table has, in the order given ('writeRaw')
+    raw :: !(IORef [BatchOp]),
     -- | values read from the database
     cache :: !ReadCache,
     -- | how long the stages of the imports of blocks took, if any block was
@@ -408,6 +443,60 @@ mergeBalance w a d =
     Nothing -> do
       pending <- T.lookup w.memory.balanceMerges a
       T.insert w.memory.balanceMerges a (maybe d (`addBalVal` d) pending)
+
+-- | Add a transaction to the index of a category of tokens.
+insertCatTx :: Writer -> TxHash -> TxRef -> IO ()
+insertCatTx w c t = T.insert w.memory.catTxTable (c, t) (Just ())
+
+-- | Remove a transaction from the index of a category of tokens.
+deleteCatTx :: Writer -> TxHash -> TxRef -> IO ()
+deleteCatTx w c t = T.insert w.memory.catTxTable (c, t) Nothing
+
+-- | Add an unspent output to the index of a category of tokens.
+insertCatUnspent :: Writer -> TxHash -> Unspent -> IO ()
+insertCatUnspent w c u =
+  T.insert w.memory.catOutTable (c, u.block, u.outpoint) (Just (OutVal u.value u.script))
+
+-- | Remove an unspent output from the index of a category of tokens.
+deleteCatUnspent :: Writer -> TxHash -> Unspent -> IO ()
+deleteCatUnspent w c u = T.insert w.memory.catOutTable (c, u.block, u.outpoint) Nothing
+
+-- | Add differences to the tokens of a category at an address without
+-- reading them, as 'mergeBalance' does for a balance: each of the five
+-- numbers modulo 2^64. For the import of a block.
+mergeTokBal :: Writer -> Address -> TxHash -> TokBalVal -> IO ()
+mergeTokBal w a c d =
+  T.lookup w.memory.tokBalTable (a, c) >>= \case
+    Just whole -> T.insert w.memory.tokBalTable (a, c) (Just (addTokBalVal (fromMaybe def whole) d))
+    Nothing -> do
+      pending <- T.lookup w.memory.tokBalMerges (a, c)
+      T.insert w.memory.tokBalMerges (a, c) (maybe d (`addTokBalVal` d) pending)
+
+-- | The tokens of a category at an address, with the changes of the batch
+-- applied, as 'getBalance' reads a balance.
+getTokBal :: Writer -> Address -> TxHash -> IO (Maybe TokBalVal)
+getTokBal w a c =
+  T.lookup w.memory.tokBalTable (a, c) >>= \case
+    Just whole -> return whole
+    Nothing -> do
+      stored <- Q.getTokBal w.reader a c
+      T.lookup w.memory.tokBalMerges (a, c) <&> \case
+        Nothing -> stored
+        Just d -> Just (addTokBalVal (fromMaybe def stored) d)
+
+-- | Set the tokens of a category at an address, as a whole value, or
+-- delete them with 'Nothing' or a value of all zeroes: what takes a block
+-- out writes, having read them with 'getTokBal'.
+setTokBal :: Writer -> Address -> TxHash -> Maybe TokBalVal -> IO ()
+setTokBal w a c v = do
+  T.insert w.memory.tokBalTable (a, c) (mfilter (/= def) v)
+  T.delete w.memory.tokBalMerges (a, c)
+
+-- | Write a key that no table of the batch has, with the rest of the batch:
+-- for a migration, which keeps its place in the database in the same
+-- atomic write as what it did, so that a batch is never done twice.
+writeRaw :: Writer -> BatchOp -> IO ()
+writeRaw w o = modifyIORef' w.memory.raw (o :)
 
 -- | Add an unspent output.
 insertUnspent :: Writer -> Unspent -> IO ()
@@ -984,10 +1073,15 @@ hashMapOps db Memory {..} =
         balMergeOps db balanceMerges,
         addrTxOps db addressTable,
         addrOutOps db outputTable,
+        tokBalOps db tokBalTable,
+        tokBalMergeOps db tokBalMerges,
+        catTxOps db catTxTable,
+        catOutOps db catOutTable,
         unspentOps db unspentTable,
         spenderOps db spenderTable,
         spenderMergeOps db spenderMerges,
-        replacedOps db replacedTable
+        replacedOps db replacedTable,
+        map Ready . reverse <$> readIORef raw
       ]
 
 -- | Operation for the change of the best block, if any.
@@ -1046,6 +1140,35 @@ balOps db t = map (uncurry f) <$> (T.toList t)
 -- without having read it: the sum of the differences.
 balMergeOps :: DB -> BalanceMergeTable -> IO [Change]
 balMergeOps db t = map (\(a, d) -> joinOpCF (balanceCF db) (BalKey a) d) <$> T.toList t
+
+-- | Operations for changed token balances: each under its address and
+-- under its category.
+tokBalOps :: DB -> TokBalTable -> IO [Change]
+tokBalOps db t = concatMap (uncurry f) <$> T.toList t
+  where
+    f (a, c) (Just v) = [setOpCF (tokBalCF db) (TokBalKey a c) v, setOpCF (holderCF db) (HolderKey c a) v]
+    f (a, c) Nothing = [dropOpCF (tokBalCF db) (TokBalKey a c), dropOpCF (holderCF db) (HolderKey c a)]
+
+-- | Merge records for the token balances that the batch changes without
+-- having read them, under their address and under their category.
+tokBalMergeOps :: DB -> TokBalMergeTable -> IO [Change]
+tokBalMergeOps db t = concatMap f <$> T.toList t
+  where
+    f ((a, c), d) = [joinOpCF (tokBalCF db) (TokBalKey a c) d, joinOpCF (holderCF db) (HolderKey c a) d]
+
+-- | Operations for changed transactions of categories.
+catTxOps :: DB -> CatTxTable -> IO [Change]
+catTxOps db t = map (uncurry f) <$> T.toList t
+  where
+    f (c, t') (Just ()) = setOpCF (catTxCF db) (CatTxKey c t') ()
+    f (c, t') Nothing = dropOpCF (catTxCF db) (CatTxKey c t')
+
+-- | Operations for changed unspent outputs of categories.
+catOutOps :: DB -> CatOutTable -> IO [Change]
+catOutOps db t = map (uncurry f) <$> T.toList t
+  where
+    f (c, b, p) (Just v) = setOpCF (catOutCF db) (CatOutKey c b p) v
+    f (c, b, p) Nothing = dropOpCF (catOutCF db) (CatOutKey c b p)
 
 -- | Operations for changed address transactions.
 addrTxOps :: DB -> AddrTxTable -> IO [Change]
@@ -1238,9 +1361,14 @@ newMemory net = do
   balanceMerges <- T.new
   addressTable <- T.new
   outputTable <- T.new
+  tokBalTable <- T.new
+  tokBalMerges <- T.new
+  catTxTable <- T.new
+  catOutTable <- T.new
   spenderTable <- T.new
   spenderMerges <- T.new
   replacedTable <- T.new
+  raw <- newIORef []
   cache <- newReadCache
   times <- newIORef Nothing
   return Memory {..}

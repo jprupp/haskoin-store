@@ -332,6 +332,11 @@ tags:
     description: |
       The state of the server and the network: health, peers, and a live stream of
       new blocks and transactions.
+  - name: Tokens
+    description: |
+      The tokens of Bitcoin Cash (CashTokens): what an address holds, and the
+      holders, transactions and unspent outputs of a category. On Bitcoin there
+      are no tokens, and these answer with nothing.
   - name: Blockchain
     description: |
       Endpoints that answer like those of Blockchain.info, for software written
@@ -2651,6 +2656,109 @@ paths:
                   version: 70015
                   services: "0000000000000425"
                   relay: true
+
+  '/address/{address}/tokens':
+    get:
+      tags:
+        - Tokens
+      operationId: getAddressTokens
+      summary: Address Tokens
+      description: |
+        The tokens that an address holds, one balance per category. An address that
+        never held tokens has none: the list is empty.
+
+        Token amounts are strings, since a category can have up to 2^63 - 1 tokens,
+        more than a JSON number holds exactly in many languages. The coins of the
+        same outputs are in the address's balance, as those of any output.
+      parameters:
+        - $ref: '#/components/parameters/addressParam'
+      responses:
+        '200':
+          description: Token balances of the address.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TokenBalance'
+        '404':
+          description: Invalid address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  '/token/{category}/holders':
+    get:
+      tags:
+        - Tokens
+      operationId: getTokenHolders
+      summary: Token Holders
+      description: |
+        The addresses that hold tokens of a category, one balance each, in the order
+        of their bytes, a page at a time. Tokens in outputs without an address are
+        in no one's balance.
+      parameters:
+        - $ref: '#/components/parameters/categoryParam'
+        - $ref: '#/components/parameters/offsetParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        '200':
+          description: Token balances of the holders.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TokenBalance'
+
+  '/token/{category}/unspent':
+    get:
+      tags:
+        - Tokens
+      operationId: getTokenUnspent
+      summary: Token Unspent Outputs
+      description: |
+        The unspent outputs that hold tokens of a category, newest first. Each has its
+        tokens in its `token` field.
+      parameters:
+        - $ref: '#/components/parameters/categoryParam'
+        - $ref: '#/components/parameters/heightParam'
+        - $ref: '#/components/parameters/offsetParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        '200':
+          description: Unspent outputs, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Unspent'
+
+  '/token/{category}/transactions':
+    get:
+      tags:
+        - Tokens
+      operationId: getTokenTransactions
+      summary: Token Transactions
+      description: |
+        The transactions that created, moved or burned tokens of a category, newest
+        first, as the transactions of an address.
+      parameters:
+        - $ref: '#/components/parameters/categoryParam'
+        - $ref: '#/components/parameters/heightParam'
+        - $ref: '#/components/parameters/offsetParam'
+        - $ref: '#/components/parameters/limitParam'
+      responses:
+        '200':
+          description: Transactions, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TxRef'
 
   '/xpub/{xpub}':
     get:
@@ -6006,6 +6114,85 @@ components:
             Number of transactions that pay to or spend from the address.
           format: int64
 
+    Token:
+      type: object
+      description: |
+        The tokens that one output holds (CashTokens): all of one category, a
+        fungible amount, a non-fungible token, or both. As in the CashTokens test
+        vectors and the RPC of Bitcoin Cash Node.
+      required:
+        - category
+        - amount
+      properties:
+        category:
+          type: string
+          description: |
+            The category: the id of the transaction whose output 0 the transaction
+            that created the tokens spent.
+        amount:
+          type: string
+          description: |
+            Fungible tokens, as a string: "0" for none.
+        nft:
+          type: object
+          description: |
+            The non-fungible token, if the output holds one.
+          properties:
+            capability:
+              type: string
+              enum: [none, mutable, minting]
+              description: |
+                What the holder can do: nothing more, change the commitment, or make
+                new tokens of the category.
+            commitment:
+              type: string
+              description: |
+                The data that the token commits to, in hexadecimal; empty for none.
+
+    TokenBalance:
+      type: object
+      description: |
+        The tokens of one category that an address holds. `confirmed` plus
+        `unconfirmed` is the fungible amount it holds now. Amounts are strings.
+      required:
+        - address
+        - category
+        - confirmed
+        - unconfirmed
+        - nfts
+        - utxo
+        - txs
+        - received
+      properties:
+        address:
+          type: string
+        category:
+          type: string
+        confirmed:
+          type: string
+          description: |
+            Fungible tokens in outputs in blocks that are not being spent.
+        unconfirmed:
+          type: string
+          description: |
+            Fungible tokens that the mempool adds.
+        nfts:
+          type: integer
+          description: |
+            Non-fungible tokens held.
+        utxo:
+          type: integer
+          description: |
+            Unspent outputs that hold tokens of the category.
+        txs:
+          type: integer
+          description: |
+            Transactions that moved tokens of the category to or from the address.
+        received:
+          type: string
+          description: |
+            Fungible tokens that the address ever received, spent ones included.
+
     Unspent:
       type: object
       description: |
@@ -6043,6 +6230,15 @@ components:
           description: |
             Value in satoshis.
           format: int64
+        token:
+          description: |
+            The tokens that the output holds, on Bitcoin Cash (CashTokens): null for
+            an output without tokens. The field is there on the Bitcoin Cash networks
+            only. The tokens are written at the front of the script field, so
+            `pkscript` has them too.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Token'
 
     BlockData:
       type: object
@@ -6200,6 +6396,15 @@ components:
             Witness stack, each item in hexadecimal; empty without SegWit.
           items:
             type: string
+        token:
+          description: |
+            The tokens that the output spent holds, on Bitcoin Cash (CashTokens): null for
+            an output without tokens. The field is there on the Bitcoin Cash networks
+            only. The tokens are written at the front of the script field, so
+            `pkscript` has them too.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Token'
 
     Spender:
       type: object
@@ -6251,6 +6456,15 @@ components:
             The input that spends it, if any.
           allOf:
             - $ref: '#/components/schemas/Spender'
+        token:
+          description: |
+            The tokens that the output holds, on Bitcoin Cash (CashTokens): null for
+            an output without tokens. The field is there on the Bitcoin Cash networks
+            only. The tokens are written at the front of the script field, so
+            `pkscript` has them too.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Token'
 
     Transaction:
       type: object
@@ -7468,6 +7682,16 @@ components:
       schema:
         type: string
         example: 03c16602a41ae7cbc2a25b0d2801fdc3295e2e8ebfb26774030b2f7d538f5568
+
+    categoryParam:
+      name: category
+      in: path
+      description: |
+        A category of tokens of Bitcoin Cash: the id of the transaction whose output
+        0 created it, in hexadecimal.
+      required: true
+      schema:
+        type: string
 
     timeParam:
       name: time

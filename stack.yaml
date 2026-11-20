@@ -26,9 +26,12 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.8.0
   - rocksdb-query-0.7.0
   - nqe-0.7.0
-  - haskoin-core-2.0.1
-  - haskoin-node-2.6.1
-  - haskoin-store-data-3.0.1
+  - git: https://github.com/jprupp/haskoin-core.git
+    commit: 008ca8aa2a9faf9929b4868c4d7aa58bb3efbbba
+  - git: https://github.com/jprupp/haskoin-node.git
+    commit: ebdc995d8d81bc7ef589f87bc51a21065ecba0a7
+  - git: https://github.com/jprupp/haskoin-store-data.git
+    commit: 20c57966f488c128cb344909eecec0e6e820f77e
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to
   # 0.3.2, the version in the snapshot, every pause, resume and tickle edits
   # GHC's one timer queue, and Warp does a pause and a resume around every

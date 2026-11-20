@@ -101,6 +101,7 @@ import Haskoin.Store.Data
   ( Balance (..),
     BlockRef (..),
     Spender,
+    TokenBalance (..),
     TxData (..),
     TxRef (..),
     UnixTime,
@@ -124,6 +125,7 @@ import Haskoin.Store.Database.Types
     AddrTxKey (..),
     MemSummary (..),
     OutVal,
+    TokBalVal (..),
     TxKey (..),
     decodeTxKey,
     toUnspent,
@@ -201,12 +203,43 @@ pooledRead r pool =
       -- from the pool, which keeps what the blocks replaced as the tip
       -- moves past them, the same for every store: not from the store's
       -- own database, which has what its own mempool lost
-      getReplaced = pool.replaced
+      getReplaced = pool.replaced,
+      getAddressTokens = chainTokens r,
+      getTokenHolders = chainHolders r,
+      getTokenTxs = Q.getCategoryTxs r,
+      getTokenUnspents = Q.getCategoryUnspents r
     }
   where
     only = \case
       [found] -> found
       _ -> Nothing
+
+-- | The token balances of an address in the chain, one per category.
+--
+-- Only what is in blocks: the pool has no token entries yet, so the
+-- unconfirmed amounts are zero and a transaction of the mempool changes no
+-- token balance until it is confirmed.
+chainTokens :: DatabaseReader -> Address -> IO [TokenBalance]
+chainTokens r a = map (uncurry (tokenBalance a)) <$> Q.getAddressTokens r a
+
+-- | The holders of a category in the chain, one token balance per address,
+-- with an offset and a limit, as 'chainTokens'.
+chainHolders :: DatabaseReader -> TxHash -> Limits -> IO [TokenBalance]
+chainHolders r c l = map (\(a, v) -> tokenBalance a c v) <$> Q.getCategoryHolders r c l
+
+-- | A token balance of the chain, as the API answers it.
+tokenBalance :: Address -> TxHash -> TokBalVal -> TokenBalance
+tokenBalance address category v =
+  TokenBalance
+    { address,
+      category,
+      confirmedTokens = v.amount,
+      unconfirmedTokens = 0,
+      nfts = v.nfts,
+      tokenUtxo = v.outputs,
+      tokenTxs = v.count,
+      receivedTokens = v.received
+    }
 
 -- | A pool that has nothing. The queries of this module with it answer
 -- from the chain alone.
@@ -257,7 +290,11 @@ chainRead r =
       xPubTxs = \x bs l -> one (\q -> q.xPubTxs x bs l),
       xPubTxCount = \x bs -> one (\q -> q.xPubTxCount x bs),
       getAddressesTxCount = \as -> one (\q -> q.getAddressesTxCount as),
-      getReplaced = \_ -> return Nothing
+      getReplaced = \_ -> return Nothing,
+      getAddressTokens = \a -> one (\q -> q.getAddressTokens a),
+      getTokenHolders = \c l -> one (\q -> q.getTokenHolders c l),
+      getTokenTxs = \c l -> one (\q -> q.getTokenTxs c l),
+      getTokenUnspents = \c l -> one (\q -> q.getTokenUnspents c l)
     }
   where
     one :: (StoreRead -> IO a) -> IO a

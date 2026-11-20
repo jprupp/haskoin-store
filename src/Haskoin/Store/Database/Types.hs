@@ -70,16 +70,33 @@
 -- | 0x10      | t'SpenderKey'    | t'SpenderVal': inputs of blocks that      |
 -- |           |                  | spend outputs of a transaction            |
 -- +-----------+------------------+-------------------------------------------+
+-- | 0x13      | t'TokBalKey'     | t'TokBalVal': tokens of a category at an  |
+-- |           |                  | address                                   |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x14      | t'HolderKey'     | t'TokBalVal': the same, category first    |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x15      | t'CatTxKey'      | nothing: a transaction of a category      |
+-- +-----------+------------------+-------------------------------------------+
+-- | 0x16      | t'CatOutKey'     | t'OutVal': an unspent output of a         |
+-- |           |                  | category                                  |
+-- +-----------+------------------+-------------------------------------------+
 --
 -- Since version 23 the values of 'BalKey' and of t'SpenderKey' can also
 -- be written as merge records, which RocksDB combines into the value:
--- "Haskoin.Store.Database.Merge".
+-- "Haskoin.Store.Database.Merge". Since version 24 those of t'TokBalKey'
+-- and t'HolderKey' too, with the operator of the balances.
 module Haskoin.Store.Database.Types
   ( AddrTxKey (..),
     AddrOutKey (..),
     BestKey (..),
     BlockKey (..),
     BalKey (..),
+    TokBalKey (..),
+    HolderKey (..),
+    TokBalVal (..),
+    addTokBalVal,
+    CatTxKey (..),
+    CatOutKey (..),
     HeightKey (..),
     MemTxKey (..),
     MemSummary (..),
@@ -588,6 +605,146 @@ instance Serialize BalKey where
 instance Key BalKey
 
 instance KeyValue BalKey BalVal
+
+-- | Key of the tokens of one category that an address holds, in the column
+-- family @tok-bal@ (CashTokens, @docs\/cashtokens.md@). The same values are
+-- kept under t'HolderKey' too, category first, to list the holders of a
+-- category.
+data TokBalKey
+  = -- | the tokens of a category at an address
+    TokBalKey !Address !TxHash
+  | -- | short key that matches the token balances of an address
+    TokBalKeyA !Address
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize TokBalKey where
+  -- 0x13 · Address · category
+  put (TokBalKey a c) = put (TokBalKeyA a) >> put c
+  -- 0x13 · Address
+  put (TokBalKeyA a) = putWord8 0x13 >> put a
+  get = do
+    guard . (== 0x13) =<< getWord8
+    TokBalKey <$> get <*> get
+
+instance Key TokBalKey
+
+instance KeyValue TokBalKey TokBalVal
+
+-- | Key of the tokens of a category at an address, category first, in the
+-- column family @holder@: the holders of a category are a scan of its
+-- prefix. Written with the same values as t'TokBalKey'.
+data HolderKey
+  = -- | the tokens of a category at an address
+    HolderKey !TxHash !Address
+  | -- | short key that matches the holders of a category
+    HolderKeyC !TxHash
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize HolderKey where
+  -- 0x14 · category · Address
+  put (HolderKey c a) = put (HolderKeyC c) >> put a
+  -- 0x14 · category
+  put (HolderKeyC c) = putWord8 0x14 >> put c
+  get = do
+    guard . (== 0x14) =<< getWord8
+    HolderKey <$> get <*> get
+
+instance Key HolderKey
+
+instance KeyValue HolderKey TokBalVal
+
+-- | The tokens of a category that an address holds in the chain: five
+-- numbers, as a t'BalVal' has, so that the merge operator of the balances
+-- adds them ("Haskoin.Store.Database.Merge"). The tokens in the mempool are
+-- in the pool that the fleet shares, not here.
+data TokBalVal = TokBalVal
+  { -- | fungible tokens in unspent outputs
+    amount :: !Word64,
+    -- | non-fungible tokens in unspent outputs
+    nfts :: !Word64,
+    -- | unspent outputs that hold tokens of the category
+    outputs :: !Word64,
+    -- | transactions that moved tokens of the category to or from the
+    -- address
+    count :: !Word64,
+    -- | fungible tokens that the outputs of the address ever received
+    received :: !Word64
+  }
+  deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
+
+instance Default TokBalVal where
+  def = TokBalVal {amount = 0, nfts = 0, outputs = 0, count = 0, received = 0}
+
+-- | The sum of two token balances, each number modulo 2^64, as the merge
+-- operator adds them.
+addTokBalVal :: TokBalVal -> TokBalVal -> TokBalVal
+addTokBalVal a b =
+  TokBalVal
+    { amount = a.amount + b.amount,
+      nfts = a.nfts + b.nfts,
+      outputs = a.outputs + b.outputs,
+      count = a.count + b.count,
+      received = a.received + b.received
+    }
+
+-- | Database key of a transaction that moved tokens of a category, in the
+-- column family @cat-tx@: as t'AddrTxKey', with the category in place of
+-- the address.
+data CatTxKey
+  = -- | a transaction of a category
+    CatTxKey !TxHash !TxRef
+  | -- | short key that matches the transactions of a category
+    CatTxKeyC !TxHash
+  | -- | short key that matches the transactions of a category at a position
+    -- in the chain
+    CatTxKeyB !TxHash !BlockRef
+  deriving (Show, Eq, Ord, Generic, Hashable)
+
+instance Serialize CatTxKey where
+  -- 0x15 · category · BlockRef · TxHash
+  put (CatTxKey c TxRef {block = b, txid = t}) = put (CatTxKeyB c b) >> put t
+  -- 0x15 · category · BlockRef
+  put (CatTxKeyB c b) = put (CatTxKeyC c) >> put b
+  -- 0x15 · category
+  put (CatTxKeyC c) = putWord8 0x15 >> put c
+  get = do
+    guard . (== 0x15) =<< getWord8
+    c <- get
+    b <- get
+    t <- get
+    return $ CatTxKey c TxRef {block = b, txid = t}
+
+instance Key CatTxKey
+
+instance KeyValue CatTxKey ()
+
+-- | Database key of an unspent output that holds tokens of a category, in
+-- the column family @cat-out@: as t'AddrOutKey', with the category in place
+-- of the address.
+data CatOutKey
+  = -- | an unspent output of a category
+    CatOutKey !TxHash !BlockRef !OutPoint
+  | -- | short key that matches the unspent outputs of a category
+    CatOutKeyC !TxHash
+  | -- | short key that matches the unspent outputs of a category at a
+    -- position in the chain
+    CatOutKeyB !TxHash !BlockRef
+  deriving (Show, Read, Eq, Ord, Generic, Hashable)
+
+instance Serialize CatOutKey where
+  -- 0x16 · category · BlockRef · OutPoint
+  put (CatOutKey c b p) = put (CatOutKeyB c b) >> put p
+  -- 0x16 · category · BlockRef
+  put (CatOutKeyB c b) = put (CatOutKeyC c) >> put b
+  -- 0x16 · category
+  put (CatOutKeyC c) = putWord8 0x16 >> put c
+  get = do
+    guard . (== 0x16) =<< getWord8
+    CatOutKey <$> get <*> get <*> get
+
+instance Key CatOutKey
+
+instance KeyValue CatOutKey OutVal
 
 -- | Key for best block in database.
 data BestKey = BestKey

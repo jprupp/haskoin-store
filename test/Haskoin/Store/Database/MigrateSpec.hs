@@ -4,13 +4,30 @@ import Control.Exception (Exception (..))
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.ByteString qualified as B
 import Data.List (isInfixOf)
+import Data.Maybe (fromJust)
 import Data.Serialize (encode)
 import Data.Word (Word32)
 import Database.RocksDB (columnFamilies, put)
 import Database.RocksDB.Query (insert, insertOp, retrieve, writeBatch)
-import Haskoin (TxHash, btcRegTest)
-import Haskoin.Store.Data (UnixTime)
+import Haskoin
+  ( NFToken (..),
+    Network (..),
+    OutPoint (..),
+    TokenCapability (..),
+    TokenData (..),
+    Tx (..),
+    TxHash,
+    TxIn (..),
+    TxOut (..),
+    bchRegTest,
+    btcRegTest,
+    encodeTokenPrefix,
+    txHash,
+  )
+import Haskoin.Store.Data (BlockData (..), UnixTime)
 import Haskoin.Store.Database.Migrate
+import Haskoin.Store.Database.Migrate.Tokens (migrateTokens)
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader (DatabaseReader (..))
 import Haskoin.Store.Database.Types (MigrationKey (..), VersionKey (..))
 import Haskoin.Store.Histories
@@ -40,11 +57,12 @@ spec = describe "the version of the database" $ do
     withSystemTempDirectory "haskoin-store-merges-" $ \dir ->
       openLayered net dir $ \db -> do
         void (upgradeDatabase (\_ -> return ()) db)
-        retrieve db.db VersionKey `shouldReturn` Just (23 :: Word32)
-        insert db.db VersionKey (24 :: Word32)
-        upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just 24))
-        retrieve db.db VersionKey `shouldReturn` Just (24 :: Word32)
-        displayException (UnknownVersion (Just 24)) `shouldSatisfy` ("newer haskoin-store" `isInfixOf`)
+        retrieve db.db VersionKey `shouldReturn` Just currentVersion
+        insert db.db VersionKey (currentVersion + 1)
+        upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just (currentVersion + 1)))
+        retrieve db.db VersionKey `shouldReturn` Just (currentVersion + 1)
+        displayException (UnknownVersion (Just (currentVersion + 1)))
+          `shouldSatisfy` ("newer haskoin-store" `isInfixOf`)
         -- no migration leaves a marker with the current version
         writeBatch db.db [insertOp VersionKey currentVersion, insertOp MigrationKey layeredVersion]
         upgradeDatabase (\_ -> return ()) db `shouldThrow` (== UnknownVersion (Just currentVersion))
@@ -75,7 +93,37 @@ spec = describe "the version of the database" $ do
         upgradeDatabase (\_ -> return ()) db `shouldReturn` nothing
         retrieve db.db VersionKey `shouldReturn` Just currentVersion
         (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
-        length (columnFamilies db.db) `shouldBe` 11
+        -- the merge guard and the four of the tokens
+        length (columnFamilies db.db) `shouldBe` 15
+
+  it "takes a database of version 23 to the current one on a network without tokens" $
+    withSystemTempDirectory "haskoin-store-tokens-" $ \dir ->
+      openLayered net dir $ \db -> do
+        insert db.db VersionKey mergesVersion
+        upgradeDatabase (\_ -> return ()) db `shouldReturn` nothing
+        retrieve db.db VersionKey `shouldReturn` Just currentVersion
+
+  it "takes a database of version 23 of Bitcoin Cash to the current one, indexing its tokens" $
+    withSystemTempDirectory "haskoin-store-tokens-" $ \dir ->
+      openLayered bchRegTest dir $ \db -> do
+        insert db.db VersionKey mergesVersion
+        upgradeDatabase (\_ -> return ()) db `shouldReturn` nothing
+        retrieve db.db VersionKey `shouldReturn` Just currentVersion
+        (retrieve db.db MigrationKey :: IO (Maybe Word32)) `shouldReturn` Nothing
+
+  it "indexes the tokens of a database of version 23 as the import of its blocks does" $
+    withSystemTempDirectory "haskoin-store-tokens-" $ \dir -> do
+      -- the same blocks, imported as version 24 does and as version 23 did
+      fresh <- tokenChain bchRegTest (dir <> "/fresh")
+      old <- tokenChain bchRegTest {cashAddrPrefix = Nothing} (dir <> "/old")
+      fresh `shouldNotBe` old
+      migrated <- openLayered bchRegTest (dir <> "/old") $ \db -> do
+        insert db.db VersionKey mergesVersion
+        n <- migrateTokens (\_ -> return ()) 0 db
+        -- the two transactions that hold tokens, and only those
+        n `shouldBe` 2
+        families db
+      migrated `shouldBe` fresh
 
   it "cannot be opened by a store that does not know the merge operators, which leaves its merge records be" $
     withSystemTempDirectory "haskoin-store-merges-" $ \dir -> do
@@ -95,5 +143,43 @@ spec = describe "the version of the database" $ do
       openLayered net dir contents `shouldReturn` written
   where
     net = btcRegTest
+    -- every column family that a block writes to, but the spenders'
+    -- groups, which the tokens do not touch: those of the chain and those
+    -- of the tokens
+    families db = forM [0, 1, 2, 4, 5, 6, 7, 11, 12, 13, 14] $ \i -> dump db (columnFamilies db.db !! i)
+    -- a chain on Bitcoin Cash with tokens, imported with the rules of a
+    -- network, and what its column families hold
+    tokenChain rules path = openLayered bchRegTest path $ \db -> do
+      startChainAs rules db
+      first <- mineAs rules db []
+      coinbase <-
+        Q.getBlock db first >>= \case
+          Just bd | h : _ <- bd.txs -> return h
+          _ -> fail "no coinbase"
+      let minted = TokenData coinbase 1000 (Just (NFToken MintingCapability "\x01"))
+          alice = "\x76\xa9\x14" <> B.replicate 20 0x11 <> "\x88\xac"
+          bob = "\x76\xa9\x14" <> B.replicate 20 0x22 <> "\x88\xac"
+          holding t lock = fromJust (encodeTokenPrefix t) <> lock
+          -- alice gets coins without tokens too, so her history has the
+          -- transaction already in version 23
+          genesis =
+            Tx
+              1
+              [TxIn (OutPoint coinbase 0) "" maxBound]
+              [TxOut 1000 (holding minted alice), TxOut 2000 bob, TxOut 3000 alice]
+              []
+              0
+          move =
+            Tx
+              1
+              [TxIn (OutPoint (txHash genesis) 0) "" maxBound]
+              [ TxOut 600 (holding (TokenData coinbase 400 Nothing) bob),
+                TxOut 400 (holding minted {amount = 600} alice)
+              ]
+              []
+              0
+      _ <- mineAs rules db [genesis]
+      _ <- mineAs rules db [move]
+      families db
     nothing = Migration {moved = 0, batches = 0, checked = 0, rewritten = 0}
     contents db = forM (columnFamilies db.db) (dump db)

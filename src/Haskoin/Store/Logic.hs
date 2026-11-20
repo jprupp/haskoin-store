@@ -109,7 +109,7 @@ import Data.Either (rights)
 import Data.Functor ((<&>))
 import Data.HashSet qualified as H
 import Data.IntMap.Strict qualified as I
-import Data.List (nub)
+import Data.List (nub, zip4)
 import Data.Maybe (catMaybes, fromMaybe, isNothing, mapMaybe)
 import Data.Serialize (encode)
 import Data.Set qualified as S
@@ -124,6 +124,7 @@ import Haskoin
     BlockNode (..),
     Network (..),
     OutPoint (..),
+    TokenData (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
@@ -145,7 +146,7 @@ import Haskoin
 import Haskoin.Node (LogLevel (..), logAt)
 import Haskoin.Store.Common (nub', replacedKept, sortTxs, sortTxsWith)
 import Haskoin.Store.Data
-import Haskoin.Store.Database.Types (BalVal (..))
+import Haskoin.Store.Database.Types (BalVal (..), TokBalVal (..), addTokBalVal)
 import Haskoin.Store.Database.Writer
 
 -- | Reasons why an import can fail.
@@ -275,6 +276,9 @@ data PreparedTx = PreparedTx
     spends :: ![OutPoint],
     -- | the address of each of its outputs, for those that have one
     paid :: ![Maybe Address],
+    -- | the tokens of each of its outputs, for those that hold any
+    -- (CashTokens, on Bitcoin Cash only)
+    tokens :: ![Maybe TokenData],
     -- | bytes that it takes in a block, with its witness
     size :: !Int,
     -- | the same without its witness
@@ -325,6 +329,7 @@ prepareTx net tx =
       txid = TxHash (doubleSHA256 stripped),
       spends = prevOuts tx,
       paid = map (eitherToMaybe . scriptToAddressBS net . (.script)) tx.outputs,
+      tokens = map (scriptTokens net . (.script)) tx.outputs,
       size = if null tx.witness then B.length stripped else B.length (encode tx),
       base = B.length stripped
     }
@@ -445,6 +450,11 @@ moveChainTx wr t new time = do
   forM_ (txDataAddresses wr t) $ \a -> do
     deleteAddrTx wr a TxRef {block = t.block, txid = h}
     insertAddrTx wr a TxRef {block = new, txid = h}
+  let spent = [(Nothing, k) | pv <- I.elems t.prevs, Just k <- [scriptTokens' wr pv.script]]
+      made = [(Nothing, k) | o <- t.tx.outputs, Just k <- [scriptTokens' wr o.script]]
+  forM_ (tokenCategories spent made) $ \c -> do
+    deleteCatTx wr c TxRef {block = t.block, txid = h}
+    insertCatTx wr c TxRef {block = new, txid = h}
   forM_ (zip [0 ..] t.tx.outputs) $ \(i, _) ->
     getUnspent wr (OutPoint h i) >>= mapM_ move
   let td = (t :: TxData) {block = new, timestamp = time}
@@ -456,6 +466,7 @@ moveChainTx wr t new time = do
       let u' = (u :: Unspent) {block = new}
       insertUnspent wr u'
       forM_ u.address $ \a -> deleteAddrUnspent wr a u >> insertAddrUnspent wr a u'
+      forM_ (unspentTokens wr u) $ \k -> deleteCatUnspent wr k.category u >> insertCatUnspent wr k.category u'
 
 -- | Revert the best block: make its parent the best block, mark it as not in
 -- the main chain, and take its transactions out of the chain, each after
@@ -528,6 +539,61 @@ modifyBalance wr a f = do
   b <- f . fromMaybe (zeroBalance a) <$> getBalance wr a
   if nullBalance b then deleteBalance wr a else setBalance wr b
 
+-- | Change the tokens of a category at an address in the chain, by reading
+-- them and writing them whole, as 'modifyBalance' does a balance.
+modifyTokBal :: Writer -> Address -> TxHash -> (TokBalVal -> TokBalVal) -> IO ()
+modifyTokBal wr a c f = do
+  v <- f . fromMaybe def <$> getTokBal wr a c
+  setTokBal wr a c (Just v)
+
+-- | The tokens of the script field of an output, on Bitcoin Cash.
+scriptTokens' :: Writer -> B.ByteString -> Maybe TokenData
+scriptTokens' wr = scriptTokens (writerNet wr)
+
+-- | The tokens of an unspent output.
+unspentTokens :: Writer -> Unspent -> Maybe TokenData
+unspentTokens wr u = scriptTokens' wr u.script
+
+-- | What an output that holds some tokens adds to the token balance of its
+-- address: its fungible amount, its non-fungible token if any, and one
+-- output. The amount received and the count of transactions are counted
+-- apart.
+tokensIn :: TokenData -> TokBalVal
+tokensIn t = (def :: TokBalVal) {amount = t.amount, nfts = maybe 0 (const 1) t.nft, outputs = 1}
+
+-- | Each number of a token balance taken off, by its two's complement: what
+-- a merge adds to take a balance away.
+negateTokBalVal :: TokBalVal -> TokBalVal
+negateTokBalVal v =
+  TokBalVal
+    { amount = negate v.amount,
+      nfts = negate v.nfts,
+      outputs = negate v.outputs,
+      count = negate v.count,
+      received = negate v.received
+    }
+
+-- | Take the tokens of an output out of a token balance, or stop if any
+-- number would go below zero.
+takeTokens :: TokenData -> TokBalVal -> TokBalVal
+takeTokens t v =
+  v
+    { amount = less "token amount" v.amount d.amount,
+      nfts = less "count of non-fungible tokens" v.nfts d.nfts,
+      outputs = less "count of token outputs" v.outputs d.outputs
+    }
+  where
+    d = tokensIn t
+
+-- | The categories of the tokens that a transaction spends and makes.
+tokenCategories :: [(Maybe Address, TokenData)] -> [(Maybe Address, TokenData)] -> [TxHash]
+tokenCategories spent made = S.toList (S.fromList [t.category | (_, t) <- spent <> made])
+
+-- | The addresses and categories of the tokens that a transaction spends
+-- and makes, each pair once: their counts of transactions go up by one.
+tokenHolders :: [(Maybe Address, TokenData)] -> [(Maybe Address, TokenData)] -> [(Address, TxHash)]
+tokenHolders spent made = S.toList (S.fromList [(a, t.category) | (Just a, t) <- spent <> made])
+
 -- | Subtract, or stop: no count or amount of the chain goes below zero.
 less :: String -> Word64 -> Word64 -> Word64
 less what x y
@@ -569,16 +635,23 @@ addChainTx wr p td us = do
   forM_ (S.toList (S.fromList (mapMaybe (.address) us <> catMaybes p.paid))) $ \a -> do
     insertAddrTx wr a TxRef {block = td.block, txid = h}
     mergeBalance wr a (def :: BalVal) {txs = 1}
-  forM_ (zip3 [0 ..] td.tx.outputs p.paid) $ \(i, o, address) -> do
+  forM_ (tokenCategories spent made) $ \c -> insertCatTx wr c TxRef {block = td.block, txid = h}
+  forM_ (tokenHolders spent made) $ \(a, c) -> mergeTokBal wr a c (def :: TokBalVal) {count = 1}
+  forM_ (zip4 [0 ..] td.tx.outputs p.paid p.tokens) $ \(i, o, address, tokens) -> do
     let u = Unspent {block = td.block, outpoint = OutPoint h i, value = o.value, script = o.script, address}
     insertUnspent wr u
     forM_ address $ \a -> do
       insertAddrUnspent wr a u
       mergeBalance wr a (def :: BalVal) {confirmed = o.value, utxo = 1, received = o.value}
+    forM_ tokens $ \t -> do
+      insertCatUnspent wr t.category u
+      forM_ address $ \a -> mergeTokBal wr a t.category (tokensIn t) {received = t.amount}
   zipWithM_ spend [0 ..] p.spends
   insertTxOf wr h td
   where
     h = p.txid
+    spent = [(u.address, t) | u <- us, Just t <- [unspentTokens wr u]]
+    made = [(a, t) | (a, Just t) <- zip p.paid p.tokens]
     spend ix o = do
       u <-
         getUnspent wr o >>= \case
@@ -593,6 +666,9 @@ addChainTx wr p td us = do
         deleteAddrUnspent wr a u
         -- taken off by adding the two's complement
         mergeBalance wr a (def :: BalVal) {confirmed = negate u.value, utxo = negate 1}
+      forM_ (unspentTokens wr u) $ \t -> do
+        deleteCatUnspent wr t.category u
+        forM_ u.address $ \a -> mergeTokBal wr a t.category (negateTokBalVal (tokensIn t))
 
 -- | Take a confirmed transaction that nothing in the chain spends out of
 -- every index of the chain, and make the outputs that it spent unspent
@@ -602,6 +678,11 @@ removeChainTx wr td = do
   forM_ (txDataAddresses wr td) $ \a -> do
     deleteAddrTx wr a TxRef {block = td.block, txid = h}
     modifyBalance wr a $ \b -> (b :: Balance) {txs = less "count of transactions" b.txs 1}
+  let spent = [(scriptAddress wr pv.script, t) | pv <- I.elems td.prevs, Just t <- [scriptTokens' wr pv.script]]
+      made = [(scriptAddress wr o.script, t) | o <- td.tx.outputs, Just t <- [scriptTokens' wr o.script]]
+  forM_ (tokenCategories spent made) $ \c -> deleteCatTx wr c TxRef {block = td.block, txid = h}
+  forM_ (tokenHolders spent made) $ \(a, c) ->
+    modifyTokBal wr a c $ \v -> v {count = less "count of token transactions" v.count 1}
   forM_ (zip [0 ..] td.tx.outputs) $ \(i, o) -> do
     let p = OutPoint h i
         u = unspentOutput wr td.block p o
@@ -614,6 +695,11 @@ removeChainTx wr td = do
             utxo = less "count of unspent outputs" b.utxo 1,
             received = less "amount received" b.received o.value
           }
+    forM_ (unspentTokens wr u) $ \t -> do
+      deleteCatUnspent wr t.category u
+      forM_ u.address $ \a ->
+        modifyTokBal wr a t.category $ \v ->
+          (takeTokens t v) {received = less "token amount received" v.received t.amount}
   forM_ (prevOuts td.tx) $ \p -> do
     parent <-
       chainTx wr p.hash >>= \case
@@ -626,6 +712,9 @@ removeChainTx wr td = do
     forM_ u.address $ \a -> do
       insertAddrUnspent wr a u
       modifyBalance wr a $ \b -> (b :: Balance) {confirmed = b.confirmed + o.value, utxo = b.utxo + 1}
+    forM_ (unspentTokens wr u) $ \t -> do
+      insertCatUnspent wr t.category u
+      forM_ u.address $ \a -> modifyTokBal wr a t.category (addTokBalVal (tokensIn t))
   deleteTxData wr h
   where
     h = txHash td.tx

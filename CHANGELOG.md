@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Added
+- **Tokens of Bitcoin Cash (CashTokens).** Outputs that hold tokens have
+  their addresses now, with haskoin-core 2.1, and so are in the history,
+  the balance and the unspent outputs of those addresses. Outputs, inputs
+  and unspent outputs have a `token` field on Bitcoin Cash. New endpoints:
+  `/address/{address}/tokens`, the token balances of an address, and
+  `/token/{category}/holders`, `/unspent` and `/transactions`
+  (`docs/cashtokens.md`). For now they answer from the blocks: the tokens
+  of unconfirmed transactions are not counted yet.
+
+### Changed
+- **Database version 24.** On Bitcoin Cash the migration from version 23
+  indexes the outputs that hold tokens since the upgrade of May 2023: hours,
+  once, and it carries on where it was if stopped. On Bitcoin it writes the
+  new version. Four new column families keep older stores out.
+- The checks of a published transaction read the token prefix with
+  haskoin-core's parser.
+
 ## [1.16.6] - 2026-11-19
 
 ### Fixed
