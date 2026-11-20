@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Changed
+- **Releasing and formatting moved to
+  [jprupp/tools](https://github.com/jprupp/tools)**, shared by the Haskell
+  packages of this family. `haskell-release` builds and tests the package,
+  builds the source and documentation archives, then tags the commit,
+  pushes the tag and uploads both to Hackage. It leaves out the
+  documentation of the internal library `integration`, whose file
+  `haskoin-store:integration.txt` made Hackage refuse the archive, so a
+  release needs no step by hand. `haskell-format` replaces `scripts/format`.
+- **CI runs through the workflow that the packages share** in jprupp/tools,
+  which also keeps the cache of the Nix build per release of nixpkgs.
+  `check-stack-paths` from there replaces `scripts/check-local-deps.sh`.
+
 ## [1.16.7] - 2026-11-20
 
 ### Fixed

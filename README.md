@@ -1313,14 +1313,29 @@ here; `swagger.yaml` stays here and describes the server.
 ```sh
 stack build --test --no-run-tests
 stack test                     # includes a 6000-block heap-growth test
-scripts/format                 # ormolu, the code style used here
+haskell-format                 # ormolu, the code style used here (jprupp/tools)
 scripts/bench-web.sh           # load-test the API with wrk
 stack bench haskoin-store:bench:haskoin-store-bench \
   --ba 'import +RTS -N4 -A64m' # time the import of full blocks
 scripts/heap-profile-summary.py FILE.hp  # what grew in a heap profile
-scripts/check-local-deps.sh    # what CI checks: no local paths in stack.yaml
+check-stack-paths              # what CI checks: no local paths in stack.yaml
 scripts/install-system-libraries.sh  # the C libraries, on Ubuntu or Debian
+haskell-release --dry-run      # build and check a release, upload nothing
 ```
+
+`haskell-format`, `check-stack-paths` and `haskell-release` are in
+[jprupp/tools](https://github.com/jprupp/tools), the scripts shared by the
+Haskell packages of this family: clone it and put it on your `PATH`.
+
+A release is made with `haskell-release`, once the version in
+`package.yaml` is bumped, its CHANGELOG entry written and the commit pushed.
+It builds and tests the package, builds the source and documentation
+archives, and only if all of that works tags the commit, pushes the tag and
+uploads both archives to Hackage. It uploads the documentation itself,
+because `stack upload --documentation` fails here: the internal library
+`integration` gets a documentation file named `haskoin-store:integration.txt`,
+and Hackage refuses a colon in a file name. The script leaves the
+documentation of the internal libraries out, as they are only for the tests.
 
 `stack.yaml` must pin released versions, or git commits, of every
 dependency. Pointing
@@ -1390,7 +1405,7 @@ compacted.
 
 Pull requests are welcome.
 
-- Format the code with `scripts/format` (Ormolu), and keep every line of
+- Format the code with `haskell-format` (Ormolu, from jprupp/tools), and keep every line of
   code shorter than 120 columns.
 - Put scripts in files of their own rather than embedding them: Lua for
   Redis under `src/Haskoin/Store/Fleet/lua/` or `src/Haskoin/Store/XPub/lua/`,

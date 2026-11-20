@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the C libraries that haskoin-store links against, as Ubuntu packages
-# them: RocksDB, secp256k1 and zlib, with pkg-config to find them. CI runs it
-# for the build with the libraries of the OS; it works on any Ubuntu or Debian.
+# them: RocksDB, secp256k1 and zlib, with pkg-config to find them, for a build
+# without Nix. It works on any Ubuntu or Debian. CI installs the same packages
+# through the shared workflow of jprupp/tools.
 set -euo pipefail
 
 sudo apt-get update
