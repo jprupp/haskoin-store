@@ -325,7 +325,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, or a test network (see `--help`) |
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
-| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER` |
+| `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`; repeat for more, space-separated in `PEER`. On Bitcoin, only these peers are asked for their mempools when the pool fills again: whitelist the store on them (`whitebind=mempool@…`) |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
@@ -401,9 +401,10 @@ fleet of one. Every key starts with `hs2:<network>:`.
   blocks, the stores fill it again too.
 - **Filling the pool again** works best with `--node-rpc`: each store reads
   its node's mempool (`getrawmempool`), 2,000 transactions every two
-  seconds. Each also asks its peers for their mempools, once. Bitcoin Cash
-  Node answers; Bitcoin Core answers only a store it whitelists, and
-  disconnects any other that asks (`docs/fleet-mempool.md`).
+  seconds. Each also asks its peers for their mempools, once: every peer on
+  Bitcoin Cash, whose nodes answer anyone, and on Bitcoin only the peers
+  given with `--peer`, since Bitcoin Core disconnects a store that asks
+  unless it whitelists it (`docs/fleet-mempool.md`).
 - **`/events` is the same stream on every store**, written to Redis with
   each change of the pool and each move of the tip.
 - **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).

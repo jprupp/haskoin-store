@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
+## [Unreleased]
+
+### Fixed
+- **A Bitcoin store no longer loses its peers when the pool fills again.**
+  A refill asked every connected peer for its mempool, and Bitcoin Core
+  disconnects a peer that asks unless it whitelists it: on groot the btc
+  store lost its three peers at once and answered 503 for seven seconds.
+  On Bitcoin only the peers given with `--peer` are asked now, since an
+  operator whitelists those; on Bitcoin Cash every peer still is, since
+  Bitcoin Cash Node answers anyone.
+
 ## [1.16.6] - 2026-11-19
 
 ### Fixed
