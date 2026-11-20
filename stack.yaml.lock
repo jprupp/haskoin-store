@@ -54,37 +54,37 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    commit: 0e6ff5868b1dee5641f258061d131f8661ec66d0
+    commit: ce2f58c7388e2bc88674f260559a4b50cce935d0
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: fa8b0982c775e081ca5c8bc4fc2e2c827f103029ce01fee6aa14737cf0ea6fdd
+      sha256: 69230800586549af70979918ea5fc0323cb58d448b849c0582c2633764c16c69
       size: 9316
     version: 3.0.0
   original:
-    commit: 0e6ff5868b1dee5641f258061d131f8661ec66d0
+    commit: ce2f58c7388e2bc88674f260559a4b50cce935d0
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
-    commit: bf29ecdd4068d9794113e5494ee64fd591cc50be
+    commit: 1cec994c7c8e98bf8f853a37decc3dd2dafcf6be
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: fd2602942d9e4bfeb9578e149f7440d959ea5977b62e7a846d467ef5f598a0a2
+      sha256: 70334095ec22d61a7d00595ddfb26f861fb7fa3fa54f9bb95f996bf3da8fa042
       size: 3081
     version: 2.6.1
   original:
-    commit: bf29ecdd4068d9794113e5494ee64fd591cc50be
+    commit: 1cec994c7c8e98bf8f853a37decc3dd2dafcf6be
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: 1fff20152bf10b59c1f927845be99f6e803693b1
+    commit: c412e62d435d0dd3692f03669e3d7f8273c27a56
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: 85c6e4c8f19e8f0b7bac652ecf057a53835188b1dd888999bbf1dffc1d105633
+      sha256: 1330d0d959fff6fca694c3561126e32e601208f8379413bf46d18658fbe74028
       size: 1206
     version: 4.0.0
   original:
-    commit: 1fff20152bf10b59c1f927845be99f6e803693b1
+    commit: c412e62d435d0dd3692f03669e3d7f8273c27a56
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550

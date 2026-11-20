@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   haskoin-core's parser.
 - **Builds on haskoin-core 3.0**, which reads the token prefix and adds a
   field to `Network`, with haskoin-node and haskoin-store-data 4.0 on it
-  too. Until they are on Hackage, `stack.yaml` pins their `cashtokens`
-  branches. The Blockchain.info API gives the legacy addresses of the
+  too. Until they are on Hackage, `stack.yaml` pins commits of their
+  GitHub repositories. The Blockchain.info API gives the legacy addresses of the
   Bitcoin Cash test networks with the prefixes of testnet4, which are
   those of testnet3, now that haskoin-core marks testnet3 as deprecated.
 - **Releasing and formatting moved to

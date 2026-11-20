@@ -3,9 +3,7 @@
 Since May 2023 (block 792,772), an output on Bitcoin Cash can hold tokens
 (CHIP-2022-02). The tokens are written at the front of the output's script
 field, in a token prefix, before the script that locks the coins. This page
-says how the store reads, indexes and serves them. It is the plan for the
-`cashtokens` branches of haskoin-node, haskoin-store-data and this
-repository, and it becomes the reference once the work is done.
+says how the store reads, indexes and serves them.
 
 ## What the store did before
 
@@ -151,8 +149,9 @@ the token entries.
 
 ## Where it stands
 
-Done, on the `cashtokens` branches of haskoin-node, haskoin-store-data and
-this repository, each pinned to the commit of the one below:
+Done, in haskoin-core 3.0 (merged to its master), haskoin-store-data 4.0
+(its `cashtokens` branch), and the master branches of haskoin-node and
+this repository, each pinned to a commit of the one below:
 
 - the `token` field of the JSON, and `TokenBalance` and the requests of the
   new endpoints, in haskoin-store-data 4.0;
@@ -169,8 +168,8 @@ this repository, each pinned to the commit of the one below:
 
 Still to do:
 
-- haskoin-core 3.0 and haskoin-store-data 4.0 on Hackage, and the pins back
-  to Hackage versions.
+- haskoin-core 3.0, haskoin-store-data 4.0 and haskoin-node on Hackage,
+  and the pins back to Hackage versions.
 
 ## Not done
 
