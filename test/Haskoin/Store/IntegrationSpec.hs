@@ -1493,9 +1493,14 @@ clientTest env = do
       call r = Client.apiCall conf r >>= either (fail . show) return
   heard <- newIORef []
   listener <- async . Client.apiEvents conf $ \e -> modifyIORef' heard (e :) >> return True
-  -- the client is listening once it hears of a block
-  void (mine env 1)
-  waitFor "the client to listen" (not . null <$> readIORef heard)
+  -- the client is listening once it hears of a block. Its stream may not
+  -- be open yet when a block comes, and the event of that block is then
+  -- gone, so another block is mined at each look until it hears one.
+  let listening =
+        readIORef heard >>= \case
+          [] -> False <$ mine env 1
+          _ -> return True
+  waitFor "the client to listen" listening
   ref <- newLedger
   paid <- pay env x ref [([0, 0], 100000)]
   txid <- maybe (fail "Not a hash") return (hexToTxHash paid)

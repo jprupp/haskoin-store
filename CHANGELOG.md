@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `HASKOIN_STORE_NO_PODMAN`. The Bitcoin Core node that does not whitelist the
   store now gives it its mempool, the one permission that the store asks
   of a `--peer` on Bitcoin: without it the node closed the store's
-  connection over the request, now and then during a test.
+  connection over the request, now and then during a test. The test of
+  the Haskell client mines a block at each look until the client hears
+  one, where it mined one and waited: a client whose stream opened after
+  that block heard nothing.
 - **Database version 24.** On Bitcoin Cash the migration from version 23
   indexes the outputs that hold tokens since the upgrade of May 2023: hours,
   once, and it carries on where it was if stopped. On Bitcoin it writes the
