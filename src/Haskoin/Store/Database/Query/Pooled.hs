@@ -19,8 +19,8 @@
 -- its database at that block ("Haskoin.Store.Database.Views"), and from the
 -- one pool that they share. The mempool's part comes through a
 -- t'PoolReads', a handful of functions that say what a pool has: its
--- summaries, the entries of an address by the page, bodies, spenders and
--- its list. A pool far away answers each in one round trip, and
+-- summaries, the entries of an address by the page, bodies, spenders,
+-- its list, and what it does to tokens (CashTokens). A pool far away answers each in one round trip, and
 -- 'emptyPool' answers for no pool at all, which is how the chain alone is
 -- read ('chainRead').
 --
@@ -63,6 +63,7 @@ import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.Bytes.Put (runPutS)
 import Data.Bytes.Serial (serialize)
+import Data.Default (def)
 import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -71,7 +72,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust)
-import Data.Serialize (encode)
+import Data.Serialize (Serialize, encode)
 import Data.Word (Word16, Word32, Word64)
 import Database.RocksDB (Iterator)
 import Database.RocksDB.Query (matchingAsListCF)
@@ -116,6 +117,8 @@ import Haskoin.Store.Database.Reader
     Derived (..),
     addrOutCF,
     addrTxCF,
+    catOutCF,
+    catTxCF,
     derivedAddrs,
     txCF,
     withSnapshotReader,
@@ -123,8 +126,12 @@ import Haskoin.Store.Database.Reader
 import Haskoin.Store.Database.Types
   ( AddrOutKey (..),
     AddrTxKey (..),
+    CatOutKey (..),
+    CatTxKey (..),
+    CategorySummary (..),
     MemSummary (..),
-    OutVal,
+    OutVal (..),
+    PoolTokens (..),
     TokBalVal (..),
     TxKey (..),
     decodeTxKey,
@@ -165,7 +172,21 @@ data PoolReads = PoolReads
     startingWith :: (Word32, Word16) -> IO [TxHash],
     -- | what the pool keeps of a transaction that a block replaced as the
     -- tip moved past it ('Haskoin.Store.Fleet.Pool.advanceReplacing')
-    replaced :: TxHash -> IO (Maybe Replaced)
+    replaced :: TxHash -> IO (Maybe Replaced),
+    -- | what the pool does to the tokens of each category at an address,
+    -- in no order (CashTokens)
+    addressTokens :: Address -> IO [(TxHash, PoolTokens)],
+    -- | what the pool does to the tokens of a category at each address, in
+    -- no order
+    categoryHolders :: TxHash -> IO [(Address, PoolTokens)],
+    -- | what the pool does to a category, or 'Nothing' if it does not move
+    -- it
+    categorySummary :: TxHash -> IO (Maybe CategorySummary),
+    -- | transactions that move tokens of a category, as 'addressTxs'
+    categoryTxs :: TxHash -> Maybe (UnixTime, TxHash) -> Int -> IO [(UnixTime, TxHash)],
+    -- | outputs that the pool makes and that hold tokens of a category, as
+    -- 'addressOuts', each with whether the pool also uses it up
+    categoryOuts :: TxHash -> Maybe (UnixTime, OutPoint) -> Int -> IO [(Unspent, Bool)]
   }
 
 -- | The queries of a store that answers from the chain as a reader has it,
@@ -204,42 +225,15 @@ pooledRead r pool =
       -- moves past them, the same for every store: not from the store's
       -- own database, which has what its own mempool lost
       getReplaced = pool.replaced,
-      getAddressTokens = chainTokens r,
-      getTokenHolders = chainHolders r,
-      getTokenTxs = Q.getCategoryTxs r,
-      getTokenUnspents = Q.getCategoryUnspents r
+      getAddressTokens = getAddressTokens r pool,
+      getTokenHolders = getTokenHolders r pool,
+      getTokenTxs = getTokenTxs r pool,
+      getTokenUnspents = getTokenUnspents r pool
     }
   where
     only = \case
       [found] -> found
       _ -> Nothing
-
--- | The token balances of an address in the chain, one per category.
---
--- Only what is in blocks: the pool has no token entries yet, so the
--- unconfirmed amounts are zero and a transaction of the mempool changes no
--- token balance until it is confirmed.
-chainTokens :: DatabaseReader -> Address -> IO [TokenBalance]
-chainTokens r a = map (uncurry (tokenBalance a)) <$> Q.getAddressTokens r a
-
--- | The holders of a category in the chain, one token balance per address,
--- with an offset and a limit, as 'chainTokens'.
-chainHolders :: DatabaseReader -> TxHash -> Limits -> IO [TokenBalance]
-chainHolders r c l = map (\(a, v) -> tokenBalance a c v) <$> Q.getCategoryHolders r c l
-
--- | A token balance of the chain, as the API answers it.
-tokenBalance :: Address -> TxHash -> TokBalVal -> TokenBalance
-tokenBalance address category v =
-  TokenBalance
-    { address,
-      category,
-      confirmedTokens = v.amount,
-      unconfirmedTokens = 0,
-      nfts = v.nfts,
-      tokenUtxo = v.outputs,
-      tokenTxs = v.count,
-      receivedTokens = v.received
-    }
 
 -- | A pool that has nothing. The queries of this module with it answer
 -- from the chain alone.
@@ -254,7 +248,12 @@ emptyPool =
       spenders = return . map (const Nothing),
       page = \_ _ -> return [],
       startingWith = \_ -> return [],
-      replaced = \_ -> return Nothing
+      replaced = \_ -> return Nothing,
+      addressTokens = \_ -> return [],
+      categoryHolders = \_ -> return [],
+      categorySummary = \_ -> return Nothing,
+      categoryTxs = \_ _ _ -> return [],
+      categoryOuts = \_ _ _ -> return []
     }
 
 -- | The queries of the chain alone, each on a snapshot of the database of
@@ -556,11 +555,8 @@ getAddressesTxs r pool as limits = paged r pool limits $ \from -> do
 -- | The stream of unspent outputs of each address, from where a page
 -- starts, given the iterators on the chain's index: the outputs that the
 -- pool pays and does not spend, then those of the chain that the pool does
--- not spend. The pool is asked which outputs of the chain it spends
--- several at a time, four at first and then four times as many each time,
--- so that the first output of each of many addresses does not cost a batch
--- of rows read ahead, and no more once as many were found as its summary
--- counts.
+-- not spend ('unspentStream'). One read of the pool gives the summaries of
+-- all the addresses, which say which of them have anything in the pool.
 unspentStreams ::
   DatabaseReader ->
   PoolReads ->
@@ -572,31 +568,62 @@ unspentStreams r pool from limits as = do
   sums <- pool.summaries as
   return $ \its -> zipWith3 stream as sums its
   where
-    stream a summary it = fresh a summary >> (chainUnspentsC r from a it .| hide a (maybe 0 hidden summary) 4)
-    hidden s = s.spentCount - s.bothCount
-    fresh a = \case
-      Just s | s.paidCount > s.bothCount -> case from of
-        Top -> outs a Nothing
-        InMempool time h -> outs a (Just (time, OutPoint h 0))
-        InChain _ -> return ()
-      _ -> return ()
-    -- some of what the pool pays it also spends, so more is asked for
-    outs a start =
-      pages (\(u, _) -> position u) (pool.addressOuts a) (2 * firstPage limits) start
+    stream a summary it =
+      unspentStream
+        from
+        limits
+        (maybe False (\s -> s.paidCount > s.bothCount) summary)
+        (pool.addressOuts a)
+        (pool.spentOutputs a)
+        (maybe 0 (\s -> s.spentCount - s.bothCount) summary)
+        (chainUnspentsC r from a it)
+
+-- | A stream of unspent outputs, newest first, from where a page starts:
+-- the outputs that the pool makes and does not spend, if it has any, then
+-- those of the chain without the ones that the pool spends, of which it
+-- has so many. The pool is asked which outputs of the chain it spends
+-- several at a time, four at first and then four times as many each time,
+-- so that the first output of each of many lists does not cost a batch of
+-- rows read ahead, and no more once as many were found as it spends.
+unspentStream ::
+  From ->
+  Limits ->
+  -- | whether the pool makes outputs of the list that it does not spend
+  Bool ->
+  -- | the outputs of the list that the pool makes, by the page
+  (Maybe (UnixTime, OutPoint) -> Int -> IO [(Unspent, Bool)]) ->
+  -- | whether the pool spends each of some outputs of the list
+  ([OutPoint] -> IO [Bool]) ->
+  -- | how many outputs of the chain in the list the pool spends
+  Word64 ->
+  -- | the list in the chain
+  ConduitT () Unspent IO () ->
+  ConduitT () Unspent IO ()
+unspentStream from limits made outs spentBy hidden chain = fresh >> (chain .| hide hidden 4)
+  where
+    fresh
+      | made = case from of
+          Top -> stream Nothing
+          InMempool time h -> stream (Just (time, OutPoint h 0))
+          InChain _ -> return ()
+      | otherwise = return ()
+    -- some of what the pool makes it also spends, so more is asked for
+    stream start =
+      pages (\(u, _) -> position u) outs (2 * firstPage limits) start
         .| awaitForever (\(u, spent) -> if spent then return () else yield u)
     position u = case u.block of
       MemRef t -> (t, u.outpoint)
       BlockRef {} -> (0, u.outpoint)
-    hide :: Address -> Word64 -> Int -> ConduitT Unspent Unspent IO ()
-    hide _ 0 _ = awaitForever yield
-    hide a n size = do
+    hide :: Word64 -> Int -> ConduitT Unspent Unspent IO ()
+    hide 0 _ = awaitForever yield
+    hide n size = do
       batch <- gather size
       case batch of
         [] -> return ()
         _ -> do
-          flags <- lift (pool.spentOutputs a (map (.outpoint) batch))
+          flags <- lift (spentBy (map (.outpoint) batch))
           yieldMany [u | (u, False) <- zip batch flags]
-          hide a (n - min n (fromIntegral (length (filter id flags)))) (min 256 (size * 4))
+          hide (n - min n (fromIntegral (length (filter id flags)))) (min 256 (size * 4))
     gather :: Int -> ConduitT Unspent o IO [Unspent]
     gather 0 = return []
     gather k =
@@ -648,3 +675,122 @@ getAddressesTxCount r pool as = do
       txs <- forM several $ \(a, _) -> runConduit (poolTxsC pool Top 256 a True .| mapC (.txid) .| sinkList)
       return (HashSet.size (HashSet.fromList (concat txs)))
   return (inBlocks + fromIntegral inPool)
+
+-------------------------------------------------------------------------------
+-- Tokens
+-------------------------------------------------------------------------------
+
+-- | The token balances of an address, one per category, in the order of
+-- the categories' bytes as the chain keeps them, with the pool applied:
+-- the categories of the chain, and those that only the pool moves at the
+-- address.
+getAddressTokens :: DatabaseReader -> PoolReads -> Address -> IO [TokenBalance]
+getAddressTokens r pool a = do
+  chain <- Q.getAddressTokens r a
+  pooled <- pool.addressTokens a
+  return [tokenBalance a c v t | (c, v, t) <- overlay chain pooled]
+
+-- | The holders of a category, one token balance per address, in the order
+-- of the addresses' bytes as the chain keeps them, with an offset and a
+-- limit, and the pool applied. The addresses that only the pool has can
+-- fall anywhere in the list, so with any of them the chain's list is read
+-- from its start to the end of the page, which the offset and the limit
+-- are then applied to.
+getTokenHolders :: DatabaseReader -> PoolReads -> TxHash -> Limits -> IO [TokenBalance]
+getTokenHolders r pool c limits =
+  pool.categoryHolders c >>= \case
+    [] -> map (\(a, v) -> tokenBalance a c v Nothing) <$> Q.getCategoryHolders r c limits
+    pooled -> do
+      let upTo = case limits.limit of
+            0 -> limits {offset = 0}
+            n -> limits {offset = 0, limit = limits.offset + n}
+      chain <- Q.getCategoryHolders r c upTo
+      let listed = [tokenBalance a c v t | (a, v, t) <- overlay chain pooled]
+          page = drop (fromIntegral limits.offset) listed
+      return $ case limits.limit of
+        0 -> page
+        n -> take (fromIntegral n) page
+
+-- | Token balances of the chain and what the pool does to tokens, by the
+-- same key, a category or an address: one for each key that either has,
+-- in the order of the keys' bytes, which is that of the chain's index.
+overlay :: (Serialize k) => [(k, TokBalVal)] -> [(k, PoolTokens)] -> [(k, TokBalVal, Maybe PoolTokens)]
+overlay chain pooled = Map.elems (Map.unionWith joined inChain inPool)
+  where
+    inChain = Map.fromList [(encode k, (k, v, Nothing)) | (k, v) <- chain]
+    inPool = Map.fromList [(encode k, (k, def, Just t)) | (k, t) <- pooled]
+    joined (k, v, _) (_, _, t) = (k, v, t)
+
+-- | A token balance as the API answers it, from what the chain has, with
+-- what the pool does applied, as 'applySummary' does for a balance.
+tokenBalance :: Address -> TxHash -> TokBalVal -> Maybe PoolTokens -> TokenBalance
+tokenBalance address category v pooled =
+  TokenBalance
+    { address,
+      category,
+      confirmedTokens = v.amount `minus` p.spent,
+      unconfirmedTokens = p.free,
+      nfts = (v.nfts `minus` p.spentNfts) + p.freeNfts,
+      tokenUtxo = (v.outputs `minus` p.spentOutputs) + p.freeOutputs,
+      tokenTxs = v.count + p.txs,
+      receivedTokens = v.received + p.received
+    }
+  where
+    p = fromMaybe (PoolTokens 0 0 0 0 0 0 0 0) pooled
+    minus x y = if y > x then 0 else x - y
+
+-- | Transactions that moved tokens of a category, newest first: those of
+-- the pool, then those of the chain, paged as those of an address.
+getTokenTxs :: DatabaseReader -> PoolReads -> TxHash -> Limits -> IO [TxRef]
+getTokenTxs r pool c limits = paged r pool limits $ \from ->
+  Q.withManyIters r (catTxCF r.db) [CatTxKeyC c] $ \its ->
+    Q.joinConduits txRefKey [inPool from >> chainCatTxsC from c it | it <- its] limits
+  where
+    inPool from = case from of
+      InChain _ -> return ()
+      Top -> stream Nothing
+      InMempool time h -> stream (Just (time, h))
+    stream start =
+      pages id (pool.categoryTxs c) (firstPage limits) start .| mapC (\(t, h) -> TxRef {block = MemRef t, txid = h})
+
+-- | Transactions of a category in the chain, newest first, from where a
+-- page starts.
+chainCatTxsC :: From -> TxHash -> Iterator -> ConduitT i TxRef IO ()
+chainCatTxsC from c it = chain .| concatMapC ref
+  where
+    chain = case from of
+      InChain position -> Q.scanFrom it (CatTxKeyC c) (CatTxKeyB c position)
+      _ -> Q.scan it (CatTxKeyC c)
+    ref :: (CatTxKey, ()) -> Maybe TxRef
+    ref (CatTxKey _ t, ()) = Just t
+    ref _ = Nothing
+
+-- | Unspent outputs that hold tokens of a category, newest first: those
+-- that the pool makes and does not use up, then those of the chain that
+-- the pool does not use up, as for an address ('unspentStream').
+getTokenUnspents :: DatabaseReader -> PoolReads -> TxHash -> Limits -> IO [Unspent]
+getTokenUnspents r pool c limits = paged r pool limits $ \from -> do
+  summary <- pool.categorySummary c
+  let stream it =
+        unspentStream
+          from
+          limits
+          (maybe False ((> 0) . (.free)) summary)
+          (pool.categoryOuts c)
+          (fmap (map isJust) . pool.spenders)
+          (maybe 0 (.spent) summary)
+          (chainCatUnspentsC r from c it)
+  Q.withManyIters r (catOutCF r.db) [CatOutKeyC c] $ \its -> Q.joinConduits unspentKey (map stream its) limits
+
+-- | Unspent outputs of a category in the chain, newest first, from where a
+-- page starts. Those that the pool uses up are among them.
+chainCatUnspentsC :: DatabaseReader -> From -> TxHash -> Iterator -> ConduitT i Unspent IO ()
+chainCatUnspentsC r from c it = chain .| concatMapC output
+  where
+    chain = case from of
+      InChain position -> Q.scanFrom it (CatOutKeyC c) (CatOutKeyB c position)
+      _ -> Q.scan it (CatOutKeyC c)
+    output :: (CatOutKey, OutVal) -> Maybe Unspent
+    output (CatOutKey _ block outpoint, OutVal value script) =
+      Just Unspent {block, outpoint, value, script, address = eitherToMaybe (scriptToAddressBS r.net script)}
+    output _ = Nothing

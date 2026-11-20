@@ -25,6 +25,11 @@ knows nothing of the mempool, and is unhealthy.
   output, the children of each transaction, its body, the time it first
   entered a mempool, and, for every address, its transactions, its outputs
   and their sums.
+- **The tokens of the pool** (CashTokens, on Bitcoin Cash): for each
+  category, its transactions and the outputs that hold it, and for each
+  address and category, the sums of a token balance. The server reads the
+  tokens of each output and sends them with the transaction, so the
+  scripts never read a token prefix (`docs/cashtokens.md`).
 - **Counters** next to the tip: how many times the tip moved, and how many
   times the pool was started again.
 - **A stream of events**: what entered, what left, which blocks the tip
@@ -300,14 +305,16 @@ uses, and cannot be better without knowing what miners will do.
   property that the pool stays valid on top of the chain whatever is
   offered, mined and unwound (3,000 random histories).
 - `Haskoin.Store.Fleet.RedisSpec`: the scripts against a real Redis, step
-  by step against the model, plus the emptying rules, the events, and
-  the set of what the fleet saw.
+  by step against the model, the tokens included, plus the emptying
+  rules, the events, and the set of what the fleet saw.
 - `Haskoin.Store.Fleet.CacheSpec`: two members on one chain and a real
   Redis: random histories of payments, blocks, reorganisations and builds,
   each cached entry held to the queries at the tip and the pool; a
   reorganisation that keeps the cache; the pool filling again after Redis
   lost its data; a transaction that one member received fetched by the
-  other until it is offered, and not after.
+  other until it is offered, and not after; and the token endpoints'
+  queries on Bitcoin Cash, with tokens moved twice in the pool and then
+  confirmed.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 

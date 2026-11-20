@@ -35,6 +35,23 @@
 --
 -- 'ids': some bytes. The transactions whose id starts with them.
 --
+-- 'tokens': an address. For each category of tokens that the pool moves at
+-- the address: the category, and its eleven sums separated by spaces: the
+-- transactions; the amount in two parts, the digits above the last nine
+-- and the last nine, the non-fungible tokens and the outputs, that are
+-- free; the same that are spent; and the amount paid in two parts.
+--
+-- 'holders': a category. For each address at which the pool moves tokens
+-- of it: the address and its sums, as 'tokens' gives them.
+--
+-- 'csum': a category. Its transactions, free outputs and spent outputs
+-- separated by spaces, or '' if the pool does not move it.
+--
+-- 'ctxs': as 'txs', for a category of tokens.
+--
+-- 'couts': as 'outs', for the outputs that hold a category of tokens; the
+-- flag says whether the pool uses the output up.
+--
 -- 'replaced': transactions. For each, the transaction of a block that
 -- replaced it and the height of the block in four bytes, or ''.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
@@ -170,6 +187,50 @@ elseif what == 'ids' then
     '[' .. ARGV[5], '(' .. ARGV[5] .. string.rep(string.char(255), tsize))
   for _, t in ipairs(found) do
     answer[#answer + 1] = t
+  end
+elseif what == 'tokens' or what == 'holders' then
+  local sets, lead = prefix .. 'pool:acat:', true
+  if what == 'holders' then
+    sets, lead = prefix .. 'pool:chold:', false
+  end
+  for _, m in ipairs(redis.call('SMEMBERS', sets .. ARGV[5])) do
+    local c, a = m, ARGV[5]
+    if not lead then
+      c, a = ARGV[5], m
+    end
+    local s = redis.call('HMGET', prefix .. 'pool:tsum:' .. c .. a, 'txs', 'freeHi', 'freeLo', 'freeNfts',
+      'freeOutputs', 'spentHi', 'spentLo', 'spentNfts', 'spentOutputs', 'receivedHi', 'receivedLo')
+    for j = 1, 11 do
+      s[j] = s[j] or '0'
+    end
+    answer[#answer + 1] = m
+    answer[#answer + 1] = table.concat(s, ' ')
+  end
+elseif what == 'csum' then
+  local s = redis.call('HMGET', prefix .. 'pool:csum:' .. ARGV[5], 'txs', 'free', 'spent')
+  if s[1] then
+    answer[2] = (s[1] or '0') .. ' ' .. (s[2] or '0') .. ' ' .. (s[3] or '0')
+  else
+    answer[2] = ''
+  end
+elseif what == 'ctxs' then
+  local zkey = prefix .. 'pool:ctx:' .. ARGV[5]
+  local at = position(zkey, ARGV[6], ARGV[7])
+  local rows = redis.call('ZRANGE', zkey, at, at + tonumber(ARGV[8]) - 1, 'WITHSCORES')
+  for i = 1, #rows, 2 do
+    answer[#answer + 1] = rows[i]
+    answer[#answer + 1] = string.format('%.0f', -tonumber(rows[i + 1]))
+  end
+elseif what == 'couts' then
+  local c = ARGV[5]
+  local zkey = prefix .. 'pool:cout:' .. c
+  local at = position(zkey, ARGV[6], ARGV[7])
+  local rows = redis.call('ZRANGE', zkey, at, at + tonumber(ARGV[8]) - 1, 'WITHSCORES')
+  for i = 1, #rows, 2 do
+    answer[#answer + 1] = rows[i]
+    answer[#answer + 1] = string.format('%.0f', -tonumber(rows[i + 1]))
+    answer[#answer + 1] = redis.call('HGET', prefix .. 'pool:cval:' .. c, rows[i])
+    answer[#answer + 1] = tostring(redis.call('HEXISTS', prefix .. 'pool:spender', rows[i]))
   end
 elseif what == 'replaced' then
   for i = 5, #ARGV do

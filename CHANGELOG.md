@@ -8,13 +8,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 - **Tokens of Bitcoin Cash (CashTokens).** Outputs that hold tokens have
-  their addresses now, with haskoin-core 2.1, and so are in the history,
+  their addresses now, with haskoin-core 3.0, and so are in the history,
   the balance and the unspent outputs of those addresses. Outputs, inputs
   and unspent outputs have a `token` field on Bitcoin Cash. New endpoints:
   `/address/{address}/tokens`, the token balances of an address, and
   `/token/{category}/holders`, `/unspent` and `/transactions`
-  (`docs/cashtokens.md`). For now they answer from the blocks: the tokens
-  of unconfirmed transactions are not counted yet.
+  (`docs/cashtokens.md`). They count the mempool, as an address's balance
+  does: the fleet's pool in Redis keeps, for each category, its
+  transactions and outputs, and for each address and category the sums of
+  a token balance. Every store of a fleet must run this version, since
+  the pool's scripts take token entries.
 
 ### Changed
 - **Database version 24.** On Bitcoin Cash the migration from version 23
@@ -23,6 +26,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   new version. Four new column families keep older stores out.
 - The checks of a published transaction read the token prefix with
   haskoin-core's parser.
+- **Builds on haskoin-core 3.0**, which reads the token prefix and adds a
+  field to `Network`, with haskoin-node and haskoin-store-data 4.0 on it
+  too. Until they are on Hackage, `stack.yaml` pins their `cashtokens`
+  branches. The Blockchain.info API gives the legacy addresses of the
+  Bitcoin Cash test networks with the prefixes of testnet4, which are
+  those of testnet3, now that haskoin-core marks testnet3 as deprecated.
 - **Releasing and formatting moved to
   [jprupp/tools](https://github.com/jprupp/tools)**, shared by the Haskell
   packages of this family. `haskell-release` builds and tests the package,

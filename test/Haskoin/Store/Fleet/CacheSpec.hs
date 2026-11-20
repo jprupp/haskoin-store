@@ -31,31 +31,39 @@ import Haskoin
     BlockHash,
     BlockHeader (..),
     BlockNode (..),
+    NFToken (..),
+    Network,
     OutPoint (..),
+    TokenCapability (..),
+    TokenData (..),
     Tx (..),
     TxHash (..),
     TxIn (..),
     TxOut (..),
     addressToScriptBS,
+    bchRegTest,
     btcRegTest,
     buildMerkleRoot,
     deriveXPubKey,
     doubleSHA256,
+    encodeTokenPrefix,
     isValidPOW,
     makeXPrvKey,
+    maxTokenAmount,
     nullOutPoint,
     scriptToAddressBS,
     txHash,
   )
 import Haskoin.Store.BlockStore (toFetch)
-import Haskoin.Store.Common (StoreRead (..), sortTxs)
+import Haskoin.Store.Common (Limits (..), Start (..), StoreRead (..), sortTxs)
 import Haskoin.Store.Data
   ( BlockData (..),
     BlockRef (..),
     DeriveType (..),
     Prev (..),
+    TokenBalance (..),
     TxData (..),
-    TxRef,
+    TxRef (..),
     Unspent (..),
     XPubBal,
     XPubSpec (..),
@@ -113,6 +121,7 @@ spec = do
       it "fetches no transaction that another member received" (`withBed` seenTest)
       it "offers again a transaction that left the pool and is sent again" (`withBed` resendTest)
       it "lets go of an orphan whose parent did not come in twenty minutes" (`withBed` orphanTest)
+      it "answers the tokens of the chain with what the pool does to them" (\r -> withBedOn bchRegTest r tokenTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
           property $ \steps -> ioProperty (withBed r (\bed -> modelTest bed (take 12 steps)) >> return True)
@@ -430,13 +439,90 @@ modelTest bed steps =
       tip <- fleetTipOf bed
       join <$> answeringCached m tip (\_ sess _ -> seenIn sess x)
 
+-- | The token balances, holders, transactions and unspent outputs of a
+-- category, from the chain with the pool on top (CashTokens). A block makes
+-- a supply of the largest amount and a non-fungible token; in the pool the
+-- supply moves twice, which sums that counted it each time would not hold.
+-- Once a block confirms the pool, the chain alone gives what the pool did.
+tokenTest :: Bed -> IO ()
+tokenTest bed = do
+  c : _ <- coins bed
+  let cat = c.outpoint.hash
+      (alice, bob, carol) = (p2pkh 0x11, p2pkh 0x22, p2pkh 0x33)
+      p2pkh n = "\x76\xa9\x14" <> B.replicate 20 n <> "\x88\xac"
+      holding amount nft lock = fromMaybe (error "Bad tokens") (encodeTokenPrefix (TokenData cat amount nft)) <> lock
+      addr lock = either error id (scriptToAddressBS bed.net lock)
+      most = maxTokenAmount
+      badge = Just (NFToken MutableCapability "x")
+      minted = spend [c] [(holding most Nothing alice, 1000000), (holding 0 badge bob, 1000000)]
+      -- one input and some outputs
+      tx p outs = Tx 1 [TxIn p "" maxBound] [TxOut v lock | (lock, v) <- outs] [] 0
+      moved =
+        tx
+          (OutPoint (txHash minted) 0)
+          [(holding 1000 Nothing bob, 400000), (holding (most - 1000) Nothing alice, 400000)]
+      onward = tx (OutPoint (txHash moved) 1) [(holding (most - 1000) Nothing carol, 300000)]
+  mineBlock bed [minted]
+  settle bed
+  offer bed moved
+  settle bed
+  offer bed onward
+  settle bed
+  poolTxs bed >>= \txs -> map txHash txs `shouldMatchList` map txHash [moved, onward]
+  let balance lock inBlocks unconfirmed nfts utxo txs received =
+        TokenBalance
+          { address = addr lock,
+            category = cat,
+            confirmedTokens = inBlocks,
+            unconfirmedTokens = unconfirmed,
+            nfts,
+            tokenUtxo = utxo,
+            tokenTxs = txs,
+            receivedTokens = received
+          }
+      unsettled =
+        [ balance alice 0 0 0 0 3 (most + most - 1000),
+          balance bob 0 1000 1 2 2 1000,
+          balance carol 0 (most - 1000) 0 1 1 (most - 1000)
+        ]
+      byAddress = sortOn (encode . (.address))
+  -- an address: what the block gave it, with what the pool did
+  forM_ unsettled $ \b -> atTip bed (\q -> q.getAddressTokens b.address) `shouldReturn` [b]
+  -- the holders, in the order of their addresses, by the page
+  atTip bed (\q -> q.getTokenHolders cat def) `shouldReturn` byAddress unsettled
+  atTip bed (\q -> q.getTokenHolders cat def {offset = 1, limit = 1})
+    `shouldReturn` take 1 (drop 1 (byAddress unsettled))
+  -- the transactions: the two of the pool, then the block's
+  txs <- atTip bed (\q -> q.getTokenTxs cat def)
+  map (.txid) (take 2 txs) `shouldMatchList` map txHash [moved, onward]
+  map (.txid) (drop 2 txs) `shouldBe` [txHash minted]
+  -- from one of the pool: the page starts there
+  later <- atTip bed (\q -> q.getTokenTxs cat def {start = Just (AtTx (txs !! 1).txid)})
+  map (.txid) later `shouldBe` map (.txid) (drop 1 txs)
+  -- the unspent outputs: those that the pool makes and keeps, then the
+  -- block's that the pool does not spend
+  outs <- atTip bed (\q -> q.getTokenUnspents cat def)
+  map (.outpoint) (take 2 outs) `shouldMatchList` [OutPoint (txHash moved) 0, OutPoint (txHash onward) 0]
+  map (.outpoint) (drop 2 outs) `shouldBe` [OutPoint (txHash minted) 1]
+  map (.address) outs `shouldMatchList` map (Just . addr) [bob, carol, bob]
+  -- confirmed, the chain alone gives the same, with what was unconfirmed
+  -- now confirmed
+  mineBlock bed [moved, onward]
+  settle bed
+  poolTxs bed `shouldReturn` []
+  let settled = [b {confirmedTokens = b.confirmedTokens + b.unconfirmedTokens, unconfirmedTokens = 0} | b <- unsettled]
+  forM_ settled $ \b -> atTip bed (\q -> q.getAddressTokens b.address) `shouldReturn` [b]
+  outs' <- atTip bed (\q -> q.getTokenUnspents cat def)
+  map (.outpoint) outs' `shouldMatchList` map (.outpoint) outs
+
 -------------------------------------------------------------------------------
 -- The test bed
 -------------------------------------------------------------------------------
 
 -- | Two members of a fleet on one database and one Redis.
 data Bed = Bed
-  { conn :: !Redis.Connection,
+  { net :: !Network,
+    conn :: !Redis.Connection,
     prefix :: !ByteString,
     db :: !DatabaseReader,
     a :: !Member,
@@ -447,15 +533,19 @@ data Bed = Bed
 -- | A new chain with a few blocks of coins, in a new database, and two
 -- members on keys of Redis that no other test uses, with their indexers.
 withBed :: (Redis.Connection, IO FleetKeys) -> (Bed -> IO x) -> IO x
-withBed (conn, fresh) go = do
+withBed = withBedOn btcRegTest
+
+-- | 'withBed' on a network.
+withBedOn :: Network -> (Redis.Connection, IO FleetKeys) -> (Bed -> IO x) -> IO x
+withBedOn net (conn, fresh) go = do
   keys <- fresh
   withSystemTempDirectory "haskoin-store-fleet-cache" $ \dir ->
-    openLayered btcRegTest dir $ \db -> do
+    openLayered net dir $ \db -> do
       startChain db
       a <- newMember (config keys.prefix "a") conn db
       b <- newMember (config keys.prefix "b") conn db
       salt <- newIORef 0
-      let bed = Bed {conn, prefix = keys.prefix, db, a, b, salt}
+      let bed = Bed {net, conn, prefix = keys.prefix, db, a, b, salt}
       withAsync (memberCacheLoop a) $ \_ ->
         withAsync (memberCacheLoop b) $ \_ -> do
           noted bed
@@ -520,7 +610,7 @@ mineBlock bed txs = do
       included = coinbase : map snd (sortTxs txs)
       merkle = either error id (buildMerkleRoot (map txHash included))
       candidate = BlockHeader 0x20000000 h merkle (parent.header.timestamp + 600) parent.header.bits
-      header = fromMaybe (error "No nonce") (find (isValidPOW btcRegTest) (map candidate [0 ..]))
+      header = fromMaybe (error "No nonce") (find (isValidPOW bed.net) (map candidate [0 ..]))
   run bed.db (\w -> importBlock w (Block header included) (BlockNode header height 0 h))
     >>= either (fail . show) (void . return)
   noted bed
@@ -543,7 +633,7 @@ atTip bed f =
 -- not spend.
 coins :: Bed -> IO [Unspent]
 coins bed = do
-  let coinAddress = either error id (scriptToAddressBS btcRegTest script)
+  let coinAddress = either error id (scriptToAddressBS bed.net script)
   filter (confirmed . (.block)) <$> atTip bed (\q -> q.getAddressUnspents coinAddress def)
 
 -- | The output script of an address of the external chain of a key.

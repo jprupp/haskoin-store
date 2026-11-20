@@ -55,6 +55,13 @@
 -- every entry of the address, which is what the store's own mempool area
 -- did at first and was measured to be thousands of times too slow for a
 -- busy address.
+--
+-- The tokens of Bitcoin Cash come the same way: each output that holds
+-- some and that a transaction makes or uses up is an entry
+-- (t'PoolTokenOut'), with its category and amounts read by the store, and
+-- the script keeps for each category its transactions and outputs, and for
+-- each address and category the sums that a token balance needs.
+-- 'Haskoin.Store.Fleet.Pool.tokenTotals' says what those should be.
 module Haskoin.Store.Fleet.Redis
   ( FleetKeys (..),
     fleetKeys,
@@ -69,6 +76,7 @@ module Haskoin.Store.Fleet.Redis
     PoolChange (..),
     PoolTx (..),
     PoolEntry (..),
+    PoolTokenOut (..),
     poolOffer,
     poolWithdraw,
     fleetAdvance,
@@ -200,6 +208,28 @@ data PoolEntry
     PoolSpends !ByteString !ByteString !Word64
   | -- | it pays this output to the address, with this amount and script
     PoolPays !ByteString !ByteString !Word64 !ByteString
+  | -- | it makes an output that holds tokens (CashTokens)
+    PoolMakes !PoolTokenOut
+  | -- | it uses up an output that holds tokens
+    PoolUses !PoolTokenOut
+  deriving (Eq, Show)
+
+-- | An output that holds tokens, as an entry of the pool gives it, so that
+-- the scripts in Redis never read the token prefix of a script.
+data PoolTokenOut = PoolTokenOut
+  { -- | the address of the output, if it has one
+    address :: !(Maybe ByteString),
+    output :: !ByteString,
+    category :: !ByteString,
+    -- | fungible tokens
+    amount :: !Word64,
+    -- | whether it also holds a non-fungible token
+    nft :: !Bool,
+    -- | the value of the output and its script: what the pool keeps of an
+    -- output that it makes, to list it with the category. Not given for
+    -- an output that it uses up.
+    coins :: !(Maybe (Word64, ByteString))
+  }
   deriving (Eq, Show)
 
 -- | A transaction as the pool keeps it.
@@ -476,9 +506,14 @@ txArgs tx =
     <> concatMap entry tx.entries
   where
     entry = \case
-      PoolTouches a -> ["t", a, "", "", ""]
-      PoolSpends a o v -> ["s", a, o, num v, ""]
-      PoolPays a o v s -> ["o", a, o, num v, s]
+      PoolTouches a -> ["t", a, "", "", "", ""]
+      PoolSpends a o v -> ["s", a, o, num v, "", ""]
+      PoolPays a o v s -> ["o", a, o, num v, s, ""]
+      PoolMakes k -> token (if k.nft then "M" else "m") k
+      PoolUses k -> token (if k.nft then "U" else "u") k
+    token kind k =
+      [kind, fromMaybe "" k.address, k.output, num k.amount, maybe "" coins k.coins, k.category]
+    coins (v, s) = num v <> " " <> s
 
 -- | The transactions of the pool, each with the outputs that it spends one
 -- after the other.

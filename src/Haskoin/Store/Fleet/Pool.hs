@@ -82,6 +82,13 @@ module Haskoin.Store.Fleet.Pool
     addresses,
     totals,
 
+    -- * What the pool holds for tokens
+    TokenOut (..),
+    TokenTotals (..),
+    CategoryPool (..),
+    tokenTotals,
+    categories,
+
     -- * Replacing by fee
     replaceable,
   )
@@ -273,16 +280,34 @@ advanceReplacing maker change label lost waiting pool0 = (final, now <> clashed,
         let leaving = Set.toList (descendants [s] p)
          in (withdraw [s] p, replaced <> maybe [] (\w -> [(t, w) | t <- leaving]) (label o))
 
--- | What a transaction does at an address, for addresses of type @a@, which
--- a store works out from the transaction alone and gives to the pool with
--- it ('Haskoin.Store.Fleet.Member.poolTx').
-data Entry a o
+-- | What a transaction does at an address, for addresses of type @a@, and
+-- to tokens of categories of type @c@, which a store works out from the
+-- transaction alone and gives to the pool with it
+-- ('Haskoin.Store.Fleet.Member.poolTx').
+data Entry a o c
   = -- | it spends from the address or pays to it
     Touches !a
   | -- | it spends this output of the address, of this amount
     Spends !a !o !Word64
   | -- | it pays this output to the address, with this amount
     Pays !a !o !Word64
+  | -- | it makes an output that holds tokens (CashTokens)
+    Makes !(TokenOut a o c)
+  | -- | it uses up an output that holds tokens
+    Uses !(TokenOut a o c)
+  deriving (Eq, Show)
+
+-- | An output that holds tokens.
+data TokenOut a o c = TokenOut
+  { -- | its address, if it has one
+    owner :: !(Maybe a),
+    output :: !o,
+    category :: !c,
+    -- | fungible tokens
+    amount :: !Word64,
+    -- | whether it holds a non-fungible token
+    nft :: !Bool
+  }
   deriving (Eq, Show)
 
 -- | What the pool holds for an address: the union of the entries of its
@@ -318,14 +343,15 @@ data Totals = Totals
 -- of what "Haskoin.Store.Fleet.Redis" keeps up to date as transactions come
 -- and go: it depends on which transactions are in the pool and on nothing
 -- else, so the tests work it out again after every step and compare.
-addresses :: (Ord a, Ord t, Ord o) => [(t, Word64, [Entry a o])] -> Map a (AddressPool t o)
+addresses :: (Ord a, Ord t, Ord o) => [(t, Word64, [Entry a o c])] -> Map a (AddressPool t o)
 addresses members = Map.map ordered (Map.fromListWith merge (concatMap single members))
   where
-    single (t, time, entries) = map (one t time) entries
+    single (t, time, entries) = mapMaybe (one t time) entries
     one t time = \case
-      Touches a -> (a, AddressPool [(time, t)] [] Map.empty)
-      Spends a o v -> (a, AddressPool [] [] (Map.singleton o v))
-      Pays a o v -> (a, AddressPool [] [(time, o, v)] Map.empty)
+      Touches a -> Just (a, AddressPool [(time, t)] [] Map.empty)
+      Spends a o v -> Just (a, AddressPool [] [] (Map.singleton o v))
+      Pays a o v -> Just (a, AddressPool [] [(time, o, v)] Map.empty)
+      _ -> Nothing
     merge x y = AddressPool (x.txs <> y.txs) (x.paid <> y.paid) (Map.union x.spent y.spent)
     ordered p =
       AddressPool
@@ -347,6 +373,108 @@ totals p =
     }
   where
     inside = [v | (_, o, v) <- p.paid, Map.member o p.spent]
+
+-- | The sums that the pool keeps for the tokens of a category at an
+-- address: what 'Haskoin.Store.Database.Types.PoolTokens' reads.
+data TokenTotals = TokenTotals
+  { txs :: !Word64,
+    -- | fungible tokens, non-fungible tokens and number of the outputs that
+    -- the pool makes and does not use up
+    free :: !Word64,
+    freeNfts :: !Word64,
+    freeOutputs :: !Word64,
+    -- | the same of the outputs that the pool uses up and does not make
+    spent :: !Word64,
+    spentNfts :: !Word64,
+    spentOutputs :: !Word64,
+    -- | fungible tokens of every output that the pool makes
+    received :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | What the pool holds for a category of tokens.
+data CategoryPool t o = CategoryPool
+  { -- | the transactions that move it, newest first, and in the order of
+    -- their ids within a time
+    txs :: ![(Word64, t)],
+    -- | the outputs that hold it and that the pool makes, in the same order
+    outs :: ![(Word64, o)],
+    -- | how many of those the pool does not use up
+    free :: !Word64,
+    -- | how many outputs that hold it the pool uses up and does not make
+    spent :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | The sums of what a pool does to each category at each address, given
+-- which transaction made an output and the pool's transactions with their
+-- times and entries. Only the outputs with an address count. A
+-- transaction moves the tokens of a category at an address when it makes
+-- or uses up an output of the address that holds some.
+tokenTotals :: (Ord a, Ord t, Ord o, Ord c) => (o -> t) -> [(t, Word64, [Entry a o c])] -> Map (c, a) TokenTotals
+tokenTotals maker members = Map.fromListWith plus (moved <> concatMap sums made <> concatMap sums' used)
+  where
+    ids = Set.fromList [t | (t, _, _) <- members]
+    made = [k | (_, _, es) <- members, Makes k <- es]
+    used = [k | (_, _, es) <- members, Uses k <- es]
+    usedUp = Set.fromList (map (.output) used)
+    -- in the order of the fields: txs, the three that are free, the three
+    -- that are spent, received
+    nfts k = if k.nft then 1 else 0
+    moved =
+      [ ((c, a), TokenTotals 1 0 0 0 0 0 0 0)
+      | (_, _, es) <- members,
+        (c, a) <- Set.toList (Set.fromList [(k.category, a) | e <- es, Just k <- [token e], Just a <- [k.owner]])
+      ]
+    sums k = case k.owner of
+      Nothing -> []
+      Just a
+        | Set.member k.output usedUp -> [((k.category, a), TokenTotals 0 0 0 0 0 0 0 k.amount)]
+        | otherwise ->
+            [((k.category, a), TokenTotals 0 k.amount (nfts k) 1 0 0 0 k.amount)]
+    sums' k = case k.owner of
+      Just a
+        | not (Set.member (maker k.output) ids) ->
+            [((k.category, a), TokenTotals 0 0 0 0 k.amount (nfts k) 1 0)]
+      _ -> []
+    plus x y =
+      TokenTotals
+        { txs = x.txs + y.txs,
+          free = x.free + y.free,
+          freeNfts = x.freeNfts + y.freeNfts,
+          freeOutputs = x.freeOutputs + y.freeOutputs,
+          spent = x.spent + y.spent,
+          spentNfts = x.spentNfts + y.spentNfts,
+          spentOutputs = x.spentOutputs + y.spentOutputs,
+          received = x.received + y.received
+        }
+
+-- | What the pool holds for each category, given which transaction made an
+-- output and the pool's transactions with their times and entries.
+categories :: (Ord t, Ord o, Ord c) => (o -> t) -> [(t, Word64, [Entry a o c])] -> Map c (CategoryPool t o)
+categories maker members = Map.map ordered (Map.fromListWith merge (concatMap single members))
+  where
+    ids = Set.fromList [t | (t, _, _) <- members]
+    usedUp = Set.fromList [k.output | (_, _, es) <- members, Uses k <- es]
+    single (t, time, es) =
+      [(c, CategoryPool [(time, t)] [] 0 0) | c <- Set.toList (Set.fromList [k.category | Just k <- map token es])]
+        <> [ (k.category, CategoryPool [] [(time, k.output)] (if Set.member k.output usedUp then 0 else 1) 0)
+           | Makes k <- es
+           ]
+        <> [(k.category, CategoryPool [] [] 0 1) | Uses k <- es, not (Set.member (maker k.output) ids)]
+    merge x y = CategoryPool (x.txs <> y.txs) (x.outs <> y.outs) (x.free + y.free) (x.spent + y.spent)
+    ordered p =
+      p
+        { txs = Map.elems (Map.fromList [((Down time, t), (time, t)) | (time, t) <- p.txs]),
+          outs = Map.elems (Map.fromList [((Down time, o), (time, o)) | (time, o) <- p.outs])
+        }
+
+-- | The output that holds tokens of an entry, if it is one.
+token :: Entry a o c -> Maybe (TokenOut a o c)
+token = \case
+  Makes k -> Just k
+  Uses k -> Just k
+  _ -> Nothing
 
 -- | The transactions of a pool that can be replaced by fee, given those
 -- that say so themselves: those, and whatever spends from one that can be.

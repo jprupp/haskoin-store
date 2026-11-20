@@ -9,12 +9,22 @@
 --
 -- A transaction is given as its id, the time it entered a mempool, the
 -- outputs that it spends, its body, '1' if it says itself that it can be
--- replaced by fee or '0', the number of its entries by address, and then
--- five arguments for each entry: its kind, the address, an output
--- or '', an amount or '', and a script or ''. The kinds are 't', the
--- transaction touches the address; 's', it spends that output of the
--- address, of that amount; and 'o', it pays that output to the address,
--- with that amount and script.
+-- replaced by fee or '0', the number of its entries, and then six
+-- arguments for each entry: its kind, an address or '', an output or '',
+-- an amount or '', a script or '', and a category of tokens or ''. The
+-- kinds are 't', the transaction touches the address; 's', it spends that
+-- output of the address, of that amount; and 'o', it pays that output to
+-- the address, with that amount and script.
+--
+-- The tokens of Bitcoin Cash (CashTokens) have kinds of their own, so that
+-- this script never reads the token prefix of a script: 'm', the
+-- transaction makes that output, which holds that amount of fungible
+-- tokens of the category, and a script that is the value of the output, a
+-- space and its script; 'u', it uses up that output, with that amount of
+-- the category. 'M' and 'U' are the same for an output that also holds a
+-- non-fungible token. The address is that of the output, or '' if it has
+-- none. The amount is in decimal digits, as long as it needs, up to the
+-- largest signed integer of 64 bits.
 --
 -- 'offer': the tip that the store saw or '', a string with '1' for each
 -- output that the transaction spends and that the store finds unspent at
@@ -76,6 +86,18 @@
 -- mempool, and by its id alone, to find those whose id starts with some
 -- bytes.
 --
+-- What the pool holds for the tokens of each category: its transactions
+-- and the outputs that hold it, both newest first, with the value and
+-- script of each output, and three counts: its transactions, the outputs
+-- that are free and those that are spent ('tokens'). For each address and
+-- category, which the store reads as the address's token balance: the
+-- amount, non-fungible tokens and outputs that are free, the same that are
+-- spent, the amount that the pool pays to the address, and the number of
+-- transactions; the categories of each address and the addresses of each
+-- category, to find them. A transaction moves the tokens of a category,
+-- and those of an address, when it makes or uses up an output that holds
+-- some, as for a block (Haskoin.Store.Logic).
+--
 -- A transaction can be replaced by fee if it says so itself or if it spends
 -- from a transaction of the pool that can be. The second changes when a
 -- parent is confirmed or comes back from an abandoned block, so the pool
@@ -117,6 +139,13 @@ local key = {
   aval = prefix .. 'pool:aval:',
   aspent = prefix .. 'pool:aspent:',
   asum = prefix .. 'pool:asum:',
+  tsum = prefix .. 'pool:tsum:',
+  acat = prefix .. 'pool:acat:',
+  chold = prefix .. 'pool:chold:',
+  ctx = prefix .. 'pool:ctx:',
+  cout = prefix .. 'pool:cout:',
+  cval = prefix .. 'pool:cval:',
+  csum = prefix .. 'pool:csum:',
   rep = prefix .. 'pool:rep',
   repby = prefix .. 'pool:repby:',
   repat = prefix .. 'pool:repat',
@@ -202,8 +231,8 @@ local function read(at)
   local n = tonumber(ARGV[at + 5])
   at = at + 6
   for i = 1, n do
-    entries[i] = {ARGV[at], ARGV[at + 1], ARGV[at + 2], ARGV[at + 3], ARGV[at + 4]}
-    at = at + 5
+    entries[i] = {ARGV[at], ARGV[at + 1], ARGV[at + 2], ARGV[at + 3], ARGV[at + 4], ARGV[at + 5]}
+    at = at + 6
   end
   tx.entries = entries
   return tx, at
@@ -221,20 +250,97 @@ end
 -- add to a field of the summary of an address; the + 0 turns -0, which taking
 -- out an output of value 0 gives, into 0: Redis reads '-0' as no integer, and
 -- the error would stop the whole script half way
+local function addTo(k, field, by)
+  redis.call('HINCRBY', k, field, string.format('%.0f', by + 0))
+end
+
 local function add(a, field, by)
-  redis.call('HINCRBY', key.asum .. a, field, string.format('%.0f', by + 0))
+  addTo(key.asum .. a, field, by)
+end
+
+-- an amount of tokens in two parts, the digits above the last nine and the
+-- last nine, each of which a number of Lua holds exactly: an amount can be
+-- as large as 2^63 - 1, and Lua's numbers are exact only to 2^53. Each
+-- part is added up apart in Redis, where neither sum comes near what an
+-- integer of Redis holds, and the store joins them again.
+local function parts(s)
+  local n = #s
+  if n <= 9 then
+    return 0, tonumber(s)
+  end
+  return tonumber(string.sub(s, 1, n - 9)), tonumber(string.sub(s, n - 8))
+end
+
+-- What the pool does to the tokens of an output, by category and by
+-- address. An output is 'free' while the pool makes it and nothing in the
+-- pool uses it up, and 'spent' while the pool uses it up and the chain
+-- made it. An output that the pool both makes and uses up is neither. So
+-- both sums are the tokens of a set of outputs that exist together, which
+-- a sum that counted an output each time it was paid and spent would not
+-- be: a supply of 2^63 - 1 that moves twice in the pool would go past what
+-- Redis counts, and the error would stop the script half way.
+local function tokens(c, a, which, sign, hi, lo, nft)
+  addTo(key.csum .. c, which, sign)
+  if a ~= '' then
+    local k = key.tsum .. c .. a
+    addTo(k, which .. 'Hi', sign * hi)
+    addTo(k, which .. 'Lo', sign * lo)
+    addTo(k, which .. 'Nfts', sign * nft)
+    addTo(k, which .. 'Outputs', sign)
+  end
 end
 
 -- put the entries of a transaction in, with sign 1, or take them out, with
 -- sign -1
 local function account(t, time, entries, sign)
   local touched = {}
+  -- the categories of tokens that the transaction moves, and the
+  -- addresses with each
+  local cats, held = {}, {}
   for _, e in ipairs(entries) do
     local kind, a, o, v = e[1], e[2], e[3], tonumber(e[4])
-    touched[a] = true
+    if kind == 'm' or kind == 'M' or kind == 'u' or kind == 'U' then
+      local c = e[6]
+      local hi, lo = parts(e[4])
+      local nft = 0
+      if kind == 'M' or kind == 'U' then
+        nft = 1
+      end
+      cats[c] = true
+      if a ~= '' then
+        held[c .. a] = {c, a}
+      end
+      if kind == 'm' or kind == 'M' then
+        if sign > 0 then
+          redis.call('ZADD', key.cout .. c, -time, o)
+          redis.call('HSET', key.cval .. c, o, e[5])
+        else
+          redis.call('ZREM', key.cout .. c, o)
+          redis.call('HDEL', key.cval .. c, o)
+        end
+        -- an output that the pool uses up was spent from the chain until
+        -- the pool made it, and is spent from the chain again once the
+        -- pool no longer makes it
+        if redis.call('HEXISTS', key.spender, o) == 1 then
+          tokens(c, a, 'spent', -sign, hi, lo, nft)
+        else
+          tokens(c, a, 'free', sign, hi, lo, nft)
+        end
+        if a ~= '' then
+          addTo(key.tsum .. c .. a, 'receivedHi', sign * hi)
+          addTo(key.tsum .. c .. a, 'receivedLo', sign * lo)
+        end
+      elseif member(string.sub(o, 1, tsize)) then
+        tokens(c, a, 'free', -sign, hi, lo, nft)
+      else
+        tokens(c, a, 'spent', sign, hi, lo, nft)
+      end
+    else
+      touched[a] = true
+    end
     -- the cached keys that have the address
     local watching = {}
-    if kind ~= 's' then
+    if kind == 't' or kind == 'o' then
       watching = redis.call('SMEMBERS', key.of .. a)
     end
     if kind == 't' then
@@ -263,7 +369,7 @@ local function account(t, time, entries, sign)
         add(a, 'both', sign * v)
         add(a, 'bothCount', sign)
       end
-    else
+    elseif kind == 'o' then
       if sign > 0 then
         redis.call('ZADD', key.aout .. a, -time, o)
         redis.call('HSET', key.aval .. a, o, e[4] .. ' ' .. e[5])
@@ -298,11 +404,43 @@ local function account(t, time, entries, sign)
       redis.call('HSET', key.entry .. id .. ':meta', 'ver', ver)
     end
   end
-  -- an address that no transaction touches has no summary
+  -- the transaction in the lists of the categories that it moves, and in
+  -- the count of each address that it moves tokens of
+  for c, _ in pairs(cats) do
+    if sign > 0 then
+      redis.call('ZADD', key.ctx .. c, -time, t)
+    else
+      redis.call('ZREM', key.ctx .. c, t)
+    end
+    addTo(key.csum .. c, 'txs', sign)
+  end
+  for _, h in pairs(held) do
+    local c, a = h[1], h[2]
+    addTo(key.tsum .. c .. a, 'txs', sign)
+    if sign > 0 then
+      redis.call('SADD', key.acat .. a, c)
+      redis.call('SADD', key.chold .. c, a)
+    end
+  end
+  -- an address that no transaction touches has no summary, nor has a
+  -- category or an address of one that no transaction moves
   if sign < 0 then
     for a, _ in pairs(touched) do
       if tonumber(redis.call('HGET', key.asum .. a, 'txs')) == 0 then
         redis.call('DEL', key.asum .. a)
+      end
+    end
+    for c, _ in pairs(cats) do
+      if tonumber(redis.call('HGET', key.csum .. c, 'txs')) == 0 then
+        redis.call('DEL', key.csum .. c)
+      end
+    end
+    for _, h in pairs(held) do
+      local c, a = h[1], h[2]
+      if tonumber(redis.call('HGET', key.tsum .. c .. a, 'txs')) == 0 then
+        redis.call('DEL', key.tsum .. c .. a)
+        redis.call('SREM', key.acat .. a, c)
+        redis.call('SREM', key.chold .. c, a)
       end
     end
   end

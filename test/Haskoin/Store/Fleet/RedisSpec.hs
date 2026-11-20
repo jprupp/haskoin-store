@@ -186,6 +186,41 @@ spec = do
         -- from the tip that the store saw
         fleetRestart conn keys 4 (Just 0) (Just (block 2)) (block 3) `shouldReturn` Raced
         fleetRestart conn keys 4 (Just 0) (Just (block 1)) (block 2) `shouldReturn` Raced
+      it "reads what the pool does to tokens, by address and by category" $ \(conn, fresh) -> do
+        keys <- fresh
+        fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
+        fleetAdvance conn keys 4 (Just 0) Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        -- ten transactions: the fifth spends the first output of the first
+        -- two, and the tenth an output of the chain that holds tokens
+        let tip = Just (block 1)
+            spendsOf t = case t of
+              4 -> [out 0 0, out 1 0]
+              9 -> [out 21 0]
+              _ -> []
+            members = [(block t, timeOf t, entriesOf t (spendsOf t)) | t <- [0 .. 9]]
+            byToken = P.tokenTotals (B.take 4) members
+            byCategory = P.categories (B.take 4) members
+            spentInPool = Set.fromList (concatMap spendsOf [0 .. 9 :: Word32])
+        forM_ [0 .. 9] $ \t ->
+          poolOffer conn keys 4 tip (txOf t (spendsOf t)) [t == 9 | _ <- spendsOf t] [] `shouldReturn` Taken
+        [p.spent | p <- Map.elems byCategory] `shouldSatisfy` any (> 0)
+        forM_ (map address [0 .. 3]) $ \a -> do
+          Just rows <- poolRead conn keys 4 tip "tokens" [a]
+          Map.fromList [(c, tokenTotalsOf row) | [c, row] <- chunks 2 rows]
+            `shouldBe` Map.fromList [(c, p) | ((c, a'), p) <- Map.toList byToken, a' == a]
+        forM_ (map category [0, 1]) $ \c -> do
+          let p = byCategory Map.! c
+          Just rows <- poolRead conn keys 4 tip "holders" [c]
+          Map.fromList [(a, tokenTotalsOf row) | [a, row] <- chunks 2 rows]
+            `shouldBe` Map.fromList [(a, t) | ((c', a), t) <- Map.toList byToken, c' == c]
+          Just [row] <- poolRead conn keys 4 tip "csum" [c]
+          map read (words (C.unpack row)) `shouldBe` [fromIntegral (length p.txs), p.free, p.spent]
+          Just txs <- poolRead conn keys 4 tip "ctxs" [c, "", "", "100"]
+          pairs txs `shouldBe` [(t, time) | (time, t) <- p.txs]
+          Just outs <- poolRead conn keys 4 tip "couts" [c, "", "", "100"]
+          [(o, read (C.unpack time), C.unpack flag) | [o, time, _, flag] <- chunks 4 outs]
+            `shouldBe` [(o, time, if Set.member o spentInPool then "1" else "0") | (time, o) <- p.outs]
+        poolRead conn keys 4 tip "csum" ["no category"] `shouldReturn` Just [""]
       it "reads the pool by the page, as it is at the tip that is asked for" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
@@ -408,11 +443,85 @@ spec = do
           Nothing -> (a, found, Map.null sums) `shouldBe` (a, P.AddressPool [] [] Map.empty, True)
           Just p -> (a, found, totalled) `shouldBe` (a, p, P.totals p)
         Map.keysSet values `shouldBe` Set.fromList [o | (_, o) <- scored outs]
+      -- and what it holds for tokens is what the token entries of its
+      -- transactions come to
+      let byToken = P.tokenTotals (B.take 4) members
+          byCategory = P.categories (B.take 4) members
+          number' :: Map.Map ByteString ByteString -> ByteString -> Integer
+          number' m f = maybe 0 (read . C.unpack) (Map.lookup f m)
+          joined m f = fromInteger (number' m (f <> "Hi") * 1000000000 + number' m (f <> "Lo"))
+      forM_ (map category [0, 1]) $ \c -> do
+        txs <- list (Redis.zrangeWithscores (key ("pool:ctx:" <> c)) 0 (-1))
+        outs <- list (Redis.zrangeWithscores (key ("pool:cout:" <> c)) 0 (-1))
+        values <- list (Redis.hkeys (key ("pool:cval:" <> c)))
+        sums <- Map.fromList <$> list (Redis.hgetall (key ("pool:csum:" <> c)))
+        holders <- list (Redis.smembers (key ("pool:chold:" <> c)))
+        let found =
+              P.CategoryPool
+                { txs = scored txs,
+                  outs = scored outs,
+                  free = fromInteger (number' sums "free"),
+                  spent = fromInteger (number' sums "spent")
+                }
+        case Map.lookup c byCategory of
+          Nothing -> (c, found, Map.null sums) `shouldBe` (c, P.CategoryPool [] [] 0 0, True)
+          Just p -> (c, found) `shouldBe` (c, p)
+        Set.fromList values `shouldBe` Set.fromList [o | (_, o) <- scored outs]
+        Set.fromList holders `shouldBe` Set.fromList [a | (c', a) <- Map.keys byToken, c' == c]
+        forM_ (map address [0 .. 3]) $ \a -> do
+          m <- Map.fromList <$> list (Redis.hgetall (key ("pool:tsum:" <> c <> a)))
+          let found' =
+                P.TokenTotals
+                  { txs = fromInteger (number' m "txs"),
+                    free = joined m "free",
+                    freeNfts = fromInteger (number' m "freeNfts"),
+                    freeOutputs = fromInteger (number' m "freeOutputs"),
+                    spent = joined m "spent",
+                    spentNfts = fromInteger (number' m "spentNfts"),
+                    spentOutputs = fromInteger (number' m "spentOutputs"),
+                    received = joined m "received"
+                  }
+          case Map.lookup (c, a) byToken of
+            Nothing -> (c, a, Map.null m) `shouldBe` (c, a, True)
+            Just p -> (c, a, found') `shouldBe` (c, a, p)
+      forM_ (map address [0 .. 3]) $ \a -> do
+        cats <- list (Redis.smembers (key ("pool:acat:" <> a)))
+        Set.fromList cats `shouldBe` Set.fromList [c | (c, a') <- Map.keys byToken, a' == a]
     same conn keys now model = do
       fleetTip conn keys `shouldReturn` (model :: F.Fleet ByteString ByteString).tip
       leases <- fleetLive conn keys
       Map.keys (Map.filter (> now) (Map.fromList leases)) `shouldBe` Map.keys (live now model)
     lease = 10
+
+-- | The sums of the tokens of a category at an address, as @read.lua@
+-- gives them, each amount in two parts joined again.
+tokenTotalsOf :: ByteString -> P.TokenTotals
+tokenTotalsOf row = case map read (words (C.unpack row)) :: [Integer] of
+  [ txs,
+    freeHi,
+    freeLo,
+    freeNfts,
+    freeOutputs,
+    spentHi,
+    spentLo,
+    spentNfts,
+    spentOutputs,
+    receivedHi,
+    receivedLo
+    ] ->
+      P.TokenTotals
+        { txs = fromInteger txs,
+          free = joined freeHi freeLo,
+          freeNfts = fromInteger freeNfts,
+          freeOutputs = fromInteger freeOutputs,
+          spent = joined spentHi spentLo,
+          spentNfts = fromInteger spentNfts,
+          spentOutputs = fromInteger spentOutputs,
+          received = joined receivedHi receivedLo
+        }
+  _ -> error ("Not the sums of tokens: " <> show row)
+  where
+    joined hi lo = fromInteger (hi * 1000000000 + lo)
 
 -- | The items of a list two by two, each second one a number.
 pairs :: [ByteString] -> [(ByteString, Word64)]
@@ -455,13 +564,38 @@ timeOf t = fromIntegral (t `mod` 3) + 100
 
 -- | What a transaction of the tests that spends some outputs does at each
 -- address: it pays two outputs of its own.
-entriesOf :: Word32 -> [ByteString] -> [P.Entry ByteString ByteString]
+entriesOf :: Word32 -> [ByteString] -> [P.Entry ByteString ByteString ByteString]
 entriesOf t spends =
   map P.Touches (nubOrd (map (fst . paidTo) (spends <> made)))
     <> [P.Spends a o v | o <- spends, let (a, v) = paidTo o]
     <> [P.Pays a o v | o <- made, let (a, v) = paidTo o]
+    <> [P.Uses k | o <- spends, Just k <- [tokenOf o]]
+    <> [P.Makes k | o <- made, Just k <- [tokenOf o]]
   where
     made = [out t 0, out t 1]
+
+-- | The tokens of an output of the tests, if it holds any: two in three
+-- do, of one of two categories, some near the largest amount so that the
+-- sums of the pool go past what one integer holds, the first output of a
+-- transaction with a non-fungible token, and some without an address.
+tokenOf :: ByteString -> Maybe (P.TokenOut ByteString ByteString ByteString)
+tokenOf o
+  | (t + i) `mod` 3 == 2 = Nothing
+  | otherwise =
+      Just
+        P.TokenOut
+          { owner = if t `mod` 4 == 1 && i == 1 then Nothing else Just (fst (paidTo o)),
+            output = o,
+            category = category ((t + i) `mod` 2),
+            amount = if even t then 0x7fffffffffffffff - fromIntegral (t * 7 + i) else fromIntegral (t * 1000 + i),
+            nft = i == 0
+          }
+  where
+    (t, i) = (number (B.take 4 o), number (B.drop 4 o))
+
+-- | One of the two categories of tokens of the tests.
+category :: Word32 -> ByteString
+category n = C.pack ("cat " <> show n)
 
 -- | Whether a transaction of the tests says itself that it can be replaced
 -- by fee: one in four does.
@@ -484,6 +618,17 @@ txOf t spends =
       P.Touches a -> PoolTouches a
       P.Spends a o v -> PoolSpends a o v
       P.Pays a o v -> PoolPays a o v "script"
+      P.Makes k -> PoolMakes (tokenOut k) {coins = Just (snd (paidTo k.output), "script")}
+      P.Uses k -> PoolUses (tokenOut k)
+    tokenOut k =
+      PoolTokenOut
+        { address = k.owner,
+          output = k.output,
+          category = k.category,
+          amount = k.amount,
+          nft = k.nft,
+          coins = Nothing
+        }
 
 -- | A step of the shared mempool, with transactions numbered from 0 to 11.
 data PoolStep

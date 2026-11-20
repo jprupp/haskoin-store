@@ -22,7 +22,7 @@ token rules before they are sent to a node.
 
 ## What changes
 
-haskoin-core 2.1 takes the prefix off before it matches the templates, on
+haskoin-core 3.0 takes the prefix off before it matches the templates, on
 the Bitcoin Cash networks only. An output with tokens now has the address
 of its locking script, in the plain CashAddr form (type 0 or 1), as Bitcoin
 Cash Node shows it. So the coins of one script stay under one address,
@@ -64,11 +64,11 @@ field on the Bitcoin Cash networks; on Bitcoin it is not there, and the
 JSON is as it was. A client that does not know the field ignores it.
 
 The Haskell types do not get a field: the tokens are in the script field,
-which they carry already, and haskoin-store-data 3.1's `scriptTokens` reads
+which they carry already, and haskoin-store-data 4.0's `scriptTokens` reads
 them. So the types keep their binary encoding, which the store writes in
 its database and its caches, and nothing that builds them changes. The new
 `TokenBalance` type and the requests of the new endpoints are in
-haskoin-store-data 3.1 too.
+haskoin-store-data 4.0 too.
 
 ## Database
 
@@ -89,17 +89,45 @@ They are not stored apart: the script is already in the transaction.
 
 ## The shared mempool
 
-The fleet's pool in Redis keeps a summary of each address that its
-transactions touch (`pool:asum:*`). It gets the same token parts as the
-database: per address and category, the fungible amount and the number of
-non-fungible tokens, and per category the transactions and unspent outputs
-in the pool. The fleet member sends the token entries of a transaction
-with its other entries, so that the Lua scripts never read a prefix.
+The token endpoints count the mempool, as an address's balance does. The
+fleet's pool in Redis keeps, as transactions come and go:
+
+| Key | What it holds |
+| --- | --- |
+| `pool:ctx:{category}` | the transactions that move the category, newest first |
+| `pool:cout:{category}`, `pool:cval:{category}` | the outputs of the pool that hold it, with value and script |
+| `pool:csum:{category}` | how many transactions, free outputs and spent outputs |
+| `pool:tsum:{category}{address}` | the sums of the address's token balance |
+| `pool:acat:{address}`, `pool:chold:{category}` | the categories of an address, the addresses of a category |
+
+The fleet member sends the tokens of every output that a transaction makes
+or uses up with its other entries, so the Lua scripts never read a prefix.
+
+**Free and spent, not paid and spent.** The summary of an address adds up
+what the pool pays and what it spends, and takes off what it does both
+to. Token sums cannot work that way. A category can have 2^63 − 1 tokens,
+often all in one output, and moving them twice in the pool would push a
+sum of what was paid past what Redis can hold. The script would then fail
+halfway. So each output that holds tokens counts once at most: as free,
+while the pool makes it and doesn't use it up, or as spent, while the pool
+uses it up and the chain made it. Each sum is then the tokens of outputs
+that exist together, never more than the supply. Only the amount received
+counts every output, as it does in the chain.
+
+**Amounts in two parts.** Lua's numbers are exact only up to 2^53. The
+script splits each amount into the digits above the last nine and the
+last nine, adds the two parts apart, and the store joins them again.
+
+A token balance with the pool is the chain's balance minus what the pool
+spends, plus what is free: `confirmed` is the chain's amount minus the
+spent, and `unconfirmed` is the free amount. The holders of a category are
+the chain's and the pool's together, in the order of their addresses.
+Transactions and unspent outputs list the pool's first, as an address's do.
 
 ## Migration of an existing database
 
 A database of version 23 on Bitcoin Cash was built without the addresses
-of token outputs. haskoin-core 2.1 finds them when such an output is
+of token outputs. haskoin-core 3.0 finds them when such an output is
 spent: without a migration, the store would take out of a balance coins
 that were never put in.
 
@@ -114,8 +142,12 @@ networks there are no tokens, and the migration only writes the new
 version.
 
 The mempool is in Redis, not in the database, so the migration does not
-touch it. The fleet's pool is emptied once at the upgrade, and refills
-from the nodes and the peers.
+touch it. The scripts of the new version read the entries that the old
+one kept, so the pool carries on. The transactions that were already in
+it have no token entries, though: their tokens count once a block
+confirms them, a few minutes after the upgrade. Every store of a fleet
+has to be upgraded together, since an older store's script does not know
+the token entries.
 
 ## Where it stands
 
@@ -123,7 +155,7 @@ Done, on the `cashtokens` branches of haskoin-node, haskoin-store-data and
 this repository, each pinned to the commit of the one below:
 
 - the `token` field of the JSON, and `TokenBalance` and the requests of the
-  new endpoints, in haskoin-store-data 3.1;
+  new endpoints, in haskoin-store-data 4.0;
 - database version 24: the four column families, written by the import of
   a block and taken out by a revert ("Haskoin.Store.Logic"), and read by
   the four endpoints;
@@ -131,15 +163,13 @@ this repository, each pinned to the commit of the one below:
   ("Haskoin.Store.Database.Migrate.Tokens"). Its test imports the same
   blocks as version 23 did and as version 24 does, migrates the first, and
   finds every column family of the two the same;
-- the publishing checks on haskoin-core's parser.
+- the publishing checks on haskoin-core's parser;
+- the shared mempool: the token entries of the pool in Redis, their reads,
+  and the endpoints with the pool on top.
 
 Still to do:
 
-- the shared mempool: the token entries of the pool in Redis and their
-  reads, so that the endpoints count unconfirmed transactions, as the
-  balances of addresses do. Until then the token endpoints answer from the
-  blocks alone;
-- haskoin-core 2.1 and haskoin-store-data 3.1 on Hackage, and the pins back
+- haskoin-core 3.0 and haskoin-store-data 4.0 on Hackage, and the pins back
   to Hackage versions.
 
 ## Not done

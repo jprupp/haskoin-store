@@ -100,6 +100,8 @@ module Haskoin.Store.Database.Types
     HeightKey (..),
     MemTxKey (..),
     MemSummary (..),
+    PoolTokens (..),
+    CategorySummary (..),
     MigrationKey (..),
     ReplacedKey (..),
     ReplacedAtKey (..),
@@ -394,6 +396,54 @@ data MemSummary = MemSummary
     both :: !Word64,
     -- | number of those outputs
     bothCount :: !Word64
+  }
+  deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
+
+-- | What the mempool does to the tokens of one category at one address,
+-- added up, as the pool of the fleet keeps it (@pool.lua@): what a token
+-- balance of the chain needs to become one with the mempool.
+--
+-- Unlike t'MemSummary', it does not add up what is paid and what is spent
+-- and take off what is both. Every output that holds tokens is counted at
+-- most once: as free, while the pool makes it and does not use it up, or
+-- as spent, while the pool uses it up and the chain made it. So no sum is
+-- ever more than the tokens that exist, which a supply of the largest
+-- amount that moves twice in the pool would be otherwise. The amount paid
+-- is the exception, as the chain's amount received is.
+data PoolTokens = PoolTokens
+  { -- | mempool transactions that move tokens of the category at the
+    -- address
+    txs :: !Word64,
+    -- | fungible tokens of the outputs that the mempool makes and does not
+    -- use up
+    free :: !Word64,
+    -- | non-fungible tokens of those outputs
+    freeNfts :: !Word64,
+    -- | number of those outputs
+    freeOutputs :: !Word64,
+    -- | fungible tokens of the outputs of the chain that the mempool uses
+    -- up
+    spent :: !Word64,
+    -- | non-fungible tokens of those outputs
+    spentNfts :: !Word64,
+    -- | number of those outputs
+    spentOutputs :: !Word64,
+    -- | fungible tokens of all the outputs that the mempool makes, as the
+    -- amount received of the chain counts them
+    received :: !Word64
+  }
+  deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
+
+-- | What the mempool does to the tokens of one category, as the pool of the
+-- fleet keeps it: enough to know whether a list of the category needs to
+-- read the pool.
+data CategorySummary = CategorySummary
+  { -- | mempool transactions that move tokens of the category
+    txs :: !Word64,
+    -- | outputs that the mempool makes and does not use up
+    free :: !Word64,
+    -- | outputs of the chain that the mempool uses up
+    spent :: !Word64
   }
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
 

@@ -3492,8 +3492,9 @@ handleShortBal st req =
             if
               | cashaddr -> net
               | net == bch -> btc
-              | net == bchTest -> btcTest
-              | net == bchTest4 -> btcTest
+              -- both test networks of Bitcoin Cash; the legacy prefixes
+              -- of every Bitcoin test network are the same
+              | net.cashAddrPrefix == Just "bchtest" -> btcTest4
               | otherwise -> net
        in case addrToText net' a of
             Nothing -> return Nothing

@@ -2667,6 +2667,8 @@ paths:
         The tokens that an address holds, one balance per category. An address that
         never held tokens has none: the list is empty.
 
+        The balances count the mempool, as the balance of an address does.
+
         Token amounts are strings, since a category can have up to 2^63 - 1 tokens,
         more than a JSON number holds exactly in many languages. The coins of the
         same outputs are in the address's balance, as those of any output.
@@ -2719,8 +2721,9 @@ paths:
       operationId: getTokenUnspent
       summary: Token Unspent Outputs
       description: |
-        The unspent outputs that hold tokens of a category, newest first. Each has its
-        tokens in its `token` field.
+        The unspent outputs that hold tokens of a category, newest first: those of the
+        mempool first, then those of blocks that the mempool does not spend. Each has
+        its tokens in its `token` field.
       parameters:
         - $ref: '#/components/parameters/categoryParam'
         - $ref: '#/components/parameters/heightParam'
@@ -2744,7 +2747,7 @@ paths:
       summary: Token Transactions
       description: |
         The transactions that created, moved or burned tokens of a category, newest
-        first, as the transactions of an address.
+        first, those of the mempool first, as the transactions of an address.
       parameters:
         - $ref: '#/components/parameters/categoryParam'
         - $ref: '#/components/parameters/heightParam'
@@ -6171,11 +6174,11 @@ components:
         confirmed:
           type: string
           description: |
-            Fungible tokens in outputs in blocks that are not being spent.
+            Fungible tokens in outputs in blocks that the mempool does not spend.
         unconfirmed:
           type: string
           description: |
-            Fungible tokens that the mempool adds.
+            Fungible tokens in outputs of the mempool that the mempool does not spend.
         nfts:
           type: integer
           description: |

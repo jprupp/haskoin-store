@@ -149,6 +149,7 @@ import Haskoin
     BlockHeader (..),
     Network (..),
     OutPoint (..),
+    TokenData (..),
     Tx (..),
     TxHash,
     TxIn (..),
@@ -171,11 +172,12 @@ import Haskoin.Store.Data
     UnixTime,
     Unspent (..),
     XPubSpec,
+    scriptTokens,
   )
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Pooled (From, PoolReads (..), pageStart, pooledRead)
 import Haskoin.Store.Database.Reader (DatabaseReader (..), txCF, withSnapshotReader)
-import Haskoin.Store.Database.Types (MemSummary (..), TxKey (..))
+import Haskoin.Store.Database.Types (CategorySummary (..), MemSummary (..), PoolTokens (..), TxKey (..))
 import Haskoin.Store.Database.Views (Views, heldViews, keepViews, newViews, takeView, withViewAt)
 import Haskoin.Store.Exception (handleAny, tryAny)
 import Haskoin.Store.Fleet qualified as F
@@ -831,6 +833,17 @@ poolTx net td =
              | (i, o) <- zip [0 ..] td.tx.outputs,
                Just a <- [address o.script]
              ]
+          -- the outputs that hold tokens, made and used up (CashTokens)
+          <> [ PoolMakes (tokenOut (OutPoint h i) o.script t) {coins = Just (o.value, o.script)}
+             | (i, o) <- zip [0 ..] td.tx.outputs,
+               Just t <- [scriptTokens net o.script]
+             ]
+          <> [ PoolUses (tokenOut i.outpoint p.script t)
+             | (k, i) <- zip [0 :: Int ..] td.tx.inputs,
+               i.outpoint /= nullOutPoint,
+               Just p <- [IntMap.lookup k td.prevs],
+               Just t <- [scriptTokens net p.script]
+             ]
     }
   where
     h = txHash td.tx
@@ -842,6 +855,15 @@ poolTx net td =
       BlockRef {} -> max 1 td.timestamp
     spent = [i.outpoint | i <- td.tx.inputs, i.outpoint /= nullOutPoint]
     address = eitherToMaybe . scriptToAddressBS net
+    tokenOut op s t =
+      PoolTokenOut
+        { address = encode <$> address s,
+          output = encode op,
+          category = encode t.category,
+          amount = t.amount,
+          nft = isJust t.nft,
+          coins = Nothing
+        }
     touched =
       nub $
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)
@@ -870,7 +892,7 @@ offerMempool m =
       now <- round <$> getPOSIXTime
       held <- readTVarIO m.waiting
       let todo = take mostOffers (sortOn (fst . snd) (HashMap.toList held))
-          pool = redisPool m.redis m.keys (encode tip) (return ())
+          pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
       go now at pool tip todo
   where
     go _ _ _ _ [] = return ()
@@ -937,7 +959,7 @@ memberPoolBody m h =
   readTVarIO m.tip >>= \case
     Nothing -> return Nothing
     Just tip ->
-      (redisPool m.redis m.keys (encode tip) (return ())).bodies [h] <&> \case
+      (redisPool m.db.net m.redis m.keys (encode tip) (return ())).bodies [h] <&> \case
         [(td, _)] -> td
         _ -> Nothing
 
@@ -950,7 +972,7 @@ memberNewest m =
     Nothing -> return Nothing
     Just tip ->
       handleAny (\_ -> return Nothing) $
-        (redisPool m.redis m.keys (encode tip) (return ())).page 0 1 <&> \case
+        (redisPool m.db.net m.redis m.keys (encode tip) (return ())).page 0 1 <&> \case
           (t, _) : _ -> Just t
           [] -> Nothing
 
@@ -1077,7 +1099,7 @@ answeringWith m tip action = case decode tip of
                   now <- memberTip m
                   if now == Just tip then saw >> writeIORef checked True else throwIO TipMoved
         found = saw >> writeIORef checked True
-    action r (redisPool m.redis m.keys tip found) found confirm
+    action r (redisPool m.db.net m.redis m.keys tip found) found confirm
 
 -- | 'answeringAt' with the queries ready: those of
 -- "Haskoin.Store.Database.Query.Pooled" for the view and the pool, and
@@ -1248,8 +1270,8 @@ cacheGauges m =
 -- "Haskoin.Store.Database.Query.Pooled". Every read throws v'TipMoved' if
 -- the tip is another one by then, and runs an action if it is not, by which
 -- a caller knows that the tip was checked.
-redisPool :: R.Connection -> FleetKeys -> ByteString -> IO () -> PoolReads
-redisPool conn keys tip checked =
+redisPool :: Network -> R.Connection -> FleetKeys -> ByteString -> IO () -> PoolReads
+redisPool net conn keys tip checked =
   PoolReads
     { summaries = \as -> case as of
         [] -> return []
@@ -1284,7 +1306,36 @@ redisPool conn keys tip checked =
       replaced = \h ->
         ask "replaced" [encode h] >>= \case
           [value] | Right (by, height) <- runGet ((,) <$> get <*> getWord32be) value -> return (Just Replaced {..})
-          _ -> return Nothing
+          _ -> return Nothing,
+      addressTokens = \a -> do
+        rows <- ask "tokens" [encode a]
+        return [(c, t) | [m, row] <- groups 2 rows, Right c <- [decode m], Just t <- [tokens row]],
+      categoryHolders = \c -> do
+        rows <- ask "holders" [encode c]
+        return [(a, t) | [m, row] <- groups 2 rows, Right a <- [decode m], Just t <- [tokens row]],
+      categorySummary = \c ->
+        ask "csum" [encode c] <&> \case
+          [row] | [txs, free, spent] <- map number (C.words row) -> Just CategorySummary {..}
+          _ -> Nothing,
+      categoryTxs = \c start n -> do
+        rows <- ask "ctxs" (encode c : from start <> [num n])
+        return [(number time, h) | [member, time] <- groups 2 rows, Right h <- [decode member]],
+      categoryOuts = \c start n -> do
+        rows <- ask "couts" (encode c : from start <> [num n])
+        let made time p v s =
+              Unspent
+                { block = MemRef time,
+                  outpoint = p,
+                  value = v,
+                  script = s,
+                  address = eitherToMaybe (scriptToAddressBS net s)
+                }
+        return
+          [ (made (number time) p (number v) s, f == "1")
+          | [member, time, kept, f] <- groups 4 rows,
+            Right p <- [decode member],
+            let (v, s) = B.drop 1 <$> C.break (== ' ') kept
+          ]
     }
   where
     ask what args = poolRead conn keys 32 (Just tip) what args >>= maybe (throwIO TipMoved) (<$ checked)
@@ -1313,6 +1364,35 @@ redisPool conn keys tip checked =
     transactions _ = []
     outpoint :: ByteString -> Either String OutPoint
     outpoint = decode
+    -- the sums of the tokens of a category at an address, each amount
+    -- in two parts, the digits above the last nine and the last nine,
+    -- joined again modulo 2^64 as the chain's sums are
+    tokens row = case map number (C.words row) :: [Integer] of
+      [ txs,
+        freeHi,
+        freeLo,
+        freeNfts,
+        freeOutputs,
+        spentHi,
+        spentLo,
+        spentNfts,
+        spentOutputs,
+        receivedHi,
+        receivedLo
+        ] ->
+          Just
+            PoolTokens
+              { txs = fromInteger txs,
+                free = joined freeHi freeLo,
+                freeNfts = fromInteger freeNfts,
+                freeOutputs = fromInteger freeOutputs,
+                spent = joined spentHi spentLo,
+                spentNfts = fromInteger spentNfts,
+                spentOutputs = fromInteger spentOutputs,
+                received = joined receivedHi receivedLo
+              }
+      _ -> Nothing
+    joined hi lo = fromInteger (hi * 1000000000 + lo)
     summary row = case map number (C.words row) of
       [txs, paid, paidCount, spent, spentCount, both, bothCount] -> Just MemSummary {..}
       _ -> Nothing
