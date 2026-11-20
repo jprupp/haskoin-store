@@ -149,9 +149,9 @@ the token entries.
 
 ## Where it stands
 
-Done, in haskoin-core 3.0 (merged to its master), haskoin-store-data 4.0
-(its `cashtokens` branch), and the master branches of haskoin-node and
-this repository, each pinned to a commit of the one below:
+Done, on the master branches of haskoin-core (3.0), haskoin-store-data
+(4.0), haskoin-node and this repository, each pinned to a commit of the
+one below:
 
 - the `token` field of the JSON, and `TokenBalance` and the requests of the
   new endpoints, in haskoin-store-data 4.0;
