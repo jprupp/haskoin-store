@@ -16,6 +16,10 @@ nix:
   - zlib
   - pkg-config
   - cacert
+  # the test of HTTPS makes a certificate with openssl and asks with curl;
+  # the pure shell of Nix has neither on its PATH
+  - openssl
+  - curl
 packages:
   - .
 extra-deps:
