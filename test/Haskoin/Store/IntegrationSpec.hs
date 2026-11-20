@@ -159,25 +159,31 @@ import System.Process (readProcessWithExitCode)
 import Test.Hspec
 import Text.Read (readMaybe)
 
+-- | Each environment, a node, a Redis and a store of its own, is a group at
+-- the top of the module, so that haskell-dev (of jprupp/tools) runs each in
+-- a process of its own, at the same time as the others (@haskell-dev.toml@).
+-- Their containers have names and ports of their own, and each process a
+-- temporary folder of its own, so nothing is shared between them.
 spec :: Spec
 spec = do
   usable <- runIO podmanUsable
-  describe "Regtest chains in Podman" $ case usable of
+  case usable of
     Left why ->
-      it "check the store against Bitcoin Core and Bitcoin Cash Node" $
-        pendingWith why
+      describe "Regtest chains in Podman" $
+        it "check the store against Bitcoin Core and Bitcoin Cash Node" $
+          pendingWith why
     Right () -> do
       forM_ [BitcoinCore, BitcoinCashNode] $ \kind ->
         aroundAll (withEnvOf False kind) $
-          describe (name kind <> " that does not whitelist the store") $
+          describe ("Regtest " <> name kind <> " that does not whitelist the store") $
             it "publishes what it verified, and keeps its node when sent what it cannot verify" strangerTest
       aroundAll (withEnvAt True (Just (30 * 24 * 3600)) BitcoinCore) $
-        describe "Bitcoin Core with blocks of a month ago" $
+        describe "Regtest Bitcoin Core with blocks of a month ago" $
           it "keeps what a reorganisation of an old block put back in the mempool" oldBlockTest
       aroundAll (withEnv BitcoinCore) $
-        describe "Bitcoin Core" (chainSpec BitcoinCore)
+        describe "Regtest Bitcoin Core" (chainSpec BitcoinCore)
       aroundAll (withEnv BitcoinCashNode) $
-        describe "Bitcoin Cash Node" (chainSpec BitcoinCashNode)
+        describe "Regtest Bitcoin Cash Node" (chainSpec BitcoinCashNode)
 
 -- | The name of a node, as people write it.
 name :: NodeKind -> String

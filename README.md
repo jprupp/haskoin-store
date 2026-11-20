@@ -1339,6 +1339,23 @@ haskell-release --dry-run      # build and check a release, upload nothing
 [jprupp/tools](https://github.com/jprupp/tools), the scripts shared by the
 Haskell packages of this family: clone it and put it on your `PATH`.
 
+The Stack commands build the store as it is released, with optimisation.
+For the time between two commits there is a faster loop, `haskell-dev`,
+from jprupp/tools too:
+
+```sh
+haskell-dev build              # build without optimisation
+haskell-dev test               # the tests in eight processes: 75 s, not 4 min
+haskell-dev test Fleet.Redis   # the specs whose module name has a word
+haskell-dev docs               # build the documentation and check its comments
+```
+
+`haskell-dev.toml` names the slow spec module, `Haskoin.Store.Integration`
+(`test/Haskoin/Store/IntegrationSpec.hs`), whose five environments then run
+at the same time, each with its own node, Valkey and store in Podman. Do not mix the two kinds of build in one folder:
+the flags differ, so each switch compiles everything again. Never time the
+store with `haskell-dev`: the benchmarks run with `stack bench`.
+
 A release is made with `haskell-release`, once the version in
 `package.yaml` is bumped, its CHANGELOG entry written and the commit pushed.
 It builds and tests the package, builds the source and documentation

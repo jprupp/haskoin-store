@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - **CI runs through the workflow that the packages share** in jprupp/tools,
   which also keeps the cache of the Nix build per release of nixpkgs.
   `check-stack-paths` from there replaces `scripts/check-local-deps.sh`.
+- **`haskell-dev`, from jprupp/tools, is the fast loop of work on the
+  code**: `build`, `test` and `docs`, without optimisation and with the
+  tests in eight processes, about 75 seconds in place of four minutes. The
+  five environments of `Haskoin.Store.IntegrationSpec`, each a node, a
+  Valkey and a store in Podman, are now groups at the top of the module, and
+  `haskell-dev.toml` names it, so that they run at the same time.
 
 ## [1.16.7] - 2026-11-20
 

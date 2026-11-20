@@ -1,0 +1,12 @@
+# What sets haskoin-store apart for haskell-dev, the development loop of
+# https://github.com/jprupp/tools: `haskell-dev build`, `test` and `docs`.
+
+# The spec modules that take most of the time of the tests. Each of their
+# groups is run apart, so that the test processes share them evenly.
+#
+# Haskoin.Store.Integration: each group is an environment of its own, a
+# regtest node, a Redis and a store in Podman, with containers named after
+# the process and ports picked at random, so the groups run at the same time.
+slow-specs = [
+  "Haskoin.Store.Integration",
+]

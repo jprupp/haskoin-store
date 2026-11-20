@@ -57,8 +57,8 @@
 -- busy address.
 --
 -- The tokens of Bitcoin Cash come the same way: each output that holds
--- some and that a transaction makes or uses up is an entry
--- (t'PoolTokenOut'), with its category and amounts read by the store, and
+-- some and that a transaction makes or uses up is an entry, a
+-- t'PoolTokenOut' with its category and amounts read by the store, and
 -- the script keeps for each category its transactions and outputs, and for
 -- each address and category the sums that a token balance needs.
 -- 'Haskoin.Store.Fleet.Pool.tokenTotals' says what those should be.
