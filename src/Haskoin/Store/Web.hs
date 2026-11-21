@@ -257,6 +257,7 @@ import Haskoin.Store.Fleet.Member
     memberPoolBody,
     memberReceived,
     memberTip,
+    setHealthy,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
 import Haskoin.Store.Manager
@@ -804,7 +805,7 @@ serveWeb config serve = do
   -- web server has nothing else to say when; with one, a store that had
   -- just started took a turn before its first check, reported the blocks
   -- that it had then, and with nobody else there moved the fleet to them.
-  forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first.blocks && isOK first.peers))
+  forM_ config.store.fleet $ \member -> atomically (setHealthy member (isOK first.blocks && isOK first.peers))
   cacheUp <- cacheCheck >>= newTVarIO
   -- requests in a row that found Redis too slow to say the tip; see 'reach'
   cacheMisses <- newTVarIO (0 :: Int)
@@ -998,7 +999,7 @@ serveWeb config serve = do
           tellHealth saidWell h
           -- a store whose checks fail stops taking its turns as a member
           -- of its fleet, so that it does not hold the others back
-          forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK h.blocks && isOK h.peers))
+          forM_ config.store.fleet $ \member -> atomically (setHealthy member (isOK h.blocks && isOK h.peers))
           -- Redis is asked less often, every five seconds: it is the one
           -- part of the check that leaves the program, and waits up to
           -- two seconds for a Redis that is away. Requests find out by
@@ -2038,7 +2039,7 @@ chainRules st = do
 -- transaction that the node has already was sent.
 sendNode :: WebState -> String -> Tx -> IO Publish.Direct
 sendNode st url tx =
-  tryAny (Wreq.Session.postWith opts st.nodeSession url body) >>= \case
+  tryAny (Wreq.Session.postWith nodeOptions st.nodeSession url body) >>= \case
     Left e -> unheard (cs (show e))
     Right r -> case A.decode (r ^. Wreq.responseBody) >>= answer of
       Nothing -> unheard ("HTTP " <> cs (show (r ^. Wreq.responseStatus . Wreq.statusCode)))
@@ -2047,7 +2048,6 @@ sendNode st url tx =
         | "already" `T.isInfixOf` why -> return Publish.Sent
         | otherwise -> return (Publish.Declined why)
   where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
     body =
       A.object
         [ "jsonrpc" .= ("1.0" :: Text),
@@ -2222,7 +2222,7 @@ refillFromNode st m url = do
 -- their order: 'Nothing' for one that failed.
 nodeCalls :: WebState -> String -> [(Text, [A.Value])] -> IO [Maybe A.Value]
 nodeCalls st url calls = do
-  r <- Wreq.Session.postWith opts st.nodeSession url (A.toJSON (zipWith call [0 :: Int ..] calls))
+  r <- Wreq.Session.postWith nodeOptions st.nodeSession url (A.toJSON (zipWith call [0 :: Int ..] calls))
   let answers = case A.decode (r ^. Wreq.responseBody) of
         Just (A.Array a) ->
           HashMap.fromList
@@ -2235,7 +2235,6 @@ nodeCalls st url calls = do
         _ -> HashMap.empty
   return [HashMap.lookup (T.pack (show i)) answers | i <- [0 .. length calls - 1]]
   where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
     call i (method, params) =
       A.object
         [ "jsonrpc" .= ("1.0" :: Text),
@@ -2243,6 +2242,19 @@ nodeCalls st url calls = do
           "method" .= method,
           "params" .= params
         ]
+
+-- | The options of every request to the node's JSON-RPC: an answer of any
+-- status is read, since the node says what went wrong in its body, and the
+-- connection is closed after each answer. A connection kept open made
+-- Bitcoin Cash Node wait, when it stopped, until the connection had been
+-- idle for its @-rpcservertimeout@, 30 seconds by default. The store calls
+-- the RPC to publish a transaction and to fill the pool again, rarely
+-- enough that a new connection each time costs nothing that shows.
+nodeOptions :: Wreq.Options
+nodeOptions =
+  Wreq.defaults
+    & Wreq.checkResponse ?~ (\_ _ -> return ())
+    & Wreq.header "Connection" .~ ["close"]
 
 -- GET Mempool / Events --
 

@@ -64,6 +64,7 @@ module Haskoin.Store.Fleet.Member
     MemberConfig (..),
     newMember,
     noteBest,
+    setHealthy,
     memberTick,
     memberLoop,
     memberAlive,
@@ -108,7 +109,8 @@ where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
-  ( TVar,
+  ( STM,
+    TVar,
     atomically,
     check,
     modifyTVar',
@@ -320,6 +322,15 @@ data Member = Member
     -- member does nothing, so that its lease runs out and a store that is
     -- stuck does not hold the fleet back.
     healthy :: !(TVar Bool),
+    -- | whether the store was found unwell since the member's last whole
+    -- turn, which it then takes as soon as the store is well ('setHealthy')
+    owed :: !(TVar Bool),
+    -- | whether the store has a new best block since the last whole turn
+    -- ('noteBest')
+    newBest :: !(TVar Bool),
+    -- | whether a transaction came to offer since the last turn
+    -- ('memberReceived')
+    offered :: !(TVar Bool),
     -- | the indexer that builds the entries of the xpubs that requests
     -- miss, one store of the fleet for each, holding its dibs in Redis
     indexer :: !(Indexer XPubSpec ()),
@@ -368,6 +379,9 @@ newMember config redis db = do
   tip <- newTVarIO Nothing
   waiting <- newTVarIO Map.empty
   healthy <- newTVarIO True
+  owed <- newTVarIO False
+  newBest <- newTVarIO False
+  offered <- newTVarIO False
   metrics <- mapM newCacheMetrics config.stats
   outage <- newOutage
   built <- newTVarIO HashMap.empty
@@ -405,6 +419,17 @@ noteBest m block = do
   atomically . modifyTVar' m.recent $ \blocks -> take m.config.depth (block : filter (/= block) blocks)
   takeView m.views block
   prune m
+  -- last, so that the turn that this wakes finds the view
+  atomically (writeTVar m.newBest True)
+
+-- | Say whether the store's own health checks pass. A store found unwell
+-- owes a whole turn, which its member takes as soon as it is well again
+-- ('Haskoin.Store.Fleet.turn'), instead of waiting up to two seconds for
+-- its timer.
+setHealthy :: Member -> Bool -> STM ()
+setHealthy m well = do
+  writeTVar m.healthy well
+  unless well (writeTVar m.owed True)
 
 -- | Let go of the views that the rules do not ask for: all but those of
 -- the recent blocks, of the last report, and of the tip read after it. The
@@ -502,18 +527,46 @@ noteRestarts m = do
   when restarted . m.config.note LevelInfo $
     "The pool started again: it fills again from the node and the peers"
 
--- | Take a turn as a member every two seconds, and at once when an action
--- that waits for the next best block returns, for as long as the store's
--- health checks pass. A turn that fails, as when Redis is away, is tried
--- again at the next, and logged as an outage is ('attempt').
-memberLoop :: Member -> IO () -> IO a
-memberLoop m nextBlock = go
+-- | Take the member's turns, for as long as the store runs, when the rule
+-- of 'Haskoin.Store.Fleet.turn' says: a whole turn ('memberTick') every
+-- two seconds, at each new best block and when the store is well again,
+-- and an offer alone ('offerMempool') as soon as a transaction comes, all
+-- of them only while the store's health checks pass. A turn that fails,
+-- as when Redis is away, is tried again at the next, and logged as an
+-- outage is ('attempt').
+--
+-- The member waits in one transaction for what wakes it, and clears in
+-- the same transaction what the turn will see to: a block, a health or a
+-- transaction that comes during the turn wakes it again after it, and
+-- none is lost between the read and the clearing. Before, the member
+-- waited for a block with a timer around it, and read the health after:
+-- a store that the block made well took no turn for up to two seconds,
+-- nor offered a transaction for as long.
+memberLoop :: Member -> IO a
+memberLoop m = registerDelay 2000000 >>= go
   where
-    go = do
-      void (timeout 2000000 nextBlock)
-      well <- readTVarIO m.healthy
-      when well (void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m)))
-      go
+    go timer = do
+      t <- atomically $ do
+        wake <-
+          F.Wake
+            <$> readTVar m.healthy
+            <*> readTVar m.owed
+            <*> readTVar m.newBest
+            <*> readTVar timer
+            <*> readTVar m.offered
+        t <- maybe retry return (F.turn wake)
+        writeTVar m.offered False
+        when (t == F.Whole) $ do
+          writeTVar m.owed False
+          writeTVar m.newBest False
+        return t
+      case t of
+        F.Whole -> do
+          void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m))
+          registerDelay 2000000 >>= go
+        F.Offers -> do
+          void (attempt m.outage m.config.note "offer to the pool" (offerMempool m))
+          go timer
 
 -- | Hear what happens to the fleet, for as long as the store runs: each
 -- move of the tip and each transaction that enters or leaves the pool is
@@ -962,11 +1015,13 @@ offerMempool m =
 -- With no bound, a Redis that was away for long, when nothing is offered,
 -- or a read of a node's whole mempool, held every transaction in memory.
 memberReceived :: Member -> UnixTime -> Tx -> IO ()
-memberReceived m time tx =
-  atomically . modifyTVar' m.waiting $ \held ->
+memberReceived m time tx = atomically $ do
+  modifyTVar' m.waiting $ \held ->
     if Map.size held >= mostWaiting && not (Map.member (txHash tx) held)
       then held
       else Map.insertWith (\_ old -> old) (txHash tx) (time, tx) held
+  -- the member offers it at once ('F.turn')
+  writeTVar m.offered True
 
 -- | The most transactions that a store holds to offer ('memberReceived').
 mostWaiting :: Int

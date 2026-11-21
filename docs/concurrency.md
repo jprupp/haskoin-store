@@ -91,6 +91,13 @@ The member's own state:
 | `views`, with `recent`, `reported`, `tip` | the member and the block store both prune | one transaction per decision (`keepViews`) |
 | `waiting`, transactions to offer | written by the block store, read by the member | one transaction per change; at most `mostWaiting` |
 | `built`, announcements of builds | the listener and the requests that wait | one transaction per change; a key only while a request waits |
+| `healthy`, `owed`, `newBest`, `offered`: what wakes the member | set by the web server's health check (`setHealthy`), the block store (`noteBest`) and whoever gives a transaction (`memberReceived`); cleared by the member | `memberLoop` reads them and clears what its turn sees to in one transaction, so a signal that comes during a turn wakes the next |
+
+The member's turns follow `Haskoin.Store.Fleet.turn`: none while the store
+is unwell, a whole turn at a new block, every two seconds and as soon as
+the store is well again, and an offer alone as soon as a transaction comes.
+`FleetSpec` replays any sequence of blocks, transactions, health changes
+and timers through it, and checks that a well store leaves nothing waiting.
 
 ## The web server
 
@@ -161,6 +168,12 @@ finding was checked against the code before it was fixed.
     behind a bounded queue.
 16. **The transactions a member held to offer had no bound** while Redis was
     away. At most 100,000 wait now.
+17. **A store that a block made well took no turn for up to two seconds.**
+    The member woke at the block, read the health the check had not yet
+    updated, and slept until its timer; and a transaction waited for the
+    next turn before it was in the pool, so listed. The member now waits on
+    all its signals in one transaction (`Fleet.turn`), takes a whole turn
+    when the store is well again, and offers each transaction as it comes.
 
 **Known limits, left as they are:**
 

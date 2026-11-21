@@ -54,10 +54,11 @@ changes them together or not at all.
 ## Getting in: the offer
 
 A server hands each transaction that a peer sends it to its member of the
-fleet (`memberReceived`). Every two seconds the server takes a turn, and
-offers what it holds (`offerMempool`), reading the outputs that each
-spends from its view at the tip or from the pool. One whose outputs are in
-neither waits, as an orphan.
+fleet (`memberReceived`), which offers it at once (`offerMempool`), with
+whatever else is waiting, reading the outputs that each spends from its
+view at the tip or from the pool. One whose outputs are in neither waits,
+as an orphan, and is offered again with the next, and at each turn, every
+two seconds and at each block.
 
 1. The server reads the fleet tip, and opens its own view of its database
    at that block. A server without that view offers nothing.

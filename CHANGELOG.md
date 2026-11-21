@@ -168,6 +168,20 @@ whitelist it must now say what they grant (`--peer-permission`, or
     transactions;
   - announcements of transactions held up blocks on the block store's
     thread; the transactions waiting to be offered had no bound.
+- **New transactions and blocks show at once again.** Since the pool moved
+  to Redis, a transaction from a peer or from `POST /transactions` waited
+  for the member's next turn, up to two seconds, before it was in the pool
+  and listed; it is offered as soon as it comes now. A store that a block
+  made well, as after a sync, took no turn for up to two seconds either:
+  the block woke the member before the health check had run, and the
+  member slept until its timer. It now takes a turn as soon as the store
+  is well (`Haskoin.Store.Fleet.turn`). Measured in a downstream regtest
+  suite: 1.3 to 2.0 seconds for a transaction against 0.3 to 0.4 on
+  1.12.1, and 2.0 seconds for 101 blocks after a start against 0.01.
+- **A Bitcoin Cash Node with `--node-rpc` no longer waits half a minute
+  when it stops.** The store kept its RPC connection open, and the node
+  waited until it had been idle for `-rpcservertimeout`. Every RPC request
+  closes its connection now.
 
 ## [1.16.7] - 2026-11-20
 

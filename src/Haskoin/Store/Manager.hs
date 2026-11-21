@@ -256,7 +256,7 @@ withStore cfg action = do
               withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
                 withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
                   link fwd
-                  withStoreFleet cfg pub member $
+                  withStoreFleet member $
                     withFleetEvents cfg pub member $ \events ->
                       action $
                         Store
@@ -313,21 +313,15 @@ storeMember cfg redis db = case redis of
   Nothing -> return Nothing
 
 -- | Take the store's turns as a member of its fleet while an action runs,
--- if it is one: every two seconds, and whenever the best block changes.
--- Beside them, in a thread of its own, the member builds the entries of
--- the fleet's cache of extended public keys that requests asked for.
-withStoreFleet :: StoreConfig -> Publisher StoreEvent -> Maybe Member -> IO a -> IO a
-withStoreFleet _ _ Nothing action = action
-withStoreFleet _ pub (Just member) action =
-  withSubscription pub $ \sub ->
-    withAsync (memberLoop member (nextBlock sub)) $ \a ->
-      withAsync (memberCacheLoop member) $ \b -> link a >> link b >> action
-  where
-    -- until the next block
-    nextBlock sub =
-      receive sub >>= \case
-        StoreBestBlock _ -> return ()
-        _ -> nextBlock sub
+-- if it is one: every two seconds, whenever the best block changes, and
+-- an offer as soon as a transaction comes ('memberLoop'). Beside them, in
+-- a thread of its own, the member builds the entries of the fleet's cache
+-- of extended public keys that requests asked for.
+withStoreFleet :: Maybe Member -> IO a -> IO a
+withStoreFleet Nothing action = action
+withStoreFleet (Just member) action =
+  withAsync (memberLoop member) $ \a ->
+    withAsync (memberCacheLoop member) $ \b -> link a >> link b >> action
 
 -- | Run an action with the events that the store tells its clients: those
 -- of the fleet, which a thread reads from Redis for as long as the action
