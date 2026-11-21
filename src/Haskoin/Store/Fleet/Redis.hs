@@ -9,18 +9,26 @@
 -- Portability : POSIX
 --
 -- The rules of "Haskoin.Store.Fleet" carried out against Redis: the state
--- of a fleet in three keys, and a Lua script for each step that has to be
--- one step.
+-- of a fleet in three keys, and each change that has to be one step made
+-- one.
 --
--- = Why scripts
+-- = Why one step
 --
 -- Whether a store may report depends on the tip and on the leases of the
 -- others, and the block that the tip moves to depends on every report. Read
 -- and written in separate commands, each could change in between: two
 -- stores would both find themselves alone, or the tip would move to a block
 -- that a store had just stopped reporting. Redis runs a script without
--- letting anything else in, so each rule sees one state and changes it at
--- once.
+-- letting anything else in, so a rule that is a script sees one state and
+-- changes it at once.
+--
+-- The reports and the move of the tip alone are short Lua scripts. The
+-- changes to the shared mempool, and the move of the tip with the pool,
+-- are decisions made in Haskell ("Haskoin.Store.Fleet.Pool.Decide") and
+-- carried out by one script that decides nothing
+-- ("Haskoin.Store.Fleet.Atomic"): a script of eight hundred lines that
+-- failed half way left the pool half changed, and its rules had to be kept
+-- twice.
 --
 -- = Whose clock
 --
@@ -36,8 +44,9 @@
 --
 -- = The shared mempool
 --
--- The rules of "Haskoin.Store.Fleet.Pool" are one more script, with the
--- pool in keys next to those of the tip. A transaction is its id, of one
+-- The rules of "Haskoin.Store.Fleet.Pool" are the decisions of
+-- "Haskoin.Store.Fleet.Pool.Decide", with the pool in keys next to those
+-- of the tip. A transaction is its id, of one
 -- fixed size, and an output is the id of the transaction that made it and
 -- four more bytes. An offer says which tip the store checked the
 -- transaction against, and is turned away if the tip has moved since: what
@@ -45,8 +54,8 @@
 -- changing the pool for the blocks in between is one step ('fleetAdvance'),
 -- so that no request finds a block without what it did to the pool.
 --
--- A transaction comes with what it does at each address (t'PoolEntry'),
--- and the script keeps what the pool holds for each address in step: its
+-- A transaction comes with what it does at each address, a t'PoolEntry'
+-- for each, and the pool keeps what it holds for each address in step: its
 -- transactions and the outputs paid to it, each in a sorted set ordered as
 -- queries list them, the outputs of it that are spent, and the sums that a
 -- balance needs. 'Haskoin.Store.Fleet.Pool.addresses' says what those
@@ -103,18 +112,19 @@ module Haskoin.Store.Fleet.Redis
   )
 where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.FileEmbed (embedFile, makeRelativeToProject)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
-import Data.Word (Word32, Word64)
-import Database.Redis (Connection, Redis, RedisResult, Reply (..))
+import Database.Redis (Connection, Redis, Reply (..))
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
-import System.IO.Unsafe (unsafePerformIO)
+import Haskoin.Store.Fleet.Atomic (Atomic)
+import Haskoin.Store.Fleet.Atomic.Redis (transact)
+import Haskoin.Store.Fleet.Pool.Decide qualified as D
+import Haskoin.Store.Fleet.Pool.Types
+import Haskoin.Store.Fleet.Script (Script, evalScript, script)
 
 -- | The keys of a fleet in Redis, and the size of its blocks in bytes.
 data FleetKeys = FleetKeys
@@ -143,16 +153,6 @@ fleetKeys prefix size =
       recent = prefix <> "fleet:recent",
       size
     }
-
--- | What became of an attempt to move the tip; see 'Haskoin.Store.Fleet.Move'.
-data Moved
-  = -- | the tip is now this block
-    MovedTo !ByteString
-  | -- | the tip is where the live stores agree, or they agree on nothing
-    Stays
-  | -- | another store moved the tip first
-    Raced
-  deriving (Eq, Show)
 
 -- | Report the recent blocks of a store, newest first, under a lease of so
 -- many milliseconds, given the blocks that the store has views of. Says
@@ -185,99 +185,6 @@ fleetTip conn keys = run conn (R.get keys.tip)
 fleetLive :: Connection -> FleetKeys -> IO [(ByteString, Time)]
 fleetLive conn keys = map (fmap (maybe 0 (fromIntegral . fst) . C.readInteger)) <$> run conn (R.hgetall keys.lease)
 
--- | What became of an offer; see 'Haskoin.Store.Fleet.Pool.Offer'.
-data Offered
-  = -- | it is in the pool now
-    Taken
-  | -- | it was there already
-    Known
-  | -- | these transactions of the pool spend what it spends
-    Conflict ![ByteString]
-  | -- | these outputs are neither made by the pool nor unspent at the tip
-    Orphan ![ByteString]
-  | -- | the tip is not the one that the store checked the transaction
-    -- against: check again and offer again
-    Late
-  deriving (Eq, Show)
-
--- | What a transaction does at an address; see
--- 'Haskoin.Store.Fleet.Pool.Entry'. Addresses, outputs and scripts are
--- whatever bytes the stores of a fleet agree on.
-data PoolEntry
-  = -- | it spends from the address or pays to it
-    PoolTouches !ByteString
-  | -- | it spends this output of the address, of this amount
-    PoolSpends !ByteString !ByteString !Word64
-  | -- | it pays this output to the address, with this amount and script
-    PoolPays !ByteString !ByteString !Word64 !ByteString
-  | -- | it makes an output that holds tokens (CashTokens)
-    PoolMakes !PoolTokenOut
-  | -- | it uses up an output that holds tokens
-    PoolUses !PoolTokenOut
-  deriving (Eq, Show)
-
--- | An output that holds tokens, as an entry of the pool gives it, so that
--- the scripts in Redis never read the token prefix of a script.
-data PoolTokenOut = PoolTokenOut
-  { -- | the address of the output, if it has one
-    address :: !(Maybe ByteString),
-    output :: !ByteString,
-    category :: !ByteString,
-    -- | fungible tokens
-    amount :: !Word64,
-    -- | whether it also holds a non-fungible token
-    nft :: !Bool,
-    -- | the value of the output and its script: what the pool keeps of an
-    -- output that it makes, to list it with the category. Not given for
-    -- an output that it uses up.
-    coins :: !(Maybe (Word64, ByteString))
-  }
-  deriving (Eq, Show)
-
--- | A transaction as the pool keeps it.
-data PoolTx = PoolTx
-  { txid :: !ByteString,
-    -- | when it entered the mempool of the store that offers it. The pool
-    -- keeps the time of the first offer, so that every store lists the
-    -- transaction in the same place.
-    time :: !Word64,
-    -- | the outputs that it spends, in the order of its inputs
-    inputs :: ![ByteString],
-    -- | what a store needs to answer about it
-    body :: !ByteString,
-    -- | whether it says itself that it can be replaced by fee. Whether it
-    -- can also depends on the transactions of the pool that it spends
-    -- from, which the pool works out and keeps right as those come and go.
-    signals :: !Bool,
-    -- | what it does at each address
-    entries :: ![PoolEntry]
-  }
-  deriving (Eq, Show)
-
--- | What the blocks between two tips did; see
--- 'Haskoin.Store.Fleet.Pool.Change'.
-data PoolChange = PoolChange
-  { -- | transactions that come back
-    returned :: ![PoolTx],
-    -- | transactions of abandoned blocks that cannot come back
-    gone :: ![ByteString],
-    -- | transactions that the new blocks confirm
-    confirmed :: ![ByteString],
-    -- | outputs that the new blocks spend, each followed by the transaction
-    -- of the block that spends it and the height of that block in four
-    -- bytes, big-endian: what replaces a transaction of the pool that
-    -- spends it ('Haskoin.Store.Fleet.Pool.advanceReplacing')
-    spent :: ![ByteString],
-    -- | the height of the block that the tip moves to, by which what was
-    -- replaced 2016 blocks before is forgotten, if it is known
-    height :: !(Maybe Word32),
-    -- | transactions of the abandoned blocks that the store has as
-    -- replaced, each followed like an output of 'spent' by what replaced
-    -- it: kept as replaced once the tip reaches it
-    lost :: ![ByteString]
-  }
-  deriving (Eq, Show)
-
 -- | Offer a transaction to the pool: given the size of a transaction id,
 -- the tip that the store checked against, the transaction, whether the
 -- store finds each output that it spends unspent at that tip, in the order
@@ -292,29 +199,18 @@ poolOffer ::
   [ByteString] ->
   IO Offered
 poolOffer conn keys tsize seen tx unspents replaced =
-  run conn (evalScript poolScript [] args) >>= \case
-    ["taken"] -> return Taken
-    ["known"] -> return Known
-    "conflict" : rivals -> return (Conflict rivals)
-    "orphan" : outputs -> return (Orphan outputs)
-    ["raced"] -> return Late
-    other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
-  where
-    flags = C.pack [if unspent then '1' else '0' | unspent <- unspents]
-    args = ["offer", keys.prefix, num tsize, maybe "" id seen, flags, B.concat replaced] <> txArgs tx
+  fromMaybe Late <$> transact conn 5 (D.offer (D.poolKeys keys.prefix tsize) seen unspents replaced tx)
 
 -- | Take transactions out of the pool, with all that spends them. Gives
 -- those that left.
 poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString]
-poolWithdraw conn keys tsize ts =
-  run conn (evalScript poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
+poolWithdraw conn keys tsize ts = decided conn (D.withdraw (D.poolKeys keys.prefix tsize) ts)
 
 -- | Take out of the pool what has been in it since before a time, in
 -- seconds of the clock of Redis, so many at most, with all that spends
 -- them, choosing and withdrawing them in one call. Gives those that left.
 poolExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
-poolExpire conn keys tsize before most =
-  run conn (evalScript poolScript [] ["expire", keys.prefix, num tsize, C.pack (show before), num most])
+poolExpire conn keys tsize before most = decided conn (D.expire (D.poolKeys keys.prefix tsize) before most)
 
 -- | Keep the newest of the transactions that the fleet has seen, so
 -- many. Gives how many are kept.
@@ -332,8 +228,7 @@ poolExpire conn keys tsize before most =
 -- trimmed here, when it has grown a hundredth past its bound, and not on
 -- every addition.
 fleetTrimSeen :: Connection -> FleetKeys -> Int -> IO Integer
-fleetTrimSeen conn keys most =
-  run conn (evalScript poolScript [] ["trim", keys.prefix, "0", num most])
+fleetTrimSeen conn keys most = decided conn (D.trim (D.poolKeys keys.prefix 0) most)
 
 -- | Of these transactions, which the fleet has seen ('fleetTrimSeen'), in one
 -- round trip.
@@ -417,10 +312,7 @@ fleetCommit ::
   ByteString ->
   IO Moved
 fleetCommit conn keys tsize clock store seen target known path token =
-  advance conn keys tsize clock seen target how (fromMaybe unchanged known) (path, token)
-  where
-    how = maybe ("1|" <> store) (const "0") known
-    unchanged = PoolChange [] [] [] [] Nothing []
+  advance conn keys tsize clock seen target (maybe (D.AloneNotKnowing store) D.Changing known) (path, token)
 
 -- | Move the tip to a block and empty the pool, for a store that has both
 -- the tip and the block and finds the way between them longer than it
@@ -437,7 +329,7 @@ fleetCommit conn keys tsize clock store seen target known path token =
 -- peers for theirs.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
-  advance conn keys tsize clock seen target "2" (PoolChange [] [] [] [] Nothing []) ([], "")
+  advance conn keys tsize clock seen target D.TooLong ([], "")
 
 -- | How many times the pool was emptied, by 'fleetRestart' or by a store
 -- alone that did not have the old tip. A store that sees another number
@@ -448,8 +340,10 @@ fleetRestarts :: Connection -> FleetKeys -> IO Integer
 fleetRestarts conn keys =
   maybe 0 (maybe 0 fst . C.readInteger) <$> run conn (R.get (keys.prefix <> "fleet:restarts"))
 
--- | The advance of the pool script, with its way of treating the pool: "0"
--- to change it, "1" and "2" to empty it ('fleetAdvance', 'fleetRestart').
+-- | A move of the tip with the pool and the cache, as one decision
+-- ('Haskoin.Store.Fleet.Pool.Decide.advance'). Another store that changes
+-- what the decision asked about makes it be decided again, three times at
+-- most: then the move is 'Raced', and the store tries at its next turn.
 advance ::
   Connection ->
   FleetKeys ->
@@ -457,24 +351,21 @@ advance ::
   Maybe Time ->
   Maybe ByteString ->
   ByteString ->
-  ByteString ->
-  PoolChange ->
+  D.How ->
   ([ByteString], ByteString) ->
   IO Moved
-advance conn keys tsize clock seen target how change (path, token) =
-  run conn (evalScript poolScript [] args) >>= \case
-    ["moved"] -> return (MovedTo target)
-    ["stays"] -> return Stays
-    ["raced"] -> return Raced
-    other -> fail ("Unexpected answer of the pool script: " <> show (other :: [ByteString]))
+advance conn keys tsize clock seen target how (path, token) =
+  fromMaybe Raced <$> transact conn 3 decision
   where
-    args =
-      ["advance", keys.prefix, num tsize, maybe "" id seen, target, maybe "" num clock, num keys.size, how]
-        <> [maybe "" num change.height]
-        <> [B.concat change.gone, B.concat change.confirmed, B.concat change.spent, B.concat change.lost]
-        <> [num (length change.returned)]
-        <> concatMap txArgs change.returned
-        <> [B.concat path, token]
+    decision :: (Monad m) => Atomic m Moved
+    decision = D.advance (D.poolKeys keys.prefix tsize) seen target (fromIntegral <$> clock) keys.size how path token
+
+-- | Carry out a decision that has to be: one that other stores keep
+-- changing the ground of is decided again, a hundred times before this
+-- gives up with an exception. Nothing was written then.
+decided :: Connection -> (forall m. (Monad m) => Atomic m a) -> IO a
+decided conn decision =
+  transact conn 100 decision >>= maybe (fail "The fleet changed under a decision a hundred times") return
 
 -- | Read from the pool as it is at a tip: given the size of a transaction
 -- id, the tip that the caller answers from, what to read and its arguments,
@@ -532,22 +423,6 @@ fleetEventsAfter conn keys from wait =
     pairs (R.Bulk (Just k) : R.Bulk (Just v) : more) = (k, v) : pairs more
     pairs _ = []
 
--- | A transaction as the arguments of the pool script.
-txArgs :: PoolTx -> [ByteString]
-txArgs tx =
-  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, if tx.signals then "1" else "0", num (length tx.entries)]
-    <> concatMap entry tx.entries
-  where
-    entry = \case
-      PoolTouches a -> ["t", a, "", "", "", ""]
-      PoolSpends a o v -> ["s", a, o, num v, "", ""]
-      PoolPays a o v s -> ["o", a, o, num v, s, ""]
-      PoolMakes k -> token (if k.nft then "M" else "m") k
-      PoolUses k -> token (if k.nft then "U" else "u") k
-    token kind k =
-      [kind, fromMaybe "" k.address, k.output, num k.amount, maybe "" coins k.coins, k.category]
-    coins (v, s) = num v <> " " <> s
-
 -- | The transactions of the pool, each with the outputs that it spends one
 -- after the other.
 poolSpends :: Connection -> FleetKeys -> IO [(ByteString, ByteString)]
@@ -570,44 +445,6 @@ run conn f =
     Right x -> return x
     Left e -> fail ("Redis error: " <> show e)
 
--- | A Lua script that Redis keeps compiled under its digest.
---
--- @EVAL@ sends the whole script with every call, and Redis hashes it every
--- time to find it compiled: for the scripts of the pool, several kilobytes
--- for a read of a few bytes. That was most of what Redis did for a simple
--- request, and Redis has one thread for the whole fleet. So a script is
--- loaded once, its digest kept here, and called by it with @EVALSHA@. A
--- Redis that lost its scripts, as one that restarted, says @NOSCRIPT@, and
--- the script is loaded again. The digest is the same on every Redis, so
--- one is kept for the program, not for each connection.
-data Script = Script
-  { source :: !ByteString,
-    digest :: !(IORef (Maybe ByteString))
-  }
-
--- | A script of this source. Only for a top-level binding marked NOINLINE,
--- so that there is one of each script.
-script :: ByteString -> Script
-script s = unsafePerformIO (Script s <$> newIORef Nothing)
-{-# NOINLINE script #-}
-
--- | Run a script, as 'R.eval' does, by its digest.
-evalScript :: (RedisResult a) => Script -> [ByteString] -> [ByteString] -> Redis (Either Reply a)
-evalScript sc keys args =
-  liftIO (readIORef sc.digest) >>= \case
-    Nothing -> load
-    Just sha ->
-      R.evalsha sha keys args >>= \case
-        Left (Error e) | "NOSCRIPT" `B.isPrefixOf` e -> load
-        r -> return r
-  where
-    load =
-      R.scriptLoad sc.source >>= \case
-        Left e -> return (Left e)
-        Right sha -> do
-          liftIO (writeIORef sc.digest (Just sha))
-          R.evalsha sha keys args
-
 -- | 'Haskoin.Store.Fleet.mayReport' and 'Haskoin.Store.Fleet.report' in one
 -- step.
 reportScript :: Script
@@ -624,9 +461,3 @@ moveScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/move.lu
 readScript :: Script
 readScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/read.lua" >>= embedFile)
 {-# NOINLINE readScript #-}
-
--- | 'Haskoin.Store.Fleet.Pool.offer', 'Haskoin.Store.Fleet.Pool.withdraw',
--- and 'Haskoin.Store.Fleet.Pool.advance' with the move of the tip.
-poolScript :: Script
-poolScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/pool.lua" >>= embedFile)
-{-# NOINLINE poolScript #-}

@@ -140,6 +140,35 @@ whitelist it must now say what they grant (`--peer-permission`, or
   token endpoint, taken from a regtest chain.
 
 ### Changed
+- **The shared mempool is changed by decisions made in Haskell, each
+  carried out in Redis in one step or not at all**
+  (`Haskoin.Store.Fleet.Atomic`, `Haskoin.Store.Fleet.Pool.Decide`,
+  `docs/concurrency.md`). Its rules were a Lua script of eight hundred
+  lines, which had two faults. A script that fails after its first write
+  keeps what it wrote, so an error in it left the pool half changed, as
+  the output of value 0 did on 19 November; and the rules were kept
+  twice, in Lua to run and in Haskell to test against.
+  - A decision can only ask Redis questions and list writes, which its
+    type says. One small script that decides nothing asks the questions
+    again and carries out the writes only if every answer is the same;
+    otherwise it writes nothing and the decision is made again. An error
+    in a decision is an exception in Haskell before Redis is told
+    anything.
+  - The decisions are held to the script that they replace, which no
+    store runs any more: the two side by side in one Valkey, through
+    drawn sequences of offers, withdrawals, expiries and moves of the
+    tip, with all that Redis has compared after every step
+    (`Haskoin.Store.Fleet.DecideSpec`).
+  - **It costs Redis more:** an offer that is taken is two calls where it
+    was one, and about 137 microseconds of Redis where the script took 74
+    (Valkey's own count). That leaves room for some seven thousand offers
+    a second.
+  - **Breaking for a fleet: keys start with `hs3:<network>:`**, where they
+    started with `hs2:`. Stores of this version and older ones on one
+    Redis are two fleets, each with its own pool. Upgrade every store of
+    a fleet together; the keys under `hs2:` can be deleted afterwards.
+  The scripts of the reports, of the move of the tip without the pool and
+  of the cache of extended public keys are as they were.
 - **The testnet3 of Bitcoin Cash is `--net bchtest3`**, no longer
   `bchtest`, as haskoin-core 3.0 renames it after `bchtest4`. Bitcoin Cash
   Node still runs testnet3, and the store keeps it, as it keeps Bitcoin

@@ -15,17 +15,21 @@ in step with the code.
 
 Every concurrent protocol is a pure state machine: its transitions are
 functions of a module of their own, tested with QuickCheck through arbitrary
-sequences of events, or a Lua script that Redis runs atomically, tested
-against a model of it. The threads store the state and carry out what the
-transitions decide. A race is ruled out in one of four ways, and each piece
-of state below names which:
+sequences of events; or a decision about the state in Redis, made in
+Haskell and carried out in one step; or a short Lua script that Redis runs
+atomically, tested against a model of it. The threads store the state and
+carry out what the transitions decide. A race is ruled out in one of four
+ways, and each piece of state below names which:
 
 - **A single owner.** One thread changes the state; others at most read it.
 - **One transaction per decision.** The state is read, the decision made and
   the new state written in one STM transaction.
-- **One script per decision.** In Redis, a decision and its writes are one
-  Lua script, which checks again what it depends on (the tip, the agreed
-  block, the token of a move) and refuses with `raced` if it changed.
+- **One step per decision.** In Redis, a decision and its writes are one
+  step: a Lua script that checks again what it depends on (the tip, the
+  agreed block, the token of a move) and refuses with `raced` if it
+  changed; or, for the shared mempool, a decision made in Haskell from
+  what Redis said, which a script carries out only if Redis still says
+  all of it ("Decisions in one step", below).
 - **The order of one queue.** Events that must keep an order go through one
   mailbox that one thread reads.
 
@@ -89,22 +93,81 @@ every order of events, or by a test.
 
 Each store is a member of a fleet, alone or not. The state in Redis (the
 tip, the pool, the leases and reports, the seen set, the cache of xpubs, the
-events) is written only by the Lua scripts of `src/Haskoin/Store/Fleet/lua`,
-each a single decision that checks again what it depends on. The pure model
-is `Haskoin.Store.Fleet` (tip agreement, leases, who may empty the pool) and
-`Haskoin.Store.Fleet.Pool` (the pool), and `RedisSpec` runs the scripts
-against the model step by step.
+events) is written only in single steps, each a decision that checks again
+what it depends on. The pool, the seen set, the events of the pool and the
+move of the tip with the pool are written by the decisions of
+`Haskoin.Store.Fleet.Pool.Decide`; the reports, the move of the tip alone
+and the cache of xpubs by the Lua scripts of `src/Haskoin/Store/Fleet/lua`.
+The pure model is `Haskoin.Store.Fleet` (tip agreement, leases, who may
+empty the pool) and `Haskoin.Store.Fleet.Pool` (the pool), and `RedisSpec`
+runs both against the model step by step.
+
+### Decisions in one step
+
+The changes to the pool were one Lua script of eight hundred lines. Redis
+ran it alone, which made each change one step, and it had two faults. A
+script that fails after its first write keeps what it wrote, since Redis
+undoes nothing: a field that was not there, or a number that Redis did not
+take, left the pool half changed. And the rules were kept twice, in Lua to
+run and in Haskell to test against, joined by tests that draw sequences
+at random; a bug of 19 November was in that gap.
+
+Now a change is a **decision** (`Haskoin.Store.Fleet.Atomic`):
+
+1. It is a computation that can only ask Redis questions and add to a
+   list of writes. It runs in any monad, so its type says that it does
+   nothing else. Every question is kept with its answer.
+2. One small script (`lua/atomic.lua`) is given the questions with their
+   answers, and the writes. It asks every question again. If one answer
+   differs it writes nothing and says so, and the decision is made again.
+   If all are the same it carries out the writes.
+
+Why that is one step. Redis runs the script alone (R1), so the answers
+are all true at one moment, that of the script. The decision is a
+function of its answers and of nothing else. So the writes are what the
+decision would have written had it run inside Redis at that moment.
+
+Why it cannot fail half way. The script compares every answer before its
+first write, and then runs plain commands with nothing to decide between
+them. A fault in a decision is an exception in Haskell, before Redis is
+told anything.
+
+What it rests on, and how each part is established:
+
+| Part | How |
+| --- | --- |
+| A decision does nothing but ask and write | by its type: it is run as `forall m. Monad m => Atomic m a` |
+| The script compares before it writes, and decides nothing | by reading it: a hundred lines, with no rule of the fleet in them |
+| A decision sees its own writes as Redis would say them (`replay`) | tested: 5,000 drawn cases against the pure model of Redis, and 300 against a Valkey; where it cannot tell, it stops with an error and guesses nothing |
+| The pure model of Redis says what Redis says | tested against a Valkey: any writes, then every question |
+| A decision whose answers changed writes nothing | tested against a Valkey, with a set and a hash of 200 members in whatever order Redis lists them |
+| No change is lost when many decide at once | tested: eight threads, four hundred additions to one number |
+| Each key has one kind, so a plain write cannot be refused | by convention of `Haskoin.Store.Fleet.Pool.Decide`, not by a type |
+| The decisions do what the script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
+
+None of this is proved. What changed is where a fault can be: in a pure
+function, where it is an exception before any write, and no longer in
+the middle of a script.
+
+What it costs. An offer that is taken is two calls to Redis where it was
+one, and Redis spends about 137 microseconds on it where the script took
+74 (Valkey's own count, 2,000 offers). A decision is gone through more
+than once to learn what it asks, so that Redis is asked in a few calls
+and not once for each question.
+
+Stores that keep the pool in this way have keys that start with `hs3:`,
+and those that ran the script `hs2:`: on one Redis they are two fleets.
 
 The invariants the fleet relies on:
 
 | | Invariant | Why it holds |
 | --- | --- | --- |
-| I1 | The tip, the pool and the cache's tip change only together | one script, `pool.lua` advance |
-| I2 | Each pool input spends an output of the pool or one unspent at the tip; one spender per output; the pool is closed under parents | the offer checks the tip it was judged at, in the script |
+| I1 | The tip, the pool and the cache's tip change only together | one decision, `advance`, carried out in one step |
+| I2 | Each pool input spends an output of the pool or one unspent at the tip; one spender per output; the pool is closed under parents | the offer checks the tip it was judged at, in the same step |
 | I3 | The tip moves only to a block that every live store has a view of | `report.lua` takes a report only from a store with a view of the tip, or alone; the advance checks the agreed block |
 | I4 | The pool is emptied only when no live store could say the way | the advance empties for a way that the caller does not know only if the caller is the one live store (`mayEmptyAlone`), and only a store whose report was taken moves the tip |
 | I5 | A store keeps a view of the fleet tip while it is live | `prune` decides what to keep in the transaction that lets views go, and a block joins the recent ones before its view is taken |
-| I6 | A transaction is in the seen set only if some store will not need to fetch it again | a transaction in conflict stays waiting until the pool decides on it; expiry chooses and withdraws in one script |
+| I6 | A transaction is in the seen set only if some store will not need to fetch it again | a transaction in conflict stays waiting until the pool decides on it; expiry chooses and withdraws in one step |
 
 The member's own state:
 
@@ -242,3 +305,8 @@ finding was checked against the code before it was fixed.
   above.
 - A change to a Lua script is tested against Redis (`Haskoin.Store.Fleet.*`
   specs), and the pure model changes with it.
+- A change to a decision of the pool is tested against the pure model
+  (`RedisSpec`). `DecideSpec` then fails, since the script that it
+  compares with has not changed: say there what differs and why, or drop
+  the comparison once the script is no longer what the stores should do.
+- A decision writes to a key only as the kind that the key has.

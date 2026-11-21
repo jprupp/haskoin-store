@@ -1,7 +1,7 @@
 -- The cache of extended public keys of a fleet: xpubScript in
 -- Haskoin.Store.Fleet.XPub, which says what an entry is and why, after
--- greedy.lua. pool.lua keeps the part of each entry that comes from the
--- shared mempool.
+-- greedy.lua. The pool (Haskoin.Store.Fleet.Pool.Decide) keeps the part
+-- of each entry that comes from the shared mempool.
 --
 -- ARGV[1] is what to do, ARGV[2] the prefix of the keys, and ARGV[3] the
 -- size of a transaction id in bytes. An output is the id of the transaction
@@ -62,7 +62,7 @@
 --
 -- A move of the fleet tip changes the chain's layer of the entries in the
 -- same commit as the pool and the tip: the last step is the advance of
--- pool.lua, which takes the pool to the new block, stamps a new version on
+-- the pool, which takes the pool to the new block, stamps a new version on
 -- every entry that the move wrote, and puts the cache at the new place of
 -- the tip. What comes before it is written in pieces, each a short script,
 -- so that a large block does not hold Redis for long:
@@ -350,7 +350,7 @@ if what == 'build' then
       redis.call('HSET', e .. 'oval', ARGV[i], kept(a, ARGV[i + 2], ARGV[i + 3]))
       i = i + 4
     end
-    -- what the pool has for the address, which pool.lua keeps up from now
+    -- what the pool has for the address, which the pool keeps up from now
     local rows = redis.call('ZRANGE', key.atx .. a, 0, -1, 'WITHSCORES')
     for j = 1, #rows, 2 do
       redis.call('ZADD', e .. 'txs', rows[j + 1], rows[j])

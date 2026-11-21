@@ -8,8 +8,10 @@ describes the code; it is not part of the package.
 
 Every server answers from the same mempool, that mempool is valid on top
 of the block the fleet answers from, and the two always change together.
-Each rule is a Lua script that Redis runs in one step, and the tests hold
-the scripts to a pure model. The weak points are listed at the end.
+Each change to the pool is a decision made in Haskell and carried out in
+Redis in one step, or not at all (`docs/concurrency.md`, "Decisions in one
+step"). The tests hold the decisions to a pure model, and to the Lua
+script that they replace. The weak points are listed at the end.
 
 ## The problem
 
@@ -37,7 +39,7 @@ knows nothing of the mempool, and is unhealthy.
 - **What the fleet saw** (`fleet:seen`): the newest 100,000 transactions
   that the pool decided on, by the time each was first seen: those that
   entered it, that an offer found in it or in conflict with it, and that
-  left it unconfirmed. `pool.lua` adds them in the step that decides, and
+  left it unconfirmed. The pool adds them in the step that decides, and
   each server trims the set at its turn when it grows a hundredth past its
   bound. A server checks every announcement against it in one call
   (`ZMSCORE`), and against what it holds to offer, and fetches none of
@@ -48,8 +50,10 @@ knows nothing of the mempool, and is unhealthy.
   another fetches the transaction. Without an answer from Redis, a server
   fetches what is announced.
 
-The pool and the tip are written only by `pool.lua`, so one script call
-changes them together or not at all.
+The pool and the tip are written only by the decisions of the pool
+(`Haskoin.Store.Fleet.Pool.Decide`), each carried out in one step: they
+change together or not at all, and a decision that fails has written
+nothing.
 
 ## Getting in: the offer
 
@@ -102,8 +106,8 @@ A transaction leaves the pool only for a reason:
 
 - it was replaced (above);
 - it is older than the mempool timeout, counted on the pool's own times
-  (`expirePool`, run by every server each turn): `pool.lua` chooses the
-  old transactions and withdraws them in one call, so that one that left
+  (`expirePool`, run by every server each turn): one decision chooses the
+  old transactions and withdraws them, so that one that left
   and came back with a new time is not withdrawn for its old one;
 - the tip moved to a block that confirms it, or that spends what it spends.
 
@@ -271,8 +275,9 @@ These hold after every script call:
   inserts.
 - **Closed under parents.** Removing a transaction removes its
   descendants, except when it was confirmed.
-- **Tip and pool together.** Only `pool.lua` changes either, in one call,
-  after checking the tip it was given. Reads check the tip too.
+- **Tip and pool together.** Only a decision of the pool changes either,
+  in one step, after checking the tip it was given. Reads check the tip
+  too.
 
 The check of the chain (the flags) happens in the server, outside Redis.
 That is safe because the flags are about the chain at one block, which
@@ -352,8 +357,10 @@ size.
 | Part | Code |
 | --- | --- |
 | The rules, as pure functions | `src/Haskoin/Store/Fleet/Pool.hs`, `src/Haskoin/Store/Fleet.hs` |
-| Offer, withdraw, move the tip | `src/Haskoin/Store/Fleet/lua/pool.lua` |
+| Offer, withdraw, expire, move the tip | `src/Haskoin/Store/Fleet/Pool/Decide.hs` |
+| Decisions carried out in one step | `src/Haskoin/Store/Fleet/Atomic.hs`, `Atomic/Redis.hs`, `lua/atomic.lua` |
 | Reads that check the tip | `src/Haskoin/Store/Fleet/lua/read.lua` |
-| Calling the scripts | `src/Haskoin/Store/Fleet/Redis.hs` |
+| Calling them | `src/Haskoin/Store/Fleet/Redis.hs` |
+| The script that the decisions replace, for the tests | `test/Haskoin/Store/Fleet/pool.lua`, `Oracle.hs` |
 | Offering, moving, restarting, expiring | `src/Haskoin/Store/Fleet/Member.hs` |
 | Answering from view and pool | `src/Haskoin/Store/Database/Query/Pooled.hs` |

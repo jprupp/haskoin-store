@@ -64,9 +64,10 @@ for i = 1, #first, size do
       return {'stays'}
     end
     redis.call('SET', KEYS[1], block)
-    -- the moves of the tip are counted, next to it: see pool.lua
+    -- the moves of the tip are counted, next to it, as the advance of the
+    -- pool counts them (Haskoin.Store.Fleet.Pool.Decide)
     redis.call('INCR', string.sub(KEYS[1], 1, -4) .. 'moves')
-    -- and told to the stores, as pool.lua tells it
+    -- and told to the stores, as the advance tells it
     redis.call('XADD', string.sub(KEYS[1], 1, -4) .. 'events', 'MAXLEN', '~', '10000', '*', 'k', 'b', 'h', block)
     return {'moved', block}
   end

@@ -400,7 +400,8 @@ data MemSummary = MemSummary
   deriving (Show, Read, Eq, Ord, Generic, Hashable, Serialize, NFData)
 
 -- | What the mempool does to the tokens of one category at one address,
--- added up, as the pool of the fleet keeps it (@pool.lua@): what a token
+-- added up, as the pool of the fleet keeps it
+-- ("Haskoin.Store.Fleet.Pool.Decide"): what a token
 -- balance of the chain needs to become one with the mempool.
 --
 -- Unlike t'MemSummary', it does not add up what is paid and what is spent

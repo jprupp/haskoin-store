@@ -27,8 +27,8 @@ tested-with:
     GHC == 9.12.4
 extra-source-files:
     cbits/haskoin_store_merge.h
+    src/Haskoin/Store/Fleet/lua/atomic.lua
     src/Haskoin/Store/Fleet/lua/move.lua
-    src/Haskoin/Store/Fleet/lua/pool.lua
     src/Haskoin/Store/Fleet/lua/read.lua
     src/Haskoin/Store/Fleet/lua/report.lua
     src/Haskoin/Store/Fleet/lua/xpub.lua
@@ -67,9 +67,14 @@ library
       Haskoin.Store.Database.Writer
       Haskoin.Store.Exception
       Haskoin.Store.Fleet
+      Haskoin.Store.Fleet.Atomic
+      Haskoin.Store.Fleet.Atomic.Redis
       Haskoin.Store.Fleet.Member
       Haskoin.Store.Fleet.Pool
+      Haskoin.Store.Fleet.Pool.Decide
+      Haskoin.Store.Fleet.Pool.Types
       Haskoin.Store.Fleet.Redis
+      Haskoin.Store.Fleet.Script
       Haskoin.Store.Fleet.XPub
       Haskoin.Store.Ingest
       Haskoin.Store.Ingest.Ledger
@@ -314,7 +319,10 @@ test-suite spec
       Haskoin.Store.Database.WriterSpec
       Haskoin.Store.DownloadSpec
       Haskoin.Store.ExceptionSpec
+      Haskoin.Store.Fleet.AtomicSpec
       Haskoin.Store.Fleet.CacheSpec
+      Haskoin.Store.Fleet.DecideSpec
+      Haskoin.Store.Fleet.Oracle
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
       Haskoin.Store.Fleet.XPubSpec

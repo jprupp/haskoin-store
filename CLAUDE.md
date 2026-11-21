@@ -55,12 +55,22 @@
 ## Concurrency
 
 Every protocol that runs at once, in a store or across a fleet, is a pure
-machine or a Lua script that decides it in one call, and
-`docs/concurrency.md` says which, who owns each piece of shared state, and
-why no interleaving breaks it. A change to one of them updates that
+machine, a decision of `Haskoin.Store.Fleet.Atomic` or a Lua script that
+decides it in one call, and `docs/concurrency.md` says which, who owns
+each piece of shared state, and why no interleaving breaks it. A change to one of them updates that
 document, and adds the property that the change keeps to the machine's
 spec. Change shared state only from its owner, or in one STM transaction
 that reads what the decision depends on.
+
+The shared mempool in Redis is changed only by the decisions of
+`Haskoin.Store.Fleet.Pool.Decide`: Haskell that asks Redis questions and
+lists writes, which `lua/atomic.lua` carries out only if every answer is
+still the same. Do not write a rule of the fleet in Lua: a script that
+fails after its first write leaves Redis half changed. A decision writes
+to a key only as the kind that the key has. `Haskoin.Store.Fleet.DecideSpec`
+holds the decisions to the script that they replaced
+(`test/Haskoin/Store/Fleet/pool.lua`); a change to a decision makes it
+fail, and has to say there what differs and why.
 
 ## The path into the shared mempool
 
@@ -171,12 +181,12 @@ obvious, and no long chains of commands joined with `&&` or `;` on one line.
 
 Build the documentation with `haskell-dev docs` and make sure it has no
 warnings about broken markup. The command ends with a check of the comments:
-a change must add nothing to what that check reports. It reports 170
-problems on master after the concurrency fixes of 2.0.0, all older than the
-check: 49 ambiguous names, 17 names out of scope, 77 links to names that
-their module does not export, 10 links to pages or anchors that do not
-exist, 4 namespace letters
-written right after a parenthesis, and 13 slashes to write `\/`. Keep the
+a change must add nothing to what that check reports. It reports 165
+problems on master since the rules of the shared mempool are decided in
+Haskell, all older than the check: 49 ambiguous names, 17 names out of
+scope, 77 links to names that their module does not export, 6 links to
+pages or anchors that do not exist, 3 namespace letters written right
+after a parenthesis, and 13 slashes to write `\/`. Keep the
 lines after `Documentation check` in a file before the change, and compare
 with `diff` after it. CI builds the documentation too, with `stack haddock`,
 both with the OS libraries and with `stack --nix`.

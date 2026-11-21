@@ -15,9 +15,9 @@ An entry has, for the addresses that a scan of the key reads:
 - **the chain's layer**: balances, transactions and unspent outputs at the
   block that the cache is at, which is the fleet tip;
 - **the pool's layer**: what the shared pool does at those addresses.
-  `pool.lua` edits it in the same script that changes the pool;
+  the pool edits it in the same step that changes the pool;
 - **lookahead**: a gap's worth of unused addresses after the window of each
-  chain, derived and indexed at build, so that `pool.lua` finds a payment
+  chain, derived and indexed at build, so that the pool finds a payment
   to the next address of a wallet and puts it in the entry at once.
 
 A read answers only when the request's tip, the fleet tip and the cache's
@@ -29,7 +29,7 @@ reads one version of each entry, and is answered again if one changes.
 
 The member that moves the fleet tip writes the cache's part first, in
 pieces (`cacheBegin`, then `cachePieces`), each marking the entries that it
-touches. Then one script (`fleetCommit`, in `pool.lua`) moves the pool, the
+touches. Then one step (`fleetCommit`, the decision `advance`) moves the pool, the
 fleet tip and the cache tip together, stamps the marked entries and clears
 the marks. A read of a marked entry waits up to two seconds, then has the
 request answered again: no request sees half a move. A move with no piece

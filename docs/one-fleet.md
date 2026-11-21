@@ -35,7 +35,7 @@ exactly the code that a fleet of ten runs.
 ## How a request is answered
 
 ```
-peers ──tx──▶ intake ──checks at tip + pool──▶ pool.lua ──▶ pool, xpub entries, events
+peers ──tx──▶ intake ──checks at tip + pool──▶ offer ──▶ pool, xpub entries, events
 peers ──block──▶ block store ──▶ RocksDB (chain only) ──▶ report ──▶ tip move
 request ──▶ RocksDB view at the fleet tip + pool (Query.Pooled) ──▶ answer
 xpub request ──▶ door ──hit──▶ entry in Redis ──▶ answer

@@ -1,4 +1,17 @@
-module Haskoin.Store.Fleet.RedisSpec (spec, withRedis) where
+module Haskoin.Store.Fleet.RedisSpec
+  ( spec,
+    withRedis,
+
+    -- * For the spec of the decisions of the pool
+    PoolStep (..),
+    txOf,
+    block,
+    out,
+    number,
+    address,
+    timeOf,
+  )
+where
 
 import Control.Monad (foldM_, forM_)
 import Data.ByteString (ByteString)

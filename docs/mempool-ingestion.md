@@ -293,6 +293,6 @@ into inputs and carries out outputs, and drops events of peers past a
 bound while telling the machine so), the thread that asks the RPC of the
 node and the calls that it makes (`ingestFeed`, `nodeFeed`, tested
 against both nodes), the two functions of the member that
-ask the pool and offer to it (`memberSettled`, `memberOffer`), the Lua
-scripts of the pool (`docs/concurrency.md` says how those are checked,
-and that gap is the next piece of work), and GHC's runtime.
+ask the pool and offer to it (`memberSettled`, `memberOffer`), the pool
+itself (`docs/concurrency.md`, "Decisions in one step", says how its
+changes are made one step and how that is checked), and GHC's runtime.

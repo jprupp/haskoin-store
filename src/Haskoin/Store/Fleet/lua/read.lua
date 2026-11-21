@@ -1,5 +1,6 @@
 -- What a store reads from the shared mempool of its fleet: readScript in
--- Haskoin.Store.Fleet.Redis. pool.lua writes what this reads.
+-- Haskoin.Store.Fleet.Redis. Haskoin.Store.Fleet.Pool.Decide writes what
+-- this reads.
 --
 -- ARGV[1] is what to read, ARGV[2] the prefix of the keys, ARGV[3] the size
 -- of a transaction id in bytes, and ARGV[4] the fleet tip that the store

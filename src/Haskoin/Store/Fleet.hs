@@ -146,7 +146,8 @@ mayReport now store has fleet =
 -- tip, may empty the pool to move there: only if it is the one store that
 -- is live. Another that is live may know the way; and a store that is not
 -- live, whose report was refused, is behind the others and knows least.
--- @pool.lua@ checks the same in the script that empties the pool.
+-- 'Haskoin.Store.Fleet.Pool.Decide.advance' checks the same in the step
+-- that empties the pool.
 --
 -- One store live was the rule once, whichever store it was: a store that
 -- came back behind the tip, with its report refused, emptied the pool of

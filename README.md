@@ -386,7 +386,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--redis-max-xpubs` | `REDIS_MAX_XPUBS` | `10000` | Size of the xpub cache, at least 1; evicted by cost to index again and by use |
 
 Redis is how stores agree, and every store is a member of a fleet, even a
-fleet of one. Every key starts with `hs2:<network>:`.
+fleet of one. Every key starts with `hs3:<network>:`.
 
 - **The block** is the newest that every live store has. A request is
   answered from it, from the store's view of its database at that block.
@@ -898,8 +898,9 @@ RocksDB holds the chain alone. The mempool is the fleet's pool in Redis.
 
 `docs/one-fleet.md` has the reasons, and `docs/fleet-mempool.md` the pool
 in detail and its tests. `docs/concurrency.md` says, for every protocol
-that runs at once, in a store and across a fleet, which pure machine or
-Lua script decides it, who owns what, and why no interleaving breaks it.
+that runs at once, in a store and across a fleet, which pure machine,
+decision or Lua script decides it, who owns what, and why no interleaving
+breaks it.
 The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
@@ -913,10 +914,13 @@ cannot open the database afterwards, so take a copy first.
 - **Take a copy of the database first.** The migration from version 23 is
   the one below; on Bitcoin Cash it reads every block since May 2023, which
   takes hours, and carries on where it was if it is stopped.
-- **Upgrade every store of a fleet together.** The scripts of the shared
-  pool in Redis take token entries, which an older store's scripts do not
-  know. The transactions that are in the pool at the upgrade have no token
-  entries: their tokens count once a block confirms them.
+- **Upgrade every store of a fleet together.** The stores of 2.0.0 keep
+  the shared pool under keys that start with `hs3:`, where older stores
+  use `hs2:`: on one Redis the two are separate fleets, each with a pool
+  of its own, and their answers differ until all are upgraded. The new
+  pool starts empty and fills from the nodes. Once no older store runs,
+  the keys under `hs2:` are of no use: flush that Redis, or delete them
+  (`redis-cli --scan --pattern 'hs2:*' | xargs redis-cli unlink`).
 - **Clients** that do not know the `token` field ignore it; on Bitcoin the
   JSON is as it was.
 
@@ -1069,7 +1073,9 @@ entry as soon as the pool takes it. `docs/xpub-indexing.md` has the design.
 | `Haskoin.Store.XPub.Service` | The door to the fleet's cache of xpubs: a hit answers, a miss asks the indexer |
 | `Haskoin.Store.Fleet.Member`, `Haskoin.Store.Fleet.XPub` | A fleet, and its cache |
 | `Haskoin.Store.Fleet`, `Haskoin.Store.Fleet.Pool` | The rules of the fleet tip and of the pool, as pure decisions |
-| `Haskoin.Store.Fleet.Redis` | Those rules carried out in Redis, one Lua script per step |
+| `Haskoin.Store.Fleet.Redis` | Those rules carried out in Redis, each change in one step |
+| `Haskoin.Store.Fleet.Atomic` | A decision made in Haskell from what Redis says, and carried out only if Redis still says the same |
+| `Haskoin.Store.Fleet.Pool.Decide` | Every change to the shared mempool, as such decisions |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Router` | Routing of requests to handlers, directly over WAI |
 | `Haskoin.Store.Web.Docs` | The API reference that the server serves at its root |

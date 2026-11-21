@@ -99,22 +99,24 @@ fleet's pool in Redis keeps, as transactions come and go:
 | `pool:acat:{address}`, `pool:chold:{category}` | the categories of an address, the addresses of a category |
 
 The fleet member sends the tokens of every output that a transaction makes
-or uses up with its other entries, so the Lua scripts never read a prefix.
+or uses up with its other entries, so nothing in Redis ever reads a prefix.
 
 **Free and spent, not paid and spent.** The summary of an address adds up
 what the pool pays and what it spends, and takes off what it does both
 to. Token sums cannot work that way. A category can have 2^63 − 1 tokens,
 often all in one output, and moving them twice in the pool would push a
-sum of what was paid past what Redis can hold. The script would then fail
-halfway. So each output that holds tokens counts once at most: as free,
+sum of what was paid past what Redis can hold, and Redis would refuse the
+addition. So each output that holds tokens counts once at most: as free,
 while the pool makes it and doesn't use it up, or as spent, while the pool
 uses it up and the chain made it. Each sum is then the tokens of outputs
 that exist together, never more than the supply. Only the amount received
 counts every output, as it does in the chain.
 
-**Amounts in two parts.** Lua's numbers are exact only up to 2^53. The
-script splits each amount into the digits above the last nine and the
-last nine, adds the two parts apart, and the store joins them again.
+**Amounts in two parts.** The pool keeps each amount as the digits above
+the last nine and the last nine, adds the two parts apart, and the store
+joins them again. It began for the Lua script that kept the pool, whose
+numbers are exact only up to 2^53, and stays because the scripts that
+read the pool still add the parts.
 
 A token balance with the pool is the chain's balance minus what the pool
 spends, plus what is free: `confirmed` is the chain's amount minus the

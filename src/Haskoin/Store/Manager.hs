@@ -302,9 +302,15 @@ withStalls cfg db action = do
   where
     note level = logAt level (withSource "Database" cfg.logger)
 
--- | What every key of the fleet in Redis starts with.
+-- | What every key of the fleet in Redis starts with. The number is that of
+-- the way the fleet keeps its state: stores that keep it in another way
+-- have another, and so are a fleet of their own on the same Redis, where
+-- sharing keys would have each misread what the other wrote. It is 3 since
+-- the rules of the shared mempool are decided in Haskell
+-- ("Haskoin.Store.Fleet.Pool.Decide"), which keeps what a transaction does
+-- at addresses in a form that the script before it does not read.
 cachePrefix :: Network -> ByteString
-cachePrefix net = "hs2:" <> C.pack net.name <> ":"
+cachePrefix net = "hs3:" <> C.pack net.name <> ":"
 
 -- | The store as a member of its fleet, on the Redis that 'connectRedis'
 -- connected and checked ('Nothing' only without one, in tests): under a
