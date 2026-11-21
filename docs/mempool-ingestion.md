@@ -40,7 +40,7 @@ what had to hold from end to end, so nothing could be proved.
 These are the axioms: what the proofs take from the world. Each is a rule
 of the nodes that haskoin-core's protocol notes translate from their
 source (`doc/protocol/bitcoin-core.md`, `bitcoin-cash-node.md`). A1, A2,
-A3 and A5 have a test against both nodes in Podman
+A3, A5 and F1 have a test against both nodes in Podman
 (`Haskoin.Store.NodeAxiomsSpec`), so that a release of a node that
 changes one of them is noticed.
 
@@ -52,10 +52,19 @@ changes one of them is noticed.
 | A4 | A node sends in order, and stops sending to a peer that stops reading. It never asks again by itself. |
 | A5 | A node names a transaction after the transactions that it spends from, within one answer. Across answers and across peers there is no order. |
 | A6 | A node drops transactions from its mempool without saying so: confirmed, replaced, evicted, expired. |
+| F1 | The RPC of a node is a source as a peer is one: `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from, and `getrawtransaction` gives a transaction or the error -5 for one that the node has not. Any other answer, or none, says nothing of what the node has. |
 | R1 | A Redis script runs alone, start to end. |
 | R2 | Redis may lose all its data, and the store finds out (the epoch). It may be away for any time. |
 | U1 | The runner gives every connection a name of its own, never used again: in haskoin-node a connection is a peer of its own. |
 | U2 | The runner gives the machine its inputs one at a time, those of one peer in the order in which they came. |
+
+**What A5 is needed for.** The machine fetches and offers a chain in any
+order of arrival, so with room to spare the order of names does not
+matter. At the bound it does: the ids that are named first get the room.
+A source that named a transaction before what it spends from would give
+the room to one that cannot be offered, and a store with less room than
+its node's mempool has transactions would go round for ever. The model
+checker has a world that shows this, and that must fail.
 
 ## What must be true
 
@@ -94,8 +103,11 @@ changes one of them is noticed.
 
 - **Without a source**, T3 does not hold, and cannot: by A1 a transaction
   that the store missed is not announced again. A store whose peers are
-  all strangers on Bitcoin has no source. T1 and T2 still hold, and the
-  store says at its start, and in `/health`, that it has no source.
+  all strangers on Bitcoin, and that was not given the RPC of a node, has
+  no source. T1 and T2 still hold, and the store says in its log, for
+  each peer that is none, and in `/health` (`mempool`), that it has no
+  source. A test shows it: such a store lacks what its node took before
+  it connected, and has it once it is given the RPC.
 - **The pool may hold what the node dropped** (A6): a transaction evicted
   or expired at the node stays in the pool until a block conflicts with
   it or the pool's own limit of age takes it out. Each store of a fleet
@@ -124,6 +136,14 @@ changes one of them is noticed.
 - **Reading the source again**, at the start, when dirty, and at a period
   that follows what a reading costs and what it finds. This is what makes
   every loss temporary, and T3 true from any state.
+- **A source that is no peer is a peer to the machine.** The RPC of the
+  node (`Haskoin.Store.NodeRpc`) comes as a peer that is a source, is
+  asked for its mempool and for transactions by the same outputs, within
+  the same window, and answers with the same inputs. When a call fails it
+  is a peer that went, and when it is tried again a new peer (U1). So the
+  machine, its proofs and its model have nothing that is particular to
+  the RPC, and what the store asks a node at once over RPC follows what
+  the node delivers, with no number written down for it.
 - **No room is a reason, not a wait.** Announcements are ids of 32 bytes
   and cheap to drop when the source is read again; blocking a peer's
   reader would stop its blocks too.
@@ -191,6 +211,10 @@ states.
   ends with the mempool of every connected source in the pool (T3).
 - Four bugs planted in `step`, one for each kind of check, are each
   found. A check that has never failed is not known to work.
+- One world breaks an assumption and must fail: a source that names a
+  child first, with room for one id (A5). The search finds the store going
+  round for ever there, and the program of `scripts/check-ingest.sh` ends
+  with a failure if that world passes, or if any other fails.
 
 **Sampled**, which is weaker: 3,000 runs of a larger world (two chains of
 three, three peers, every disturbance) keep the same rules and converge.
@@ -208,6 +232,11 @@ in Podman:
   and one failed one run in three on the path before this one, a race.
   They do not decide the order of events, and so cannot find a race by
   themselves: that is what the model checker is for.
+- **A store whose only source is the RPC** (the same spec): a Bitcoin
+  Core that whitelists nobody, and a store that was away while
+  transactions came, with and without a block. It has them when it is
+  back. Without the RPC the same test fails, on what the node took before
+  the store connected.
 - **The assumptions** (`Haskoin.Store.NodeAxiomsSpec`), with a peer of the
   tests' own that keeps what a node sends: a node names a transaction to
   a peer once, and never one that it took before the peer connected (A1);
@@ -215,7 +244,11 @@ in Podman:
   each transaction after those it spends from, sends one that is asked
   for, and says `notfound` for one that it never had (A2, A3, A5); asked
   by a peer with no permission, Bitcoin Core closes the connection and
-  Bitcoin Cash Node, which serves Bloom filters, answers (A2).
+  Bitcoin Cash Node, which serves Bloom filters, answers (A2). Over its
+  RPC, a node gives the id of every transaction of its mempool, each
+  after those it spends from, the transactions asked for, and its word
+  for one that it never had; a node that nobody listens for, or that does
+  not know the account, is an exception and never an empty mempool (F1).
 - **Not tested:** that a node stops sending to a peer that stops reading
   (A4), and that it says nothing of what it drops (A6), which is an
   absence. The limit of 50,000 names to a message is not reached by a
@@ -240,6 +273,16 @@ kind that the stores had, and none showed in an example.
    by reading, before the checker ran; each source owes its own reading
    now.
 
+5. **A call of the RPC that failed was an empty mempool**, in the loop
+   that read the RPC before it was a source of this path, and a
+   transaction that the node did not send was no different from one that
+   it has not. Found by reading, when the RPC was made a source: the two
+   are now an exception and the node's word (F1).
+6. **The program of the model checker said that all was well after a
+   world had failed.** It printed the failure and ended as a success.
+   Found by breaking A5 on purpose to see what the order of names is
+   needed for.
+
 The same search showed where the first model of the world was wrong: it
 used the name of a peer again for a later connection, which haskoin-node
 never does (U1).
@@ -247,7 +290,9 @@ never does (U1).
 What stays outside the proofs is named: the axioms, the runner
 (`Haskoin.Store.Ingest.Run`, which decides nothing: it turns messages
 into inputs and carries out outputs, and drops events of peers past a
-bound while telling the machine so), the two functions of the member that
+bound while telling the machine so), the thread that asks the RPC of the
+node and the calls that it makes (`ingestFeed`, `nodeFeed`, tested
+against both nodes), the two functions of the member that
 ask the pool and offer to it (`memberSettled`, `memberOffer`), the Lua
 scripts of the pool (`docs/concurrency.md` says how those are checked,
 and that gap is the next piece of work), and GHC's runtime.

@@ -64,15 +64,26 @@ thread, the runner of `Haskoin.Store.Ingest.Run`, owns one pure machine,
 of one queue: a peer that comes or goes, what it names, a transaction, a
 `notfound`, the clock, whether the store is in sync, and the answers of
 the pool to what the machine asked. The machine decides; the runner
-carries out. `docs/mempool-ingestion.md` has what the machine guarantees
-and how each guarantee is established, by a proof, by a model checker that
-goes through every order of events, or by a test.
+carries out.
+
+The RPC of the node, when the store has it, is a source of the path with a
+thread of its own (`ingestFeed`). To the machine it is a peer: one that
+comes when the web server starts, goes when a call fails, and comes again,
+as a new peer, when it is tried again. The thread decides nothing either:
+it makes the calls that the machine asked for and puts the answers in the
+queue of events.
+
+`docs/mempool-ingestion.md` has what the machine guarantees and how each
+guarantee is established, by a proof, by a model checker that goes through
+every order of events, or by a test.
 
 | State | Owner | Rule |
 | --- | --- | --- |
 | the machine: where each id is, the window of each peer | the runner's thread | single owner; every change is `step` |
 | the queue of events | written by the thread that reads the node's events, read by the runner | events of peers are dropped past 20,000, and the machine is told that something was lost |
 | `state`, what `/health` reads | written by the runner after each step | one transaction per write |
+| what is asked of the RPC of the node | written by the runner, read by the thread of the feed (`ingestFeed`) | a queue for each time the RPC is reached, named in the event that tells the machine of it; what the feed answers goes into the queue of events, and waits for room there |
+| the number of the next feed | the thread of the feed | read and added to in the transaction that tells the machine of the feed, so no number is used twice (U1) |
 
 ## The fleet
 

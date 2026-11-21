@@ -423,6 +423,14 @@ paths:
                   text: >-
                     RocksDB writes at full speed. Its files hold 412.0 GB, 405.3 GB of
                     them live data. 1 compaction running.
+                mempool:
+                  sources: 1
+                  dirty: false
+                  known: 0
+                  held: 0
+                  text: >-
+                    The store has 1 source to read a whole mempool from again, which it
+                    does when it may have missed a transaction.
                 time: '2021-06-14 10:21:43 UTC'
         '503':
           description: unavailable
@@ -488,6 +496,14 @@ paths:
                   text: >-
                     RocksDB writes at full speed. Its files hold 412.0 GB, 405.3 GB of
                     them live data. Nothing waits to be compacted or flushed.
+                mempool:
+                  sources: 1
+                  dirty: false
+                  known: 0
+                  held: 0
+                  text: >-
+                    The store has 1 source to read a whole mempool from again, which it
+                    does when it may have missed a transaction.
                 time: '2021-06-14 10:21:43 UTC'
 
   '/address/{address}/transactions':
@@ -6830,6 +6846,7 @@ components:
         - peers
         - redis
         - database
+        - mempool
         - net
         - version
         - ok
@@ -6949,6 +6966,55 @@ components:
               description: |
                 What RocksDB reports, in words: the state of writes, the size of
                 the files, and the work in hand.
+        mempool:
+          type: object
+          description: |
+            How the server stands with the mempool of its nodes. It is not a
+            check: it has no `ok`, and does not change the status.
+
+            A node announces a transaction to a peer once. A server that misses
+            one gets it back only by reading the whole mempool of a node again,
+            from a source: the RPC of a node, if the server was given one, or a
+            peer whose node allows it. Bitcoin Core allows it to a peer that it
+            whitelists with the permission `mempool`, or when it serves Bloom
+            filters; Bitcoin Cash Node serves them by default. A server with no
+            source may show fewer unconfirmed transactions than a node until the
+            next block, and the `text` at the top says so.
+          required:
+            - sources
+            - dirty
+            - known
+            - held
+            - text
+          properties:
+            sources:
+              type: integer
+              description: |
+                What the server can read a whole mempool from: connected peers
+                that give theirs when asked, and the RPC of a node while it
+                answers.
+            dirty:
+              type: boolean
+              description: |
+                Whether the server may have missed transactions that a node has,
+                and has not read a source since: it gave some up, it dropped
+                messages of its peers, or the shared mempool lost what it had. It
+                reads its sources again within seconds; with no source it stays
+                true.
+            known:
+              type: integer
+              description: |
+                Transaction ids on their way to the shared mempool: wanted,
+                asked of a peer, or held.
+            held:
+              type: integer
+              description: |
+                Transactions held: being offered, or waiting for one that they
+                spend from.
+            text:
+              type: string
+              description: |
+                The same in words.
         net:
           type: string
           description: |

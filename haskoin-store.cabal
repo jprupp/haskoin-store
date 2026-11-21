@@ -76,6 +76,7 @@ library
       Haskoin.Store.Ingest.Run
       Haskoin.Store.Logic
       Haskoin.Store.Manager
+      Haskoin.Store.NodeRpc
       Haskoin.Store.Outage
       Haskoin.Store.Runtime
       Haskoin.Store.Startup

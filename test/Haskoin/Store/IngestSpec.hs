@@ -39,6 +39,11 @@ spec = do
         case result.failure of
           Nothing -> result.states `shouldSatisfy` (> 100)
           Just _ -> expectationFailure (describeResult result)
+  describe "With a source that names a transaction before what it spends from, against A5" $
+    it "a store with room for one id goes round for ever: the order is needed at the bound" $
+      case (explore withoutOrder).failure of
+        Just (what, _) -> what `shouldContain` "goes round for ever"
+        Nothing -> expectationFailure "The world that breaks A5 converges"
   describe "in runs drawn from a larger world" $
     modifyMaxSuccess (const 2000) $
       it ("keeps the rules and converges: " <> large.name) $

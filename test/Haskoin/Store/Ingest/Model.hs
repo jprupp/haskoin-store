@@ -57,6 +57,7 @@ module Haskoin.Store.Ingest.Model
     explore,
     wander,
     scenarios,
+    withoutOrder,
     large,
     describeResult,
   )
@@ -88,6 +89,10 @@ data Scenario = Scenario
     txs :: Map H [H],
     -- | the peers, and whether each is a source
     peers :: [(P, Bool)],
+    -- | whether a source names a transaction __before__ those that it
+    -- spends from, against A5: for the world that shows what A5 is needed
+    -- for ('withoutOrder'), and for no world that has to pass
+    backwards :: Bool,
     disturbances :: [Disturbance],
     -- | disturbances stop while more than this many messages and
     -- questions are on their way: the world is not infinitely faster
@@ -291,8 +296,9 @@ nodeReads sc p msg w = case Map.lookup p w.nodes of
       | otherwise ->
           w
             { nodes = Map.insert p node {told = Set.union node.told node.has} w.nodes,
-              -- A5: parents before children
-              toStore = Map.adjust (|> MInv (sortOn depth (Set.toAscList node.has))) p w.toStore
+              -- A5: parents before children, unless the world is one
+              -- that breaks it
+              toStore = Map.adjust (|> MInv (sortOn inOrder (Set.toAscList node.has))) p w.toStore
             }
     MGet hs ->
       let (found, lost) = (filter (`Set.member` node.has) hs, filter (`Set.notMember` node.has) hs)
@@ -301,6 +307,7 @@ nodeReads sc p msg w = case Map.lookup p w.nodes of
        in w {toStore = Map.insert p reply w.toStore}
   where
     fromMaybe' = maybe Seq.empty id
+    inOrder h = if sc.backwards then negate (depth h) else depth h
     depth :: H -> Int
     depth h = case Map.findWithDefault [] h sc.txs of
       [] -> 0
@@ -515,9 +522,46 @@ large =
           },
       txs = Map.fromList [(1, []), (2, [1]), (3, [2]), (4, []), (5, [4]), (6, [5, 3])],
       peers = [(1, True), (2, True), (3, False)],
+      backwards = False,
       disturbances = [minBound .. maxBound],
       busy = 6,
       limit = 0
+    }
+
+-- | A world that must __fail__: a chain of two and room for one id and one
+-- body, as one of 'scenarios', with a source that names the child before
+-- what it spends from, against A5. The child gets the only room, cannot
+-- be offered without its parent and cannot wait in the last room, so it
+-- is given up, and the next reading of the source goes the same way: the
+-- store goes round for ever.
+--
+-- It is here to say what A5 is needed for. With room to spare the order
+-- of names does not matter, as the worlds that ask for a child first
+-- show; at the bound it decides which ids get the room. A source that
+-- named in another order would make a store with less room than its
+-- node's mempool has transactions never take the rest.
+withoutOrder :: Scenario
+withoutOrder =
+  Scenario
+    { name = "a chain of two, room for one id and one body, a source that names the child first",
+      config =
+        Config
+          { room = 1,
+            heldRoom = 1,
+            minWindow = 1,
+            maxWindow = 2,
+            patience = 1,
+            orphanLife = 2,
+            retry = 1,
+            sweepGap = 1,
+            sweepEvery = 0
+          },
+      txs = Map.fromList [(1, []), (2, [1])],
+      peers = [(1, True)],
+      backwards = True,
+      disturbances = [Mempools],
+      busy = 2,
+      limit = 1500000
     }
 
 -- | The worlds that the specs go through: each small enough to go
@@ -547,7 +591,7 @@ scenarios =
   ]
   where
     world name txs peers disturbances config =
-      Scenario {name, config, txs, peers, disturbances, busy = 2, limit = 1500000}
+      Scenario {name, config, txs, peers, backwards = False, disturbances, busy = 2, limit = 1500000}
     mixed = [(1, True), (2, False)]
     tight = small {room = 1, heldRoom = 1}
     two = small {heldRoom = 2, maxWindow = 3}

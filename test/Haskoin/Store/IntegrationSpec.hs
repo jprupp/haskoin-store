@@ -152,6 +152,7 @@ import Haskoin.Store.Data
     EventCommand (..),
     Except (..),
     HealthCheck (..),
+    MempoolHealth (..),
     RawResult (..),
     SerialList (..),
     Spender (..),
@@ -1644,6 +1645,8 @@ clientTest env = do
   sum (map (.balance.confirmed) keys.get) `shouldBe` 100000
   health <- call Client.GetHealth
   health.blocks.blocks `shouldSatisfy` (> 0)
+  -- the node of the tests whitelists the store, so it is a source
+  fmap (\(m :: MempoolHealth) -> m.sources) health.mempool `shouldBe` Just 1
   -- the database is in the check, with what RocksDB said at its last poll
   fmap (\(d :: DatabaseHealth) -> d.errors) health.database `shouldBe` Just 0
   -- an error comes back as the error that it is
@@ -2490,7 +2493,7 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
   (health ! "text") `shouldSatisfy` \case
     String t -> "The store is healthy: it has every block up to height " `T.isPrefixOf` t
     _ -> False
-  forM_ ["blocks", "last-block", "last-tx", "pending-txs", "peers", "redis", "database"] $ \check ->
+  forM_ ["blocks", "last-block", "last-tx", "pending-txs", "peers", "redis", "database", "mempool"] $ \check ->
     ((health ! check) ! "text") `shouldSatisfy` \case
       String t -> not (T.null t)
       _ -> False

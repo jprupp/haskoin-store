@@ -34,7 +34,8 @@ whitelist it must now say what they grant (`--peer-permission`, or
   - Every transaction id has one place, and leaves it settled or given up
     for a counted reason (`ingest.given_up.*`). A store that gave
     something up reads the whole mempool of its **sources** again: the
-    peers whose node gives its mempool when asked. It also reads them when
+    RPC of its node (`--node-rpc`), and the peers whose node gives its
+    mempool when asked. It also reads them when
     one connects, when the pool lost what it had, and every ten minutes.
     So a loss is temporary, where it lasted until a block: a node
     announces a transaction to a peer once.
@@ -56,14 +57,34 @@ whitelist it must now say what they grant (`--peer-permission`, or
   checker in the test suite (`Haskoin.Store.Ingest.Model`,
   `scripts/check-ingest.sh`), or tested against Bitcoin Core and Bitcoin
   Cash Node in Podman (`Haskoin.Store.MempoolSpec`, and
-  `Haskoin.Store.NodeAxiomsSpec` for what is assumed of a node). A store with no source, as one whose
-  peers are all strangers on Bitcoin, says so in its log.
+  `Haskoin.Store.NodeAxiomsSpec` for what is assumed of a node). A store
+  with no source, as one whose peers are all strangers on Bitcoin and
+  that has no RPC, says so in its log and in `/health`.
+- **The RPC of the node is a source of that path** (`--node-rpc`,
+  `Haskoin.Store.NodeRpc`): the store reads the node's whole mempool
+  through it when it starts, whenever it may have missed a transaction,
+  when the pool lost what it had, and every ten minutes, as it does of a
+  peer that gives its mempool. So a store of Bitcoin Core that its node
+  does not whitelist no longer needs a block to get back what it missed.
+  To the machine the RPC is one more peer that is a source, asked within
+  a window that follows what the node delivers, so nothing of the machine
+  or of its proofs is particular to it. Before, the RPC was read only
+  after the pool had been emptied, 2,000 transactions every two seconds,
+  and a call that failed was taken for an empty mempool: a node that does
+  not answer now says nothing about what it has, and is tried again after
+  a second, then two, up to a minute.
 - **`/health` says in words what it found.** Each check has a `text`,
   such as "The database is 4 blocks behind the best header, at height
   688,798, more than the 2 allowed: the store is syncing, or cannot import
   blocks fast enough.", and the top a `text` for the whole store: that it is
   healthy, with its height and peers, or what is wrong. They come from
   haskoin-store-data 4.0 (`healthText`), so a client writes the same.
+- **`/health` says how the store stands with the mempool of its nodes**,
+  in `mempool`: how many sources it has to read a whole mempool from
+  again, whether it may have missed transactions and has not read a
+  source since, and what is on its way to the pool. A store with no
+  source is healthy, and the `text` at the top says that what it misses
+  stays missed until a block.
 - **The check of the database says more**: beside the state of writes, the
   compactions and flushes running, the full tables in memory waiting for a
   flush, the size of the files and of their live data, and the errors in

@@ -88,7 +88,8 @@ well =
       version = "0",
       time = 0,
       redis = Nothing,
-      database = Nothing
+      database = Nothing,
+      mempool = Nothing
     }
 
 spec :: Spec

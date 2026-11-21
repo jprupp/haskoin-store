@@ -30,6 +30,7 @@ import Data.List (elemIndex, sort)
 import Data.Maybe (mapMaybe)
 import Data.Serialize (runGet, runPut)
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Haskoin
   ( GetData (..),
@@ -53,13 +54,15 @@ import Haskoin
     txHash,
     txHashToHex,
   )
+import Haskoin.Store.Ingest.Run (Feed (..))
 import Haskoin.Store.Integration.Node
-import Haskoin.Store.MempoolSpec (Bed (..), chainOf, fund, send, submit, withBed, withBedOf)
+import Haskoin.Store.MempoolSpec (Bed (..), bare, chainOf, fund, send, submit, withBed, withBedOf)
+import Haskoin.Store.NodeRpc (RpcFailure (..), nodeFeed, nodeSession)
 import Network.Socket (SockAddr (..), Socket, close)
 import Network.Socket.ByteString (recv, sendAll)
 import System.Timeout (timeout)
 import Test.Hspec
-import Test.Podman (ContainerSpec (..), address, connectTo, podmanUsable)
+import Test.Podman (address, connectTo, podmanUsable)
 
 spec :: Spec
 spec = do
@@ -76,13 +79,12 @@ spec = do
       on "asked for its mempool by a peer that it gives no permission" $
         it "closes the connection, or answers if it serves Bloom filters (A2)" $
           withBedOf (bare kind) kind (noSource kind)
+      on "asked for its mempool over its RPC" $
+        it "gives all of it, the transactions asked for, and its word for one that it has not" $
+          withBed kind overRpc
   where
     name BitcoinCore = "Bitcoin Core"
     name BitcoinCashNode = "Bitcoin Cash Node"
-    -- a node that whitelists nobody
-    bare kind =
-      let c = nodeContainer kind
-       in c {name = c.name <> "-bare", command = filter (/= "-whitelist=0.0.0.0/0") c.command}
 
 -- | A1. The node takes one transaction, a peer connects, and the node
 -- takes another: the peer is told of the second once, and of the first
@@ -142,6 +144,43 @@ noSource kind bed = do
       BitcoinCashNode -> do
         named <- namedIn <$> collect p 8
         Set.fromList named `shouldBe` Set.fromList (map txHash txs)
+
+-- | What the path into the pool assumes of the RPC of a node as a source
+-- ('nodeFeed'), which is A2 and A3 for something that is no peer: it gives
+-- the id of every transaction of the mempool; asked for transactions, it
+-- gives each that it has and says of one that it never had that it has it
+-- not. And a node that does not answer, or does not let the store in, is
+-- an exception: it is never taken for an empty mempool, or for a
+-- transaction that is gone.
+overRpc :: Bed -> IO ()
+overRpc bed = do
+  roots <- fund bed 3
+  let chains = map (chainOf 5) roots
+  submit bed chains
+  session <- nodeSession (Just bed.node.rpcSocket)
+  let feed = nodeFeed session bed.node.url
+  named <- feed.names
+  has <- rawMempool bed.node
+  length named `shouldBe` 15
+  Set.fromList (map txHashToHex named) `shouldBe` Set.fromList has
+  -- each after those it spends from, as a peer names them (A5)
+  forM_ chains $ \chain -> do
+    let places = mapMaybe ((`elemIndex` named) . txHash) chain
+    places `shouldBe` sort places
+  let mine = map txHash (concat chains)
+      never = TxHash (doubleSHA256 ("never sent" :: ByteString))
+      asked = take 2 mine <> [never] <> drop 13 mine
+  found <- feed.bodies asked
+  map (fmap txHash) found `shouldBe` map Just (take 2 mine) <> [Nothing] <> map Just (drop 13 mine)
+  -- nobody listens
+  deaf <- nodeSession (Just "/nowhere/rpc.sock")
+  (nodeFeed deaf bed.node.url).names `shouldThrow` anyException
+  (nodeFeed deaf bed.node.url).bodies asked `shouldThrow` anyException
+  -- the node does not know the account
+  let stranger = nodeFeed session (T.unpack (T.replace "test:test@" "test:other@" (T.pack bed.node.url)))
+  bed.node.url `shouldContain` "test:test@"
+  stranger.names `shouldThrow` \(RpcFailure _) -> True
+  stranger.bodies asked `shouldThrow` \(RpcFailure _) -> True
 
 -- | The transactions that messages name, in their order.
 namedIn :: [Message] -> [TxHash]

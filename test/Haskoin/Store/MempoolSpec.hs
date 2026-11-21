@@ -31,6 +31,7 @@ module Haskoin.Store.MempoolSpec
     Bed (..),
     withBed,
     withBedOf,
+    bare,
     chainOf,
     fund,
     send,
@@ -43,6 +44,7 @@ import Control.Concurrent.Async (forConcurrently_, link, withAsync)
 import Control.Exception (throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..))
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -69,7 +71,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (Logger, Permissions)
-import Haskoin.Store (Store, runWebSocket, withStore)
+import Haskoin.Store (Store, WebConfig (..), runWebSocket, withStore)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Temp (withRamDir)
 import Haskoin.Store.Integration.Valkey (redisContainer)
@@ -95,24 +97,34 @@ spec = do
   usable <- runIO podmanUsable
   case usable of
     Left why -> describe "The mempool of a store and that of its node" $ it "are the same" (pendingWith why)
-    Right () -> forM_ [BitcoinCore, BitcoinCashNode] $ \kind -> do
-      -- a group for each test on each node, with a pod of its own
-      let on what = describe (what <> ", on " <> name kind)
-      on "A store that starts from nothing" $
-        it "has the mempool of its node once it has its blocks" (withBed kind fromNothing)
-      on "A store that starts at the tip with an empty pool" $
-        it "takes the whole mempool of its node, and stays healthy and connected" (withBed kind atTheTip)
-      on "A store that was away while transactions came" $
-        it "has them when it is back" (withBed kind (away False))
-      on "A store that was away while transactions and a block came" $
-        it "has what the block left in the mempool when it is back" (withBed kind (away True))
-      on "A store whose Valkey is stopped and started again under it" $
-        it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
-      on "A store whose node takes chains while it finds blocks" $
-        it "has every transaction that no block confirmed" (withBed kind busy)
+    Right () -> do
+      forM_ [BitcoinCore, BitcoinCashNode] $ \kind -> do
+        -- a group for each test on each node, with a pod of its own
+        let on what = describe (what <> ", on " <> name kind)
+        on "A store that starts from nothing" $
+          it "has the mempool of its node once it has its blocks" (withBed kind fromNothing)
+        on "A store that starts at the tip with an empty pool" $
+          it "takes the whole mempool of its node, and stays healthy and connected" (withBed kind atTheTip)
+        on "A store that was away while transactions came" $
+          it "has them when it is back" (withBed kind (away False))
+        on "A store that was away while transactions and a block came" $
+          it "has what the block left in the mempool when it is back" (withBed kind (away True))
+        on "A store whose Valkey is stopped and started again under it" $
+          it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
+        on "A store whose node takes chains while it finds blocks" $
+          it "has every transaction that no block confirmed" (withBed kind busy)
+      -- Bitcoin Cash Node gives its mempool to any peer, so only a store
+      -- of Bitcoin Core can have no peer that is a source
+      forM_ [False, True] $ \block ->
+        describe ("A store that no peer gives a mempool to, with the RPC of its node" <> withBlock block) $
+          it "has what came while it was away" $
+            withBedOf (bare BitcoinCore) BitcoinCore (away block . rpcOnly)
   where
     name BitcoinCore = "Bitcoin Core"
     name BitcoinCashNode = "Bitcoin Cash Node"
+    withBlock block = if block then ", and a block while it is away" else ""
+    -- the node grants the store nothing, and the store has its RPC
+    rpcOnly bed = bed {granted = Set.empty, viaRpc = True}
 
 -------------------------------------------------------------------------------
 -- The tests
@@ -234,6 +246,7 @@ convergesWith each bed server seconds = do
             if now - start > fromIntegral seconds
               then do
                 recent <- bed.logTail
+                (_, health) <- getJSON server "/health"
                 when (Set.size node /= Set.size ours || node /= ours) $
                   hPutStrLn stderr . unlines $
                     ["--- the last lines of the log of the store"] <> recent
@@ -248,7 +261,9 @@ convergesWith each bed server seconds = do
                     "that the store lacks,",
                     show (Set.size (ours `Set.difference` node)),
                     "that only the store has; same best block:",
-                    show same
+                    show same <> ".",
+                    "The store says of its path into the pool:",
+                    maybe "nothing" T.unpack (field "mempool" health >>= textField "text")
                   ]
               else threadDelay 250000 >> go
   go
@@ -268,6 +283,9 @@ convergesWith each bed server seconds = do
     list = \case
       v@(Array _) -> arr v
       _ -> []
+    field name = \case
+      Object o -> KeyMap.lookup name o
+      _ -> Nothing
 
 -------------------------------------------------------------------------------
 -- Chains of transactions
@@ -366,6 +384,8 @@ data Bed = Bed
     miner :: !Text,
     redisURL :: !String,
     granted :: !Permissions,
+    -- | whether the stores of the bed are given the RPC of the node
+    viaRpc :: !Bool,
     logger :: !Logger,
     -- | the last lines of the log of the stores of the bed
     logTail :: !(IO [String])
@@ -373,6 +393,13 @@ data Bed = Bed
 
 withBed :: NodeKind -> (Bed -> IO ()) -> IO ()
 withBed kind = withBedOf (nodeContainer kind) kind
+
+-- | The container of a node that whitelists nobody: to its peers it is
+-- what a node of somebody else is.
+bare :: NodeKind -> ContainerSpec
+bare kind = c {name = c.name <> "-bare", command = filter (/= "-whitelist=0.0.0.0/0") c.command}
+  where
+    c = nodeContainer kind
 
 -- | 'withBed' with the container of the node given, for a node that is
 -- started with other options.
@@ -393,6 +420,7 @@ withBedOf nodeSpec kind go =
             miner,
             redisURL = Valkey.redisURL p,
             granted = grantedBy True kind,
+            viaRpc = False,
             logger,
             logTail
           }
@@ -410,8 +438,17 @@ withMemberIn :: Bed -> FilePath -> (Store -> Server -> IO a) -> IO a
 withMemberIn bed dir f =
   withStore (storeConfig bed.net bed.logger dir bed.redisURL bed.node.peer bed.granted) $ \store ->
     listening $ \(sock, server) ->
-      withAsync (runWebSocket (webConfig bed.logger store) sock) $ \web ->
-        link web >> f store server
+      withAsync (runWebSocket (web store) sock) $ \running ->
+        link running >> f store server
+  where
+    web store
+      | bed.viaRpc =
+          (webConfig bed.logger store)
+            { nodeRpc = Just bed.node.url,
+              nodeRpcSocket = Just bed.node.rpcSocket
+            } ::
+            WebConfig
+      | otherwise = webConfig bed.logger store
 
 -- | 'withMemberIn' a new folder.
 withMember :: Bed -> (Store -> Server -> IO a) -> IO a

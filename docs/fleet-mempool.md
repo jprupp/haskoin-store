@@ -190,22 +190,23 @@ every live server reports. Then it fills the pool again.
 ## Filling the pool again
 
 A server reads the whole mempool of its **sources** again and again: the
-peers whose node gives its mempool when asked. It does so when a source
-connects, since a node announces a transaction to a peer once and never
-one that it took before the peer connected; whenever it gave something up,
+RPC of its node, if it was given one (`--node-rpc`), and the peers whose
+node gives its mempool when asked. It does so when a source connects,
+since a node announces a transaction to a peer once and never one that it
+took before the peer connected; whenever it may have missed something,
 for want of room, of an answer or of Redis; when the pool lost what it
-had; and every ten minutes besides. What the pool has is not fetched
-again: the server asks the pool about each id first, so a reading of a
-mempool that the pool already has costs the list of its ids and no more.
-`docs/mempool-ingestion.md` has the rules, and why they make every loss
-temporary.
+had, after a loss of Redis or a restart of the pool; and every ten minutes
+besides. What the pool has is not fetched again: the server asks the pool
+about each id first, so a reading of a mempool that the pool already has
+costs the list of its ids and no more. `docs/mempool-ingestion.md` has
+the rules, and why they make every loss temporary.
 
-After a loss of Redis or a restart of the pool, each server also:
-
-- **reads its node's mempool over RPC**, with `--node-rpc`
-  (`getrawmempool`, then `getrawtransaction`), 2,000 transactions every
-  two seconds. Each goes through the offer as if a peer had sent it. This
-  always works.
+**The RPC** (`getrawmempool`, then `getrawtransaction` in batches) always
+answers its account, whatever the node allows its peers. The server asks
+it as it asks a peer: for as many transactions at once as a window that
+grows while the node answers in time and halves when it does not. A node
+that does not answer is tried again after a second, then two, up to a
+minute, and is never taken for a node with an empty mempool.
 
 **Which peers are sources.** Both nodes answer a peer that they whitelist
 with the permission `mempool`, or any
@@ -222,9 +223,11 @@ permissions that the operator says the nodes of `--peer` grant
 (`--peer-permission mempool`, as `whitebind=mempool@…` grants).
 
 A fleet without `--node-rpc`, and without a peer that serves Bloom filters
-or a `--peer` that grants `mempool`, gets back only what its peers announce
-from then on: new transactions, and those wallets broadcast again. The seen
-set was emptied with the pool, so none of those is skipped.
+or a `--peer` that grants `mempool`, has no source. It gets back only what
+its peers announce from then on: new transactions, and those wallets
+broadcast again. After a loss of the pool the seen set was emptied with
+it, so none of those is skipped. Each of its servers says in `/health`
+(`mempool`) that it has no source.
 
 ## Reading
 

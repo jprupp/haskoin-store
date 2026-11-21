@@ -127,13 +127,12 @@ import Control.Concurrent.STM
     readTVar,
     readTVarIO,
     registerDelay,
-    retry,
     stateTVar,
     writeTQueue,
     writeTVar,
   )
 import Control.Exception (Exception, catch, evaluate, fromException, throwIO, try)
-import Control.Lens ((&), (.~), (<&>), (?~), (^.))
+import Control.Lens ((&), (.~), (^.))
 import Control.Monad
   ( filterM,
     forM,
@@ -170,7 +169,6 @@ import Data.Bytes.Put
 import Data.Bytes.Serial
 import Data.Char (isSpace)
 import Data.Default (Default (..))
-import Data.Foldable qualified as Foldable
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
@@ -256,8 +254,10 @@ import Haskoin.Store.Fleet.Member
     setHealthy,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
-import Haskoin.Store.Ingest.Run (IngestState (..), ingestNamedSTM, ingestState, ingestSubmit)
+import Haskoin.Store.Ingest.Run (IngestState (..), ingestFeed, ingestNamedSTM, ingestState)
 import Haskoin.Store.Manager
+import Haskoin.Store.NodeRpc (nodeFeed, nodeOptions, unixSocketManager)
+import Haskoin.Store.NodeRpc qualified as NodeRpc
 import Haskoin.Store.Startup (explainListen, redisProblem)
 import Haskoin.Store.Web.Admission
   ( Admission,
@@ -303,8 +303,6 @@ import NQE
   ( subscribe,
     unsubscribe,
   )
-import Network.HTTP.Client (ManagerSettings (..), defaultManagerSettings)
-import Network.HTTP.Client.Internal (socketConnection)
 import Network.HTTP.Types
   ( ResponseHeaders,
     Status (..),
@@ -327,8 +325,7 @@ import Network.HTTP.Types
     statusIsClientError,
     statusIsServerError,
   )
-import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream))
-import Network.Socket qualified as Socket
+import Network.Socket (SockAddr (SockAddrUnix), Socket)
 import Network.Wai
   ( Application,
     Middleware,
@@ -481,8 +478,10 @@ data WebConfig = WebConfig
     -- | log every request, at the level of information ('logIt')
     accessLog :: !Bool,
     -- | URL of the JSON-RPC interface of a full node, with its user and
-    -- password, to publish transactions through ('sendNode'); 'Nothing'
-    -- to publish through peers only
+    -- password, to publish transactions through ('sendNode') and to read
+    -- the node's whole mempool from, as a source of the path into the
+    -- shared mempool (@nodeFeedLoop@); 'Nothing' to publish through peers
+    -- only, and to read the mempools of the peers that allow it
     nodeRpc :: !(Maybe String),
     -- | a Unix socket to send the requests of 'nodeRpc' through, in place of
     -- the host and port of its URL, which are not used then
@@ -792,9 +791,7 @@ serveWeb config serve = do
   ticker <- newTVarIO HashMap.empty
   metrics <- mapM createMetrics config.stats
   session <- Wreq.Session.newAPISession
-  nodeSession <- case config.nodeRpcSocket of
-    Nothing -> return session
-    Just path -> Wreq.Session.newSessionControl Nothing (unixSocketManager path)
+  nodeSession <- maybe (return session) (NodeRpc.nodeSession . Just) config.nodeRpcSocket
   first <- runHealthCheck
   health <- newTVarIO first
   -- A member of a fleet takes no turn before its store is known to be
@@ -954,7 +951,7 @@ serveWeb config serve = do
             withAsync (supervise "Regulate" (regulate admission (reportControl metrics))) $ \_a6 ->
               withAsync (feedEvents st) $ \a3 ->
                 withAsync (supervise "Publish" (askingLoop st)) $ \_a4 ->
-                  withAsync (supervise "Refill" (refillLoop st)) $ \_a7 ->
+                  withAsync (supervise "Node RPC" (nodeFeedLoop st)) $ \_a7 ->
                     link a3 >> do
                       let logged = logIt config.logger config.accessLog config.limits.slowRequest
                           outer =
@@ -2066,21 +2063,6 @@ sendNode st url tx =
         ("The node did not take a transaction over RPC, which goes to a peer if it is verified: " <> why)
       return Publish.Unavailable
 
--- | Settings of an HTTP client whose every connection goes to a Unix
--- socket, whatever host and port the URL names: for the RPC of a node that
--- is reached through a socket (@--node-rpc-socket@). Neither Bitcoin Core
--- nor Bitcoin Cash Node listens on one, so the socket is something that
--- joins it to the node, such as socat, or the bridge of a test in a
--- container. The URL still carries the user and the password of the RPC.
-unixSocketManager :: FilePath -> ManagerSettings
-unixSocketManager path =
-  defaultManagerSettings
-    { managerRawConnection = return $ \_ _ _ -> do
-        s <- Socket.socket AF_UNIX Stream Socket.defaultProtocol
-        Socket.connect s (SockAddrUnix path) `onException` Socket.close s
-        socketConnection s 8192
-    }
-
 -- | Run a loop of the web server for as long as the server runs: an
 -- exception that it throws is logged as an error, and the loop starts again
 -- a second later. A loop that ends by itself, as one with nothing to do,
@@ -2162,93 +2144,22 @@ askingLoop st = forever $ do
         Nothing -> maybe (return False) (\m -> isJust <$> memberPoolBody m h) own.fleet
     ask h = getPeers own.peerMgr >>= mapM_ (\op -> atomically (ingestNamedSTM op.mailbox [h] own.ingest))
 
--- | Fill the pool again from the RPC of the store's node (@--node-rpc@),
--- each time the member finds the pool emptied, because Redis lost its data
--- ('Haskoin.Store.Fleet.Member.noteEpoch') or the pool started again
--- ('Haskoin.Store.Fleet.Member.noteRestarts'): read the node's whole
--- mempool, 'refillBatch' transactions every two seconds, each given to
--- the path into the pool as a transaction that came from no peer
--- ('ingestSubmit'). That path reads the mempools of its sources again by
--- itself ("Haskoin.Store.Ingest"), but a store may have none: Bitcoin
--- Core answers only a peer that it whitelists or when it serves bloom
--- filters, which it does not by default. The RPC answers in any case.
-refillLoop :: WebState -> IO ()
-refillLoop st = forM_ own.fleet $ \m -> go m 0
-  where
-    own = st.config.store
-    say = withSource "Fleet" st.config.logger
-    go m seen = do
-      n <- atomically $ do
-        n <- readTVar m.refills
-        when (n == seen) retry
-        return n
-      forM_ st.config.nodeRpc $ \url ->
-        tryAny (refillFromNode st url) >>= \case
-          Left e -> logWarn say ("Could not read the mempool of the node over RPC: " <> cs (show e))
-          Right k -> logInfo say ("Gave the pool " <> cs (show k) <> " transactions of the node's mempool")
-      go m n
-
--- | How many transactions 'refillLoop' reads from the node at a time.
-refillBatch :: Int
-refillBatch = 2000
-
--- | Give a member every transaction of the mempool of a node, read over its
--- RPC (@getrawmempool@, then @getrawtransaction@ in batches of
--- 'refillBatch'). Says how many it gave.
-refillFromNode :: WebState -> String -> IO Int
-refillFromNode st url = do
-  ids <-
-    nodeCalls st url [("getrawmempool", [])] <&> \case
-      [Just (A.Array a)] -> [h | A.String h <- Foldable.toList a]
-      _ -> []
-  fmap sum . forM (batches ids) $ \hs -> do
-    found <- nodeCalls st url [("getrawtransaction", [A.String h]) | h <- hs]
-    let txs = [tx | Just (A.String hex) <- found, Just bytes <- [decodeHex hex], Right tx <- [decode bytes]]
-    mapM_ (ingestSubmit st.config.store.ingest) txs
-    threadDelay 2000000
-    return (length txs)
-  where
-    batches xs
-      | null xs = []
-      | otherwise = take refillBatch xs : batches (drop refillBatch xs)
-
--- | The results of calls to the JSON-RPC of a node, made in one batch, in
--- their order: 'Nothing' for one that failed.
-nodeCalls :: WebState -> String -> [(Text, [A.Value])] -> IO [Maybe A.Value]
-nodeCalls st url calls = do
-  r <- Wreq.Session.postWith nodeOptions st.nodeSession url (A.toJSON (zipWith call [0 :: Int ..] calls))
-  let answers = case A.decode (r ^. Wreq.responseBody) of
-        Just (A.Array a) ->
-          HashMap.fromList
-            [ (i, v)
-            | A.Object o <- Foldable.toList a,
-              Just (A.String i) <- [KeyMap.lookup "id" o],
-              Just v <- [KeyMap.lookup "result" o],
-              v /= A.Null
-            ]
-        _ -> HashMap.empty
-  return [HashMap.lookup (T.pack (show i)) answers | i <- [0 .. length calls - 1]]
-  where
-    call i (method, params) =
-      A.object
-        [ "jsonrpc" .= ("1.0" :: Text),
-          "id" .= T.pack (show i),
-          "method" .= method,
-          "params" .= params
-        ]
-
--- | The options of every request to the node's JSON-RPC: an answer of any
--- status is read, since the node says what went wrong in its body, and the
--- connection is closed after each answer. A connection kept open made
--- Bitcoin Cash Node wait, when it stopped, until the connection had been
--- idle for its @-rpcservertimeout@, 30 seconds by default. The store calls
--- the RPC to publish a transaction and to fill the pool again, rarely
--- enough that a new connection each time costs nothing that shows.
-nodeOptions :: Wreq.Options
-nodeOptions =
-  Wreq.defaults
-    & Wreq.checkResponse ?~ (\_ _ -> return ())
-    & Wreq.header "Connection" .~ ["close"]
+-- | Give the path into the shared mempool the RPC of the store's node
+-- (@--node-rpc@) as a source, for as long as the web server runs
+-- ('ingestFeed', 'nodeFeed'): the path then reads the node's whole mempool
+-- when the store starts, when it gave something up, when the pool lost
+-- what it had, and every ten minutes, as it does of a peer that gives its
+-- mempool. A store may have no such peer: Bitcoin Core answers only one
+-- that it whitelists, or any when it serves Bloom filters, which it does
+-- not by default. The RPC answers in any case.
+--
+-- This replaces a loop of the web server that read the RPC only after the
+-- pool had been emptied, 2,000 transactions every two seconds, and took a
+-- call that failed for an empty mempool.
+nodeFeedLoop :: WebState -> IO ()
+nodeFeedLoop st =
+  forM_ st.config.nodeRpc $ \url ->
+    ingestFeed st.config.store.ingest (nodeFeed st.nodeSession url)
 
 -- GET Mempool / Events --
 
@@ -4003,11 +3914,21 @@ handleHealth st _ =
     h <- readTVarIO st.health
     up <- readTVarIO st.cacheUp
     database <- readTVarIO st.config.store.writes
+    path <- atomically (ingestState st.config.store.ingest)
     -- Redis is mandatory: the answer always says whether it answers. The
     -- database is read every five seconds by a thread of its own
-    -- ("Haskoin.Store.Database.Stalls"), and is the last state it read
+    -- ("Haskoin.Store.Database.Stalls"), and is the last state it read.
+    -- How the store stands with the mempool of its nodes is what the path
+    -- into the pool last said ("Haskoin.Store.Ingest.Run").
     let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
-    return HealthCheck {redis = Just up, database = Just database, ..}
+        mempool =
+          MempoolHealth
+            { sources = fromIntegral path.sources,
+              dirty = path.dirty,
+              known = fromIntegral path.known,
+              held = fromIntegral path.held
+            }
+    return HealthCheck {redis = Just up, database = Just database, mempool = Just mempool, ..}
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth
@@ -4087,6 +4008,7 @@ healthCheck cfg = do
         -- or ping found, and from the last poll of the database
         redis = Nothing,
         database = Nothing,
+        mempool = Nothing,
         ..
       }
 

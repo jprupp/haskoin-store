@@ -360,7 +360,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--target-delay` | `TARGET_DELAY` | `25` | Milliseconds that a thread ready to run may wait for a core before the limit comes down |
 | `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 429 |
 | `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
-| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to fill the shared mempool from again after it is emptied; without it, or when it does not answer, transactions go to the peers |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to read the node's whole mempool from, as a source of the shared mempool; without it, or when it does not answer, transactions go to the peers, and the store reads the mempools of the peers that allow it |
 | `--node-rpc-socket` | `NODE_RPC_SOCKET` | none | Unix socket to send the requests of `--node-rpc` through, in place of the host and port of its URL; the URL still gives the user and password. Neither node listens on one itself: it is something that joins it to the node, such as socat |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
@@ -402,15 +402,16 @@ fleet of one. Every key starts with `hs2:<network>:`.
   built again as requests ask for them.
 - **When the pool starts again**, after a reorganisation deeper than 50
   blocks, the stores fill it again too.
-- **Filling the pool again** works best with `--node-rpc`: each store reads
-  its node's mempool (`getrawmempool`), 2,000 transactions every two
-  seconds. Each also reads the mempools of its sources again, as it does
-  when one connects and whenever it missed something: the peers
-  whose node takes the request, which a node closes the connection over
-  unless it offers Bloom filters or whitelists the store with `mempool`.
-  The store knows which from a model of each peer's node
-  (`docs/fleet-mempool.md`): tell it what your nodes grant with
-  `--peer-permission`.
+- **Filling the pool again** is reading the whole mempool of a
+  **source**, which a store does when it starts, whenever it may have
+  missed a transaction, when the pool lost what it had, and every ten
+  minutes. With `--node-rpc` the RPC of the node is a source, whatever the
+  node allows its peers. A peer is one when its node takes the request,
+  which a node closes the connection over unless it offers Bloom filters
+  or whitelists the store with `mempool`. The store knows which from a
+  model of each peer's node (`docs/fleet-mempool.md`): tell it what your
+  nodes grant with `--peer-permission`. A store with no source says so in
+  `/health`.
 - **`/events` is the same stream on every store**, written to Redis with
   each change of the pool and each move of the tip.
 - **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).
@@ -1128,6 +1129,19 @@ JSON).
 
 They are for people looking at a store; a program should read `"ok"` and
 the numbers, as the wording may change.
+
+**The mempool of the nodes** is in `"mempool"`: `"sources"` is how many
+things the store can read a whole mempool from again, `"dirty"` whether it
+may have missed transactions and has not read a source since, and `"known"`
+and `"held"` how many transaction ids are on their way to the shared
+mempool and how many are held. It is no check and has no `"ok"`: a store
+with no source is healthy. But a node announces a transaction to a peer
+once, so such a store shows fewer unconfirmed transactions than its node
+after it missed some, until a block has them, and the `"text"` at the top
+says so. A source is the RPC of a node (`--node-rpc`), or a peer whose node
+gives its mempool when asked: for Bitcoin Core, one that whitelists the
+store with the permission `mempool`, named with `--peer` and declared with
+`--peer-permission mempool` (`docs/mempool-ingestion.md`).
 
 **The database** is in `"database"`, as RocksDB reports it every five
 seconds: `"writes"` is `flowing`, `delayed` or `stopped`, with

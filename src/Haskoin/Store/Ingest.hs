@@ -89,6 +89,7 @@ module Haskoin.Store.Ingest
     holding,
     isDirty,
     hasSource,
+    sourceCount,
     windowOf,
 
     -- * For the specs
@@ -293,6 +294,10 @@ isDirty s = s.dirty || any (\l -> l.source && l.owed) (Map.elems s.links)
 -- the store misses stays missed.
 hasSource :: Ingest p h b -> Bool
 hasSource s = any (.source) (Map.elems s.links)
+
+-- | How many peers give their whole mempool when asked.
+sourceCount :: Ingest p h b -> Int
+sourceCount s = length (filter (.source) (Map.elems s.links))
 
 -- | The window of a peer.
 windowOf :: (Ord p) => p -> Ingest p h b -> Maybe Int

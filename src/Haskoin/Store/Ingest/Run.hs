@@ -40,12 +40,32 @@
 -- While Redis does not answer, an offer fails, and the machine asks for it
 -- again at each tick. The runner makes one such attempt a tick, not one
 -- for each transaction that is held.
+--
+-- = A source that is no peer
+--
+-- A node announces a transaction to a peer once, so what the store misses
+-- comes back only from a /source/: something that gives a node's whole
+-- mempool when asked. A peer is one when its node allows it, which Bitcoin
+-- Core does only for a peer that it whitelists. The RPC of a node always
+-- answers, so a store that has it has a source whatever its peers are: it
+-- is given to the runner as a t'Feed', with 'ingestFeed'.
+--
+-- To the machine a feed is one more peer that is a source: it is told that
+-- the feed came, asks it for its mempool and for transactions with the
+-- same outputs, within the same window, and gets the same inputs back. So
+-- nothing of the machine, of its proofs or of its model is particular to a
+-- feed. A feed that fails is a peer that went, and one that answers again
+-- is a new peer, with a new number (U1).
 module Haskoin.Store.Ingest.Run
   ( Ingester,
     IngestConfig (..),
     IngestState (..),
     withIngest,
     ingestState,
+
+    -- * A source that is no peer
+    Feed (..),
+    ingestFeed,
 
     -- * What happens
     ingestPeerUpSTM,
@@ -55,10 +75,10 @@ module Haskoin.Store.Ingest.Run
     ingestMissingSTM,
     ingestLookSTM,
     ingestEmptiedSTM,
-    ingestSubmit,
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
   ( STM,
@@ -67,6 +87,7 @@ import Control.Concurrent.STM
     atomically,
     check,
     modifyTVar',
+    newTQueue,
     newTQueueIO,
     newTVarIO,
     orElse,
@@ -102,7 +123,7 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger, Peer, logAt, sendMessage)
-import Haskoin.Store.Exception (catchAny)
+import Haskoin.Store.Exception (catchAny, onException, tryAny)
 import Haskoin.Store.Fleet.Member (Member, memberOffer, memberSettled)
 import Haskoin.Store.Ingest
 import System.Metrics.StatsD (StatCounter, StatGauge, Stats, incrementCounter, newStatCounter, newStatGauge, setGauge)
@@ -125,13 +146,41 @@ data IngestConfig = IngestConfig
     logger :: !Logger
   }
 
+-- | A way to read the whole mempool of a node that is no peer of the
+-- store, such as its RPC. Both actions throw when the node does not
+-- answer, and only then: what they return is the node's word.
+data Feed = Feed
+  { -- | what it is, for the log, as in "Reading the mempool of …"
+    label :: !Text,
+    -- | the id of every transaction of the node's mempool; none for an
+    -- empty mempool
+    names :: !(IO [TxHash]),
+    -- | the transactions asked for, in the order asked, with 'Nothing'
+    -- for one that the node says it has not
+    bodies :: !([TxHash] -> IO [Maybe Tx])
+  }
+
+-- | What the runner asks of a feed.
+data Job
+  = -- | every id of the mempool
+    ReadAll
+  | Fetch ![TxHash]
+
+-- | What the machine knows as a peer: a connection to a node, or a feed
+-- from when it is reached to when it fails, with its number among the
+-- feeds, its label and the queue of what is asked of it.
+data Link
+  = Wire !Peer
+  | Fed !Int !Text !(TQueue Job)
+  deriving (Eq)
+
 -- | Something that happened, for the runner.
 data Event
-  = PeerCame !Peer
-  | PeerLeft !Peer
-  | Names !Peer ![TxHash]
-  | Came !(Maybe Peer) !Tx
-  | Lacks !Peer ![TxHash]
+  = PeerCame !Link
+  | PeerLeft !Link
+  | Names !Link ![TxHash]
+  | Came !Link !Tx
+  | Lacks !Link ![TxHash]
   | -- | the store may be in sync now, or no longer
     Look
   | PoolLost
@@ -143,7 +192,10 @@ data Ingester = Ingester
     waiting :: !(TVar Int),
     -- | how many were dropped since the machine was last told
     dropped :: !(TVar Int),
-    state :: !(TVar IngestState)
+    state :: !(TVar IngestState),
+    -- | the number of the next feed
+    feeds :: !(TVar Int),
+    logger :: !Logger
   }
 
 -- | What the path into the pool is at, for the health check of a store
@@ -158,9 +210,9 @@ data IngestState = IngestState
     held :: !Int,
     -- | whether something was given up that no source has been read for
     dirty :: !Bool,
-    -- | whether a peer gives its whole mempool when asked. Without one,
+    -- | how many peers give their whole mempool when asked. With none,
     -- what the store misses stays missed until a block has it.
-    sourced :: !Bool
+    sources :: !Int
   }
   deriving (Eq, Show)
 
@@ -184,25 +236,35 @@ bulk e ing = do
     then modifyTVar' ing.dropped (+ 1)
     else writeTQueue ing.events e >> writeTVar ing.waiting (n + 1)
 
+-- | An event that waits until there is room for it: for a thread that
+-- may wait, as that of a feed, which the reader of the node's events may
+-- not.
+patient :: Event -> Ingester -> STM ()
+patient e ing = do
+  n <- readTVar ing.waiting
+  check (n < room)
+  writeTQueue ing.events e
+  writeTVar ing.waiting (n + 1)
+
 -- | A peer finished its handshake.
 ingestPeerUpSTM :: Peer -> Ingester -> STM ()
-ingestPeerUpSTM = always . PeerCame
+ingestPeerUpSTM = always . PeerCame . Wire
 
 -- | A peer is gone.
 ingestPeerDownSTM :: Peer -> Ingester -> STM ()
-ingestPeerDownSTM = always . PeerLeft
+ingestPeerDownSTM = always . PeerLeft . Wire
 
 -- | A peer named transactions (@inv@).
 ingestNamedSTM :: Peer -> [TxHash] -> Ingester -> STM ()
-ingestNamedSTM p hs = bulk (Names p hs)
+ingestNamedSTM p hs = bulk (Names (Wire p) hs)
 
 -- | A peer sent a transaction.
 ingestTxSTM :: Peer -> Tx -> Ingester -> STM ()
-ingestTxSTM p tx = bulk (Came (Just p) tx)
+ingestTxSTM p tx = bulk (Came (Wire p) tx)
 
 -- | A peer does not have transactions that it was asked for (@notfound@).
 ingestMissingSTM :: Peer -> [TxHash] -> Ingester -> STM ()
-ingestMissingSTM p hs = bulk (Lacks p hs)
+ingestMissingSTM p hs = bulk (Lacks (Wire p) hs)
 
 -- | The store has a new best header or a new best block: it may be in
 -- sync now, or no longer.
@@ -216,16 +278,74 @@ ingestLookSTM = always Look
 ingestEmptiedSTM :: Ingester -> STM ()
 ingestEmptiedSTM = always PoolLost
 
--- | A transaction that the store has from elsewhere than a peer, such as
--- the RPC of its node, to offer.
-ingestSubmit :: Ingester -> Tx -> IO ()
-ingestSubmit ing tx = atomically (bulk (Came Nothing tx) ing)
+-- | Give the path into the pool a source that is no peer, for as long as
+-- this runs: it does not return.
+--
+-- The feed is told to the machine as a peer that gives its mempool. What
+-- the machine then asks of that peer is asked of the feed, one thing at a
+-- time, and what the feed answers goes to the machine as what a peer names
+-- and sends. The machine asks within the window that it keeps for every
+-- peer, which follows what the feed delivers, so nothing here says how
+-- much a node is asked at once or how often.
+--
+-- When the feed throws, the machine is told that the peer went, which
+-- makes it give up what it had asked of it, with a reason, and remember
+-- that it has something to read again. The feed is tried again after a
+-- second, then two, up to a minute, as a new peer each time (U1).
+--
+-- Its events wait for room in the queue of the runner and are never
+-- dropped: this thread reads nothing else, so making it wait holds up
+-- nothing.
+ingestFeed :: Ingester -> Feed -> IO a
+ingestFeed ing feed = connect 1 False
+  where
+    -- with the seconds to wait if it fails at once, and whether it failed
+    -- the last time
+    connect wait down = do
+      (me, jobs) <- atomically $ do
+        n <- readTVar ing.feeds
+        writeTVar ing.feeds (n + 1)
+        jobs <- newTQueue
+        let me = Fed n feed.label jobs
+        always (PeerCame me) ing
+        return (me, jobs)
+      let gone = atomically (always (PeerLeft me) ing)
+      (why, still) <- serve me jobs down `onException` gone
+      gone
+      let pause = if still then wait else 1
+      unless still . say LevelWarn $
+        "Could not read " <> feed.label <> ", and will try again: " <> cs (show why)
+      threadDelay (pause * 1000000)
+      connect (min 60 (pause * 2)) True
+    -- carry out what is asked until something fails: the failure, and
+    -- whether nothing worked since the last one
+    serve me jobs down = do
+      job <- atomically (readTQueue jobs)
+      tryAny (carry me job) >>= \case
+        Left e -> return (e, down)
+        Right () -> do
+          when down (say LevelInfo ("Reading " <> feed.label <> " works again"))
+          serve me jobs False
+    carry me = \case
+      ReadAll -> do
+        hs <- feed.names
+        forM_ (pieces hs) $ \some -> atomically (patient (Names me some) ing)
+      Fetch hs -> do
+        found <- feed.bodies hs
+        forM_ found . mapM_ $ \tx -> atomically (patient (Came me tx) ing)
+        let lacking = [h | (h, Nothing) <- zip hs found]
+        unless (null lacking) (atomically (patient (Lacks me lacking) ing))
+    -- as many ids to an event as a node names in a message
+    pieces hs
+      | null hs = []
+      | otherwise = take 50000 hs : pieces (drop 50000 hs)
+    say level = logAt level ing.logger
 
 -- | What the runner keeps beside the machine.
 data Run = Run
   { machine :: !(Ingest Int TxHash Tx),
-    -- | the connections, by the numbers that name them
-    peers :: !(Map Int Peer),
+    -- | the connections and the feeds, by the numbers that name them
+    peers :: !(Map Int Link),
     -- | the number of the next connection
     next :: !Int
   }
@@ -269,10 +389,11 @@ withIngest cfg action = do
   events <- newTQueueIO
   waiting <- newTVarIO 0
   dropped <- newTVarIO 0
-  state <- newTVarIO (IngestState 0 0 0 False False)
+  state <- newTVarIO (IngestState 0 0 0 False 0)
   metrics <- mapM newMetrics cfg.stats
+  feeds <- newTVarIO 0
   now <- milliseconds
-  let ing = Ingester {events, waiting, dropped, state}
+  let ing = Ingester {events, waiting, dropped, state, feeds, logger = cfg.logger}
       run0 = Run {machine = start cfg.config now, peers = Map.empty, next = 0}
   withAsync (loop cfg ing metrics run0) $ \a -> link a >> action ing
 
@@ -336,15 +457,22 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
         when (droppable e) (atomically (modifyTVar' ing.waiting (subtract 1)))
         case e of
           PeerCame p -> do
-            src <- cfg.source p
-            unless src . say LevelInfo $
-              "Peer " <> shown p <> " does not give its mempool when asked: what the store misses of it stays missed"
+            src <- case p of
+              Wire peer -> do
+                src <- cfg.source peer
+                unless src . say LevelInfo . T.unwords $
+                  [ "Peer " <> shown peer <> " does not give its mempool when asked:",
+                    "what the store misses of it stays missed"
+                  ]
+                return src
+              -- a feed is nothing but a source
+              Fed {} -> return True
             return (run {peers = Map.insert run.next p run.peers, next = run.next + 1}, [PeerUp run.next src])
           PeerLeft p -> case keyOf run p of
             Just k -> return (run {peers = Map.delete k run.peers}, [PeerDown k])
             Nothing -> return (run, [])
           Names p hs -> return (run, [Named k hs | Just k <- [keyOf run p]])
-          Came from tx -> return (run, [Body (from >>= keyOf run) (txHash tx) tx])
+          Came from tx -> return (run, [Body (keyOf run from) (txHash tx) tx])
           Lacks p hs -> return (run, [Missing k hs | Just k <- [keyOf run p]])
           Look -> return (run, [])
           PoolLost -> return (run, [Emptied])
@@ -363,13 +491,18 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
       drive peers failing lostNow m' (is <> answers)
     perform peers failing lostNow = \case
       Get k hs -> do
-        forM_ (Map.lookup k peers) $ \p ->
-          MGetData (GetData [InvVector kind h.get | h <- hs]) `sendMessage` p
+        forM_ (Map.lookup k peers) $ \case
+          Wire p -> MGetData (GetData [InvVector kind h.get | h <- hs]) `sendMessage` p
+          Fed _ _ jobs -> atomically (writeTQueue jobs (Fetch hs))
         return []
       Sweep k -> do
-        forM_ (Map.lookup k peers) $ \p -> do
-          say LevelInfo ("Asking peer " <> shown p <> " for its mempool")
-          MMempool `sendMessage` p
+        forM_ (Map.lookup k peers) $ \case
+          Wire p -> do
+            say LevelInfo ("Asking peer " <> shown p <> " for its mempool")
+            MMempool `sendMessage` p
+          Fed _ label jobs -> do
+            say LevelInfo ("Reading " <> label)
+            atomically (writeTQueue jobs ReadAll)
         return []
       Check k hs -> case cfg.member of
         Nothing -> return [Unchecked k hs]
@@ -406,7 +539,7 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
                 pending = Haskoin.Store.Ingest.pending m,
                 held = holding m,
                 dirty = isDirty m,
-                sourced = hasSource m
+                sources = sourceCount m
               }
       atomically (writeTVar ing.state st)
       forM_ metrics $ \x -> do

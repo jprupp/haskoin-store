@@ -37,7 +37,7 @@ extra-deps:
   - git: https://github.com/jprupp/haskoin-node.git
     commit: 4e8fd893dba4e474d59de8d1078dafbdccb1e00e
   - git: https://github.com/jprupp/haskoin-store-data.git
-    commit: f202fb6d5e3277e553cb042d325a37bdc2955085
+    commit: 38977200483d01efc78c1bbef45e8b2d64310261
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to
   # 0.3.2, the version in the snapshot, every pause, resume and tickle edits
   # GHC's one timer queue, and Warp does a pause and a resume around every

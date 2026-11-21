@@ -751,7 +751,7 @@ config c = do
           "NODE_RPC"
           ( unwords
               [ "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails;",
-                "fill the shared mempool from it again after it is emptied"
+                "read the node's whole mempool over it, as a source of the shared mempool"
               ]
           )
         <> value c.nodeRpc
