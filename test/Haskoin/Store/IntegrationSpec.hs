@@ -30,7 +30,9 @@
 -- bridged to sockets. The store reaches all three through the sockets,
 -- with @--redis-url unix:PATH@, the peer @unix:PATH@ and
 -- @--node-rpc-socket@, so the pod has no network and environments that run
--- at once never meet.
+-- at once never meet. The web servers of the store listen on Unix sockets
+-- of their own too ('listening'), and the tests reach them there: no test
+-- names an address or a port of the machine.
 --
 -- The tests are skipped when Podman cannot run containers, or when
 -- @PODMAN_TEST_SKIP@ is set. Pods are removed when the tests end, data is
@@ -123,6 +125,7 @@ import Haskoin.Store
     decodeTxBody,
     defaultXPubConfig,
     runWebSocket,
+    unixSocketManager,
     withStore,
   )
 import Haskoin.Store.Common (Limits (..), StoreEvent (..))
@@ -151,6 +154,7 @@ import Haskoin.Store.Exception (bracket, tryAny)
 import Haskoin.Store.Fleet.Member (memberTip)
 import Haskoin.Store.Fleet.Redis (fleetKeys)
 import Haskoin.Store.Fleet.XPub (cacheHave, xpubId)
+import Haskoin.Store.Integration.Image (testImage)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Temp (withRamDir, withSystemTempDirectory)
 import Haskoin.Store.Integration.Valkey (redisContainer)
@@ -162,6 +166,7 @@ import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
 import Haskoin.Store.XPub.Indexer (Settings (..))
 import Haskoin.Store.XPub.Service (XPubConfig (..))
 import NQE (publish, receive, withSubscription)
+import Network.HTTP.Client (Manager, newManager)
 import Network.HTTP.Types (ResponseHeaders)
 import Network.Socket qualified as Socket
 import Network.WebSockets qualified as WS
@@ -169,11 +174,26 @@ import Network.Wreq qualified as Wreq
 import Network.Wreq.Types (FormParam ((:=)))
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.Log.FastLogger (fromLogStr, toLogStr)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec
-import Test.Podman (PodSpec (..), pod, podmanUsable, withPod)
+import Test.Podman
+  ( ContainerSpec (..),
+    Endpoint (..),
+    PodSpec (..),
+    PodmanError,
+    address,
+    container,
+    execWithin,
+    pod,
+    podmanUsable,
+    socketFolder,
+    socketInside,
+    withPod,
+  )
+import Test.Podman qualified as Podman (Address (..))
 import Text.Read (readMaybe)
 
 -- | Each environment, a node, a Redis and a store of its own, is a group at
@@ -245,11 +265,11 @@ data Env = Env
     node :: !Node,
     net :: !Network,
     store :: !Store,
-    -- | base URL of the first web server
-    cached :: !String,
-    -- | base URL of the second web server of the same store, which answers
-    -- xpubs from the same cache
-    plain :: !String,
+    -- | the first web server
+    cached :: !Server,
+    -- | the second web server of the same store, which answers xpubs from
+    -- the same cache
+    plain :: !Server,
     -- | address of the wallet of the node, to mine to
     miner :: !Text,
     -- | connection to Redis, to look at the keys
@@ -307,7 +327,7 @@ withEnvAt whitelisted ago kind go = do
           granted = grantedBy whitelisted kind
           cfg = storeConfig net logger dir redisURL node.peer granted
       withStore cfg $ \store -> do
-        listening $ \(cachedSock, cachedPort) -> listening $ \(plainSock, plainPort) -> do
+        listening $ \(cachedSock, cachedServer) -> listening $ \(plainSock, plainServer) -> do
           let web s = runWebSocket (webConfig logger s)
           conn <- Redis.checkedConnect (either error id (redisConnectInfo redisURL))
           withAsync (web store cachedSock) $ \a1 ->
@@ -322,8 +342,8 @@ withEnvAt whitelisted ago kind go = do
                         node = node,
                         net = net,
                         store = store,
-                        cached = "http://127.0.0.1:" <> show cachedPort,
-                        plain = "http://127.0.0.1:" <> show plainPort,
+                        cached = cachedServer,
+                        plain = plainServer,
                         miner = miner,
                         redis = conn,
                         configIn = \d -> storeConfig net logger d redisURL node.peer granted,
@@ -448,7 +468,9 @@ storeConfig net logger dir redisURL peer granted =
 webConfig :: Logger -> Store -> WebConfig
 webConfig logger store =
   WebConfig
-    { host = "127.0.0.1",
+    { -- not used: each server of the tests is given its Unix socket
+      -- ('listening')
+      host = "localhost",
       port = 0,
       store = store,
       maxLaggingBlocks = 100,
@@ -458,8 +480,10 @@ webConfig logger store =
       version = "test",
       stats = Nothing,
       tickerRefresh = 90 * 1000 * 1000,
-      tickerURL = "http://127.0.0.1:9/",
-      priceHistoryURL = "http://127.0.0.1:9/",
+      -- a name that never resolves (RFC 2606): nothing is asked of a
+      -- port, and the store does without its prices
+      tickerURL = "http://ticker.invalid/",
+      priceHistoryURL = "http://ticker.invalid/",
       noBlockchainInfo = False,
       healthCheckInterval = 5,
       accessLog = False,
@@ -469,16 +493,34 @@ webConfig logger store =
       logger = logger
     }
 
--- | A socket that listens on a port of the loopback interface that the
--- system chose, with that port. Nothing else can take the port between
--- choosing it and serving on it.
-listening :: ((Socket.Socket, Int) -> IO a) -> IO a
-listening f =
-  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \s -> do
-    Socket.bind s (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+-- | A web server of the tests, on a Unix socket of its own: the URL that the
+-- requests name, whose host is never looked up, the socket, and an HTTP
+-- client whose every connection goes to the socket.
+data Server = Server
+  { url :: !String,
+    socket :: !FilePath,
+    manager :: !Manager
+  }
+
+-- | The options of a request to a server, through its socket, that take
+-- every status for an answer.
+through :: Server -> Wreq.Options
+through server =
+  Wreq.defaults
+    & Wreq.manager .~ Right server.manager
+    & Wreq.checkResponse ?~ (\_ _ -> return ())
+
+-- | A socket that listens on a Unix socket in a folder of its own, and the
+-- server that it is to a client. Tests that run at once never meet, and no
+-- port of the machine is taken.
+listening :: ((Socket.Socket, Server) -> IO a) -> IO a
+listening f = withRamDir $ \dir -> do
+  let path = dir <> "/web.sock"
+  manager <- newManager (unixSocketManager path)
+  bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \s -> do
+    Socket.bind s (Socket.SockAddrUnix path)
     Socket.listen s 128
-    port <- Socket.socketPort s
-    f (s, fromIntegral port)
+    f (s, Server {url = "http://localhost", socket = path, manager})
 
 -------------------------------------------------------------------------------
 -- Talking to the store
@@ -486,20 +528,16 @@ listening f =
 
 -- | Status and JSON body of a request. A body that is not JSON, as the
 -- plain-text Blockchain.info queries give, is returned as a string.
-getJSON :: String -> String -> IO (Int, Value)
-getJSON base path = do
-  r <- Wreq.getWith opts (base <> path)
+getJSON :: Server -> String -> IO (Int, Value)
+getJSON server path = do
+  r <- Wreq.getWith (through server) (server.url <> path)
   return (r ^. Wreq.responseStatus . Wreq.statusCode, body (r ^. Wreq.responseBody))
-  where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
 
 -- | Like 'getJSON', posting a form.
-postForm :: String -> String -> [(C8.ByteString, Text)] -> IO (Int, Value)
-postForm base path params = do
-  r <- Wreq.postWith opts (base <> path) [k := v | (k, v) <- params]
+postForm :: Server -> String -> [(C8.ByteString, Text)] -> IO (Int, Value)
+postForm server path params = do
+  r <- Wreq.postWith (through server) (server.url <> path) [k := v | (k, v) <- params]
   return (r ^. Wreq.responseStatus . Wreq.statusCode, body (r ^. Wreq.responseBody))
-  where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
 
 body :: BL.ByteString -> Value
 body b = either (const (String (cs b))) id (eitherDecode b)
@@ -1159,7 +1197,7 @@ piecesTest env = do
   forM_ [block <> "/raw", "/block/best/raw"] $ \p ->
     (field "result" <$> plainJSON env p) `shouldReturn` Just hex
   plainJSON env ("/block/height/" <> show height <> "/raw") `shouldReturn` toJSON [hex]
-  text <- Wreq.get (env.plain <> "/blockchain/rawblock/" <> cs best <> "?format=hex")
+  text <- Wreq.getWith (through env.plain) (env.plain.url <> "/blockchain/rawblock/" <> cs best <> "?format=hex")
   String (cs (text ^. Wreq.responseBody)) `shouldBe` hex
   lookup "Content-Length" (text ^. Wreq.responseHeaders) `shouldBe` Nothing
   -- the transactions of a block
@@ -1216,7 +1254,7 @@ endpointsTest env = do
   field "result" raw `shouldBe` Just rawNode
   -- the same bytes as a list of one, and as the text of Blockchain.info
   plainJSON env ("/transactions/raw?txids=" <> cs t1) `shouldReturn` toJSON [rawNode]
-  rawText <- Wreq.get (env.plain <> "/blockchain/rawtx/" <> cs t1 <> "?format=hex")
+  rawText <- Wreq.getWith (through env.plain) (env.plain.url <> "/blockchain/rawtx/" <> cs t1 <> "?format=hex")
   String (cs (rawText ^. Wreq.responseBody)) `shouldBe` rawNode
   bal <- plainJSON env ("/address/" <> cs a <> "/balance")
   num "confirmed" bal `shouldBe` 400000
@@ -1539,11 +1577,8 @@ errorFormatTest :: Env -> IO ()
 errorFormatTest env = do
   let unknown = "/transaction/" <> replicate 64 'a'
       ask accept = do
-        let opts =
-              Wreq.defaults
-                & Wreq.checkResponse ?~ (\_ _ -> return ())
-                & maybe id (\a -> Wreq.header "Accept" .~ [a]) accept
-        r <- Wreq.getWith opts (env.plain <> unknown)
+        let opts = through env.plain & maybe id (\a -> Wreq.header "Accept" .~ [a]) accept
+        r <- Wreq.getWith opts (env.plain.url <> unknown)
         return
           ( r ^. Wreq.responseStatus . Wreq.statusCode,
             r ^. Wreq.responseHeader "Content-Type",
@@ -1563,7 +1598,7 @@ clientTest env = do
   let x = newXPub env "client" DeriveNormal
       -- the client puts the name of the network in the path, as
       -- api.haskoin.com has it, and the server of the tests has none
-      conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain}
+      conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain.url, socket = Just env.plain.socket}
       call :: (ApiResource a b) => a -> IO b
       call r = Client.apiCall conf r >>= either (fail . show) return
   heard <- newIORef []
@@ -1604,28 +1639,54 @@ clientTest env = do
 
 -- | A web server on the store of the tests, given a certificate that is
 -- made for the occasion: it answers over HTTPS, and does not answer a
--- request that is not encrypted. The requests are made with curl, told
--- not to mind who signed the certificate.
+-- request that is not encrypted.
+--
+-- openssl makes the certificate and curl makes the requests, both in a
+-- container of the test image ("Haskoin.Store.Integration.Image"), not
+-- from the machine: the server listens on a Unix socket of the folder of
+-- the pod, where the container reaches it, and curl is told not to mind
+-- who signed the certificate.
 tlsTest :: Env -> IO ()
-tlsTest env = withSystemTempDirectory "haskoin-store-tls-" $ \dir -> withTestLogger $ \logger -> do
-  let certificate = dir <> "/cert.pem"
-      key = dir <> "/key.pem"
+tlsTest env = withTestLogger $ \logger -> withPod (pod "tls" [tools]) {ready = []} $ \p -> do
+  path <- case address p "web" of
+    Podman.UnixSocket at -> return at
+    a -> fail ("The endpoint of the server is not a socket: " <> show a)
+  -- the folder of the pod, as the tests and as the container see it
+  let here = takeDirectory path
+      there = socketFolder
+      run = execWithin 60 p "tools"
       subject = ["-subj", "/CN=localhost", "-days", "1"]
-      files = ["-keyout", key, "-out", certificate]
-  (made, _, why) <-
-    readProcessWithExitCode "openssl" (["req", "-x509", "-newkey", "rsa:2048", "-nodes"] <> files <> subject) ""
-  (made, why) `shouldSatisfy` ((== ExitSuccess) . fst)
-  listening $ \(sock, port) -> do
-    let config = (webConfig logger env.store) {tls = Just (certificate, key)} :: WebConfig
-        status scheme = do
-          let url = scheme <> "://127.0.0.1:" <> show port <> "/health"
-          let quietly = ["-sk", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}"]
-          (_, code, _) <- readProcessWithExitCode "curl" (quietly <> [url]) ""
-          return code
+      files = ["-keyout", there </> "key.pem", "-out", there </> "cert.pem"]
+  _ <- run (["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes"] <> files <> subject)
+  let config = (webConfig logger env.store) {tls = Just (here </> "cert.pem", here </> "key.pem")} :: WebConfig
+      status scheme = do
+        let quietly = ["-sk", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}"]
+            url = scheme <> "://localhost/health"
+        -- curl prints the status, and 000 with no answer, and then fails
+        r <- try @PodmanError (run (["curl", "--unix-socket", socketInside "web"] <> quietly <> [url]))
+        return (either (const "000") id r)
+  bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+    Socket.bind sock (Socket.SockAddrUnix path)
+    Socket.listen sock 128
     withAsync (runWebSocket config sock) $ \web -> do
       link web
       waitFor "the server to answer over HTTPS" ((== "200") <$> status "https")
       status "http" `shouldNotReturn` "200"
+  where
+    -- the test image, idle until the test runs its programs; the socket
+    -- of the server is in the folder of the pod, as a socket of the
+    -- container would be. SELinux lets the tests connect to a socket that a
+    -- container made, not a container connect to one that the tests made,
+    -- so this container, which has no network and only reaches that
+    -- socket, runs without its label.
+    tools =
+      (container "tools" testImage)
+        { entrypoint = Just "sleep",
+          command = ["infinity"],
+          memory = Just "256m",
+          endpoints = [Native "web"],
+          options = ["--security-opt", "label=disable"]
+        }
 
 -- | The parts of HTTP that are not about any one endpoint: a request for
 -- the headers alone, the question that a browser asks before a request
@@ -1635,19 +1696,19 @@ httpTest :: Env -> IO ()
 httpTest env = do
   let x = newXPub env "http" DeriveNormal
       addresses = T.intercalate "," [at env x [0, i] | i <- [0 .. 2]]
-      quiet = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
+      quiet = through env.plain
       statusOf r = r ^. Wreq.responseStatus . Wreq.statusCode
   -- the headers of an answer, without the answer
-  headed <- Wreq.headWith quiet (env.plain <> "/block/best")
+  headed <- Wreq.headWith quiet (env.plain.url <> "/block/best")
   (statusOf headed, headed ^. Wreq.responseHeader "Content-Type") `shouldBe` (200, "application/json")
   -- what may be asked from another site
-  asked <- Wreq.optionsWith quiet (env.plain <> "/transactions")
+  asked <- Wreq.optionsWith quiet (env.plain.url <> "/transactions")
   statusOf asked `shouldBe` 204
   asked ^. Wreq.responseHeader "Access-Control-Allow-Methods" `shouldBe` "GET, HEAD, POST, DELETE, OPTIONS"
   asked ^. Wreq.responseHeader "Access-Control-Allow-Origin" `shouldBe` "*"
   -- compressed for a client that reads it, and the same answer
   let balances = "/address/balances?addresses=" <> T.unpack addresses
-  packed <- Wreq.getWith (quiet & Wreq.header "Accept-Encoding" .~ ["gzip"]) (env.plain <> balances)
+  packed <- Wreq.getWith (quiet & Wreq.header "Accept-Encoding" .~ ["gzip"]) (env.plain.url <> balances)
   packed ^. Wreq.responseHeader "Content-Encoding" `shouldBe` "gzip"
   (_, inQuery) <- getJSON env.plain balances
   -- the same list in the body of a request, where it may be as long as it likes
@@ -1656,10 +1717,10 @@ httpTest env = do
   inBody `shouldBe` inQuery
   length (arr inBody) `shouldBe` 3
   -- the reference of the API, as a page and as what the page shows
-  page <- Wreq.getWith quiet (env.plain <> "/")
+  page <- Wreq.getWith quiet (env.plain.url <> "/")
   (statusOf page, page ^. Wreq.responseHeader "Content-Type") `shouldBe` (200, "text/html; charset=utf-8")
   BL.toStrict (page ^. Wreq.responseBody) `shouldSatisfy` C8.isInfixOf "swagger-ui"
-  reference <- Wreq.getWith quiet (env.plain <> "/swagger.yaml")
+  reference <- Wreq.getWith quiet (env.plain.url <> "/swagger.yaml")
   statusOf reference `shouldBe` 200
   -- one server, the one that served it, wherever it is mounted
   let described = BL.toStrict (reference ^. Wreq.responseBody)
@@ -1777,10 +1838,8 @@ publishTx env tx = publishBody env (cs (encodeHex (encode tx)))
 
 publishBody :: Env -> C8.ByteString -> IO (Int, Value)
 publishBody env bytes = do
-  r <- Wreq.postWith opts (env.plain <> "/transactions") bytes
+  r <- Wreq.postWith (through env.plain) (env.plain.url <> "/transactions") bytes
   return (r ^. Wreq.responseStatus . Wreq.statusCode, body (r ^. Wreq.responseBody))
-  where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
 
 -- | A good transaction whose input the store cannot judge, because it
 -- would have to run a script: it spends a coin locked by a script of its
@@ -1913,36 +1972,35 @@ inflatedTokens env = do
 -- what the store verified goes to the peers. Each that is published is
 -- answered 202.
 askTest :: Env -> IO ()
-askTest env = withTestLogger $ \logger -> listening $ \(sock, port) -> listening $ \(deaf, deafPort) -> do
-  let rpcURL = env.node.url
-      config url
-        | url == rpcURL = (webConfig logger env.store) {nodeRpc = Just url, nodeRpcSocket = Just env.node.rpcSocket}
-        | otherwise = (webConfig logger env.store) {nodeRpc = Just url} :: WebConfig
-      asking = env {plain = "http://127.0.0.1:" <> show port} :: Env
-      unanswered = env {plain = "http://127.0.0.1:" <> show deafPort} :: Env
-      up e = (== 200) . fst <$> getJSON e.plain "/block/best?notx=true"
-      refused why (code, v) = (code, fmap (T.isInfixOf why) (textField "message" v)) `shouldBe` (400, Just True)
-  -- nothing listens on port 1
-  let withBoth go =
-        withAsync (runWebSocket (config rpcURL) sock) $ \a ->
-          withAsync (runWebSocket (config "http://127.0.0.1:1/") deaf) $ \b ->
-            link a >> link b >> go
-  withBoth $ do
-    waitFor "the server that has the RPC of the node" (up asking)
-    waitFor "the server whose node does not answer" (up unanswered)
-    unsentFree env >>= publishTx asking >>= refused "min relay fee not met"
-    unsent env >>= publishTx asking >>= \(code, v) -> do
-      code `shouldBe` 202
-      fmap (T.isInfixOf "full node took") (textField "message" v) `shouldBe` Just True
-    -- not judged by the store: over RPC only
-    first <- unjudged env
-    publishTx env first >>= refused "cannot verify"
-    publishTx unanswered first >>= refused "cannot verify"
-    publishTx asking first >>= \(code, _) -> code `shouldBe` 202
-    -- verified by the store: to the peers when the RPC does not answer
-    unsent env >>= publishTx unanswered >>= \(code, v) -> do
-      code `shouldBe` 202
-      fmap (T.isInfixOf "Handed over") (textField "message" v) `shouldBe` Just True
+askTest env = withTestLogger $ \logger -> listening $ \(sock, server) -> listening $ \(deaf, deafServer) ->
+  withRamDir $ \dir -> do
+    let rpc' socket =
+          (webConfig logger env.store) {nodeRpc = Just env.node.url, nodeRpcSocket = Just socket} :: WebConfig
+        asking = env {plain = server} :: Env
+        unanswered = env {plain = deafServer} :: Env
+        up e = (== 200) . fst <$> getJSON e.plain "/block/best?notx=true"
+        refused why (code, v) = (code, fmap (T.isInfixOf why) (textField "message" v)) `shouldBe` (400, Just True)
+        -- an RPC that does not answer: a socket that nothing listens on
+        withBoth go =
+          withAsync (runWebSocket (rpc' env.node.rpcSocket) sock) $ \a ->
+            withAsync (runWebSocket (rpc' (dir <> "/nothing.sock")) deaf) $ \b ->
+              link a >> link b >> go
+    withBoth $ do
+      waitFor "the server that has the RPC of the node" (up asking)
+      waitFor "the server whose node does not answer" (up unanswered)
+      unsentFree env >>= publishTx asking >>= refused "min relay fee not met"
+      unsent env >>= publishTx asking >>= \(code, v) -> do
+        code `shouldBe` 202
+        fmap (T.isInfixOf "full node took") (textField "message" v) `shouldBe` Just True
+      -- not judged by the store: over RPC only
+      first <- unjudged env
+      publishTx env first >>= refused "cannot verify"
+      publishTx unanswered first >>= refused "cannot verify"
+      publishTx asking first >>= \(code, _) -> code `shouldBe` 202
+      -- verified by the store: to the peers when the RPC does not answer
+      unsent env >>= publishTx unanswered >>= \(code, v) -> do
+        code `shouldBe` 202
+        fmap (T.isInfixOf "Handed over") (textField "message" v) `shouldBe` Just True
 
 -- | Pay a script from the wallet of the node, and give the coin: where it
 -- is, and the output that holds it.
@@ -2131,7 +2189,7 @@ tokenTest env = do
     String t | Just c <- hexToTxHash t -> return c
     other -> fail ("Not a category: " <> show other)
   owner <- maybe (fail "Not an address") return (textToAddr env.net to)
-  let conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain}
+  let conf = Client.ApiConfig {net = env.net {name = ""}, host = env.plain.url, socket = Just env.plain.socket}
       call :: (ApiResource a b) => a -> IO b
       call r = Client.apiCall conf r >>= either (fail . show) return
       everything = LimitsParam Nothing (OffsetParam 0) Nothing
@@ -2175,8 +2233,11 @@ eventsTest :: Env -> IO ()
 eventsTest env = do
   let x = newXPub env "events" DeriveNormal
       y = newXPub env "events-other" DeriveNormal
-      port = read (reverse (takeWhile (/= ':') (reverse env.plain))) :: Int
-      client path = WS.runClient "127.0.0.1" port path
+      client :: String -> WS.ClientApp a -> IO a
+      client path app =
+        bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \s -> do
+          Socket.connect s (Socket.SockAddrUnix env.plain.socket)
+          WS.runClientWithSocket s "localhost" path WS.defaultConnectionOptions [] app
       json = BL.toStrict . marshalJSON env.net
       -- every event that a client hears after saying something, in order
       hearing path say heard = client path $ \c -> do
@@ -2247,10 +2308,10 @@ eventsTest env = do
   cancel resumed
   (reverse <$> readIORef again) `shouldReturn` [two, three, four, block]
   -- and the same without a WebSocket, one event to a line
-  streamed <- eventLines (env.plain <> since) 4
+  streamed <- eventLines env.plain since 4
   map (either error id . eitherDecode . BL.fromStrict) streamed `shouldBe` [two, three, four, block]
   -- the stream too can be of what touches an address
-  chosen <- eventLines (env.plain <> since <> "&addresses=" <> T.unpack (at env y [0, 1])) 2
+  chosen <- eventLines env.plain (since <> "&addresses=" <> T.unpack (at env y [0, 1])) 2
   map (either error id . eitherDecode . BL.fromStrict) chosen `shouldBe` [three, block]
   fst <$> getJSON env.plain "/events?addresses=nonsense" `shouldReturn` 400
   fst <$> getJSON env.plain "/events?derive=segwit" `shouldReturn` 400
@@ -2260,27 +2321,31 @@ eventsTest env = do
   refused <- tryAny (client ("/events?after=" <> replicate 64 '0') (\_ -> return ()))
   either (const True) (const False) refused `shouldBe` True
   -- a command that cannot be read ends the connection, with the reason,
-  -- and so does a binary frame
+  -- and so does a binary frame. The frame that closes it is read as it
+  -- comes, without the answer that the library would send: on a Unix
+  -- socket the server is gone by then, and the answer fails.
   let sent message = do
-        closed <- try . client "/events" $ \c -> do
+        closed <- client "/events" $ \c -> do
           WS.sendDataMessage c message
-          void (WS.receiveDataMessage c)
-        case closed of
-          Left (WS.CloseRequest code why) -> (code, why) `shouldBe` (1008, "Could not read the command")
-          wrong -> expectationFailure ("Not closed: " <> show wrong)
+          let next =
+                WS.receive c >>= \case
+                  WS.ControlMessage (WS.Close code why) -> return (code, why)
+                  _ -> next
+          next
+        closed `shouldBe` (1008, "Could not read the command")
   sent (WS.Text "{\"type\":\"nonsense\"}" Nothing)
   sent (WS.Binary "\x06")
 
 -- | The first lines of a stream of events, which has no end: the request
 -- is given up once they are there.
-eventLines :: String -> Int -> IO [C8.ByteString]
-eventLines url n = do
+eventLines :: Server -> String -> Int -> IO [C8.ByteString]
+eventLines server path n = do
   got <- newIORef C8.empty
   let collect () chunk = do
         modifyIORef' got (<> chunk)
         enough <- (>= n) . C8.count '\n' <$> readIORef got
         when enough (throwIO (userError "enough"))
-  _ <- tryAny (Wreq.foldGet collect () url)
+  _ <- tryAny (Wreq.foldGetWith (through server) collect () (server.url <> path))
   take n . C8.lines <$> readIORef got
 
 -- | Two more stores, each with its own database, syncing from the same
@@ -2394,8 +2459,8 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
   -- and a client that heard of the payment from one takes up on the other
   let since = "/events?after=" <> T.unpack txid
       then' = "{\"type\":\"block\",\"id\":\"" <> cs best <> "\"}"
-  eventLines (urlA <> since) 1 `shouldReturn` [then']
-  eventLines (urlB <> since) 1 `shouldReturn` [then']
+  eventLines urlA since 1 `shouldReturn` [then']
+  eventLines urlB since 1 `shouldReturn` [then']
   (_, confirmed) <- getJSON urlB ("/transaction/" <> T.unpack txid)
   (confirmed ! "block") `shouldSatisfy` \case
     Object o -> KeyMap.member "height" o
@@ -2449,9 +2514,9 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
           shared = config.logger
           named = shared {push = \line -> shared.push (name <> " " <> line)} :: Logger
       withStore ((config :: StoreConfig) {logger = named}) $ \s ->
-        listening $ \(sock, port) ->
+        listening $ \(sock, server) ->
           withAsync (runWebSocket (webConfig named s) sock) $ \web ->
-            link web >> f s ("http://127.0.0.1:" <> show port)
+            link web >> f s server
 
 -- | Run a second store, with its own database, syncing from the same node
 -- and sharing the same Redis, while an action runs.
@@ -2467,16 +2532,14 @@ waitStore env st =
     return (fmap blockHashToHex ours == Just best)
 
 -- | GET a path, with the status, the headers and the body of the answer.
-getWithHeaders :: String -> String -> IO (Int, ResponseHeaders, Value)
-getWithHeaders base path = do
-  r <- Wreq.getWith opts (base <> path)
+getWithHeaders :: Server -> String -> IO (Int, ResponseHeaders, Value)
+getWithHeaders server path = do
+  r <- Wreq.getWith (through server) (server.url <> path)
   return
     ( r ^. Wreq.responseStatus . Wreq.statusCode,
       r ^. Wreq.responseHeaders,
       body (r ^. Wreq.responseBody)
     )
-  where
-    opts = Wreq.defaults & Wreq.checkResponse ?~ (\_ _ -> return ())
 
 -- | The clock of Redis, in milliseconds.
 redisNowMs :: Env -> IO Integer

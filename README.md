@@ -1502,11 +1502,23 @@ haskell-dev docs                     # build the documentation and check its com
 ```
 
 `test` builds first, so a separate `build` is not needed. A run of all the
-tests takes about 65 seconds in eight processes, against about four minutes
-for `stack test`. `haskell-dev.toml` names the slow spec module,
+tests takes about 70 seconds in eight processes, against about four minutes
+for `stack test`. `haskell-dev.toml` names the slow spec modules,
 `Haskoin.Store.Integration` (`test/Haskoin/Store/IntegrationSpec.hs`), whose
 five environments then run at the same time, each with its own node, Valkey
-and store in Podman. When a test fails, the output gives the seed: run the
+and store in Podman, and `Haskoin.Store.Download`, the downloads of a store
+from real nodes, one of them frozen with `SIGSTOP` to hang as a bad peer
+does.
+
+The tests name no address or port of the machine. The nodes, Valkey, and
+openssl and curl for the test of HTTPS, run in containers of
+[podman-test](https://github.com/jprupp/podman-test), reached through Unix
+sockets of their pods; the web servers of the store listen on Unix sockets
+of their own, which the tests and the client of haskoin-store-data reach;
+and what stands for a peer in memory is named by a Unix socket. Nothing in
+the tests uses a Bitcoin Core or a Bitcoin Cash Node of the machine.
+
+When a test fails, the output gives the seed: run the
 test again alone with `--seed` and `--match` on its path, which prints the
 usual output of hspec.
 

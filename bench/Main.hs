@@ -66,6 +66,7 @@ import Data.Word (Word32)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
 import Haskoin.Node
+import Haskoin.Node.Address (peerHostAddress)
 import Haskoin.Store
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
@@ -192,9 +193,10 @@ storeConfig ::
 storeConfig net dir redis blocks mock logger cache buffer =
   StoreConfig
     { maxPeers = 20,
-      -- the mock peer, by name: since haskoin-node 2.5 the seed of a regtest
-      -- network is not an address that discovery takes
-      initPeers = ["127.0.0.1:18444"],
+      -- the mock peer, which lives in memory ('mockPeer'), by a name: a Unix
+      -- socket, so that no address or port of the machine is named
+      initPeers = ["unix:mock-peer"],
+      peerPermissions = mempty,
       discover = False,
       db = dir,
       net = net,
@@ -245,6 +247,7 @@ webConfig store port =
       accessLog = False,
       tls = Nothing,
       nodeRpc = Nothing,
+      nodeRpcSocket = Nothing,
       logger = quiet
     }
 
@@ -402,7 +405,7 @@ mockPeer blocks mock net ad sa f = do
     go r s = do
       nonce <- randomIO
       now <- round <$> getPOSIXTime
-      let rmt = NetworkAddress 0 (sockToHostAddress sa)
+      let rmt = NetworkAddress 0 (peerHostAddress sa)
           ver = buildVersion net nonce 0 ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
       runConduit $

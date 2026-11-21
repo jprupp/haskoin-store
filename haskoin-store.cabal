@@ -309,6 +309,7 @@ test-suite spec
       Haskoin.Store.Database.StallsSpec
       Haskoin.Store.Database.ViewsSpec
       Haskoin.Store.Database.WriterSpec
+      Haskoin.Store.DownloadSpec
       Haskoin.Store.ExceptionSpec
       Haskoin.Store.Fleet.CacheSpec
       Haskoin.Store.Fleet.PoolSpec
@@ -329,7 +330,6 @@ test-suite spec
       Haskoin.Store.Web.RouterSpec
       Haskoin.Store.WebSpec
       Haskoin.Store.XPub.IndexerSpec
-      Haskoin.StoreSpec
       Paths_haskoin_store
   autogen-modules:
       Paths_haskoin_store

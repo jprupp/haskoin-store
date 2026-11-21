@@ -9,4 +9,6 @@
 # sockets of the pod, and a store, so the groups run at the same time.
 slow-specs = [
   "Haskoin.Store.Integration",
+  # each download test is a group with a pod of its own
+  "Haskoin.Store.Download",
 ]

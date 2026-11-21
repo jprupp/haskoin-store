@@ -73,6 +73,21 @@ whitelist it must now say what they grant (`--peer-permission`, or
   token endpoint, taken from a regtest chain.
 
 ### Changed
+- **The tests name no address or port, and use only real nodes in
+  Podman.** The tests of downloading that a mock peer served in memory
+  (`StoreSpec`) now sync from Bitcoin Cash Node in Podman
+  (`Haskoin.Store.DownloadSpec`): the blocks asked 64 at a time, every
+  transaction of a block as the node has it, a second node taking over from
+  one frozen with `SIGSTOP`, and a heap that stays flat over 5000 blocks.
+  The web servers of the integration tests listen on Unix sockets, which the
+  tests, the WebSocket client and the client of haskoin-store-data reach;
+  the price service is a name that never resolves, and the RPC that does
+  not answer is a socket that nothing listens on. The test of HTTPS makes
+  its certificate with openssl and its requests with curl in a container of
+  the test image, not with the programs of the machine. The mock peer of
+  the benchmark, and the peers of the tests of publishing, are named by
+  Unix sockets. The benchmark compiles again: it lacked the field
+  `nodeRpcSocket` of its web server, and now the permissions of its peer.
 - **The test of tokens queries the four endpoints** through the client of
   haskoin-store-data, with the transactions in the mempool and then
   confirmed: the balance of the address, the holders, the unspent outputs

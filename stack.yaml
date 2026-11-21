@@ -35,9 +35,9 @@ extra-deps:
   - git: https://github.com/jprupp/podman-test.git
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
   - git: https://github.com/jprupp/haskoin-node.git
-    commit: f33bf072d3614931c8ae4c669106ae5f6574da45
+    commit: 2997135c343c844aeb6bcb3db3219db1891889a7
   - git: https://github.com/jprupp/haskoin-store-data.git
-    commit: 77c1f273e5ed7872d97e0e64fb18c69ca8095576
+    commit: ffd4809d514c640995514ac58aa841d388d1288c
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to
   # 0.3.2, the version in the snapshot, every pause, resume and tickle edits
   # GHC's one timer queue, and Warp does a pause and a resume around every

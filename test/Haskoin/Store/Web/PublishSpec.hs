@@ -14,7 +14,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Word (Word32, Word64, Word8)
 import Haskoin hiding (Coin (..))
 import Haskoin.Store.Web.Publish
-import Network.Socket (SockAddr (..), tupleToHostAddress)
+import Network.Socket (SockAddr (..))
 import Test.Hspec
 
 -- | An output, told apart by a number.
@@ -55,9 +55,10 @@ rulesOf = Rules {net = btc, inputs = \tx _ -> map verdict tx.inputs, height = 10
       | i.script == saying "script" = InputUndecided
       | otherwise = InputVerified
 
--- | A peer, told apart by a number.
+-- | A peer, told apart by a number: a Unix socket by name, which nothing
+-- opens, since the courier of these tests is a function.
 node :: Int -> SockAddr
-node n = SockAddrInet 8333 (tupleToHostAddress (10, 0, 0, fromIntegral n))
+node n = SockAddrUnix ("peer-" <> show n)
 
 -- | A desk to publish at: every output is a coin of 1000, the store has no
 -- transaction, there is no node to ask over RPC, and there are as many

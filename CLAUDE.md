@@ -25,7 +25,17 @@
   top of the module, so that each runs in its own process; keep a new
   environment at the top too. The longest, Bitcoin Cash Node, takes about 64
   seconds. Eight processes at once use about 1.2 GB more than one, with the
-  containers.
+  containers. `Haskoin.Store.DownloadSpec` has the downloads of a store from
+  real nodes, a group with a pod of its own for each test.
+- Tests name no address or port of the machine. A node, Valkey or any other
+  program runs in a container of podman-test, reached through a Unix socket
+  of its pod; nothing uses a Bitcoin Core or a Bitcoin Cash Node, or another
+  program such as openssl or curl, of the machine. A web server of the tests
+  listens on a Unix socket (`listening` in `IntegrationSpec`), and a peer in
+  memory is named `unix:NAME`. What an honest node does is tested against a
+  real one, not a mock. SELinux lets the tests connect to a socket that a
+  container made, not a container connect to one that the tests made: such
+  a container runs with `--security-opt label=disable` (`tlsTest`).
 - A store that does not sync with its node in time, which happened a
   few times on Bitcoin Cash Node without being understood yet, prints what
   the node and the store say of their sync and the last 400 lines of the

@@ -76,26 +76,26 @@ packages:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
     git: https://github.com/jprupp/podman-test.git
 - completed:
-    commit: f33bf072d3614931c8ae4c669106ae5f6574da45
+    commit: 2997135c343c844aeb6bcb3db3219db1891889a7
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: 3afd772aec3699185131db590038570dafd24e220b4034c0fc13638b3d8a54d2
+      sha256: a8944e90f52014d991f3a78d11d93e6909e5fac3bbe482dc2ac571bb0f9f8fb0
       size: 3310
     version: 2.7.0
   original:
-    commit: f33bf072d3614931c8ae4c669106ae5f6574da45
+    commit: 2997135c343c844aeb6bcb3db3219db1891889a7
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: 77c1f273e5ed7872d97e0e64fb18c69ca8095576
+    commit: ffd4809d514c640995514ac58aa841d388d1288c
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: 36ffd78714d36bcfa2c8b79e8a295a748374e80896c568c69761f6653f74fcc3
-      size: 1262
+      sha256: 3b6ef9383e78672338253c06d5586d27a62ec95a2130e3ed311866ca8a51b0ed
+      size: 1263
     version: 4.0.0
   original:
-    commit: 77c1f273e5ed7872d97e0e64fb18c69ca8095576
+    commit: ffd4809d514c640995514ac58aa841d388d1288c
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550

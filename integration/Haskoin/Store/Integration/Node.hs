@@ -29,8 +29,12 @@ module Haskoin.Store.Integration.Node
   ( NodeKind (..),
     Node (..),
     nodeContainer,
+    nodeContainerAt,
     strangerContainer,
     nodeOf,
+    nodeAt,
+    freezeNode,
+    thawNode,
     nodeNetwork,
     RpcError (..),
     rpc,
@@ -67,7 +71,8 @@ import Haskoin.Store.Integration.Image (bchnBin, coreBin, testImage)
 import Haskoin.Store.Web (unixSocketManager)
 import Network.HTTP.Client (Manager, newManager)
 import Network.Wreq qualified as Wreq
-import Test.Podman (Address (..), ContainerSpec (..), Endpoint (..), Pod, address, container)
+import Test.Podman (Address (..), ContainerSpec (..), Endpoint (..), Pod, address, container, containerName)
+import Test.Podman.Command (podman)
 
 -- | Which node software.
 data NodeKind = BitcoinCore | BitcoinCashNode
@@ -90,9 +95,13 @@ data Node = Node
 
 -- | The node of a pod that runs 'nodeContainer' or 'strangerContainer'.
 nodeOf :: NodeKind -> Pod -> IO Node
-nodeOf kind p = do
-  rpcSocket <- socketOf "rpc"
-  p2pSocket <- socketOf "p2p"
+nodeOf = nodeAt 0
+
+-- | Node number @i@ of a pod that runs 'nodeContainerAt' for it.
+nodeAt :: Int -> NodeKind -> Pod -> IO Node
+nodeAt i kind p = do
+  rpcSocket <- socketOf ("rpc" <> suffix i)
+  p2pSocket <- socketOf ("p2p" <> suffix i)
   manager <- newManager (unixSocketManager rpcSocket)
   return
     Node
@@ -106,6 +115,28 @@ nodeOf kind p = do
     socketOf e = case address p e of
       UnixSocket path -> return path
       a -> fail ("The endpoint " <> e <> " of the node is not a socket: " <> show a)
+
+-- | Stop node number @i@ of a pod in its tracks, with @SIGSTOP@ sent from
+-- outside its container: the node is the first process of the container,
+-- which takes no signal sent from inside. Its connections stay open and it
+-- answers nothing on them, as a peer that hangs does, and its RPC answers
+-- nothing either until 'thawNode'.
+freezeNode :: Pod -> Int -> NodeKind -> IO ()
+freezeNode p i kind = signalNode p i kind "STOP"
+
+-- | Let node number @i@ go on after 'freezeNode'.
+thawNode :: Pod -> Int -> NodeKind -> IO ()
+thawNode p i kind = signalNode p i kind "CONT"
+
+signalNode :: Pod -> Int -> NodeKind -> String -> IO ()
+signalNode p i kind sig =
+  void $ podman ["kill", "--signal", sig, containerName p (nodeContainerAt i kind).name]
+
+-- | What sets the names of node number @i@ apart: nothing for the first, so
+-- that the names of a pod of one node stay as they were.
+suffix :: Int -> String
+suffix 0 = ""
+suffix i = show i
 
 -- | Network constants of the regtest chain of a node.
 nodeNetwork :: NodeKind -> Network
@@ -121,11 +152,21 @@ nodeNetwork BitcoinCashNode = bchRegTest
 -- Every peer is whitelisted, so that the store may ask for the mempool and
 -- gets transactions relayed without delay.
 nodeContainer :: NodeKind -> ContainerSpec
-nodeContainer kind =
+nodeContainer = nodeContainerAt 0
+
+-- | Node number @i@ of a pod of several nodes, as 'nodeContainer' is the
+-- first: the containers of a pod share its network, so each listens on
+-- ports of its own, ten above those of the one before, with endpoints
+-- @rpcI@ and @p2pI@ (no number for the first). Add
+-- @-addnode=127.0.0.1:18444@ to its command for the first as a peer.
+nodeContainerAt :: Int -> NodeKind -> ContainerSpec
+nodeContainerAt i kind =
   ( container
-      ( case kind of
-          BitcoinCore -> "bitcoin-core"
-          BitcoinCashNode -> "bitcoin-cash-node"
+      ( ( case kind of
+            BitcoinCore -> "bitcoin-core"
+            BitcoinCashNode -> "bitcoin-cash-node"
+        )
+          <> (if i == 0 then "" else "-" <> show i)
       )
       testImage
   )
@@ -144,6 +185,8 @@ nodeContainer kind =
           "-rpcbind=0.0.0.0",
           "-rpcallowip=0.0.0.0/0",
           "-bind=0.0.0.0",
+          "-port=" <> show p2pPort,
+          "-rpcport=" <> show rpcPort,
           "-listen=1",
           "-whitelist=0.0.0.0/0",
           "-txindex=1",
@@ -156,8 +199,11 @@ nodeContainer kind =
             -- after they come out unless told not to
             BitcoinCashNode -> ["-expire=0"]
             BitcoinCore -> [],
-      endpoints = [Bridged "rpc" 18443, Bridged "p2p" 18444]
+      endpoints = [Bridged ("rpc" <> suffix i) rpcPort, Bridged ("p2p" <> suffix i) p2pPort]
     }
+  where
+    rpcPort = 18443 + 10 * i
+    p2pPort = 18444 + 10 * i
 
 -- | The same node without the whitelist: it treats the store as it treats
 -- any peer that connected to it. It announces transactions on its timer
