@@ -25,6 +25,12 @@
 -- sequence of events, and the rules are in one place:
 --
 -- * There is at most one syncing peer, and only 'start' and 'pass' set one.
+-- * A peer that was asked for a block, and has not disconnected, is never
+--   taken for a peer that was not asked: it is the syncing peer or among
+--   those passed over until it delivers, or until the timeout ('finish',
+--   'forget').
+-- * Only the block store's own thread changes the state, so that each
+--   transition sees the one before it.
 -- * A block is accepted only from a peer that was asked for it ('accept'),
 --   so a block that nobody asked that peer for is a reason to disconnect it.
 -- * A block is wanted at most once ('request').
@@ -100,7 +106,8 @@ module Haskoin.Store.BlockStore.Sync
     -- * Transitions
     start,
     pass,
-    release,
+    forget,
+    finish,
     Accept (..),
     accept,
     imported,
@@ -249,12 +256,42 @@ pass now p s = case s.current of
 -- | Forget a peer, as when it disconnects. Says whether it was the syncing
 -- peer, for the caller to unlock it; the blocks wanted are then forgotten
 -- with it, for the next syncing peer to be asked from the best block on.
-release :: (Eq p) => p -> Sync p -> (Bool, Sync p)
-release p s = case s.current of
+-- Nothing of the peer is left: a block that it sends after this is from a
+-- peer that was not asked ('NotSyncingPeer'), which a peer that is gone
+-- cannot do.
+forget :: (Eq p) => p -> Sync p -> (Bool, Sync p)
+forget p s = case s.current of
   Just a | a.peer == p -> (True, others {current = Nothing, wanted = [], passes = 0})
   _ -> (False, others)
   where
     others = skip p s {passed = filter ((/= p) . (.peer)) s.passed}
+
+-- | Stop syncing from a peer that is still connected, as when the store is
+-- in sync or the peer has nothing more to give. Says whether it was the
+-- syncing peer, for the caller to unlock it. The blocks wanted are
+-- forgotten, as with 'forget', but the peer still owes what it was asked
+-- for: it joins the peers passed over, its silence starting now, so that a
+-- block it sends later is dropped as 'Late', not taken for a fault. Only a
+-- peer that still owes blocks when the timeout runs out is disconnected
+-- ('expired'). A peer that is not the syncing peer is left as it is: it
+-- may be owed blocks as one passed over, and those are not forgotten.
+--
+-- 'forget' was used for this once, and dropped what the peer owed: a peer
+-- passed over during a stall that delivered after another had brought the
+-- store in sync was disconnected for a block that it was asked for.
+finish :: (Eq p) => UTCTime -> p -> Sync p -> (Bool, Sync p)
+finish now p s = case s.current of
+  Just a
+    | a.peer == p ->
+        ( True,
+          s
+            { current = Nothing,
+              wanted = [],
+              passes = 0,
+              passed = [a {since = now} | not (null a.owes)] <> filter ((/= p) . (.peer)) s.passed
+            }
+        )
+  _ -> (False, s)
 
 -- | What to do with a block that a peer sent.
 data Accept
@@ -301,11 +338,14 @@ imported now h s = s {wanted = delete h s.wanted, time = now, passes = 0, gap = 
     gap' = maybe sample (\g -> (3 * g + sample) / 4) s.gap
 
 -- | Blocks were requested from the syncing peer. Those already wanted are
--- not added again. Nothing changes without a syncing peer.
+-- not added again, and the peer owes each block once: after
+-- 'forgetRequests' it may be asked again for a block that it still owes,
+-- and owing it twice would leave it owing one copy after it delivered,
+-- to be disconnected for it later. Nothing changes without a syncing peer.
 request :: [BlockHash] -> Sync p -> Sync p
 request hs s = case s.current of
   Nothing -> s
-  Just a -> s {wanted = s.wanted <> new, current = Just a {owes = a.owes <> new}}
+  Just a -> s {wanted = s.wanted <> new, current = Just a {owes = a.owes <> filter (`notElem` a.owes) new}}
   where
     new = foldl' (\bs h -> if h `elem` bs || h `elem` s.wanted then bs else bs <> [h]) [] hs
 

@@ -68,10 +68,10 @@
 -- 2016 blocks after their height, by the height of the block that the tip
 -- moves to. Haskoin.Store.Fleet.Pool.advanceReplacing says the same.
 --
--- The pool is emptied instead of changed in two cases. With '1' the store
--- cannot say what the blocks between the two tips did, because it does
--- not have the old tip: only when no other store is live, and {'raced'}
--- otherwise, since another store may know. With '2' the store has both
+-- The pool is emptied instead of changed in two cases. With '1|NAME' the
+-- store of that name cannot say what the blocks between the two tips did,
+-- because it does not have the old tip: only when it is the one store that
+-- is live, and {'raced'} otherwise, since another store may know. With '2' the store has both
 -- tips and the way between them is longer than a store goes through: that
 -- is so for every store, so any of them may, or the tip would never move
 -- again. Each time the pool is emptied, what the fleet has seen is
@@ -536,6 +536,14 @@ if what == 'withdraw' then
   return withdraw(split(ARGV[4], tsize))
 end
 
+-- expire: what has been in the pool since before a time, so many at most,
+-- chosen and withdrawn in this one call. Chosen by the caller, in a call
+-- before, a transaction could leave and come back in between with a new
+-- time, and be withdrawn for the time that it had before.
+if what == 'expire' then
+  return withdraw(redis.call('ZRANGEBYSCORE', key.time, 0, ARGV[4], 'LIMIT', 0, tonumber(ARGV[5])))
+end
+
 -- trimmed only when the set has grown a hundredth past its bound, so that
 -- most calls cost a ZCARD
 if what == 'trim' then
@@ -699,8 +707,13 @@ end
 
 -- a store that does not know the way from the old tip starts the pool
 -- again: if it is alone, or if the way is too long for any store
-if ARGV[8] == '1' or ARGV[8] == '2' then
-  if ARGV[8] == '1' and #live ~= 1 then
+-- '1' comes with the name of the store, as '1|NAME': it may empty the pool
+-- only if it is the one store that is live, not merely if one store is.
+-- A store whose report was refused is not live, and another that is live
+-- may know the way
+local how, caller = string.match(ARGV[8], '^([012])|?(.*)$')
+if how == '1' or how == '2' then
+  if how == '1' and (#live ~= 1 or live[1] ~= caller) then
     return {'raced'}
   end
   for _, k in ipairs(redis.call('KEYS', prefix .. 'pool:*')) do

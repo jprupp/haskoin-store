@@ -76,7 +76,12 @@ puts it in front of the queries:
 - **The same decision on every store.** A job expected past `--xpub-wait`
   (10 s) is refused at once with 429 and the same `Retry-After` on every
   store. Otherwise the request waits until the build is announced
-  (`fleet:built`), and gets 429 if the wait runs out.
+  (`fleet:built`), and gets 429 if the wait runs out. Only a build that put
+  its entry in the cache is announced; one that was abandoned fails its job.
+  A store counts announcements only for the keys that its requests wait
+  for, and forgets a key when the last of them is done, and a reconnection
+  to Redis wakes nobody: a build announced while the connection was down is
+  found when the wait runs out.
 - **A dead holder.** Its lock expires within 30 s, and the next store that
   asks takes the dibs and builds.
 - **No `nocache`.** An entry is never stale, so there is nothing to read

@@ -41,7 +41,7 @@ spec = describe "views of the database by block" $ do
       first <- best
       takeView views first
       second <- next
-      keepViews views [second]
+      keepViews views (return [second])
       heldViews views `shouldReturn` [second]
       withViewAt views first Q.getBestBlock `shouldReturn` (Nothing :: Maybe (Maybe BlockHash))
       withViewAt views second Q.getBestBlock `shouldReturn` Just (Just second)
@@ -52,7 +52,7 @@ spec = describe "views of the database by block" $ do
       takeView views first
       second <- next
       result <- withViewAt views first $ \old -> do
-        keepViews views [second]
+        keepViews views (return [second])
         -- gone for anyone who asks now
         heldViews views `shouldReturn` [second]
         withViewAt views first Q.getBestBlock `shouldReturn` (Nothing :: Maybe (Maybe BlockHash))

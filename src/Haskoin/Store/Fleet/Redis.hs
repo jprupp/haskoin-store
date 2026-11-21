@@ -79,6 +79,7 @@ module Haskoin.Store.Fleet.Redis
     PoolTokenOut (..),
     poolOffer,
     poolWithdraw,
+    poolExpire,
     fleetAdvance,
     fleetCommit,
     fleetRestart,
@@ -307,6 +308,13 @@ poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString
 poolWithdraw conn keys tsize ts =
   run conn (evalScript poolScript [] ["withdraw", keys.prefix, num tsize, B.concat ts])
 
+-- | Take out of the pool what has been in it since before a time, in
+-- seconds of the clock of Redis, so many at most, with all that spends
+-- them, choosing and withdrawing them in one call. Gives those that left.
+poolExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
+poolExpire conn keys tsize before most =
+  run conn (evalScript poolScript [] ["expire", keys.prefix, num tsize, C.pack (show before), num most])
+
 -- | Keep the newest of the transactions that the fleet has seen, so
 -- many. Gives how many are kept.
 --
@@ -355,13 +363,15 @@ fleetAdvance ::
   FleetKeys ->
   Int ->
   Maybe Time ->
+  -- | the name of the store that moves the tip
+  ByteString ->
   Maybe ByteString ->
   ByteString ->
   Maybe PoolChange ->
   [ByteString] ->
   IO Moved
-fleetAdvance conn keys tsize clock seen target known path =
-  fleetCommit conn keys tsize clock seen target known path ""
+fleetAdvance conn keys tsize clock store seen target known path =
+  fleetCommit conn keys tsize clock store seen target known path ""
 
 -- | 'fleetAdvance' as the commit of a move of the tip with the cache of
 -- extended public keys: given also the token of the move of the cache that
@@ -377,16 +387,19 @@ fleetCommit ::
   FleetKeys ->
   Int ->
   Maybe Time ->
+  -- | the name of the store that moves the tip: without a change of the
+  -- pool, it empties the pool only if it is the one store that is live
+  ByteString ->
   Maybe ByteString ->
   ByteString ->
   Maybe PoolChange ->
   [ByteString] ->
   ByteString ->
   IO Moved
-fleetCommit conn keys tsize clock seen target known path token =
+fleetCommit conn keys tsize clock store seen target known path token =
   advance conn keys tsize clock seen target how (fromMaybe unchanged known) (path, token)
   where
-    how = maybe "1" (const "0") known
+    how = maybe ("1|" <> store) (const "0") known
     unchanged = PoolChange [] [] [] [] Nothing []
 
 -- | Move the tip to a block and empty the pool, for a store that has both

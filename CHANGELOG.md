@@ -145,6 +145,30 @@ whitelist it must now say what they grant (`--peer-permission`, or
   Valkey and a store in Podman, are now groups at the top of the module, and
   `haskell-dev.toml` names it, so that they run at the same time.
 
+### Fixed
+- **Races found by an audit of every protocol that runs at once**
+  (`docs/concurrency.md`, new, has each protocol, its machine, its owner,
+  the invariants and what changed):
+  - a peer passed over during a stall was disconnected for a block it was
+    asked for once another brought the store in sync (`Sync.finish`);
+  - the refill ran the block store's in-sync check on the web thread; it
+    goes through the mailbox now;
+  - a peer could owe a block twice; a block of a branch the node had left
+    could be imported; a revert published no best block;
+  - two threads pruning views could let go of the newest block's view;
+  - a store that was not live could empty the fleet's pool while one other
+    store was live; a store emptied it where the documentation said it
+    waits (`Unreadable`); a transaction in conflict could be lost for the
+    fleet; expiry could withdraw a transaction that had just come back;
+  - a request interrupted while it took the lock of an xpub left the job
+    reserved for good; the listener of builds spun while Redis was down,
+    grew without bound and woke requests for builds that never happened;
+  - one slow answer from Redis made every store answer 503; background
+    loops could die in silence; an error skipped the asking of published
+    transactions;
+  - announcements of transactions held up blocks on the block store's
+    thread; the transactions waiting to be offered had no bound.
+
 ## [1.16.7] - 2026-11-20
 
 ### Fixed

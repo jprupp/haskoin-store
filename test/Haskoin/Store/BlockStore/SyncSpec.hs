@@ -20,7 +20,10 @@ import Test.QuickCheck
 data Event
   = Start Int
   | Pass Int
-  | Release Int
+  | -- | a peer disconnects
+    Disconnect Int
+  | -- | the store stops syncing from a peer that is still connected
+    Finish Int
   | Request [Int]
   | -- | a peer sends a block, which is imported if it is accepted
     Deliver Int Int
@@ -33,7 +36,8 @@ instance Arbitrary Event where
     frequency
       [ (2, Start <$> peer),
         (2, Pass <$> peer),
-        (1, Release <$> peer),
+        (1, Disconnect <$> peer),
+        (1, Finish <$> peer),
         (3, Request <$> listOf block),
         (4, Deliver <$> peer <*> block),
         (1, pure Forget),
@@ -61,7 +65,8 @@ step :: World -> Event -> World
 step (now, s) = \case
   Start p -> (now, fromMaybe s (start now p s))
   Pass p -> (now, snd (pass now p s))
-  Release p -> (now, snd (release p s))
+  Disconnect p -> (now, snd (forget p s))
+  Finish p -> (now, snd (finish now p s))
   Request bs -> (now, request (map hash bs) s)
   Deliver p b -> case accept p (hash b) s of
     (Requested, s') -> (now, imported now (hash b) s')
@@ -104,9 +109,30 @@ spec = describe "Block download" $ do
       [ case e of
           Start p -> syncingPeer s' == if isNothing (syncingPeer s) then Just p else syncingPeer s
           Pass p -> syncingPeer s' == (p <$ syncingPeer s)
-          Release p | syncingPeer s == Just p -> isNothing (syncingPeer s')
+          Disconnect p | syncingPeer s == Just p -> isNothing (syncingPeer s')
+          Finish p | syncingPeer s == Just p -> isNothing (syncingPeer s')
           _ -> syncingPeer s' == syncingPeer s
       | ((_, s), e, (_, s')) <- steps es
+      ]
+
+  prop "never takes a peer that owes a block for one that was not asked" $ \es ->
+    and
+      [ fst (accept p (hash b) s) /= NotSyncingPeer
+      | ((_, s), Deliver p b, _) <- steps es,
+        maybe False (hash b `elem`) (owed p s)
+      ]
+
+  prop "keeps every peer owed its blocks when the store stops syncing from one" $ \es ->
+    and
+      [ all (\q -> fromMaybe [] (owed q s') == fromMaybe [] (owed q s)) [0 .. 3]
+      | ((_, s), Finish _, (_, s')) <- steps es
+      ]
+
+  prop "has a peer owe each block once" $ \es ->
+    and
+      [ nub a.owes == a.owes
+      | (_, s) <- run es,
+        a <- maybe [] pure s.current <> s.passed
       ]
 
   prop "keeps a peer that is passed over owed its blocks" $ \es ->
@@ -252,13 +278,26 @@ spec = describe "Block download" $ do
       expired timeout (at 61) s `shouldBe` [0]
     it "is forgotten when it disconnects" $ do
       let (_, s) = pass (at 11) 1 asked
-          (wasSyncing, s') = release 0 s
+          (wasSyncing, s') = forget 0 s
       wasSyncing `shouldBe` False
       passedPeers s' `shouldBe` []
       fst (accept 0 (hash 1) s') `shouldBe` NotSyncingPeer
+    it "drops, and does not disconnect, a peer that delivers after another brought the store in sync" $ do
+      -- peer 0 stalls, peer 1 is asked in its place, peer 0 delivers, and
+      -- the store, in sync, stops syncing from peer 1, which still owes it
+      let (_, s1) = pass (at 11) 1 asked
+          s2 = case accept 0 (hash 1) s1 of
+            (Requested, s') -> imported (at 12) (hash 1) s'
+            (v, _) -> error ("not taken: " <> show v)
+          (wasSyncing, s3) = finish (at 12) 1 s2
+      wasSyncing `shouldBe` True
+      passedPeers s3 `shouldBe` [1]
+      fst (accept 1 (hash 1) s3) `shouldBe` Late
+      expired timeout (at 72) s3 `shouldBe` []
+      expired timeout (at 73) s3 `shouldBe` [1]
     it "still owes its blocks if it becomes the syncing peer again" $ do
       let (_, s1) = pass (at 11) 1 asked
-          (_, s2) = release 1 s1
+          (_, s2) = forget 1 s1
           s3 = fromMaybe s2 (start (at 20) 0 s2)
       passedPeers s3 `shouldBe` []
       -- the block is not wanted any more: the request went with peer 1
@@ -352,7 +391,7 @@ spec = describe "Block download" $ do
       let (_, s) = pong wait (at 7) 1 7 searching
       overdue wait (at 7) s `shouldBe` [1, 0]
     it "ends when the last peer pinged is gone" $ do
-      let (_, s1) = release 0 searching
+      let (_, s1) = forget 0 searching
       probing s1 `shouldBe` True
       probing (skip 1 s1) `shouldBe` False
       probing (settle searching) `shouldBe` False

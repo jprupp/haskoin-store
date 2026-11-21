@@ -163,6 +163,16 @@ spec = describe "fleet tip" $ do
     -- when the store that was ahead is gone, the other may start again
     mayReport 11 1 (`elem` [7, 6, 5 :: Int]) fleet `shouldBe` True
 
+  it "lets only the one live store empty the pool for a way it does not know" $ do
+    let fleet = report 0 10 1 [9, 8] (empty :: Fleet Int Int)
+    mayEmptyAlone 5 1 fleet `shouldBe` True
+    -- a store that is not live, though one store is
+    mayEmptyAlone 5 2 fleet `shouldBe` False
+    -- with another store live
+    mayEmptyAlone 5 1 (report 0 10 2 [9, 8] fleet) `shouldBe` False
+    -- nobody live
+    mayEmptyAlone 11 1 fleet `shouldBe` False
+
   it "answers from the tip, from its own block before there is one, or not at all" $ do
     let fleet = (empty :: Fleet Int Int) {tip = Just 4}
     answer (const True) (empty :: Fleet Int Int) `shouldBe` Alone

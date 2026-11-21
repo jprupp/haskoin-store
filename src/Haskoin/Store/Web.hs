@@ -118,7 +118,8 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (getNumCapabilities, threadDelay)
 import Control.Concurrent.Async (link, mapConcurrently, race_, withAsync)
 import Control.Concurrent.STM
-  ( TVar,
+  ( STM,
+    TVar,
     atomically,
     check,
     newTQueueIO,
@@ -805,6 +806,8 @@ serveWeb config serve = do
   -- that it had then, and with nobody else there moved the fleet to them.
   forM_ config.store.fleet $ \member -> atomically (writeTVar member.healthy (isOK first.blocks && isOK first.peers))
   cacheUp <- cacheCheck >>= newTVarIO
+  -- requests in a row that found Redis too slow to say the tip; see 'reach'
+  cacheMisses <- newTVarIO (0 :: Int)
   eventLog <- newEventLog
   asking <- Publish.newAsking
   admission <-
@@ -853,9 +856,12 @@ serveWeb config serve = do
         known <- if fresh then return Nothing else fmap encode <$> readTVarIO member.tip
         asked <- case known of
           Just tip -> return (Just (Just tip))
-          Nothing -> timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing
+          Nothing -> do
+            r <- timeout 2000000 (memberTip member) `catchAny` \_ -> return Nothing
+            atomically (reach cacheMisses cacheUp (isJust r))
+            return r
         case asked of
-          Nothing -> atomically (writeTVar cacheUp False) >> behind answer
+          Nothing -> behind answer
           -- no store has reported yet
           Just Nothing -> behind answer
           Just (Just tip) -> do
@@ -938,19 +944,24 @@ serveWeb config serve = do
   -- at once
   newBlock <- newTVarIO False
   date <- httpDate >>= newIORef
-  withAsync (forever (snooze 500_000 >> httpDate >>= writeIORef date)) $ \_a0 ->
-    withAsync (priceUpdater session ticker) $ \_a1 ->
-      withAsync (healthCheckLoop health cacheUp saidWell saidRedis pinged newBlock) $ \_a2 ->
-        withAsync (admissionLoop metrics capStats admission) $ \_a5 ->
-          withAsync (regulate admission (reportControl metrics)) $ \_a6 ->
-            withAsync (feedEvents st) $ \a3 ->
-              withAsync (askingLoop st) $ \_a4 ->
-                withAsync (refillLoop st) $ \_a7 ->
-                  link a3 >> do
-                    let logged = logIt config.logger config.accessLog config.limits.slowRequest
-                        outer =
-                          webSocketEvents st . logged . dated date . anyOrigin . preflight . autohead . compressed
-                    serve . outer . cappedBody st $ app
+  -- every loop runs under 'supervised', which logs a failure and starts the
+  -- loop again: one that died once did so in silence, and the store went on
+  -- without its health checks, its prices or its line of requests
+  let supervise = supervised config.logger
+  withAsync (supervise "Date" (forever (snooze 500_000 >> httpDate >>= writeIORef date))) $ \_a0 ->
+    withAsync (supervise "Prices" (priceUpdater session ticker)) $ \_a1 ->
+      withAsync (supervise "Health" (healthCheckLoop health cacheUp cacheMisses saidWell saidRedis pinged newBlock)) $
+        \_a2 ->
+          withAsync (supervise "Admission" (admissionLoop metrics capStats admission)) $ \_a5 ->
+            withAsync (supervise "Regulate" (regulate admission (reportControl metrics))) $ \_a6 ->
+              withAsync (feedEvents st) $ \a3 ->
+                withAsync (supervise "Publish" (askingLoop st)) $ \_a4 ->
+                  withAsync (supervise "Refill" (refillLoop st)) $ \_a7 ->
+                    link a3 >> do
+                      let logged = logIt config.logger config.accessLog config.limits.slowRequest
+                          outer =
+                            webSocketEvents st . logged . dated date . anyOrigin . preflight . autohead . compressed
+                      serve . outer . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -972,7 +983,7 @@ serveWeb config serve = do
     -- costs little to run often; but a store that is catching up imports
     -- thousands of small blocks a second, and a check for each would be
     -- work for nothing, so there is a tenth of a second between two.
-    healthCheckLoop v up saidWell saidRedis pinged newBlock =
+    healthCheckLoop v up misses saidWell saidRedis pinged newBlock =
       bracket (subscribe config.store.pub (heard newBlock)) (unsubscribe config.store.pub) $ \_ ->
         loopForever $ do
           threadDelay 100000
@@ -998,7 +1009,7 @@ serveWeb config serve = do
           when (now - last' >= 5) $ do
             writeIORef pinged now
             problem <- redisCheck
-            atomically (writeTVar up (isNothing problem))
+            atomically (writeTVar misses 0 >> writeTVar up (isNothing problem))
             tellRedis saidRedis problem
     heard newBlock = \case
       StoreBestBlock _ -> writeTVar newBlock True
@@ -2072,6 +2083,35 @@ unixSocketManager path =
         Socket.connect s (SockAddrUnix path) `onException` Socket.close s
         socketConnection s 8192
     }
+
+-- | Run a loop of the web server for as long as the server runs: an
+-- exception that it throws is logged as an error, and the loop starts again
+-- a second later. A loop that ends by itself, as one with nothing to do,
+-- stays ended.
+supervised :: Logger -> Text -> IO a -> IO b
+supervised logger name loop =
+  tryAny loop >>= \case
+    Right _ -> forever (threadDelay maxBound)
+    Left e -> do
+      logError (withSource name logger) ("The loop stopped, and starts again: " <> cs (show e))
+      threadDelay 1000000
+      supervised logger name loop
+
+-- | Note whether a request found Redis quick enough to say the fleet tip,
+-- in the count of requests in a row that did not and the flag that says
+-- that Redis answers ('cacheUp'). A request that found it quick sets the
+-- flag and clears the count; it takes three in a row that did not to
+-- clear the flag. One slow answer, such as one behind a long script of
+-- another store, once cleared the flag of every store at once, and the
+-- fleet answered 503 until their next checks, up to five seconds later.
+-- The health check sets the flag too, and clears the count.
+reach :: TVar Int -> TVar Bool -> Bool -> STM ()
+reach misses up quick
+  | quick = writeTVar misses 0 >> writeTVar up True
+  | otherwise = do
+      n <- (+ 1) <$> readTVar misses
+      writeTVar misses n
+      when (n >= 3) (writeTVar up False)
 
 -- | What "Haskoin.Store.Web.Publish" needs, for a request.
 --

@@ -100,13 +100,18 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
   ( STM,
+    TBQueue,
     TVar,
     atomically,
+    isFullTBQueue,
     modifyTVar',
+    newTBQueueIO,
     newTVarIO,
+    readTBQueue,
     readTVar,
     readTVarIO,
     stateTVar,
+    writeTBQueue,
     writeTVar,
   )
 import Control.Exception (Exception, throwIO, try)
@@ -212,6 +217,7 @@ import Haskoin.Store.Database.Writer
     runWriterReport,
   )
 import Haskoin.Store.Database.Writer qualified as W
+import Haskoin.Store.Exception (catchAny)
 import Haskoin.Store.Logic
   ( ImportException (..),
     importBlock,
@@ -231,6 +237,7 @@ import NQE
     send,
     sendSTM,
   )
+import Numeric.Natural (Natural)
 import System.Metrics.StatsD
 import System.Random (randomIO, randomRIO)
 
@@ -257,6 +264,9 @@ data BlockStoreMessage
     TxRefAvailable !Peer ![TxHash]
   | -- | clock tick for housekeeping; reply when done
     BlockPing !(Listen ())
+  | -- | the pool is to be filled again: ask the peers for their mempools
+    -- once in sync ('blockStoreRefill')
+    BlockRefill
 
 -- | Fatal errors of the block store.
 data BlockException
@@ -290,7 +300,10 @@ data BlockStore = BlockStore
     -- only for blocks that it announced
     knows :: !(TVar (HashMap Text Known)),
     -- | who reserves the syncing peer, so that no one else releases it
-    owner :: !Owner
+    owner :: !Owner,
+    -- | transactions that peers announced, for the thread that asks for
+    -- them ('askForTxs'); at most 'announcedRoom' announcements wait
+    announced :: !(TBQueue (Peer, [TxHash]))
   }
 
 -- | The blocks that a peer said it has. A peer is asked for a block only
@@ -545,6 +558,7 @@ withBlockStore cfg action = do
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
   knows <- newTVarIO HashMap.empty
+  announced <- newTBQueueIO announcedRoom
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -554,7 +568,8 @@ withBlockStore cfg action = do
             metrics = metrics,
             refill = refill,
             knows = knows,
-            owner = owner
+            owner = owner,
+            announced = announced
           }
   withAsync ((go r inbox)) $ \a -> do
     link a
@@ -574,7 +589,8 @@ withBlockStore cfg action = do
             Right () -> getBestBlock self >>= mapM_ cfg.onBest
         run =
           withAsync (pingMe (inboxToMailbox inbox)) $ \a ->
-            link a >> runBlockStoreLoop self inbox
+            withAsync (askForTxs self) $ \b ->
+              link a >> link b >> runBlockStoreLoop self inbox
 
 -- | Handle messages forever.
 runBlockStoreLoop :: (InChan mbox) => BlockStore -> mbox BlockStoreMessage -> IO b
@@ -653,10 +669,14 @@ mempoolPeers self = filterM $ \p ->
 -- message, and the permissions that the operator says the nodes of
 -- @--peer@ grant (@--peer-permission@). A node that the store has over RPC
 -- (@--node-rpc@) answers in any case ('Haskoin.Store.Web.refillLoop').
+--
+-- The request goes through the mailbox of the block store, as every message
+-- does: only the thread of the block store changes the state of the sync,
+-- and the check that it is in sync, which ends the syncing peer's turn,
+-- runs there. It ran on the caller's thread once, and could end the turn
+-- of a peer that the block store had just asked for a new block.
 blockStoreRefill :: BlockStore -> IO ()
-blockStoreRefill self = do
-  atomically $ writeTVar self.refill True
-  syncMempool self
+blockStoreRefill self = BlockRefill `send` self.mailbox
 
 -- | Import a block from the syncing peer, then ask for more blocks or, if now in
 -- sync, sync the mempool. Disconnects the peer if it is not the syncing peer, if
@@ -677,18 +697,29 @@ processBlock self peer block =
               <> " sent unknown block "
               <> blockHashToHex blockhash
           killPeer peer
-        Just node -> do
-          logDebug self $
-            "Processing block "
-              <> blockText node Nothing
-              <> " from peer "
-              <> peer.label
-          ret <-
-            withBlockTiming self $
-              runImportNotify self (Just blockhash) (\wr -> importBlock wr block node)
-          case ret of
-            Left e -> failure e
-            Right _ -> success node
+        Just node ->
+          chainBlockMain self.config.chain blockhash >>= \case
+            -- the node moved to another chain since the block was asked
+            -- for: it is no fault of the peer's, and importing it would
+            -- move the store, and the fleet with it, to a block that is
+            -- reverted at once. The requests go, and the sync starts
+            -- again from the chain of the node.
+            False -> do
+              logDebug self $ "Block " <> hexhash <> " is no longer on the chain of the node"
+              transition self $ \st -> ((), Sync.forgetRequests st)
+              syncMe self
+            True -> do
+              logDebug self $
+                "Processing block "
+                  <> blockText node Nothing
+                  <> " from peer "
+                  <> peer.label
+              ret <-
+                withBlockTiming self $
+                  runImportNotify self (Just blockhash) (\wr -> importBlock wr block node)
+              case ret of
+                Left e -> failure e
+                Right _ -> success node
   where
     header = block.header
     blockhash = headerHash header
@@ -776,20 +807,51 @@ toFetch pending seen stored hs = do
   have <- if null fresh then return HashSet.empty else seen fresh
   filterM (fmap not . stored) (filter (not . (`HashSet.member` have)) fresh)
 
+-- | The most announcements of transactions that wait for 'askForTxs'. One
+-- that comes when they are this many is dropped: a peer announces a
+-- transaction again, and other peers do too.
+announcedRoom :: Natural
+announcedRoom = 1000
+
+-- | The thread that asks peers for the transactions that they announced
+-- ('processTxs'), apart from the block store's own. Whether the fleet has
+-- seen a transaction is a call to Redis, which may take up to a second: on
+-- the block store's thread, as it once was, a busy mempool and a slow Redis
+-- made blocks and headers wait behind thousands of announcements, in a
+-- mailbox with no bound. This thread changes no state of the sync, which
+-- only the block store's thread does: it reads whether the store is in
+-- sync, and notes its requests in the pending transactions, in one
+-- transaction each.
+askForTxs :: BlockStore -> IO a
+askForTxs self = loopForever $ do
+  (p, hs) <- atomically (readTBQueue self.announced)
+  processTxs self p hs `catchAny` \e ->
+    logWarn self ("Could not ask for the transactions of peer " <> p.label <> ": " <> cs (show e))
+
+-- | Whether the best block in the database is the best header of the node,
+-- without changing anything: 'isInSync' for another thread than the block
+-- store's.
+inSyncNow :: BlockStore -> IO Bool
+inSyncNow self =
+  getBestBlock self >>= \case
+    Nothing -> return False
+    Just bb -> (== bb) . headerHash . (.header) <$> chainGetBest self.config.chain
+
 -- | Request from a peer the announced transactions that are neither queued,
 -- recently requested, seen by the fleet nor in the database ('toFetch').
--- Only while in sync.
+-- Only while in sync. It runs on the thread of 'askForTxs'.
 processTxs :: BlockStore -> Peer -> [TxHash] -> IO ()
-processTxs self p hs = guardSync self $ do
-  xs <- toFetch (isPending self) self.config.seen stored hs
-  logDebug self $
-    "Requesting "
-      <> cs (show (length xs))
-      <> " of "
-      <> cs (show (length hs))
-      <> " transactions announced by peer: "
-      <> p.label
-  unless (null xs) $ go xs
+processTxs self p hs =
+  inSyncNow self >>= \yes -> when yes $ do
+    xs <- toFetch (isPending self) self.config.seen stored hs
+    logDebug self $
+      "Requesting "
+        <> cs (show (length xs))
+        <> " of "
+        <> cs (show (length hs))
+        <> " transactions announced by peer: "
+        <> p.label
+    unless (null xs) $ go xs
   where
     stored h = isJust <$> getTxData self h
     go xs = do
@@ -971,7 +1033,8 @@ revertToMainChain self = do
             <> cs (show e)
         throwIO e
       Right () -> do
-        getBestBlock self >>= mapM_ self.config.onBest
+        -- as after an import: the member first, then whoever listens
+        getBestBlock self >>= mapM_ (\b -> self.config.onBest b >> publish (StoreBestBlock b) self.config.pub)
         transition self $ \st -> ((), Sync.forgetRequests st)
     revertToMainChain self
 
@@ -1042,8 +1105,7 @@ syncMe self = do
             -- it has delivered what it had, and has not announced what
             -- comes next: let it go, for a peer that has to be found
             logDebug self $ "Syncing peer has not announced the next block: " <> p.label
-            released <- transition self (Sync.release p)
-            when released (void (releasePeer self.owner p))
+            finishPeer self p
           else request p bns
   where
     request p bns = do
@@ -1091,10 +1153,22 @@ findAncestor self height target = do
           <> cs (show target.height)
       throwIO $ AncestorNotInChain height h
 
--- | Forget a peer: release it if it was the syncing peer.
+-- | Forget a peer that disconnected ('Sync.forget'): release it if it was
+-- the syncing peer.
+forgetPeer :: BlockStore -> Peer -> IO ()
+forgetPeer self p = do
+  released <- transition self (Sync.forget p)
+  when released $ do
+    logDebug self $ "Releasing peer: " <> p.label
+    void (releasePeer self.owner p)
+
+-- | Stop syncing from a peer that is still connected ('Sync.finish'):
+-- release it if it was the syncing peer. It stays owed what it was asked
+-- for, so that a block it sends late is dropped, not taken for a fault.
 finishPeer :: BlockStore -> Peer -> IO ()
 finishPeer self p = do
-  released <- transition self (Sync.release p)
+  now <- getCurrentTime
+  released <- transition self (Sync.finish now p)
   when released $ do
     logDebug self $ "Releasing peer: " <> p.label
     void (releasePeer self.owner p)
@@ -1163,7 +1237,10 @@ processBlockStoreMessage self (BlockPeerDisconnect p) = do
   logDebug self $
     "Peer disconnected: " <> p.label
   atomically $ modifyTVar' self.knows $ HashMap.delete p.label
-  finishPeer self p
+  forgetPeer self p
+processBlockStoreMessage self BlockRefill = do
+  atomically $ writeTVar self.refill True
+  syncMempool self
 processBlockStoreMessage self (BlockReceived p b) = do
   logDebug self $
     "Received block: "
@@ -1191,7 +1268,12 @@ processBlockStoreMessage self (TxRefAvailable p ts) = do
       <> p.label
       <> ": "
       <> T.unwords (map txHashToHex ts)
-  processTxs self p ts
+  queued <- atomically $ do
+    full <- isFullTBQueue self.announced
+    unless full (writeTBQueue self.announced (p, ts))
+    return (not full)
+  unless queued . logDebug self $
+    "Too many announcements wait: dropped " <> cs (show (length ts)) <> " from peer " <> p.label
 processBlockStoreMessage self (BlockPing r) = do
   logDebug self "Internal clock event"
   -- a request that no peer answered, as a node does not for a transaction

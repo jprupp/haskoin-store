@@ -298,5 +298,13 @@ spec = do
       let (ready, after) = due (at 30) (HashMap.fromList [(h 1, (at 30, []))])
       ready `shouldBe` [h 1]
       after `shouldBe` HashMap.empty
+    it "moves a transaction on its schedule only once it was asked for" $ do
+      let m = HashMap.fromList [(h 1, (at 10, [25])), (h 2, (at 10, []))]
+          once = asked (at 10) (h 1) m
+      -- the second, not asked for yet, is still due
+      fst (due (at 10) once) `shouldBe` [h 2]
+      HashMap.lookup (h 1) once `shouldBe` Just (at 35, [])
+      -- at its last delay, it goes once asked for
+      HashMap.lookup (h 2) (asked (at 10) (h 2) once) `shouldBe` Nothing
     it "asks past the two minutes in which nodes give back what they took" $
       sum askAgain `shouldSatisfy` (> 120)

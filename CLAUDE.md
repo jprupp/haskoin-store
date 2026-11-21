@@ -46,6 +46,16 @@
   seed. Its cause is not known. Run it again before taking such a failure
   for a fault of the change.
 
+## Concurrency
+
+Every protocol that runs at once, in a store or across a fleet, is a pure
+machine or a Lua script that decides it in one call, and
+`docs/concurrency.md` says which, who owns each piece of shared state, and
+why no interleaving breaks it. A change to one of them updates that
+document, and adds the property that the change keeps to the machine's
+spec. Change shared state only from its owner, or in one STM transaction
+that reads what the decision depends on.
+
 ## Keep the documentation up to date with every change
 
 Every change to this repository must update all the documentation it affects,
@@ -129,10 +139,11 @@ obvious, and no long chains of commands joined with `&&` or `;` on one line.
 
 Build the documentation with `haskell-dev docs` and make sure it has no
 warnings about broken markup. The command ends with a check of the comments:
-a change must add nothing to what that check reports. It reports 175
-problems on master after 1.16.7, all older than the check: 50 ambiguous
-names, 17 names out of scope, 79 links to names that their module does not
-export, 12 links to pages or anchors that do not exist, 4 namespace letters
+a change must add nothing to what that check reports. It reports 174
+problems on master after the concurrency fixes of 2.0.0, all older than the
+check: 50 ambiguous names, 17 names out of scope, 79 links to names that
+their module does not export, 11 links to pages or anchors that do not
+exist, 4 namespace letters
 written right after a parenthesis, and 13 slashes to write `\/`. Keep the
 lines after `Documentation check` in a file before the change, and compare
 with `diff` after it. CI builds the documentation too, with `stack haddock`,

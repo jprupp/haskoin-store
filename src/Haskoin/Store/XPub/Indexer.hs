@@ -131,7 +131,7 @@ import Control.Concurrent.STM
     retry,
     writeTVar,
   )
-import Control.Exception (SomeException)
+import Control.Exception (SomeException, mask)
 import Control.Monad (forM_, replicateM_, unless, void, when)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
@@ -145,7 +145,7 @@ import Data.Sequence qualified as Seq
 import Foreign.C.Types (CInt (..), CUInt (..))
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin.Store.Common (loopForever)
-import Haskoin.Store.Exception (catchAny, finally, tryAny)
+import Haskoin.Store.Exception (catchAny, finally, onException, tryAny)
 import Haskoin.Store.XPub (Budget (..), noBudget)
 import Haskoin.Store.XPub.Lock (Lock (..), Taken (..))
 
@@ -561,11 +561,20 @@ prefetch i k p = do
 
 -- | Ask for a key, waiting so many microseconds at most. It counts nothing:
 -- 'request' and 'prefetch' count what they were told.
+--
+-- The reservation of a new job ('Pending') and the attempt to take its lock
+-- run masked, and an exception that comes while the lock is being taken
+-- undoes the reservation ('abandonReserved'): it answers the requests that
+-- joined the job, and lets go of the lock if it was taken. Only waiting and
+-- the call to Redis can be interrupted. A request killed between the two,
+-- by its client going away or by a sibling of @mapConcurrently@ that
+-- failed, once left the job 'Pending' for good, and every later request
+-- for the key waited on it in vain.
 ask :: (Hashable k, Semigroup p) => Bool -> Indexer k p -> Int -> k -> p -> IO Answer
 ask decided i wait k p =
   i.runner.ready >>= \case
     False -> return (Refused NotInSync i.settings.horizon)
-    True -> do
+    True -> mask $ \restore -> do
       now <- i.clock
       step <- atomically $ do
         q <- readTVar i.queue
@@ -596,14 +605,14 @@ ask decided i wait k p =
                 return (Take d w est)
       case step of
         Done a -> return a
-        Await key v -> await i key v
+        Await key v -> restore (await i key v)
         Take d w est ->
-          acquireFor i k est >>= \case
+          (restore (acquireFor i k est) `onException` abandonReserved i k) >>= \case
             Just a -> do
               forM_ w (unwait i . fst)
               return a
             Nothing -> case (d, w) of
-              (Wait, Just (key, v)) -> await i key v
+              (Wait, Just (key, v)) -> restore (await i key v)
               (RefuseKeep e, _) -> return (Refused TooLong e)
               _ -> return Failed
   where
@@ -660,22 +669,34 @@ acquireFor i k est =
       let a = case decide (Situation 0 0 0 False (AnotherStore t)) of
             RefuseNothing why e -> Refused why e
             _ -> Refused OtherStore (max 0 t)
-      gone <- atomically (unreserve a)
+      gone <- atomically (unreserve i k a)
       forM_ gone $ \j -> i.runner.blocked k j.payload t `catchAny` \_ -> return ()
       return (Just a)
     Left e -> do
-      gone <- atomically (unreserve Failed)
+      gone <- atomically (unreserve i k Failed)
       forM_ gone $ \j -> i.runner.failed k j.payload e `catchAny` \_ -> return ()
       return (Just Failed)
-  where
-    unreserve a = do
-      q <- readTVar i.queue
-      case HashMap.lookup k q.jobs of
-        Just job@Job {stage = Pending} -> do
-          writeTVar i.queue q {jobs = HashMap.delete k q.jobs}
-          mapM_ (answer a) job.waiters
-          return (Just job)
-        _ -> return Nothing
+
+-- | Drop the reservation of a key, if its job is still 'Pending', and
+-- answer the requests that joined it.
+unreserve :: (Hashable k) => Indexer k p -> k -> Answer -> STM (Maybe (Job p))
+unreserve i k a = do
+  q <- readTVar i.queue
+  case HashMap.lookup k q.jobs of
+    Just job@Job {stage = Pending} -> do
+      writeTVar i.queue q {jobs = HashMap.delete k q.jobs}
+      mapM_ (answer a) job.waiters
+      return (Just job)
+    _ -> return Nothing
+
+-- | Undo the reservation of a key after an exception: drop the job if it is
+-- still 'Pending', answering its requests 'Failed', and let go of the lock,
+-- which the store may hold if the exception came after it was taken. A job
+-- already queued is left: a worker runs it.
+abandonReserved :: (Hashable k) => Indexer k p -> k -> IO ()
+abandonReserved i k = do
+  gone <- atomically (unreserve i k Failed)
+  forM_ gone $ \_ -> i.lock.release k `catchAny` \_ -> return ()
 
 -- | A request joins the job of a key: a queued job of upkeep moves to the
 -- end of the first part, and takes the payload of the request; a running

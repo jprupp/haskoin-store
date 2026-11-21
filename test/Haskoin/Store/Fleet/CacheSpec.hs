@@ -21,6 +21,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (find, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Serialize (encode)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -137,9 +138,9 @@ burstTest bed = do
   answers <- mapConcurrently (\i -> xpubAsk (if even i then bed.a else bed.b).door x) [1 .. 20 :: Int]
   answers `shouldSatisfy` all (== Indexed)
   threadDelay 300000
-  -- one build, which Redis announced to both
-  forM_ [bed.a, bed.b] $ \m ->
-    (HashMap.lookupDefault 0 (xpubId x) <$> readTVarIO m.built) `shouldReturn` 1
+  -- the requests that waited for the announcement are gone, and nothing of
+  -- them is left: the map holds a key only while a request waits for it
+  forM_ [bed.a, bed.b] $ \m -> HashMap.null <$> readTVarIO m.built `shouldReturn` True
   forM_ [bed.a, bed.b] $ \m -> sameAsChain bed m x
 
 retryTest :: Bed -> IO ()
@@ -296,8 +297,8 @@ orphanTest bed = do
   memberReceived bed.a now young
   settle bed
   held <- readTVarIO bed.a.waiting
-  HashMap.member (txHash old) held `shouldBe` False
-  HashMap.member (txHash young) held `shouldBe` True
+  Map.member (txHash old) held `shouldBe` False
+  Map.member (txHash young) held `shouldBe` True
 
 -- | Each member counts a refill when the pool starts again, which the count
 -- of restarts says; and one only, not two, when Redis loses its data with
@@ -363,7 +364,7 @@ unsettledTest bed = do
     Redis.hdel bed.a.keys.recent ("b" :| [])
   -- the block of the payment is reverted, and the store reports its parent
   revert bed.db >> noted bed
-  report bed.a
+  void (report bed.a)
   -- and reverts the parent too before it moves the tip
   revert bed.db
   moveTip bed.a `shouldReturn` False

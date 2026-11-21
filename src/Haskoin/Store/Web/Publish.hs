@@ -99,6 +99,7 @@ module Haskoin.Store.Web.Publish
     askLoop,
     askAgain,
     due,
+    asked,
 
     -- * What the store can check
     Coin (..),
@@ -115,7 +116,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race, waitCatch, withAsync)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
 import Control.Monad (forM_, forever, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -588,17 +589,37 @@ due now m = ([h | (h, (t, _)) <- HashMap.toList m, t <= now], HashMap.mapMaybe n
           d : rest -> Just (addUTCTime d now, rest)
           [] -> Nothing
 
+-- | The schedule after a transaction whose time had come was asked for:
+-- at its next delay, or no more after its last ('due').
+asked ::
+  UTCTime ->
+  TxHash ->
+  HashMap TxHash (UTCTime, [NominalDiffTime]) ->
+  HashMap TxHash (UTCTime, [NominalDiffTime])
+asked now h = HashMap.update next h
+  where
+    next (t, ds)
+      | t > now = Just (t, ds)
+      | otherwise = case ds of
+          d : rest -> Just (addUTCTime d now, rest)
+          [] -> Nothing
+
 -- | Every second, ask for each transaction whose time has come, unless the
 -- store has it now. Runs until it is cancelled.
+--
+-- The schedule of a transaction moves on only once it was asked for, one
+-- at a time ('asked'). Moved on for all of them first, as it once was, an
+-- error in the middle lost the turn of the others, and a transaction at its
+-- last delay was never asked for at all.
 askLoop :: Asking -> (TxHash -> IO Bool) -> (TxHash -> IO ()) -> IO ()
 askLoop (Asking var) present ask = forever $ do
   threadDelay 1000000
   now <- getCurrentTime
-  ready <- atomically (stateTVar var (due now))
+  ready <- fst . due now <$> readTVarIO var
   forM_ ready $ \h ->
     present h >>= \case
       True -> atomically (modifyTVar' var (HashMap.delete h))
-      False -> ask h
+      False -> ask h >> atomically (modifyTVar' var (asked now h))
 
 -- | When to ask for a transaction that was handed over: soon, for Bitcoin
 -- Cash Node, and then every 25 seconds for two minutes and a half. The

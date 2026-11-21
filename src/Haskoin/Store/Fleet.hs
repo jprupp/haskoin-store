@@ -78,6 +78,7 @@ module Haskoin.Store.Fleet
     mayReport,
     report,
     live,
+    mayEmptyAlone,
 
     -- * Moving the tip
     agreed,
@@ -135,6 +136,19 @@ live now fleet = Map.filter ((> now) . (.expires)) fleet.reports
 mayReport :: (Ord s) => Time -> s -> (b -> Bool) -> Fleet s b -> Bool
 mayReport now store has fleet =
   maybe True has fleet.tip || Map.null (Map.delete store (live now fleet))
+
+-- | Whether a store that cannot say what the blocks between the tip and
+-- the block that the stores agree on did, because it does not have the
+-- tip, may empty the pool to move there: only if it is the one store that
+-- is live. Another that is live may know the way; and a store that is not
+-- live, whose report was refused, is behind the others and knows least.
+-- @pool.lua@ checks the same in the script that empties the pool.
+--
+-- One store live was the rule once, whichever store it was: a store that
+-- came back behind the tip, with its report refused, emptied the pool of
+-- the one other store, which knew the way.
+mayEmptyAlone :: (Eq s) => Time -> s -> Fleet s b -> Bool
+mayEmptyAlone now store fleet = Map.keys (live now fleet) == [store]
 
 -- | Note the recent blocks of a store, newest first, under a lease of some
 -- length. The store must have checked 'mayReport' against the same state:

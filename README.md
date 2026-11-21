@@ -895,7 +895,9 @@ RocksDB holds the chain alone. The mempool is the fleet's pool in Redis.
   everything in an answer is of the same moment.
 
 `docs/one-fleet.md` has the reasons, and `docs/fleet-mempool.md` the pool
-in detail and its tests.
+in detail and its tests. `docs/concurrency.md` says, for every protocol
+that runs at once, in a store and across a fleet, which pure machine or
+Lua script decides it, who owns what, and why no interleaving breaks it.
 The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database

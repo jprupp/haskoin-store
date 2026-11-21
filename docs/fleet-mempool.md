@@ -79,7 +79,7 @@ What the server does with each answer:
 | --- | --- |
 | Taken, or already known | Lets it go; the fleet has seen it, so no server fetches it again |
 | Orphan | Keeps it waiting, and tries again next round, for 20 minutes at most |
-| Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place |
+| Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place. If that offer is not decided either, as when a new rival came, it waits for the next round: the fleet counts a conflict as seen, so no other server would fetch it |
 | Late | Stops; the next round offers it again at the new tip |
 
 **Replacement by fee** works through the conflict rule. A peer relays Y
@@ -97,7 +97,9 @@ A transaction leaves the pool only for a reason:
 
 - it was replaced (above);
 - it is older than the mempool timeout, counted on the pool's own times
-  (`expirePool`, run by every server each turn);
+  (`expirePool`, run by every server each turn): `pool.lua` chooses the
+  old transactions and withdraws them in one call, so that one that left
+  and came back with a new time is not withdrawn for its old one;
 - the tip moved to a block that confirms it, or that spends what it spends.
 
 Whatever leaves takes along everything that spends it, since those would
@@ -160,7 +162,9 @@ age. Those answer 404.
 A server goes through 50 blocks at most. Two cases are past that:
 
 - **It does not have the old tip** at all. It may then empty the pool and
-  move the tip, but only when no other server is live: another might know.
+  move the tip, but only when it is the one server that is live: another
+  might know. A server whose report was refused is not live, and moves no
+  tip at all.
   A reorganisation from a tip that it has but cannot read is not this case:
   it waits.
 - **The way is longer than 50 blocks.** That is true for every server, so

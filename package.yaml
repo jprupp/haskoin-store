@@ -27,6 +27,7 @@ extra-source-files:
 extra-doc-files:
   - README.md
   - CHANGELOG.md
+  - docs/concurrency.md
 language: GHC2024
 # used by every module: records with fields of the same name, read with a dot
 default-extensions:

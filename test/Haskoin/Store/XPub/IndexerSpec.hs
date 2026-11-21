@@ -4,8 +4,8 @@
 module Haskoin.Store.XPub.IndexerSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, forConcurrently, wait, withAsync)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.Async (async, cancel, forConcurrently, wait, withAsync)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Monad (forM_, replicateM, void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -142,6 +142,23 @@ spec = do
       upkeep t.indexer 'g' [1000000]
       void (runNext t.indexer >> runNext t.indexer >> runNext t.indexer >> runNext t.indexer)
       (.median) <$> indexerStats t.indexer `shouldReturn` 200
+
+    it "undoes the reservation of a request that is killed while it takes the lock" $ do
+      t <- testbed settings
+      entered <- newEmptyMVar
+      gate <- newEmptyMVar
+      writeIORef t.acquiring (putMVar entered () >> takeMVar gate)
+      a <- async (request t.indexer 'x' [1])
+      takeMVar entered
+      cancel a
+      writeIORef t.acquiring (return ())
+      -- the lock, which it might have taken, is let go
+      readIORef t.locks `shouldReturn` ["release x"]
+      -- nothing of the request is left: upkeep for the key is queued and
+      -- run, where a job left reserved would have taken it and never run
+      upkeep t.indexer 'x' [2]
+      runNext t.indexer `shouldReturn` True
+      readIORef t.ran `shouldReturn` [('x', [2])]
 
     it "takes nothing for a key that another store holds, and gives the payload of upkeep back" $ do
       t <- testbed settings
@@ -316,6 +333,8 @@ data Testbed = Testbed
     locks :: IORef [String],
     -- | what letting go of a lock does after it is noted
     onRelease :: IORef (IO ()),
+    -- | what taking a lock does before it answers
+    acquiring :: IORef (IO ()),
     -- | when another store holds every lock, until when
     other :: IORef (Maybe Int),
     ready' :: IORef Bool,
@@ -336,6 +355,7 @@ testbed s = do
   size <- newIORef Nothing
   locks <- newIORef []
   onRelease <- newIORef (return ())
+  acquiring <- newIORef (return ())
   other <- newIORef Nothing
   ready' <- newIORef True
   abandoned <- newIORef []
@@ -347,7 +367,7 @@ testbed s = do
       lock =
         Lock
           { acquire = \k _ ->
-              readIORef other >>= \case
+              (readIORef acquiring >>= id) >> readIORef other >>= \case
                 Just t -> return (Held t)
                 Nothing -> note locks ("take " <> [k]) >> return Took,
             renew = \ks -> note renewed (sort ks) >> return 0,
@@ -383,6 +403,7 @@ testbed s = do
         size,
         locks,
         onRelease,
+        acquiring,
         other,
         ready',
         abandoned,

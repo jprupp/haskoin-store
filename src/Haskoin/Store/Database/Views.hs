@@ -42,7 +42,7 @@ module Haskoin.Store.Database.Views
   )
 where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (mask_)
 import Control.Monad (forM_, when)
 import Data.Map.Strict (Map)
@@ -87,15 +87,23 @@ takeView views block = mask_ $ do
 heldViews :: Views b -> IO [b]
 heldViews views = Map.keys . Map.filter (not . (.doomed)) <$> readTVarIO views.held
 
--- | Let go of every view but those of the given blocks. A view that is
--- being read is released when its last reader is done, and counts as gone
--- from now on.
-keepViews :: (Ord b) => Views b -> [b] -> IO ()
-keepViews views blocks = mask_ $ do
-  free <- atomically . stateTVar views.held $ \m ->
-    let (stay, go) = Map.partitionWithKey (\b _ -> b `elem` blocks) m
-        (idle, busy) = Map.partition ((== 0) . (.readers)) go
-     in (Map.elems idle, stay <> Map.map (\h -> h {doomed = True}) busy)
+-- | Let go of every view but those of the blocks that a transaction gives.
+-- A view that is being read is released when its last reader is done, and
+-- counts as gone from now on.
+--
+-- The blocks to keep are read in the same transaction that lets the others
+-- go, so that two threads that prune at once cannot let go of a view on
+-- the strength of what one of them read before the other changed it. A
+-- list read before the transaction, as this once took, could miss a block
+-- whose view another thread took in between, and let it go.
+keepViews :: (Ord b) => Views b -> STM [b] -> IO ()
+keepViews views keep = mask_ $ do
+  free <- atomically $ do
+    blocks <- keep
+    stateTVar views.held $ \m ->
+      let (stay, go) = Map.partitionWithKey (\b _ -> b `elem` blocks) m
+          (idle, busy) = Map.partition ((== 0) . (.readers)) go
+       in (Map.elems idle, stay <> Map.map (\h -> h {doomed = True}) busy)
   forM_ free (releaseSnapshot . (.snapshot))
 
 -- | Run an action with the database as it was at a block, if there is a
