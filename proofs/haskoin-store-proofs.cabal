@@ -1,0 +1,25 @@
+cabal-version: 2.4
+name:          haskoin-store-proofs
+version:       0
+synopsis:      Liquid Haskell proofs about the pure machines of haskoin-store
+description:
+  Not part of the store's build. It compiles the pure machine modules of
+  ../src again with the Liquid Haskell plugin, which checks the refinement
+  types written in their comments. See ../docs/mempool-ingestion.md.
+
+library
+  hs-source-dirs:     ../src
+  exposed-modules:    Haskoin.Store.Ingest
+  build-depends:
+    , base
+    , containers
+    , liquidhaskell  ==0.9.12.2.1
+
+  default-language:   GHC2024
+  default-extensions:
+    DuplicateRecordFields
+    NoFieldSelectors
+    OverloadedRecordDot
+    OverloadedStrings
+
+  ghc-options:        -fplugin=LiquidHaskell

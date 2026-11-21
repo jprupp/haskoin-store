@@ -25,6 +25,15 @@ whitelist it must now say what they grant (`--peer-permission`, or
 `mempool` there, a Bitcoin store no longer asks them for their mempools.
 
 ### Added
+- **A specification of the path into the shared mempool, and a machine
+  checked against it** (`docs/mempool-ingestion.md`,
+  `Haskoin.Store.Ingest`). The store does not use the machine yet. The
+  document says what the path from a node's mempool to the pool must
+  guarantee, what it assumes of a node, and how each claim is established:
+  by construction, proved by Liquid Haskell (`proofs/`), checked through
+  every order of events of small worlds by a model checker in the test
+  suite (`Haskoin.Store.Ingest.Model`, `scripts/check-ingest.sh`), or
+  tested against Bitcoin Core in Podman (`Haskoin.Store.MempoolSpec`).
 - **`/health` says in words what it found.** Each check has a `text`,
   such as "The database is 4 blocks behind the best header, at height
   688,798, more than the 2 allowed: the store is syncing, or cannot import

@@ -72,6 +72,7 @@ library
       Haskoin.Store.Fleet.Pool
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.XPub
+      Haskoin.Store.Ingest
       Haskoin.Store.Logic
       Haskoin.Store.Manager
       Haskoin.Store.Outage
@@ -319,9 +320,12 @@ test-suite spec
       Haskoin.Store.Fleet.XPubSpec
       Haskoin.Store.FleetSpec
       Haskoin.Store.Histories
+      Haskoin.Store.Ingest.Model
+      Haskoin.Store.IngestSpec
       Haskoin.Store.Integration.TempSpec
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.LogicSpec
+      Haskoin.Store.MempoolSpec
       Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.Web.AdmissionSpec

@@ -1,0 +1,570 @@
+{-# OPTIONS_GHC -O1 #-}
+
+-- |
+-- Module      : Haskoin.Store.Ingest.Model
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- A model checker for "Haskoin.Store.Ingest": the machine itself, the
+-- 'step' that a store runs, put in a small world of nodes, channels and a
+-- pool, and taken through __every__ order in which things can happen
+-- there. @docs\/mempool-ingestion.md@ has what is checked, T1 to T5.
+--
+-- The module is compiled with optimisation whatever the build: going
+-- through 790,000 states without it takes minutes.
+--
+-- = Why not random tests
+--
+-- A property test draws runs. The failures that this replaces were each
+-- one particular order of two events: a header that came between a
+-- request and its answer, an announcement while a queue was full. A
+-- draw finds such an order seldom, and going through all of them finds
+-- it always. The price is a small world: a few transactions and peers.
+-- The bet, which model checkers make, is that a wrong rule shows in a
+-- small world already.
+--
+-- = The world
+--
+-- Nodes hold mempools and follow the rules that the document assumes of
+-- a node (A1 to A6): a node names a transaction to a peer once, names its
+-- whole mempool when a source is asked, sends what it named and still
+-- has, and says so when it has it no longer. Between a node and the
+-- machine there is a channel each way, in order. The pool settles a
+-- transaction whose parents are settled. What the machine asks of the
+-- pool waits in a line, and other things happen meanwhile.
+--
+-- = Steps of two kinds
+--
+-- * __Things that go well__: a message is delivered, the pool answers,
+--   the store is in sync again, time passes while nothing else can.
+-- * __Disturbances__: a node takes or drops a transaction, a block
+--   confirms one, a peer goes and comes, the pool fails to answer or
+--   loses everything, a request gets no answer in time, the store is out
+--   of sync, another store offers a transaction first.
+--
+-- Safety is checked in every state that any mix of both reaches.
+-- Convergence is checked from every such state: let only things go well
+-- from there, and every run must end, in a state where the pool has
+-- every transaction of the mempool of every source. That is T3, "from
+-- any state that the store can reach".
+module Haskoin.Store.Ingest.Model
+  ( Scenario (..),
+    Disturbance (..),
+    Result (..),
+    explore,
+    wander,
+    scenarios,
+    large,
+    describeResult,
+  )
+where
+
+import Data.Foldable (toList)
+import Data.List (intercalate, sortOn)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Sequence (Seq, (|>))
+import Data.Sequence qualified as Seq
+import Data.Set (Set)
+import Data.Set qualified as Set
+import Haskoin.Store.Ingest
+
+type P = Int
+
+type H = Int
+
+-- | A transaction body: the transactions that it spends from.
+newtype B = B [H]
+  deriving (Eq, Ord, Show)
+
+-- | A world to go through.
+data Scenario = Scenario
+  { name :: String,
+    config :: Config,
+    -- | the transactions that there can be, each with those it spends from
+    txs :: Map H [H],
+    -- | the peers, and whether each is a source
+    peers :: [(P, Bool)],
+    disturbances :: [Disturbance],
+    -- | disturbances stop while more than this many messages and
+    -- questions are on their way: the world is not infinitely faster
+    -- than the store
+    busy :: Int,
+    -- | the most states to go through, after which the search says that
+    -- the world is too large and stops
+    limit :: Int
+  }
+
+data Disturbance
+  = -- | a node takes a transaction, or drops one
+    Mempools
+  | -- | a block confirms a transaction
+    Blocks
+  | -- | the store is out of sync for a while
+    Desyncs
+  | -- | a peer goes, and comes back
+    PeerDrops
+  | -- | the pool does not answer
+    PoolFails
+  | -- | the pool loses what it had
+    PoolEmptied
+  | -- | a request gets no answer in time
+    Timeouts
+  | -- | a client gives the store a transaction
+    Clients
+  | -- | another store of the fleet offers a transaction first
+    OtherStores
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+data Node = Node
+  { has :: !(Set H),
+    -- | what it named to the store on this connection
+    told :: !(Set H),
+    online :: !Bool,
+    source :: !Bool
+  }
+  deriving (Eq, Ord, Show)
+
+data ToNode = MGet ![H] | MSweep
+  deriving (Eq, Ord, Show)
+
+data ToStore = MInv ![H] | MTx !H | MNotFound ![H]
+  deriving (Eq, Ord, Show)
+
+data Op = OCheck !P ![H] | OOffer !H !B
+  deriving (Eq, Ord, Show)
+
+data World = World
+  { machine :: !(Ingest P H B),
+    nodes :: !(Map P Node),
+    pool :: !(Set H),
+    confirmed :: !(Set H),
+    toNode :: !(Map P (Seq ToNode)),
+    toStore :: !(Map P (Seq ToStore)),
+    asked :: !(Seq Op),
+    inSync :: !Bool
+  }
+  deriving (Eq, Ord, Show)
+
+-- | What a search found.
+data Result = Result
+  { states :: !Int,
+    transitions :: !Int,
+    -- | what went wrong, with the steps that lead there, if anything did
+    failure :: !(Maybe (String, [String]))
+  }
+
+describeResult :: Result -> String
+describeResult r = case r.failure of
+  Nothing -> show r.states <> " states, " <> show r.transitions <> " transitions"
+  Just (what, path) -> what <> "\nafter:\n" <> intercalate "\n" (map ("  " <>) path)
+
+parentsOf :: B -> [H]
+parentsOf (B ps) = ps
+
+-- | How far back a time matters in the worlds here: beyond the life of an
+-- orphan, every age is the same.
+horizon :: Scenario -> Tick
+horizon sc = sc.config.orphanLife + sc.config.patience + 2
+
+settled :: World -> Set H
+settled w = w.pool `Set.union` w.confirmed
+
+initial :: Scenario -> World
+initial sc =
+  World
+    { machine = start sc.config 0,
+      nodes = Map.fromList [(p, Node Set.empty Set.empty False src) | (p, src) <- sc.peers],
+      pool = Set.empty,
+      confirmed = Set.empty,
+      toNode = Map.fromList [(p, Seq.empty) | (p, _) <- sc.peers],
+      toStore = Map.fromList [(p, Seq.empty) | (p, _) <- sc.peers],
+      asked = Seq.empty,
+      inSync = False
+    }
+
+-- | Give the machine an input: check what the step did against the rules
+-- that hold of every step, and send its outputs on their way.
+feed :: Scenario -> Input P H B -> World -> Either String World
+feed sc input w = do
+  let before = w.machine
+      (after, outs) = step parentsOf input before
+      -- what comes into the machine with an input: a body, and the ids
+      -- that the pool was asked about; what a peer names goes to the pool
+      -- first
+      learned = Set.fromList $ case input of
+        Body _ h _ -> [h]
+        Checked _ yes no -> yes <> no
+        Unchecked _ hs -> hs
+        _ -> []
+      gone = Set.fromList [h | Gone h _ <- outs]
+  -- T1: nothing leaves in silence, and nothing comes from nowhere
+  check "an id left without a word, or came from nowhere" $
+    Set.union (ids before) learned == Set.union (ids after) gone
+  check "an id is said to have left and is still there" $
+    Set.null (Set.intersection (ids after) gone)
+  -- T1 for what a peer names: it has a place or the pool is asked
+  case input of
+    Named p hs
+      | Just (Just _) <- Just (windowOf p before) ->
+          check "a named id has no place and the pool is not asked" $
+            all (\h -> Set.member h (ids after) || h `elem` concat [cs | Check _ cs <- outs]) hs
+    _ -> return ()
+  -- the invariant, which has the bounds of T2
+  case wellFormed after of
+    [] -> return ()
+    wrong -> Left ("after " <> show input <> ": " <> intercalate "; " wrong)
+  -- T5
+  check "the count of requests out is wrong" $
+    pending after == length [() | h <- Set.toList (ids after), Just (Asked {}) <- [placeOf h after]]
+  w' <- foldl' (\acc o -> acc >>= send o) (Right w) outs
+  return w' {machine = rebase (horizon sc) after}
+  where
+    check what ok = if ok then Right () else Left (what <> ", after " <> show input)
+    send o x = case o of
+      Get p hs -> do
+        node <- maybe (Left "asked a peer that is not there") Right (Map.lookup p x.nodes)
+        -- T4: only a peer that is there, only for what it named, within its window
+        check "asked a peer that is gone" node.online
+        check "asked a peer for what it did not name" (all (`Set.member` node.told) hs)
+        check "asked for nothing" (not (null hs))
+        return x {toNode = Map.adjust (|> MGet hs) p x.toNode}
+      Sweep p -> do
+        node <- maybe (Left "swept a peer that is not there") Right (Map.lookup p x.nodes)
+        check "asked the mempool of a peer that would drop the store for it" (node.online && node.source)
+        return x {toNode = Map.adjust (|> MSweep) p x.toNode}
+      Check p hs -> return x {asked = x.asked |> OCheck p hs}
+      Offer h b -> return x {asked = x.asked |> OOffer h b}
+      Gone _ _ -> return x
+
+-- | The steps in which things go well, from a world.
+calm :: Scenario -> World -> [(String, Either String World)]
+calm sc w = if null moves then idle else moves
+  where
+    moves = concat [toNodes, toStores, answers, resync]
+    toNodes =
+      [ ( "the node of peer " <> show p <> " reads " <> show msg,
+          Right (nodeReads sc p msg w {toNode = Map.insert p rest w.toNode})
+        )
+      | (p, q) <- Map.toList w.toNode,
+        msg Seq.:<| rest <- [q]
+      ]
+    toStores =
+      [ ( "the store reads " <> show msg <> " of peer " <> show p,
+          feed sc (storeReads p msg) w {toStore = Map.insert p rest w.toStore}
+        )
+      | (p, q) <- Map.toList w.toStore,
+        msg Seq.:<| rest <- [q]
+      ]
+    answers = case w.asked of
+      OCheck p hs Seq.:<| rest ->
+        let (yes, no) = (filter (`Set.member` settled w) hs, filter (`Set.notMember` settled w) hs)
+         in [("the pool answers the check of " <> show hs, feed sc (Checked p yes no) w {asked = rest})]
+      OOffer h b Seq.:<| rest ->
+        let missing = filter (`Set.notMember` settled w) (parentsOf b)
+         in if null missing
+              then
+                [ ( "the pool takes " <> show h,
+                    feed sc (Offered h Settled) w {asked = rest, pool = Set.insert h w.pool}
+                  )
+                ]
+              else [("the pool lacks parents of " <> show h, feed sc (Offered h (Orphan missing)) w {asked = rest})]
+      _ -> []
+    resync = [("the store is in sync", feed sc (Synced True) w {inSync = True}) | not w.inSync]
+    -- time passes only when nothing else can happen: a second at a time
+    idle = [("a second passes", feed sc (Tick 1) w)]
+    storeReads p = \case
+      MInv hs -> Named p hs
+      MTx h -> Body (Just p) h (B (Map.findWithDefault [] h sc.txs))
+      MNotFound hs -> Missing p hs
+
+-- | What a node does with a message of the store (A2, A3).
+nodeReads :: Scenario -> P -> ToNode -> World -> World
+nodeReads sc p msg w = case Map.lookup p w.nodes of
+  Nothing -> w
+  Just node -> case msg of
+    MSweep
+      | Set.null node.has -> w
+      | otherwise ->
+          w
+            { nodes = Map.insert p node {told = Set.union node.told node.has} w.nodes,
+              -- A5: parents before children
+              toStore = Map.adjust (|> MInv (sortOn depth (Set.toAscList node.has))) p w.toStore
+            }
+    MGet hs ->
+      let (found, lost) = (filter (`Set.member` node.has) hs, filter (`Set.notMember` node.has) hs)
+          answers = map MTx found <> [MNotFound lost | not (null lost)]
+          reply = foldl' (|>) (fromMaybe' (Map.lookup p w.toStore)) answers
+       in w {toStore = Map.insert p reply w.toStore}
+  where
+    fromMaybe' = maybe Seq.empty id
+    depth :: H -> Int
+    depth h = case Map.findWithDefault [] h sc.txs of
+      [] -> 0
+      ps -> 1 + maximum (map depth ps)
+
+-- | The disturbances of a scenario, from a world.
+disturbed :: Scenario -> World -> [(String, Either String World)]
+disturbed sc w
+  | inFlight > sc.busy = []
+  | otherwise = concatMap of' sc.disturbances
+  where
+    inFlight =
+      sum (map Seq.length (Map.elems w.toNode))
+        + sum (map Seq.length (Map.elems w.toStore))
+        + Seq.length w.asked
+    everywhere = Set.unions (map (.has) (Map.elems w.nodes))
+    of' = \case
+      Mempools ->
+        [ ("the node of peer " <> show p <> " takes " <> show h, Right (arrive p h node))
+        | (p, node) <- Map.toList w.nodes,
+          (h, ps) <- Map.toList sc.txs,
+          Set.notMember h node.has,
+          Set.notMember h w.confirmed,
+          all (\x -> Set.member x node.has || Set.member x w.confirmed) ps
+        ]
+          <> [ ( "the node of peer " <> show p <> " drops " <> show h,
+                 Right w {nodes = Map.insert p node {has = Set.difference node.has (family h)} w.nodes}
+               )
+             | (p, node) <- Map.toList w.nodes,
+               h <- Set.toList node.has
+             ]
+      Blocks ->
+        [ ( "a block confirms " <> show h,
+            Right
+              w
+                { confirmed = Set.insert h w.confirmed,
+                  pool = Set.delete h w.pool,
+                  nodes = Map.map (\n -> n {has = Set.delete h n.has}) w.nodes
+                }
+          )
+        | h <- Set.toList everywhere,
+          all (`Set.member` w.confirmed) (Map.findWithDefault [] h sc.txs)
+        ]
+      Desyncs -> [("the store is out of sync", feed sc (Synced False) w {inSync = False}) | w.inSync]
+      PeerDrops ->
+        [ ( "peer " <> show p <> " is gone",
+            feed
+              sc
+              (PeerDown p)
+              w
+                { nodes = Map.insert p node {online = False, told = Set.empty} w.nodes,
+                  toNode = Map.insert p Seq.empty w.toNode,
+                  toStore = Map.insert p Seq.empty w.toStore
+                }
+          )
+        | (p, node) <- Map.toList w.nodes,
+          node.online
+        ]
+      PoolFails -> case w.asked of
+        OCheck p hs Seq.:<| rest ->
+          [("the pool does not answer the check of " <> show hs, feed sc (Unchecked p hs) w {asked = rest})]
+        OOffer h _ Seq.:<| rest -> [("the pool does not judge " <> show h, feed sc (Offered h Again) w {asked = rest})]
+        _ -> []
+      PoolEmptied -> [("the pool loses what it had", feed sc Emptied w {pool = Set.empty}) | not (Set.null w.pool)]
+      Timeouts ->
+        [ ("a request gets no answer in time", feed sc (Tick (sc.config.patience + 1)) w)
+        | pending w.machine > 0
+        ]
+      Clients ->
+        [ ("a client gives the store " <> show h, feed sc (Body Nothing h (B ps)) w)
+        | (h, ps) <- Map.toList sc.txs,
+          Set.notMember h w.confirmed
+        ]
+      OtherStores ->
+        [ ("another store offers " <> show h <> " first", Right w {pool = Set.insert h w.pool})
+        | (h, ps) <- Map.toList sc.txs,
+          Set.notMember h (settled w),
+          all (`Set.member` settled w) ps
+        ]
+    -- a transaction and all that spends from it
+    family h = close (Set.singleton h)
+      where
+        close s =
+          let s' = Set.union s (Set.fromList [c | (c, ps) <- Map.toList sc.txs, any (`Set.member` s) ps])
+           in if s' == s then s else close s'
+    -- A1: a node names a transaction once, to a peer that is there
+    arrive p h node
+      | node.online =
+          w
+            { nodes = Map.insert p node {has = Set.insert h node.has, told = Set.insert h node.told} w.nodes,
+              toStore = Map.adjust (|> MInv [h]) p w.toStore
+            }
+      | otherwise = w {nodes = Map.insert p node {has = Set.insert h node.has} w.nodes}
+
+-- | A peer comes: not a disturbance, and not something that has to
+-- happen. A peer that stays away is no source.
+--
+-- The name of a peer stands for one connection, as in haskoin-node, where
+-- every connection is a peer of its own: an answer of the pool about what
+-- a peer named is for that connection, never for a later one to the same
+-- node. A world has few names, so a name is used again only once nothing
+-- on its way mentions it, which no one can tell from a new name.
+comes :: Scenario -> World -> [(String, Either String World)]
+comes sc w =
+  [ ( "peer " <> show p <> " connects",
+      feed sc (PeerUp p node.source) w {nodes = Map.insert p node {online = True} w.nodes}
+    )
+  | (p, node) <- Map.toList w.nodes,
+    not node.online,
+    null [() | OCheck q _ <- toList w.asked, q == p]
+  ]
+
+-- | T3 at rest: the pool has every transaction of the mempool of every
+-- source that is connected.
+converged :: World -> Bool
+converged w = and [node.has `Set.isSubsetOf` settled w | node <- Map.elems w.nodes, node.online, node.source]
+
+-- | Go through every state of a scenario. In each: the rules of every
+-- step. From each, with only things going well: no way to go on for ever,
+-- and no way to stop short of 'converged'.
+explore :: Scenario -> Result
+explore sc = search (Map.singleton w0 Nothing) [w0] [] 0
+  where
+    w0 = initial sc
+    -- breadth first, so that the steps to a failure are the fewest
+    search seen [] [] n = lively seen n
+    search seen [] later n = search seen (reverse later) [] n
+    search seen (w : rest) later n
+      | Map.size seen > sc.limit =
+          Result (Map.size seen) n (Just ("more states than the limit: a smaller world is needed", []))
+      | otherwise = searchOne seen w rest later n
+    searchOne seen w rest later n =
+      let next = calm sc w <> disturbed sc w <> comes sc w
+       in case [(label, why) | (label, Left why) <- next] of
+            (label, why) : _ -> Result (Map.size seen) n (Just (why, trail seen w <> [label]))
+            [] ->
+              let new = [(x, label) | (label, Right x) <- next, Map.notMember x seen]
+                  seen' = foldl' (\m (x, label) -> Map.insertWith (\_ old -> old) x (Just (label, w)) m) seen new
+                  fresh = Set.toList (Set.fromList (map fst new))
+               in search seen' rest (reverse fresh <> later) (n + length next)
+    trail seen w = reverse (go w)
+      where
+        go x = case Map.lookup x seen of
+          Just (Just (label, from)) -> label : go from
+          _ -> []
+    -- with only things going well: every run ends, and ends converged
+    lively seen n = case walk Map.empty (Map.keys seen) of
+      Left (what, w, path) ->
+        let steps = trail seen w <> ("--- from here, only things that go well:" : path)
+         in Result (Map.size seen) n (Just (what, steps))
+      Right _ -> Result (Map.size seen) n Nothing
+    round' = "with only things going well, the store goes round for ever without the mempool of a source"
+    short = "the store is at rest and the pool lacks transactions of the mempool of a source"
+    -- depth first, with the states on the way marked: meeting one again is a
+    -- way to go on for ever
+    walk done [] = Right done
+    walk done (w : ws) = visit done w [] >>= \done' -> walk done' ws
+    visit done w path = case Map.lookup w done of
+      Just True -> Right done
+      Just False -> Left (round', w, reverse path)
+      Nothing ->
+        let next = [(label, x) | (label, Right x) <- calm sc w, x /= w]
+         in if null next
+              then
+                if converged w
+                  then Right (Map.insert w True done)
+                  else Left (short, w, reverse path)
+              else do
+                let on acc (label, x) = acc >>= \d -> visit d x (label : path)
+                done' <- foldl' on (Right (Map.insert w False done)) next
+                return (Map.insert w True done')
+
+-- | One run through a world, with a number for each choice: the rules of
+-- every step are checked along it, and at its end, with only things
+-- going well from there, the store must come to rest with the mempool of
+-- every source. For worlds too large to go through whole, a sample of
+-- their runs: evidence of another kind, and weaker.
+wander :: Scenario -> [Int] -> Either (String, [String]) ()
+wander sc = go (initial sc) []
+  where
+    go w path [] = settleDown w path (10000 :: Int)
+    go w path (n : ns) =
+      let next = calm sc w <> disturbed sc w <> comes sc w
+       in case next !! (abs n `mod` length next) of
+            (label, Left why) -> Left (why, reverse (label : path))
+            (label, Right w') -> go w' (label : path) ns
+    settleDown w path fuel = case [(label, x) | (label, x) <- calm sc w, x /= Right w] of
+      [] | converged w -> Right ()
+      [] -> Left ("the store is at rest and the pool lacks transactions of the mempool of a source", reverse path)
+      (label, Left why) : _ -> Left (why, reverse (label : path))
+      (label, Right w') : _
+        | fuel <= 0 -> Left ("with only things going well, the store does not come to rest", reverse path)
+        | otherwise -> settleDown w' (label : path) (fuel - 1)
+
+-- | A world too large to go through whole, for 'wander': two chains of
+-- three, two sources and a peer that is none, and every disturbance.
+large :: Scenario
+large =
+  Scenario
+    { name = "two chains of three, three peers, every disturbance",
+      config =
+        Config
+          { room = 5,
+            heldRoom = 3,
+            minWindow = 1,
+            maxWindow = 3,
+            patience = 2,
+            orphanLife = 6,
+            retry = 1,
+            sweepGap = 2,
+            sweepEvery = 0
+          },
+      txs = Map.fromList [(1, []), (2, [1]), (3, [2]), (4, []), (5, [4]), (6, [5, 3])],
+      peers = [(1, True), (2, True), (3, False)],
+      disturbances = [minBound .. maxBound],
+      busy = 6,
+      limit = 0
+    }
+
+-- | The worlds that the specs go through: each small enough to go
+-- through whole in seconds. A world has the mempools of its nodes
+-- changing and one or two other disturbances, so that every disturbance
+-- meets every other in some world, two at a time; all of them at once
+-- only fit with one transaction.
+scenarios :: [Scenario]
+scenarios =
+  [ world "one transaction, every disturbance" one [(1, True)] [minBound .. maxBound] small,
+    world "a chain of two, blocks" chain [(1, True)] [Mempools, Blocks] small,
+    world "a chain of two, a peer that goes" chain [(1, True)] [Mempools, PeerDrops] small,
+    world "a chain of two, requests that get no answer" chain [(1, True)] [Mempools, Timeouts] small,
+    world "a chain of two, a pool that fails" chain [(1, True)] [Mempools, PoolFails] small,
+    world "a chain of two, a pool that loses what it had" chain [(1, True)] [Mempools, PoolEmptied] small,
+    world "a chain of two, a store out of sync" chain [(1, True)] [Mempools, Desyncs] small,
+    world "a chain of two, clients" chain [(1, True)] [Mempools, Clients] small,
+    world "a chain of two, another store" chain [(1, True)] [Mempools, OtherStores] small,
+    world "a chain of two, room for one id and one body" chain [(1, True)] [Mempools, Clients] tight,
+    world "a chain asked for child first, room for one body" upside [(1, True)] [Mempools] small {heldRoom = 1},
+    world "a chain of three asked for child first, room for two bodies" upside3 [(1, True)] [Mempools] two,
+    world "a chain of two, a peer that goes and no answers" chain [(1, True)] [Mempools, PeerDrops, Timeouts] small,
+    world "a chain of two, the pool failing and emptied" chain [(1, True)] [Mempools, PoolFails, PoolEmptied] small,
+    world "a chain of two, blocks and a store out of sync" chain [(1, True)] [Mempools, Blocks, Desyncs] small,
+    world "one transaction, a source and a peer that is none" one mixed [Mempools, PeerDrops, Timeouts] small,
+    world "one transaction, two sources" one [(1, True), (2, True)] [Mempools, PeerDrops] small
+  ]
+  where
+    world name txs peers disturbances config =
+      Scenario {name, config, txs, peers, disturbances, busy = 2, limit = 1500000}
+    mixed = [(1, True), (2, False)]
+    tight = small {room = 1, heldRoom = 1}
+    two = small {heldRoom = 2, maxWindow = 3}
+    one = Map.fromList [(1, [])]
+    chain = Map.fromList [(1, []), (2, [1])]
+    -- the child has the smaller id, so it is asked for first
+    upside = Map.fromList [(2, []), (1, [2])]
+    upside3 = Map.fromList [(3, []), (2, [3]), (1, [2])]
+    small =
+      Config
+        { room = 8,
+          heldRoom = 8,
+          minWindow = 1,
+          maxWindow = 2,
+          patience = 1,
+          orphanLife = 2,
+          retry = 1,
+          sweepGap = 1,
+          sweepEvery = 0
+        }

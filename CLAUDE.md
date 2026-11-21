@@ -56,6 +56,25 @@ document, and adds the property that the change keeps to the machine's
 spec. Change shared state only from its owner, or in one STM transaction
 that reads what the decision depends on.
 
+## The path into the shared mempool
+
+`docs/mempool-ingestion.md` says what the path from a node's mempool to
+the pool must guarantee (T1 to T5), what it assumes (A1 to A6), and how
+each claim is established. The path is one pure machine,
+`Haskoin.Store.Ingest`. A change to it is not done until:
+
+- `scripts/check-ingest.sh` passes: the model checker goes through every
+  order of events of its small worlds, in about a minute, without building
+  the store. A new rule of the machine gets a check in
+  `Haskoin.Store.Ingest.Model`, and a planted bug that the check finds.
+- Liquid Haskell passes: `cabal build` in `proofs/`, with GHCup's GHC
+  9.12.4 and `z3` on the `PATH`.
+- The document says what is now proved, checked, sampled or only tested.
+  Never write "proved" for what is tested.
+
+Do not fix a failure of this path seen on a server by trying a build
+there. Reproduce it in the model or in `Haskoin.Store.MempoolSpec` first.
+
 ## Keep the documentation up to date with every change
 
 Every change to this repository must update all the documentation it affects,

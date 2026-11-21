@@ -39,7 +39,20 @@
 -- kept in tmpfs mounts and in a temporary directory under @\/dev\/shm@ (or
 -- @$XDG_RUNTIME_DIR@), and every container has a memory limit. Set
 -- @HASKOIN_TEST_LOG@ to see the log of the store.
-module Haskoin.Store.IntegrationSpec (spec) where
+module Haskoin.Store.IntegrationSpec
+  ( spec,
+
+    -- * For the other specs that run a store against a node
+    Server (..),
+    arr,
+    getJSON,
+    grantedBy,
+    listening,
+    storeConfig,
+    webConfig,
+    withTestLog,
+  )
+where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, forConcurrently, link, withAsync)

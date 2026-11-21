@@ -1,0 +1,4 @@
+-- The proofs are built with cabal and GHCup's GHC, apart from the store,
+-- which Stack builds: Liquid Haskell is tied to one version of GHC.
+packages: .
+with-compiler: ghc-9.12.4

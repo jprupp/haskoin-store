@@ -11,4 +11,8 @@ slow-specs = [
   "Haskoin.Store.Integration",
   # each download test is a group with a pod of its own
   "Haskoin.Store.Download",
+  # and each test of the mempool against a node
+  "Haskoin.Store.Mempool",
+  # each world of the model checker is a group
+  "Haskoin.Store.Ingest",
 ]
