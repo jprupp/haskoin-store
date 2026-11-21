@@ -1115,14 +1115,30 @@ seconds.
 
 The checks are: how far the index is behind the headers, the age of the
 last block and of the last transaction, the transactions waiting to be
-imported, the connected peers, and Redis (`"redis"` in the JSON).
+imported, the connected peers, the database, and Redis (`"redis"` in the
+JSON).
 
-**Writes to the database** are in `"database"`: `"writes"` is `flowing`,
-`delayed` or `stopped`, with `"pending-compaction-bytes"` and
-`"delayed-write-rate"` (bytes a second, 0 when not delayed). RocksDB
-delays writes and then stops them when its compactions fall behind
-([RocksDB](#rocksdb)); the store reads this every five seconds, and logs a
-warning when writes are delayed or stopped and a line when they recover.
+**Each check says in words what it found**, in its `"text"`, and the
+`"text"` at the top says what that means for the whole store, such as:
+
+> The store is not healthy. The database is 4 blocks behind the best
+> header, at height 688,798, more than the 2 allowed: the store is
+> syncing, or cannot import blocks fast enough.
+
+They are for people looking at a store; a program should read `"ok"` and
+the numbers, as the wording may change.
+
+**The database** is in `"database"`, as RocksDB reports it every five
+seconds: `"writes"` is `flowing`, `delayed` or `stopped`, with
+`"pending-compaction-bytes"` and `"delayed-write-rate"` (bytes a second, 0
+when not delayed), and the work that explains it: `"running-compactions"`,
+`"running-flushes"`, `"immutable-memtables"` (full tables in memory waiting
+to be flushed), `"size-bytes"` and `"live-data-bytes"` of the files, and
+`"background-errors"` since the database opened. RocksDB delays writes and
+then stops them when its compactions fall behind ([RocksDB](#rocksdb)).
+Only stopped writes fail the check, as the store then imports nothing. The
+store logs a warning when writes are delayed or stopped and a line when
+they recover.
 
 - **Stopped writes make the store unhealthy:** it imports nothing until
   they flow again.

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- |
 -- Module      : Haskoin.Store.Database.Stalls
@@ -29,19 +30,23 @@
 --
 -- * 'watchStalls' reads RocksDB's properties every few seconds, logs when
 --   writes start to be delayed or stopped and when they recover, keeps the
---   state for @\/health@, and sends it to StatsD.
+--   state for @\/health@, and sends it to StatsD. The state is that of the
+--   check of the database of haskoin-store-data
+--   ('Haskoin.Store.Data.DatabaseHealth'): beside the writes, the
+--   compactions and flushes running, the tables in memory waiting for a
+--   flush, the size of the files and the errors in the background, which
+--   say why writes are slow.
 --
 -- The properties are polled rather than heard from an event listener of
 -- RocksDB, which the C API of the binding does not have: a stall lasts
 -- minutes to hours, so a few seconds late is soon enough, and each poll is
--- three reads of counters that RocksDB keeps anyway.
+-- a few reads, for each column family, of counters that RocksDB keeps
+-- anyway.
 module Haskoin.Store.Database.Stalls
   ( -- * Background jobs
     defaultBackgroundJobs,
 
     -- * Write stalls
-    Writes (..),
-    Stall (..),
     noStall,
     readStall,
     stallNote,
@@ -58,6 +63,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Database.RocksDB (DB, Property (..), columnFamilies, getProperty, getPropertyCF)
 import Haskoin.Node (LogLevel (..))
+import Haskoin.Store.Data (DatabaseHealth (..), DatabaseWrites (..))
 import System.Metrics.StatsD (Stats, newStatGauge, setGauge)
 import Text.Read (readMaybe)
 
@@ -82,73 +88,81 @@ import Text.Read (readMaybe)
 defaultBackgroundJobs :: Int -> Int
 defaultBackgroundJobs cores = max 2 (min 16 cores)
 
--- | Whether RocksDB lets writes through.
-data Writes
-  = -- | at full speed
-    Flowing
-  | -- | slowed down to let compactions catch up
-    Delayed
-  | -- | stopped until compactions or flushes catch up
-    Stopped
-  deriving (Eq, Ord, Show, Enum, Bounded)
+-- | The state before the first poll: writes flowing, nothing pending or
+-- running, an empty database.
+noStall :: DatabaseHealth
+noStall =
+  DatabaseHealth
+    { writes = WritesFlowing,
+      pendingCompaction = 0,
+      delayedWriteRate = 0,
+      compactions = 0,
+      flushes = 0,
+      memtables = 0,
+      size = 0,
+      liveData = 0,
+      errors = 0
+    }
 
--- | What RocksDB said at a poll.
-data Stall = Stall
-  { -- | whether writes go through
-    writes :: !Writes,
-    -- | bytes that RocksDB estimates it has to compact, summed over every
-    -- column family (@rocksdb.estimate-pending-compaction-bytes@)
-    pending :: !Integer,
-    -- | bytes a second that writes are slowed to, 0 when they are not
-    -- (@rocksdb.actual-delayed-write-rate@)
-    rate :: !Integer
-  }
-  deriving (Eq, Show)
-
--- | The state before the first poll: writes flowing, nothing pending.
-noStall :: Stall
-noStall = Stall {writes = Flowing, pending = 0, rate = 0}
-
--- | Read the state of writes from RocksDB.
-readStall :: DB -> IO Stall
+-- | Read the state of the database from RocksDB's properties. Those of a
+-- column family are summed over all of them; the others are of the whole
+-- database. A property that RocksDB does not give reads as 0.
+readStall :: DB -> IO DatabaseHealth
 readStall db = do
-  pendings <- forM (Nothing : map Just (columnFamilies db)) $ \cf ->
-    number <$> maybe (getProperty db pendingP) (\c -> getPropertyCF db c pendingP) cf
-  stopped <- number <$> getProperty db (PropertyName "rocksdb.is-write-stopped")
-  rate <- number <$> getProperty db (PropertyName "rocksdb.actual-delayed-write-rate")
+  pendingCompaction <- summed "rocksdb.estimate-pending-compaction-bytes"
+  memtables <- summed "rocksdb.num-immutable-mem-table"
+  size <- summed "rocksdb.total-sst-files-size"
+  liveData <- summed "rocksdb.estimate-live-data-size"
+  stopped <- whole "rocksdb.is-write-stopped" :: IO Integer
+  delayedWriteRate <- whole "rocksdb.actual-delayed-write-rate"
+  compactions <- whole "rocksdb.num-running-compactions"
+  flushes <- whole "rocksdb.num-running-flushes"
+  errors <- whole "rocksdb.background-errors"
   let writes
-        | stopped /= 0 = Stopped
-        | rate /= 0 = Delayed
-        | otherwise = Flowing
-  return Stall {writes, pending = sum pendings, rate}
+        | stopped /= 0 = WritesStopped
+        | delayedWriteRate /= 0 = WritesDelayed
+        | otherwise = WritesFlowing
+  return DatabaseHealth {..}
   where
-    pendingP = PropertyName "rocksdb.estimate-pending-compaction-bytes"
+    whole :: (Read a, Num a) => String -> IO a
+    whole name = number <$> getProperty db (PropertyName name)
+    summed :: (Read a, Num a) => String -> IO a
+    -- the default column family, then the others
+    summed name =
+      let p = PropertyName name
+       in fmap sum . forM (Nothing : map Just (columnFamilies db)) $ \cf ->
+            number <$> maybe (getProperty db p) (\c -> getPropertyCF db c p) cf
+    number :: (Read a, Num a) => Maybe BS8.ByteString -> a
     number = fromMaybe 0 . (>>= readMaybe . BS8.unpack)
 
 -- | What to log when the state of writes was the first and is now the
 -- second: nothing while it stays the same, a warning when it gets worse,
 -- and an info line when it gets better. A stall lasts long, and a line at
 -- every poll would bury the rest of the log.
-stallNote :: Writes -> Stall -> Maybe (LogLevel, Text)
+stallNote :: DatabaseWrites -> DatabaseHealth -> Maybe (LogLevel, Text)
 stallNote before now
   | now.writes == before = Nothing
   | now.writes > before = Just (LevelWarn, worse)
   | otherwise = Just (LevelInfo, better)
   where
     worse = case now.writes of
-      Stopped -> "RocksDB stopped writes" <> behind <> hint
-      _ -> "RocksDB delays writes to " <> T.pack (show now.rate) <> " bytes/s" <> behind <> hint
+      WritesStopped -> "RocksDB stopped writes" <> behind <> hint
+      _ -> "RocksDB delays writes to " <> T.pack (show now.delayedWriteRate) <> " bytes/s" <> behind <> hint
     better = case now.writes of
-      Flowing -> "RocksDB writes at full speed again" <> behind
-      _ -> "RocksDB no longer stops writes, but delays them to " <> T.pack (show now.rate) <> " bytes/s" <> behind
-    behind = ": " <> T.pack (show now.pending) <> " bytes of compaction pending"
+      WritesFlowing -> "RocksDB writes at full speed again" <> behind
+      _ ->
+        "RocksDB no longer stops writes, but delays them to "
+          <> T.pack (show now.delayedWriteRate)
+          <> " bytes/s"
+          <> behind
+    behind = ": " <> T.pack (show now.pendingCompaction) <> " bytes of compaction pending"
     hint = "; more --background-jobs may help if the cores and disk have room"
 
 -- | Poll RocksDB every five seconds, forever: run it in a thread of its own.
 -- It keeps the latest state in the variable, logs the changes
 -- ('stallNote'), and sends the gauges @db.pending_compaction_bytes@ and
 -- @db.write_delayed@ (0 flowing, 1 delayed, 2 stopped) to StatsD.
-watchStalls :: (LogLevel -> Text -> IO ()) -> Maybe Stats -> DB -> TVar Stall -> IO ()
+watchStalls :: (LogLevel -> Text -> IO ()) -> Maybe Stats -> DB -> TVar DatabaseHealth -> IO ()
 watchStalls note stats db var = do
   gauges <- forM stats $ \s ->
     (,)
@@ -160,6 +174,6 @@ watchStalls note stats db var = do
     atomically (writeTVar var now)
     forM_ (stallNote before.writes now) (uncurry note)
     forM_ gauges $ \(pendingG, writesG) -> do
-      setGauge pendingG (fromIntegral now.pending)
+      setGauge pendingG (fromIntegral now.pendingCompaction)
       setGauge writesG (fromEnum now.writes)
     threadDelay 5000000

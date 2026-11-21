@@ -25,6 +25,19 @@ whitelist it must now say what they grant (`--peer-permission`, or
 `mempool` there, a Bitcoin store no longer asks them for their mempools.
 
 ### Added
+- **`/health` says in words what it found.** Each check has a `text`,
+  such as "The database is 4 blocks behind the best header, at height
+  688,798, more than the 2 allowed: the store is syncing, or cannot import
+  blocks fast enough.", and the top a `text` for the whole store: that it is
+  healthy, with its height and peers, or what is wrong. They come from
+  haskoin-store-data 4.0 (`healthText`), so a client writes the same.
+- **The check of the database says more**: beside the state of writes, the
+  compactions and flushes running, the full tables in memory waiting for a
+  flush, the size of the files and of their live data, and the errors in
+  the background since the database opened, which say why writes are
+  slow. It is now a field of `HealthCheck` in haskoin-store-data
+  (`DatabaseHealth`), so the client reads it; the store added it to its
+  JSON outside the type before.
 - **Tokens of Bitcoin Cash (CashTokens).** Outputs that hold tokens have
   their addresses now, with haskoin-core 3.0, and so are in the history,
   the balance and the unspent outputs of those addresses. Outputs, inputs

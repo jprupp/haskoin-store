@@ -19,8 +19,7 @@ import Haskoin.Store.Data
     MaxHealth (..),
     TimeHealth (..),
   )
-import Haskoin.Store.Database.Stalls (Stall (..), Writes (..), noStall)
-import Haskoin.Store.Web (ailments, decodeTxBody, logIt, withDatabase)
+import Haskoin.Store.Web (ailments, decodeTxBody, logIt)
 import Network.HTTP.Types (status200, status404, status500, status503)
 import Network.Wai (Request (..), defaultRequest, responseLBS)
 import Network.Wai.Internal (ResponseReceived (..))
@@ -88,7 +87,8 @@ well =
       network = "btc",
       version = "0",
       time = 0,
-      redis = Nothing
+      redis = Nothing,
+      database = Nothing
     }
 
 spec :: Spec
@@ -132,19 +132,6 @@ spec = do
           alone = behind {peers = CountHealth {count = 0, min = 1}} :: HealthCheck
       ailments behind `shouldBe` "5 blocks behind the headers"
       ailments alone `shouldBe` "5 blocks behind the headers, 0 peers"
-  describe "the health check with the database" $ do
-    let field k v = case v of
-          A.Object o -> KeyMap.lookup k o
-          _ -> Nothing
-        db w = withDatabase noStall {writes = w, pending = 7, rate = 0} well
-    it "is ok while writes flow or are only delayed" $ do
-      field "ok" (db Flowing) `shouldBe` Just (A.Bool True)
-      field "ok" (db Delayed) `shouldBe` Just (A.Bool True)
-      (field "database" (db Delayed) >>= field "writes") `shouldBe` Just (A.String "delayed")
-      (field "database" (db Delayed) >>= field "pending-compaction-bytes") `shouldBe` Just (A.Number 7)
-    it "is not ok when writes are stopped" $ do
-      field "ok" (db Stopped) `shouldBe` Just (A.Bool False)
-      (field "database" (db Stopped) >>= field "ok") `shouldBe` Just (A.Bool False)
   describe "decodeTxBody" $ do
     -- The id is the double SHA-256 of the bytes of plainTxHex, reversed. It
     -- was computed outside this library. The witness is not part of the id,

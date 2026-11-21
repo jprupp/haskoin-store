@@ -87,15 +87,15 @@ packages:
     commit: e0f04b95f4a5afba8afb406e69d83419cdf8a525
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: aba0772cc13162cabc7ff250b13b90dbd7f2d6bf
+    commit: 7324315f8e1ba91f97030873f7d44954e804ce6b
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: 0c287c135cc99e6c0c5794dcb222a5518eac5981fc62d205cdad65f22b19c0a5
+      sha256: a00ee6e6307f74812a9a2a461d70aebc9ecee10d93c00ee3ff87be7b46b2b93f
       size: 1263
     version: 4.0.0
   original:
-    commit: aba0772cc13162cabc7ff250b13b90dbd7f2d6bf
+    commit: 7324315f8e1ba91f97030873f7d44954e804ce6b
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550

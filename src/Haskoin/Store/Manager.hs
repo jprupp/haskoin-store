@@ -86,13 +86,14 @@ import Haskoin.Store.Common
   ( StoreEvent (..),
     loopForever,
   )
+import Haskoin.Store.Data (DatabaseHealth)
 import Haskoin.Store.Database.Migrate (Migration (..), upgradeDatabase)
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     createDataMetrics,
     withLayeredReader,
   )
-import Haskoin.Store.Database.Stalls (Stall, noStall, watchStalls)
+import Haskoin.Store.Database.Stalls (noStall, watchStalls)
 import Haskoin.Store.Fleet.Member
   ( Member (..),
     MemberConfig (..),
@@ -149,9 +150,10 @@ data Store = Store
     -- besides the ones of the peer manager
     -- ("Haskoin.Store.Web.Publish")
     connect :: !(SockAddr -> WithConnection),
-    -- | whether RocksDB lets writes through, polled every five seconds
+    -- | the state of the database: whether RocksDB lets writes through,
+    -- and its work in the background, polled every five seconds
     -- ("Haskoin.Store.Database.Stalls"); @\/health@ reports it
-    writes :: !(TVar Stall)
+    writes :: !(TVar DatabaseHealth)
   }
 
 -- | Configuration for a 'Store'.
@@ -274,7 +276,7 @@ withStore cfg action = do
 
 -- | Watch RocksDB for write stalls while an action runs
 -- ("Haskoin.Store.Database.Stalls"), and give the action the latest state.
-withStalls :: StoreConfig -> DatabaseReader -> (TVar Stall -> IO a) -> IO a
+withStalls :: StoreConfig -> DatabaseReader -> (TVar DatabaseHealth -> IO a) -> IO a
 withStalls cfg db action = do
   writes <- newTVarIO noStall
   withAsync (watchStalls note cfg.stats db.db writes) $ \a -> link a >> action writes

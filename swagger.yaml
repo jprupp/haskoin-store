@@ -374,6 +374,9 @@ paths:
                 $ref: '#/components/schemas/HealthCheck'
               example:
                 ok: true
+                text: >-
+                  The store is healthy: it has every block up to height 688,794,
+                  with 20 peers connected, and its Redis answers.
                 net: bch
                 blocks:
                   ok: true
@@ -381,30 +384,45 @@ paths:
                   blocks: 688794
                   diff: 0
                   headers: 688794
+                  text: The database has every block up to the best header, at height 688,794.
                 pending-txs:
                   ok: true
                   max: 100
                   count: 0
+                  text: 0 transactions asked of peers are still to come, within the 100 allowed.
                 version: *version
                 last-tx:
                   ok: true
                   max: 300
                   age: 0
+                  text: A transaction or block came just now, within the 5 minutes allowed.
                 last-block:
                   ok: true
                   max: 7200
                   age: 3279
+                  text: The best header is 54 minutes old, within the 2 hours allowed.
                 peers:
                   ok: true
                   count: 20
                   min: 1
+                  text: 20 peers connected, and at least 1 needed.
                 redis:
                   ok: true
+                  text: Redis answers.
                 database:
                   ok: true
                   writes: flowing
                   pending-compaction-bytes: 0
                   delayed-write-rate: 0
+                  running-compactions: 1
+                  running-flushes: 0
+                  immutable-memtables: 0
+                  size-bytes: 412000000000
+                  live-data-bytes: 405300000000
+                  background-errors: 0
+                  text: >-
+                    RocksDB writes at full speed. Its files hold 412.0 GB, 405.3 GB of
+                    them live data. 1 compaction running.
                 time: '2021-06-14 10:21:43 UTC'
         '503':
           description: unavailable
@@ -414,6 +432,11 @@ paths:
                 $ref: '#/components/schemas/HealthCheck'
               example:
                 ok: false
+                text: >-
+                  The store is not healthy. The database is 4 blocks behind the best
+                  header, at height 688,798, more than the 2 allowed: the store is
+                  syncing, or cannot import blocks fast enough. 0 peers connected,
+                  fewer than the 1 needed: the store hears too little of the network.
                 net: bch
                 blocks:
                   ok: false
@@ -421,30 +444,50 @@ paths:
                   blocks: 688794
                   diff: 4
                   headers: 688798
+                  text: >-
+                    The database is 4 blocks behind the best header, at height 688,798,
+                    more than the 2 allowed: the store is syncing, or cannot import
+                    blocks fast enough.
                 pending-txs:
                   ok: true
                   max: 100
                   count: 0
+                  text: 0 transactions asked of peers are still to come, within the 100 allowed.
                 version: *version
                 last-tx:
                   ok: true
                   max: 300
                   age: 0
+                  text: A transaction or block came just now, within the 5 minutes allowed.
                 last-block:
                   ok: true
                   max: 7200
                   age: 3279
+                  text: The best header is 54 minutes old, within the 2 hours allowed.
                 peers:
                   ok: false
                   count: 0
                   min: 1
+                  text: >-
+                    0 peers connected, fewer than the 1 needed: the store hears too
+                    little of the network.
                 redis:
                   ok: true
+                  text: Redis answers.
                 database:
                   ok: true
                   writes: flowing
                   pending-compaction-bytes: 0
                   delayed-write-rate: 0
+                  running-compactions: 0
+                  running-flushes: 0
+                  immutable-memtables: 0
+                  size-bytes: 412000000000
+                  live-data-bytes: 405300000000
+                  background-errors: 0
+                  text: >-
+                    RocksDB writes at full speed. Its files hold 412.0 GB, 405.3 GB of
+                    them live data. Nothing waits to be compacted or flushed.
                 time: '2021-06-14 10:21:43 UTC'
 
   '/address/{address}/transactions':
@@ -6658,6 +6701,7 @@ components:
         - diff
         - max
         - ok
+        - text
       properties:
         headers:
           type: integer
@@ -6679,6 +6723,12 @@ components:
           type: boolean
           description: |
             Whether `diff` is at most `max`.
+        text:
+          type: string
+          description: |
+            What the check found, in a sentence or two for people, and if it
+            fails, what that may mean. Programs should read `ok` and the
+            numbers: the wording may change.
 
     TimeHealth:
       type: object
@@ -6688,6 +6738,7 @@ components:
         - age
         - max
         - ok
+        - text
       properties:
         age:
           type: integer
@@ -6701,6 +6752,12 @@ components:
           type: boolean
           description: |
             Whether `age` is at most `max`.
+        text:
+          type: string
+          description: |
+            What the check found, in a sentence or two for people, and if it
+            fails, what that may mean. Programs should read `ok` and the
+            numbers: the wording may change.
 
     CountHealth:
       type: object
@@ -6710,6 +6767,7 @@ components:
         - count
         - min
         - ok
+        - text
       properties:
         count:
           type: integer
@@ -6723,6 +6781,12 @@ components:
           type: boolean
           description: |
             Whether `count` is at least `min`.
+        text:
+          type: string
+          description: |
+            What the check found, in a sentence or two for people, and if it
+            fails, what that may mean. Programs should read `ok` and the
+            numbers: the wording may change.
 
     MaxHealth:
       type: object
@@ -6732,6 +6796,7 @@ components:
         - count
         - max
         - ok
+        - text
       properties:
         count:
           type: integer
@@ -6745,6 +6810,12 @@ components:
           type: boolean
           description: |
             Whether `count` is at most `max`.
+        text:
+          type: string
+          description: |
+            What the check found, in a sentence or two for people, and if it
+            fails, what that may mean. Programs should read `ok` and the
+            numbers: the wording may change.
 
     HealthCheck:
       type: object
@@ -6762,6 +6833,7 @@ components:
         - net
         - version
         - ok
+        - text
       properties:
         blocks:
           description: |
@@ -6799,21 +6871,36 @@ components:
             extended public keys to answer from.
           required:
             - ok
+            - text
           properties:
             ok:
               type: boolean
+            text:
+              type: string
+              description: |
+                Whether Redis answers, in words.
         database:
           type: object
           description: |
-            Whether RocksDB lets writes through. RocksDB delays writes, and then stops
-            them, when its compactions fall behind. Stopped writes make `ok` false and
-            the status 503; delayed writes do not, as the server still answers at full
-            speed, and `blocks` says so if it falls behind. Read every five seconds.
+            The state of the database, as RocksDB reports it, read every five
+            seconds. RocksDB writes to memory, flushes that to files, and merges
+            the files in the background (compaction); when compaction falls behind
+            it delays writes, and then stops them. Stopped writes make `ok` false
+            and the status 503; delayed writes do not, as the server still answers
+            at full speed, and `blocks` says so if it falls behind. The other
+            numbers say why writes are slow, and are not judged.
           required:
             - ok
+            - text
             - writes
             - pending-compaction-bytes
             - delayed-write-rate
+            - running-compactions
+            - running-flushes
+            - immutable-memtables
+            - size-bytes
+            - live-data-bytes
+            - background-errors
           properties:
             ok:
               type: boolean
@@ -6830,6 +6917,38 @@ components:
               type: integer
               description: |
                 Bytes a second that writes are slowed to; 0 when they are not.
+            running-compactions:
+              type: integer
+              description: |
+                Compactions running.
+            running-flushes:
+              type: integer
+              description: |
+                Flushes of memory to files running.
+            immutable-memtables:
+              type: integer
+              description: |
+                Tables in memory that are full and wait to be flushed, over every
+                column family.
+            size-bytes:
+              type: integer
+              description: |
+                Bytes of the files of the database, over every column family.
+            live-data-bytes:
+              type: integer
+              description: |
+                Bytes of those files that hold live data, as RocksDB estimates.
+            background-errors:
+              type: integer
+              description: |
+                Errors of the work in the background since the database opened.
+                After one, RocksDB may refuse writes; the log of the server says
+                more.
+            text:
+              type: string
+              description: |
+                What RocksDB reports, in words: the state of writes, the size of
+                the files, and the work in hand.
         net:
           type: string
           description: |
@@ -6842,6 +6961,13 @@ components:
           type: boolean
           description: |
             Whether every check passed, writes to the database included.
+        text:
+          type: string
+          description: |
+            The state of the whole server in a sentence or two, for people: that
+            it is healthy, with its height and peers, or what is wrong, from the
+            checks that fail and Redis. Programs should read `ok` and the
+            numbers: the wording may change.
         time:
           type: string
           description: |

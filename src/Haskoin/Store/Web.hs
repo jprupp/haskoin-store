@@ -87,7 +87,6 @@ module Haskoin.Store.Web
     ailments,
 
     -- * Health
-    withDatabase,
 
     -- * Xpubs
     Unindexed (..),
@@ -245,7 +244,6 @@ import Haskoin.Store.Data
 import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Pooled (chainRead)
 import Haskoin.Store.Database.Reader
-import Haskoin.Store.Database.Stalls (Stall (..), Writes (..))
 import Haskoin.Store.Exception (bracket, bracket_, catchAny, finally, handleAny, onException, tryAny)
 import Haskoin.Store.Fleet.Member
   ( Member (..),
@@ -3990,48 +3988,14 @@ pathHealth :: WebState -> Route
 pathHealth st =
   route (renderStdMethod (resourceMethod proxy)) (capturePath proxy) [] $ \_ -> do
     h <- handleHealth st GetHealth
-    stall <- readTVarIO st.config.store.writes
-    let stopped = stall.writes == Stopped
-        (status, extra)
-          | not (isOK h) || stopped = (status503, [("Retry-After", "5")])
+    let (status, extra)
+          | not (isOK h) = (status503, [("Retry-After", "5")])
           | h.redis == Just False = (status503, [("Retry-After", "5"), ("Haskoin-Degraded", "redis")])
           | otherwise = (status200, [])
     return $
-      responseLBS status ((hContentType, "application/json") : extra) (A.encode (withDatabase stall h))
+      responseLBS status ((hContentType, "application/json") : extra) (A.encode h)
   where
     proxy = Proxy :: Proxy GetHealth
-
--- | The JSON of a health check with the state of RocksDB's writes added
--- ("Haskoin.Store.Database.Stalls"), under @\"database\"@:
---
--- > "database": {"ok": true, "writes": "delayed",
--- >              "pending-compaction-bytes": 70000000000, "delayed-write-rate": 16777216}
---
--- Writes that RocksDB stopped make the store unhealthy: it imports nothing
--- until they flow again. Delayed writes do not. RocksDB slows writes for
--- seconds at a time while a store syncs, and a store that serves requests
--- answers them at full speed meanwhile; if the delay makes it fall behind,
--- the check of the blocks says so.
---
--- The field is added here and not to 'HealthCheck', which is in
--- haskoin-store-data: clients that read it ignore the field, and see
--- @\"ok\": false@ when writes stop.
-withDatabase :: Stall -> HealthCheck -> A.Value
-withDatabase stall h = case toJSON h of
-  A.Object o ->
-    A.Object $
-      KeyMap.insert "ok" (A.Bool (isOK h && not stopped)) $
-        KeyMap.insert "database" database o
-  v -> v
-  where
-    stopped = stall.writes == Stopped
-    database =
-      A.object
-        [ "ok" .= not stopped,
-          "writes" .= T.toLower (T.pack (show stall.writes)),
-          "pending-compaction-bytes" .= stall.pending,
-          "delayed-write-rate" .= stall.rate
-        ]
 
 -- | Handler for @GET \/health@: health of the store.
 handleHealth ::
@@ -4042,9 +4006,12 @@ handleHealth st _ =
   withMetrics st (.health) $ do
     h <- readTVarIO st.health
     up <- readTVarIO st.cacheUp
-    -- Redis is mandatory: the answer always says whether it answers
+    database <- readTVarIO st.config.store.writes
+    -- Redis is mandatory: the answer always says whether it answers. The
+    -- database is read every five seconds by a thread of its own
+    -- ("Haskoin.Store.Database.Stalls"), and is the last state it read
     let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
-    return HealthCheck {redis = Just up, ..}
+    return HealthCheck {redis = Just up, database = Just database, ..}
 
 -- | Heights of the best header and best block, and the maximum lag allowed.
 blockHealthCheck :: WebConfig -> IO BlockHealth
@@ -4121,8 +4088,9 @@ healthCheck cfg = do
       { network = cfg.store.net.name,
         version = cfg.version,
         -- filled in when the check is served, from what the last request
-        -- or ping found
+        -- or ping found, and from the last poll of the database
         redis = Nothing,
+        database = Nothing,
         ..
       }
 

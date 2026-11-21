@@ -134,6 +134,7 @@ import Haskoin.Store.Data
     BlockData (..),
     BlockHealth (..),
     BlockRef (..),
+    DatabaseHealth (..),
     Event (..),
     EventCommand (..),
     Except (..),
@@ -1630,6 +1631,8 @@ clientTest env = do
   sum (map (.balance.confirmed) keys.get) `shouldBe` 100000
   health <- call Client.GetHealth
   health.blocks.blocks `shouldSatisfy` (> 0)
+  -- the database is in the check, with what RocksDB said at its last poll
+  fmap (\(d :: DatabaseHealth) -> d.errors) health.database `shouldBe` Just 0
   -- an error comes back as the error that it is
   unknown <- Client.apiCall conf (Client.GetTx (TxHash (sha256 ("nothing" :: C8.ByteString))))
   either Just (const Nothing) unknown `shouldBe` Just ThingNotFound
@@ -2470,6 +2473,14 @@ fleetTest env = member "A" $ \a urlA -> member "B" $ \b urlB -> do
   waitFor "the health check of a member to pass" ((== 200) . fst <$> getJSON urlA "/health")
   (_, health) <- getJSON urlA "/health"
   ((health ! "redis") ! "ok") `shouldBe` Bool True
+  -- what the store and each check found, in words
+  (health ! "text") `shouldSatisfy` \case
+    String t -> "The store is healthy: it has every block up to height " `T.isPrefixOf` t
+    _ -> False
+  forM_ ["blocks", "last-block", "last-tx", "pending-txs", "peers", "redis", "database"] $ \check ->
+    ((health ! check) ! "text") `shouldSatisfy` \case
+      String t -> not (T.null t)
+      _ -> False
   -- a payment that a reorganisation replaced, as in 'reorgTest': both
   -- stores answer 410 alike, from what the pool kept as the tip moved
   let y = newXPub env "fleet-replaced" DeriveNormal
