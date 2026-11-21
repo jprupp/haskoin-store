@@ -219,7 +219,13 @@ whitelist it must now say what they grant (`--peer-permission`, or
   once.** Those of a peer are merged while the store asks Redis about the
   last ones, up to 100,000 ids, where a queue of 1,000 announcements
   dropped the rest for good, said so only at debug level, and assumed that
-  peers announce again. Requests for them go in messages of 1,000.
+  peers announce again.
+- **Transactions are requested at most 2,000 at a time**, 1,000 to a
+  message, as answers come in. A refill, or the request at a start into an
+  empty pool, asked a node for its whole mempool at once: on groot, 57,000
+  transactions, which put the store's pending count at twice the 10,000
+  that its health allows, and the node, busy sending them, was dropped as
+  silent after 30 seconds with the rest of the requests unanswered.
 - **A Bitcoin Cash Node with `--node-rpc` no longer waits half a minute
   when it stops.** The store kept its RPC connection open, and the node
   waited until it had been idle for `-rpcservertimeout`. Every RPC request

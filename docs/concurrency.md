@@ -61,7 +61,8 @@ write, and the web reads through a snapshot taken right after the commit
 their own (`askForTxs`), which takes all that wait in one transaction, asks
 Redis once whether the fleet has seen them, and requests the rest. It reads
 whether the store is in sync without changing anything (`inSyncNow`), and
-notes its requests in `pending` in one transaction each. At most 100,000
+notes its requests in `pending` in the transaction that checks there is
+room for them: at most 2,000 wait for an answer (`requestWindow`). At most 100,000
 ids wait; more are dropped with a warning, since a node announces a
 transaction to a peer once.
 

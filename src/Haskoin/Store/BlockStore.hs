@@ -882,16 +882,29 @@ processTxs self p hs =
     unless (null xs) $ go xs
   where
     stored h = isJust <$> getTxData self h
-    go xs = do
+    -- in messages of 1,000, each when there is room for it among the
+    -- requests that wait for an answer ('requestWindow')
+    go xs = forM_ (chunks xs) $ \some -> do
       now <- getCurrentTime
-      changePending self (Pending.requested now xs)
-      let net = self.config.net
-      let inv = if net.segWit then InvWitnessTx else InvTx
-      -- in messages of 1,000, well under the 50,000 that a node reads in one
-      forM_ (chunks xs) $ \some ->
-        MGetData (GetData (map (InvVector inv . (.get)) some)) `sendMessage` p
+      atomically $ do
+        waiting <- Pending.size <$> readTVar self.pending
+        when (waiting > 0 && waiting + length some > requestWindow) retry
+        modifyTVar' self.pending (Pending.requested now some)
+      let inv = if self.config.net.segWit then InvWitnessTx else InvTx
+      MGetData (GetData (map (InvVector inv . (.get)) some)) `sendMessage` p
     chunks [] = []
     chunks ys = let (a, b) = splitAt 1000 ys in a : chunks b
+
+-- | The most transactions that the store waits for from its peers at once,
+-- which 'processTxs' requests 1,000 at a time as answers come in. A request
+-- of a whole mempool at once, as at a refill, asked a node for 57,000
+-- transactions on groot: the store counted twice the 10,000 that its
+-- health allows (@--max-pending-txs@), and the node, which answered
+-- nothing else while it sent them, was dropped as silent after 30 seconds,
+-- with the rest of the requests. A request that no answer comes for is
+-- forgotten after 'Pending.requestTimeout', which makes room again.
+requestWindow :: Int
+requestWindow = 2000
 
 -- | Deal with peers that do not deliver: disconnect the syncing peer if it
 -- has been silent for the timeout, else look for another peer to ask for its
