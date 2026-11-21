@@ -73,6 +73,15 @@ whitelist it must now say what they grant (`--peer-permission`, or
   token endpoint, taken from a regtest chain.
 
 ### Changed
+- **The testnet3 of Bitcoin Cash is `--net bchtest3`**, no longer
+  `bchtest`, as haskoin-core 3.0 renames it after `bchtest4`. Bitcoin Cash
+  Node still runs testnet3, and the store keeps it, as it keeps Bitcoin
+  testnet3 (`btctest`), which haskoin-core deprecates. The name is also
+  the store's data directory, its prefix in Redis, its StatsD namespace
+  and its `network` in the API: before upgrading a store of testnet3,
+  rename `DIR/bchtest` to `DIR/bchtest3`, and set `NET=bchtest3`. Its
+  shared mempool fills again under the new prefix. Addresses keep the
+  CashAddr prefix `bchtest`. `hsq -n bchtest3` follows.
 - **The tests name no address or port, and use only real nodes in
   Podman.** The tests of downloading that a mock peer served in memory
   (`StoreSpec`) now sync from Bitcoin Cash Node in Podman

@@ -54,15 +54,15 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    commit: 51661822f03719e2de3f735fb590f2849925413d
+    commit: 8820967336f0dbaaa961a13289f5a0410d523643
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: b6ef51fac7aefbac6472275b0ba45e619bd2aa7e5fa096301e320b46fe84b053
+      sha256: 0edfc821ec0f4fd4fd86954a763198e8108cf42dabaa8cd1c6c6d3aba070e510
       size: 11102
     version: 3.0.0
   original:
-    commit: 51661822f03719e2de3f735fb590f2849925413d
+    commit: 8820967336f0dbaaa961a13289f5a0410d523643
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
@@ -76,26 +76,26 @@ packages:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
     git: https://github.com/jprupp/podman-test.git
 - completed:
-    commit: 918751bd5410f15d250d7c07ddf8c5716d2bde4a
+    commit: e0f04b95f4a5afba8afb406e69d83419cdf8a525
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: 661e7d183c271e708dfdb133c6f642d8b840b93e215cc924b60fe4c45a299bf0
+      sha256: ad8f6afbe47c592848da817528a225c372ea57d0db77ab723b0060c70e35dcee
       size: 3515
     version: 2.7.0
   original:
-    commit: 918751bd5410f15d250d7c07ddf8c5716d2bde4a
+    commit: e0f04b95f4a5afba8afb406e69d83419cdf8a525
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: 98fd53800a71658d4f3ef73972dcf18766b5dd0c
+    commit: aba0772cc13162cabc7ff250b13b90dbd7f2d6bf
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: 10f870bfbea8d165a566bf5d8aa02d8636cff5cd7635ad7dcbdbd268d64ee4e8
+      sha256: 0c287c135cc99e6c0c5794dcb222a5518eac5981fc62d205cdad65f22b19c0a5
       size: 1263
     version: 4.0.0
   original:
-    commit: 98fd53800a71658d4f3ef73972dcf18766b5dd0c
+    commit: aba0772cc13162cabc7ff250b13b90dbd7f2d6bf
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550

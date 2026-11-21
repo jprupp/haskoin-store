@@ -323,7 +323,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, or a test network (see `--help`) |
+| `-n`, `--net` | `NET` | `bch` | Network: `btc`, `bch`, the testnets `btctest4`, `bchtest4`, `bchtest3` and `btctest` (Bitcoin testnet3, deprecated), or regtest `btcreg`, `bchreg` |
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER` |

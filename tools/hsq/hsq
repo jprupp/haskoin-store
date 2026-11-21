@@ -8,7 +8,7 @@ import http.client, json, os, shutil, socket, ssl, subprocess, sys, textwrap, ti
 from datetime import datetime
 from urllib.parse import urlsplit
 
-NETWORKS = ["btc", "bch", "btctest", "btctest4", "bchtest", "bchtest4", "btcreg", "bchreg"]
+NETWORKS = ["btc", "bch", "btctest", "btctest4", "bchtest3", "bchtest4", "btcreg", "bchreg"]
 PUBLIC = "https://api.haskoin.com/{net}"
 GLOBAL_CONFIG = "/etc/hsq/config.toml"
 CONFIG = os.path.expanduser(os.environ.get("HSQ_CONFIG", "~/.config/hsq/config.toml"))
