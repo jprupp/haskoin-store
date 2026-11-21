@@ -158,10 +158,10 @@ obvious, and no long chains of commands joined with `&&` or `;` on one line.
 
 Build the documentation with `haskell-dev docs` and make sure it has no
 warnings about broken markup. The command ends with a check of the comments:
-a change must add nothing to what that check reports. It reports 174
+a change must add nothing to what that check reports. It reports 170
 problems on master after the concurrency fixes of 2.0.0, all older than the
-check: 49 ambiguous names, 17 names out of scope, 79 links to names that
-their module does not export, 12 links to pages or anchors that do not
+check: 49 ambiguous names, 17 names out of scope, 77 links to names that
+their module does not export, 10 links to pages or anchors that do not
 exist, 4 namespace letters
 written right after a parenthesis, and 13 slashes to write `\/`. Keep the
 lines after `Documentation check` in a file before the change, and compare

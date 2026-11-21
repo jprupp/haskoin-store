@@ -25,7 +25,7 @@ module Haskoin.Store.Manager
 where
 
 import Control.Concurrent.Async (link, withAsync)
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
@@ -36,6 +36,7 @@ import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
   ( BlockHash (..),
+    BlockNode (..),
     Headers (..),
     Inv (..),
     InvType (..),
@@ -55,6 +56,7 @@ import Haskoin
 import Haskoin.Node
   ( Chain,
     ChainEvent (..),
+    Judgement (..),
     LogLevel (..),
     Logger,
     Node (..),
@@ -64,6 +66,8 @@ import Haskoin.Node
     PeerMgr,
     Permissions,
     WithConnection,
+    chainGetBest,
+    judgeMessage,
     logAt,
     withNode,
     withSource,
@@ -78,8 +82,6 @@ import Haskoin.Store.BlockStore
     blockStorePeerConnectSTM,
     blockStorePeerDisconnectSTM,
     blockStorePongSTM,
-    blockStoreTxHashSTM,
-    blockStoreTxSTM,
     withBlockStore,
   )
 import Haskoin.Store.Common
@@ -88,6 +90,7 @@ import Haskoin.Store.Common
   )
 import Haskoin.Store.Data (DatabaseHealth)
 import Haskoin.Store.Database.Migrate (Migration (..), upgradeDatabase)
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Reader
   ( DatabaseReader (..),
     createDataMetrics,
@@ -100,12 +103,23 @@ import Haskoin.Store.Fleet.Member
     memberCacheLoop,
     memberEvents,
     memberLoop,
-    memberReceived,
-    memberSeen,
     newMember,
     noteBest,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
+import Haskoin.Store.Ingest (defaultConfig)
+import Haskoin.Store.Ingest.Run
+  ( IngestConfig (..),
+    Ingester,
+    ingestEmptiedSTM,
+    ingestLookSTM,
+    ingestMissingSTM,
+    ingestNamedSTM,
+    ingestPeerDownSTM,
+    ingestPeerUpSTM,
+    ingestTxSTM,
+    withIngest,
+  )
 import Haskoin.Store.Startup (connectRedis, explainDatabase)
 import Haskoin.Store.XPub.Service (XPubConfig (..))
 import NQE
@@ -128,8 +142,11 @@ data Store = Store
     peerMgr :: !PeerMgr,
     -- | block header chain of the node
     chain :: !Chain,
-    -- | process that imports blocks and transactions
+    -- | process that imports blocks
     block :: !BlockStore,
+    -- | the path of transactions from the peers to the pool of the fleet
+    -- ("Haskoin.Store.Ingest.Run")
+    ingest :: !Ingester,
     -- | database reader
     db :: !DatabaseReader,
     -- | the store as a member of its fleet, with the door to the fleet's
@@ -255,24 +272,26 @@ withStore cfg action = do
           withSubscription node_pub $ \node_sub ->
             withNode (nodeCfg cfg db node_pub) $ \node -> do
               member <- storeMember cfg redis db
-              withBlockStore (blockStoreCfg cfg node pub db member) $ \block_store ->
-                withAsync (nodeForwarder block_store pub node_sub) $ \fwd -> do
-                  link fwd
-                  withStoreFleet member $
-                    withFleetEvents cfg pub member $ \events ->
-                      action $
-                        Store
-                          { peerMgr = node.peerMgr,
-                            chain = node.chain,
-                            block = block_store,
-                            db = db,
-                            fleet = member,
-                            events = events,
-                            pub = pub,
-                            net = cfg.net,
-                            connect = cfg.connect,
-                            writes = writes
-                          }
+              withIngest (ingestCfg cfg node db member) $ \ingest ->
+                withBlockStore (blockStoreCfg cfg node pub db member ingest) $ \block_store ->
+                  withAsync (nodeForwarder block_store ingest pub node_sub) $ \fwd -> do
+                    link fwd
+                    withStoreFleet member ingest $
+                      withFleetEvents cfg pub member $ \events ->
+                        action $
+                          Store
+                            { peerMgr = node.peerMgr,
+                              chain = node.chain,
+                              block = block_store,
+                              ingest = ingest,
+                              db = db,
+                              fleet = member,
+                              events = events,
+                              pub = pub,
+                              net = cfg.net,
+                              connect = cfg.connect,
+                              writes = writes
+                            }
 
 -- | Watch RocksDB for write stalls while an action runs
 -- ("Haskoin.Store.Database.Stalls"), and give the action the latest state.
@@ -319,11 +338,22 @@ storeMember cfg redis db = case redis of
 -- an offer as soon as a transaction comes ('memberLoop'). Beside them, in
 -- a thread of its own, the member builds the entries of the fleet's cache
 -- of extended public keys that requests asked for.
-withStoreFleet :: Maybe Member -> IO a -> IO a
-withStoreFleet Nothing action = action
-withStoreFleet (Just member) action =
+withStoreFleet :: Maybe Member -> Ingester -> IO a -> IO a
+withStoreFleet Nothing _ action = action
+withStoreFleet (Just member) ingest action =
   withAsync (memberLoop member) $ \a ->
-    withAsync (memberCacheLoop member) $ \b -> link a >> link b >> action
+    withAsync (memberCacheLoop member) $ \b ->
+      withAsync (emptied 0) $ \c -> link a >> link b >> link c >> action
+  where
+    -- each time the member finds that the pool lost what it had, the path
+    -- into the pool is told, and reads its sources again
+    emptied seen = do
+      n <- atomically $ do
+        n <- readTVar member.refills
+        when (n == seen) retry
+        return n
+      atomically (ingestEmptiedSTM ingest)
+      emptied n
 
 -- | Run an action with the events that the store tells its clients: those
 -- of the fleet, which a thread reads from Redis for as long as the action
@@ -389,23 +419,43 @@ blockStoreCfg ::
   Publisher StoreEvent ->
   DatabaseReader ->
   Maybe Member ->
+  Ingester ->
   BlockStoreConfig
-blockStoreCfg cfg node pub db member =
+blockStoreCfg cfg node pub db member ingest =
   BlockStoreConfig
     { chain = node.chain,
       peerMgr = node.peerMgr,
       pub = pub,
       db = db,
       net = cfg.net,
-      onBest = maybe (\_ -> return ()) noteBest member,
-      onTx = maybe (\_ _ -> return ()) memberReceived member,
-      seen = maybe (\_ -> return mempty) memberSeen member,
+      -- the member takes its view of the block, and the path into the
+      -- pool looks at whether the store is in sync now
+      onBest = \h -> mapM_ (`noteBest` h) member >> atomically (ingestLookSTM ingest),
       blockWindow = cfg.blockWindow,
       peerTimeout = cfg.peerTimeout,
       blockStall = cfg.blockStall,
       blockPing = cfg.blockPing,
       stats = cfg.stats,
       logger = withSource "BlockStore" cfg.logger
+    }
+
+-- | What the path into the pool needs of the store ("Haskoin.Store.Ingest.Run"):
+-- the member of the fleet, whether the best block of the database is the
+-- best header of the node, and which peers give their mempools when asked,
+-- as the model of each peer's node says ('judgeMessage').
+ingestCfg :: StoreConfig -> Node -> DatabaseReader -> Maybe Member -> IngestConfig
+ingestCfg cfg node db member =
+  IngestConfig
+    { net = cfg.net,
+      config = defaultConfig,
+      member,
+      inSync = do
+        best <- Q.getBestBlock db
+        top <- chainGetBest node.chain
+        return (best == Just (headerHash top.header)),
+      source = \p -> (== Allowed) <$> judgeMessage p MMempool,
+      stats = cfg.stats,
+      logger = withSource "Ingest" cfg.logger
     }
 
 -- | Configuration of the node, from the store configuration. The node keeps its
@@ -438,11 +488,12 @@ nodeCfg cfg db pub =
 -- | Forward every node event to the block store and the store publisher, forever.
 nodeForwarder ::
   BlockStore ->
+  Ingester ->
   Publisher StoreEvent ->
   Inbox NodeEvent ->
   IO ()
-nodeForwarder b pub sub =
-  loopForever $ receive sub >>= atomically . storeDispatch b pub
+nodeForwarder b ing pub sub =
+  loopForever $ receive sub >>= atomically . storeDispatch b ing pub
 
 -- | Dispatcher of node events. Peer connections, blocks, transactions,
 -- inventories and not-found messages go to the block store; peer events,
@@ -450,17 +501,20 @@ nodeForwarder b pub sub =
 -- events; new best headers go to the block store.
 storeDispatch ::
   BlockStore ->
+  Ingester ->
   Publisher StoreEvent ->
   NodeEvent ->
   STM ()
-storeDispatch b pub (PeerEvent pe) =
+storeDispatch b ing pub (PeerEvent pe) =
   case pe of
     PeerConnected p -> do
       publishSTM (StorePeerConnected p) pub
       blockStorePeerConnectSTM p b
+      ingestPeerUpSTM p ing
     PeerDisconnected p -> do
       publishSTM (StorePeerDisconnected p) pub
       blockStorePeerDisconnectSTM p b
+      ingestPeerDownSTM p ing
     PeerMessage p msg ->
       case msg of
         MPong (Pong n) -> do
@@ -473,14 +527,20 @@ storeDispatch b pub (PeerEvent pe) =
         MBlock block ->
           blockStoreBlockSTM p block b
         MTx tx ->
-          blockStoreTxSTM p tx b
+          ingestTxSTM p tx ing
         MNotFound (NotFound is) -> do
           let blocks =
                 [ BlockHash h
                 | InvVector t h <- is,
                   t == InvBlock || t == InvWitnessBlock
                 ]
+              txs =
+                [ TxHash h
+                | InvVector t h <- is,
+                  t == InvTx || t == InvWitnessTx
+                ]
           unless (null blocks) $ blockStoreNotFoundSTM p blocks b
+          unless (null txs) $ ingestMissingSTM p txs ing
         MInv (Inv is) -> do
           let txs =
                 [ TxHash h
@@ -494,12 +554,14 @@ storeDispatch b pub (PeerEvent pe) =
                 ]
           publishSTM (StoreTxAnnounce p txs) pub
           unless (null blocks) $ blockStoreAnnouncedSTM p blocks b
-          unless (null txs) $ blockStoreTxHashSTM p txs b
+          unless (null txs) $ ingestNamedSTM p txs ing
         -- A reject that names no transaction hash cannot be attributed to a
         -- transaction and falls through to the catch-all below.
         MReject Reject {message = MCTx, extra = Just h, code, reason} ->
           publishSTM (StoreTxReject p (TxHash h) code reason.get) pub
         _ -> return ()
-storeDispatch b _ (ChainEvent (ChainBestBlock bn)) =
+storeDispatch b ing _ (ChainEvent (ChainBestBlock bn)) = do
   blockStoreHeadSTM bn b
-storeDispatch _ _ (ChainEvent _) = return ()
+  -- a new best header: the store may be out of sync now
+  ingestLookSTM ing
+storeDispatch _ _ _ (ChainEvent _) = return ()

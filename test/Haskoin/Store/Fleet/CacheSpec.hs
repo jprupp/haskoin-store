@@ -55,7 +55,6 @@ import Haskoin
     scriptToAddressBS,
     txHash,
   )
-import Haskoin.Store.BlockStore (toFetch)
 import Haskoin.Store.Common (Limits (..), Start (..), StoreRead (..), sortTxs)
 import Haskoin.Store.Data
   ( BlockData (..),
@@ -90,6 +89,7 @@ import Haskoin.Store.Fleet.XPub
     xpubId,
   )
 import Haskoin.Store.Histories (openLayered, revert, run, startChain)
+import Haskoin.Store.Ingest (Verdict (..))
 import Haskoin.Store.Integration.Temp (withSystemTempDirectory)
 import Haskoin.Store.Logic (importBlock)
 import Haskoin.Store.TestBlocks (script)
@@ -119,9 +119,9 @@ spec = do
       it "fills the pool again after it started again, once after Redis lost its data" (`withBed` restartTest)
       it "keeps what an abandoned block gave back when the chain moves under a move of the tip" $
         (`withBed` unsettledTest)
-      it "fetches no transaction that another member received" (`withBed` seenTest)
+      it "counts as settled, for every member, what the pool has decided on" (`withBed` seenTest)
       it "offers again a transaction that left the pool and is sent again" (`withBed` resendTest)
-      it "lets go of an orphan whose parent did not come in twenty minutes" (`withBed` orphanTest)
+      it "says which transaction an orphan waits for, and takes it after that one" (`withBed` orphanTest)
       it "answers the tokens of the chain with what the pool does to them" (\r -> withBedOn bchRegTest r tokenTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
@@ -245,23 +245,22 @@ reorgTest bed = do
   entries `shouldSatisfy` (> 0)
   forM_ [bed.a, bed.b] $ \m -> sameAsChain bed m x
 
--- | What one store received from a peer, it does not fetch again; another
--- fetches it until the first has offered it to the pool, and not after:
--- both ask the same set in Redis, which has only what the pool decided on.
+-- | What the pool has decided on is settled for every store of the fleet,
+-- which then does not fetch it when a peer names it: both ask the same
+-- sets in Redis. What no store offered is not.
 seenTest :: Bed -> IO ()
 seenTest bed = do
   coin : _ <- coins bed
   let tx = spend [coin] [(script, 100000)]
       other = TxHash (doubleSHA256 ("never sent" :: ByteString))
-      fetch m = toFetch (\_ -> return False) (memberSeen m) (\_ -> return False)
-  fetch bed.b [txHash tx, other] `shouldReturn` [txHash tx, other]
-  offer bed tx
-  fetch bed.a [txHash tx, other] `shouldReturn` [other]
-  fetch bed.b [txHash tx, other] `shouldReturn` [txHash tx, other]
+      asked = [txHash tx, other]
   settle bed
+  memberSettled bed.a asked `shouldReturn` Just [False, False]
+  memberSettled bed.b asked `shouldReturn` Just [False, False]
+  offer bed tx
   inPool bed tx `shouldReturn` True
-  fetch bed.a [txHash tx, other] `shouldReturn` [other]
-  fetch bed.b [txHash tx, other] `shouldReturn` [other]
+  memberSettled bed.a asked `shouldReturn` Just [True, False]
+  memberSettled bed.b asked `shouldReturn` Just [True, False]
 
 -- | A transaction that a replacement pushed out of the pool, and that a
 -- peer sends again, takes its place back: a member that kept a set of what
@@ -283,22 +282,21 @@ resendTest bed = do
   inPool bed first `shouldReturn` True
   inPool bed second `shouldReturn` False
 
--- | Orphans wait for their parent for twenty minutes from when the member
--- heard of them, and are then let go.
+-- | A transaction offered before the one that it spends from is an
+-- orphan, and the member says which transaction it lacks: what the path
+-- into the pool waits for before it offers the orphan again
+-- ("Haskoin.Store.Ingest").
 orphanTest :: Bed -> IO ()
 orphanTest bed = do
   coin : _ <- coins bed
   now <- round <$> getPOSIXTime
   let parent = spend [coin] [(script, 100000)]
-      child v = Tx 1 [TxIn (OutPoint (txHash parent) 0) "" maxBound] [TxOut v script] [] 0
-      old = child 1000
-      young = child 2000
-  memberReceived bed.a (now - 1201) old
-  memberReceived bed.a now young
+      child = Tx 1 [TxIn (OutPoint (txHash parent) 0) "" maxBound] [TxOut 1000 script] [] 0
   settle bed
-  held <- readTVarIO bed.a.waiting
-  Map.member (txHash old) held `shouldBe` False
-  Map.member (txHash young) held `shouldBe` True
+  memberOffer bed.a now child `shouldReturn` Orphan [txHash parent]
+  memberOffer bed.a now parent `shouldReturn` Settled
+  memberOffer bed.a now child `shouldReturn` Settled
+  inPool bed child `shouldReturn` True
 
 -- | Each member counts a refill when the pool starts again, which the count
 -- of restarts says; and one only, not two, when Redis loses its data with
@@ -664,11 +662,19 @@ payKey bed x ns inBlock = do
       if inBlock then mineBlock bed [tx] else offer bed tx
       settle bed
 
--- | Hand a transaction to member a, as a peer would.
+-- | Offer a transaction to the pool through member a, as the path into
+-- the pool does with what a peer sent: the pool has it, unless it is an
+-- orphan. A member that has no view of the fleet tip yet takes a turn
+-- first.
 offer :: Bed -> Tx -> IO ()
-offer bed tx = do
-  now <- round <$> getPOSIXTime
-  memberReceived bed.a now tx
+offer bed tx = go (5 :: Int)
+  where
+    go n = do
+      now <- round <$> getPOSIXTime
+      memberOffer bed.a now tx >>= \case
+        Again | n > 0 -> settle bed >> go (n - 1)
+        Again -> expectationFailure "The member could not offer a transaction"
+        _ -> return ()
 
 -- | Whether the pool has a transaction.
 inPool :: Bed -> Tx -> IO Bool

@@ -28,6 +28,7 @@ module Haskoin.Store.MempoolSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (forConcurrently_, link, withAsync)
+import Control.Exception (throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..))
 import Data.ByteString (ByteString)
@@ -72,6 +73,7 @@ import Haskoin.Store.IntegrationSpec
     withTestLog,
   )
 import Haskoin.Store.Startup (redisConnectInfo)
+import Network.HTTP.Client (HttpException)
 import System.IO (hPutStrLn, stderr)
 import Test.Hspec
 import Test.Podman (PodSpec (..), pod, podmanUsable, withPod)
@@ -88,17 +90,8 @@ spec = do
         it "takes the whole mempool of its node, and stays healthy and connected" (withBed BitcoinCore atTheTip)
       describe "A store that was away while transactions came" $
         it "has them when it is back" (withBed BitcoinCore (away False))
-      -- Fails about one run in three on the path that runs today: the
-      -- store is a block behind when it asks its node for its mempool, and
-      -- the answer is dropped if the header comes first. It is here to be
-      -- turned on with the runner of "Haskoin.Store.Ingest", which keeps
-      -- what a peer names while the store is out of sync.
       describe "A store that was away while transactions and a block came" $
-        it "has what the block left in the mempool when it is back" $
-          pendingWith "the path that runs today loses the node's answer in a race: docs/mempool-ingestion.md"
-      when False $
-        describe "A store that was away while transactions and a block came, with the new path" $
-          it "has what the block left in the mempool when it is back" (withBed BitcoinCore (away True))
+        it "has what the block left in the mempool when it is back" (withBed BitcoinCore (away True))
       describe "A store whose node takes chains while it finds blocks" $
         it "has every transaction that no block confirmed" (withBed BitcoinCore busy)
 
@@ -297,17 +290,26 @@ fund bed count = do
   void $ generateTo bed.node 1 bed.miner
   return [(OutPoint (txHash split) i, each) | i <- [0 .. fromIntegral count - 1]]
 
--- | Give the node a transaction.
+-- | Give the node a transaction. The socket of its RPC takes few
+-- connections at once, and refuses one more with an error of the HTTP
+-- client: such a call is made again, a few times.
 send :: Bed -> Tx -> IO ()
-send bed tx = void $ rpc bed.node "sendrawtransaction" [String (encodeHex (encode tx))]
+send bed tx = go (5 :: Int)
+  where
+    go n =
+      try (rpc bed.node "sendrawtransaction" [String (encodeHex (encode tx))]) >>= \case
+        Right _ -> return ()
+        Left (e :: HttpException)
+          | n > 0 -> threadDelay 100000 >> go (n - 1)
+          | otherwise -> throwIO e
 
--- | Give the node chains of transactions, each in its order, eight chains
+-- | Give the node chains of transactions, each in its order, four chains
 -- at a time.
 submit :: Bed -> [[Tx]] -> IO ()
 submit bed chains = forConcurrently_ (transpose (groups chains)) (mapM_ (mapM_ (send bed)))
   where
     groups [] = []
-    groups xs = let (a, b) = splitAt 8 xs in a : groups b
+    groups xs = let (a, b) = splitAt 4 xs in a : groups b
 
 -------------------------------------------------------------------------------
 -- The bed of a test

@@ -51,7 +51,6 @@ library
   exposed-modules:
       Haskoin.Store
       Haskoin.Store.BlockStore
-      Haskoin.Store.BlockStore.Pending
       Haskoin.Store.BlockStore.Sync
       Haskoin.Store.Common
       Haskoin.Store.Database.Merge
@@ -73,6 +72,7 @@ library
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.XPub
       Haskoin.Store.Ingest
+      Haskoin.Store.Ingest.Run
       Haskoin.Store.Logic
       Haskoin.Store.Manager
       Haskoin.Store.Outage
@@ -302,7 +302,6 @@ test-suite spec
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      Haskoin.Store.BlockStore.PendingSpec
       Haskoin.Store.BlockStore.SyncSpec
       Haskoin.Store.CommonSpec
       Haskoin.Store.Database.MergeSpec
@@ -314,7 +313,6 @@ test-suite spec
       Haskoin.Store.DownloadSpec
       Haskoin.Store.ExceptionSpec
       Haskoin.Store.Fleet.CacheSpec
-      Haskoin.Store.Fleet.MemberSpec
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
       Haskoin.Store.Fleet.XPubSpec

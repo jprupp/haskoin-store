@@ -404,8 +404,8 @@ fleet of one. Every key starts with `hs2:<network>:`.
   blocks, the stores fill it again too.
 - **Filling the pool again** works best with `--node-rpc`: each store reads
   its node's mempool (`getrawmempool`), 2,000 transactions every two
-  seconds. Each also asks its peers for their mempools, once, as it does
-  when it starts: the peers
+  seconds. Each also reads the mempools of its sources again, as it does
+  when one connects and whenever it missed something: the peers
   whose node takes the request, which a node closes the connection over
   unless it offers Bloom filters or whitelists the store with `mempool`.
   The store knows which from a model of each peer's node
@@ -1253,6 +1253,12 @@ The metrics of the fleet's cache:
 
 | Metric | Kind | Meaning |
 | --- | --- | --- |
+| `ingest.settled` | counter | Transactions that peers named and that the pool decided on, or already had |
+| `ingest.given_up.REASON` | counter | Transactions given up on their way to the pool, by reason: `node_has_not`, `unanswered`, `no_room`, `peer_gone`, `waited_too_long`, `unjudged` (`docs/mempool-ingestion.md`). All but the first make the server read its sources again |
+| `ingest.dropped` | counter | Messages of peers dropped because the path into the pool was behind; the sources are read again |
+| `ingest.ids` | gauge | Transaction ids on their way to the pool: wanted, asked for, or held |
+| `ingest.pending` | gauge | Transactions asked of peers and not received, what `/health` counts |
+| `ingest.held` | gauge | Transactions held: being offered, or waiting for one that they spend from |
 | `fleet.cache.hits` | counter | Requests about an xpub whose balances the cache gave |
 | `fleet.cache.misses` | counter | Requests about an xpub that the cache did not have |
 | `fleet.cache.builds` | counter | Entries that this server built, or added addresses to |

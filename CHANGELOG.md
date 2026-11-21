@@ -25,15 +25,35 @@ whitelist it must now say what they grant (`--peer-permission`, or
 `mempool` there, a Bitcoin store no longer asks them for their mempools.
 
 ### Added
-- **A specification of the path into the shared mempool, and a machine
-  checked against it** (`docs/mempool-ingestion.md`,
-  `Haskoin.Store.Ingest`). The store does not use the machine yet. The
-  document says what the path from a node's mempool to the pool must
-  guarantee, what it assumes of a node, and how each claim is established:
-  by construction, proved by Liquid Haskell (`proofs/`), checked through
-  every order of events of small worlds by a model checker in the test
-  suite (`Haskoin.Store.Ingest.Model`, `scripts/check-ingest.sh`), or
-  tested against Bitcoin Core in Podman (`Haskoin.Store.MempoolSpec`).
+- **The path of a transaction into the shared mempool is one machine,
+  specified and checked** (`docs/mempool-ingestion.md`,
+  `Haskoin.Store.Ingest`, run by `Haskoin.Store.Ingest.Run`). It replaces
+  five stages that each lost transactions in a way of their own: the queue
+  of announcements, the set of requests, the member's list of what waited,
+  its offers by turn, and the question to the peers at the start.
+  - Every transaction id has one place, and leaves it settled or given up
+    for a counted reason (`ingest.given_up.*`). A store that gave
+    something up reads the whole mempool of its **sources** again: the
+    peers whose node gives its mempool when asked. It also reads them when
+    one connects, when the pool lost what it had, and every ten minutes.
+    So a loss is temporary, where it lasted until a block: a node
+    announces a transaction to a peer once.
+  - What a peer names is asked of the pool before anything is fetched, so
+    reading a mempool that the pool has costs the list of its ids.
+  - Each peer has a window of requests out, from 16 to 4,096, that grows
+    as the peer answers and halves when it does not, in place of asking a
+    node for its whole mempool at once.
+  - A transaction is offered when it arrives, each after those that it
+    spends from: a chain enters root first, in any order of arrival.
+  - What peers name while the store is a block behind is kept, and asked
+    for once it is in sync, where it was dropped.
+  The document says what the path guarantees and how each claim is
+  established: by construction, proved by Liquid Haskell (`proofs/`),
+  checked through every order of events of small worlds by a model
+  checker in the test suite (`Haskoin.Store.Ingest.Model`,
+  `scripts/check-ingest.sh`), or tested against Bitcoin Core in Podman
+  (`Haskoin.Store.MempoolSpec`). A store with no source, as one whose
+  peers are all strangers on Bitcoin, says so in its log.
 - **`/health` says in words what it found.** Each check has a `text`,
   such as "The database is 4 blocks behind the best header, at height
   688,798, more than the 2 allowed: the store is syncing, or cannot import
@@ -200,41 +220,22 @@ whitelist it must now say what they grant (`--peer-permission`, or
   - announcements of transactions held up blocks on the block store's
     thread; the transactions waiting to be offered had no bound.
 - **New transactions and blocks show at once again.** Since the pool moved
-  to Redis, a transaction from a peer or from `POST /transactions` waited
-  for the member's next turn, up to two seconds, before it was in the pool
-  and listed; it is offered as soon as it comes now. A store that a block
+  to Redis, a transaction from a peer waited for the member's next turn,
+  up to two seconds, before it was in the pool and listed; it is offered
+  as soon as it comes now (`Haskoin.Store.Ingest`). A store that a block
   made well, as after a sync, took no turn for up to two seconds either:
   the block woke the member before the health check had run, and the
   member slept until its timer. It now takes a turn as soon as the store
   is well (`Haskoin.Store.Fleet.turn`). Measured in a downstream regtest
   suite: 1.3 to 2.0 seconds for a transaction against 0.3 to 0.4 on
   1.12.1, and 2.0 seconds for 101 blocks after a start against 0.01.
-- **Chains of transactions enter the shared mempool in one round.** The
-  member offered what waited oldest first, by the second, and in the order
-  of the ids within a second: a chain of 24 Runes mints that a node takes
-  in one second was offered children first, each refused as an orphan
-  until its parent was in, and took up to 23 rounds. On groot's btc, after
-  the restart into 2.0.0, the pool fell some 9,000 transactions behind its
-  node, and caught up at 10 a second. Each transaction now comes after its
-  parents (`offerMempool`, `offerOrder`). An offer at an arrival offers only
-  what arrived; orphans are tried again at the turns, every two seconds and
-  at each block, instead of at every arrival.
-- **A store asks its peers for their mempools when it starts**, those whose
-  node takes the request (`--peer-permission mempool`, or a node that
-  serves Bloom filters). A node announces a transaction to a peer once: a
-  store whose one peer is its node lacked what was announced while it was
-  away until a block confirmed it.
-- **Announcements of transactions are no longer dropped when many come at
-  once.** Those of a peer are merged while the store asks Redis about the
-  last ones, up to 100,000 ids, where a queue of 1,000 announcements
-  dropped the rest for good, said so only at debug level, and assumed that
-  peers announce again.
-- **Transactions are requested at most 2,000 at a time**, 1,000 to a
-  message, as answers come in. A refill, or the request at a start into an
-  empty pool, asked a node for its whole mempool at once: on groot, 57,000
-  transactions, which put the store's pending count at twice the 10,000
-  that its health allows, and the node, busy sending them, was dropped as
-  silent after 30 seconds with the rest of the requests unanswered.
+- **A store no longer falls behind the mempool of its node.** On a server,
+  a Bitcoin store fell 17,000 transactions behind its node: chains of 24
+  transactions that the node took in one second were offered child first
+  and took 23 rounds; announcements were dropped from a full queue, or
+  while the store was a block behind; and nothing asked the node again
+  for what was missed. The path into the pool is a new machine (see
+  Added).
 - **A Bitcoin Cash Node with `--node-rpc` no longer waits half a minute
   when it stops.** The store kept its RPC connection open, and the node
   waited until it had been idle for `-rpcservertimeout`. Every RPC request

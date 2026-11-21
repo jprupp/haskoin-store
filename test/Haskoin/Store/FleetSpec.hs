@@ -133,38 +133,35 @@ states :: Rules -> [Op] -> [World]
 states rules = scanl (step rules) start
 
 -- | What happens to a member, for the spec of its turns.
-data Happening = Best | Received | Health Bool | Timer
+data Happening = Best | Health Bool | Timer
   deriving (Show)
 
 instance Arbitrary Happening where
-  arbitrary = elements [Best, Received, Health True, Health False, Timer]
+  arbitrary = elements [Best, Health True, Health False, Timer]
 
 -- | A member that is well and has nothing to do.
 idle :: Wake
-idle = Wake {well = True, owed = False, block = False, due = False, offers = False}
+idle = Wake {well = True, owed = False, block = False, due = False}
 
 -- | What the member knows after a happening, as @memberLoop@ and
--- @setHealthy@ keep it, and the turns that it then takes, at once.
-happen :: Wake -> Happening -> (Wake, [Turn])
+-- @setHealthy@ keep it, and whether it then takes a turn, which clears
+-- what the turn sees to.
+happen :: Wake -> Happening -> (Wake, Bool)
 happen w = \case
   Best -> settle w {block = True}
-  Received -> settle w {offers = True}
   Health ok -> settle w {well = ok, owed = w.owed || not ok}
   Timer -> settle w {due = True}
   where
-    -- the turns until there is nothing to do, each clearing what it sees to
-    settle v = case turn v of
-      Nothing -> (v, [])
-      Just t -> let (v', ts) = settle (cleared t v) in (v', t : ts)
-    cleared Whole v = v {owed = False, block = False, due = False, offers = False}
-    cleared Offers v = v {offers = False}
+    settle v
+      | turn v = (v {owed = False, block = False, due = False}, True)
+      | otherwise = (v, False)
 
--- | Every happening with the turns that it brought, and the member before it.
-history :: [Happening] -> [(Wake, Happening, [Turn])]
+-- | Every happening with whether it brought a turn, and the member before it.
+history :: [Happening] -> [(Wake, Happening, Bool)]
 history = go idle
   where
     go _ [] = []
-    go w (h : hs) = let (w', ts) = happen w h in (w, h, ts) : go w' hs
+    go w (h : hs) = let (w', t) = happen w h in (w, h, t) : go w' hs
 
 spec :: Spec
 spec = do
@@ -175,20 +172,17 @@ turns :: Spec
 turns = describe "turns of a member" $ modifyMaxSuccess (const 2000) $ do
   it "takes none while the store is unwell" $
     property $
-      \hs -> and [null ts | (_, Health False, ts) <- history hs]
+      \hs -> and [not t | (w, h, t) <- history hs, not (fst (happen w h)).well]
   it "leaves nothing undone while the store is well" $
     property $ \hs ->
-      let pending v = v.owed || v.block || v.due || v.offers
+      let pending v = v.owed || v.block || v.due
        in and [not (pending after) | (w, h, _) <- history hs, let after = fst (happen w h), after.well]
-  it "takes a whole turn when the store is well again" $
+  it "takes a turn when the store is well again" $
     property $
-      \hs -> and [take 1 ts == [Whole] | (w, Health True, ts) <- history hs, not w.well]
-  it "offers a transaction at once, without a whole turn" $
-    property $
-      \hs -> and [ts == [Offers] | (w, Received, ts) <- history hs, w.well]
-  it "takes at most one whole turn for what happened" $
-    property $
-      \hs -> and [length (filter (== Whole) ts) <= 1 | (_, _, ts) <- history hs]
+      \hs -> and [t | (w, Health True, t) <- history hs, not w.well]
+  it "takes a turn at each block and each time the two seconds are over, while the store is well" $
+    property $ \hs ->
+      and [t | (w, h, t) <- history hs, w.well, case h of Health _ -> False; _ -> True]
 
 tip :: Spec
 tip = describe "fleet tip" $ do

@@ -1,10 +1,9 @@
 # How transactions reach the shared mempool: what must be true
 
-**Status: a specification. The code does not follow it yet.** It says what
-the path from a node's mempool to the pool in Redis has to guarantee, what
-it may assume, and how each guarantee is established. The path is being
-rebuilt to it as one pure machine, `Haskoin.Store.Ingest`. Until this line
-changes, `docs/fleet-mempool.md` describes what runs.
+What the path from a node's mempool to the pool in Redis has to guarantee,
+what it may assume, and how each guarantee is established. The path is one
+pure machine, `Haskoin.Store.Ingest`, run by `Haskoin.Store.Ingest.Run`.
+`docs/fleet-mempool.md` has the pool itself.
 
 ## Why
 
@@ -100,6 +99,11 @@ gets a test against the real node in Podman.
   it or the pool's own limit of age takes it out. Each store of a fleet
   has a node of its own, so the pool is the union of what they hold, and
   no single node can say that a transaction is gone.
+- **What the pool let go.** The fleet remembers what the pool decided on,
+  the newest 100,000 (`fleet:seen`), and the store does not fetch those
+  again. A transaction that the pool let go for its age, or turned away
+  for one that conflicts with it, stays out while it is remembered, even
+  if a node still has it.
 - **Time.** T3 bounds steps, not seconds: a node or a Redis that answers
   slowly makes it slow, never wrong.
 
@@ -170,11 +174,12 @@ three, three peers, every disturbance) keep the same rules and converge.
 
 **Tested against the real programs**, Podman and Bitcoin Core
 (`Haskoin.Store.MempoolSpec`): five situations in which a store must end
-with the mempool of its node. They pass on the code that runs today, and
-three of them fail on the version that fell behind on the server, so they
-can see that failure. They do not decide the order of events, and so
-cannot find a race: that is what the model checker is for. Tests of each
-axiom, A1 to A6, against both nodes are still to write.
+with the mempool of its node, with the machine and its runner in the
+store. Three of them fail on the version that fell behind on the server,
+so they can see that failure, and one failed one run in three on the path
+before this one, a race. They do not decide the order of events, and so
+cannot find a race by themselves: that is what the model checker is for.
+Tests of each axiom, A1 to A6, against both nodes are still to write.
 
 ## What the checks have found
 
@@ -199,6 +204,10 @@ The same search showed where the first model of the world was wrong: it
 used the name of a peer again for a later connection, which haskoin-node
 never does (U1).
 
-What stays outside the proofs is named: the axioms, the runner, the Lua
+What stays outside the proofs is named: the axioms, the runner
+(`Haskoin.Store.Ingest.Run`, which decides nothing: it turns messages
+into inputs and carries out outputs, and drops events of peers past a
+bound while telling the machine so), the two functions of the member that
+ask the pool and offer to it (`memberSettled`, `memberOffer`), the Lua
 scripts of the pool (`docs/concurrency.md` says how those are checked,
 and that gap is the next piece of work), and GHC's runtime.

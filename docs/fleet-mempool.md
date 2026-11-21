@@ -53,13 +53,16 @@ changes them together or not at all.
 
 ## Getting in: the offer
 
-A server hands each transaction that a peer sends it to its member of the
-fleet (`memberReceived`), which offers it at once (`offerMempool`), with
-the others that arrived meanwhile, reading the outputs that each spends from
-its view at the tip or from the pool. Each comes after those of them that it
-spends from (`offerOrder`): a chain that a node took in one second enters in
-one round. One whose outputs are in neither waits, as an orphan, and is
-offered again at each turn, every two seconds and at each block.
+How a transaction gets from a peer to an offer is a machine of its own,
+`Haskoin.Store.Ingest`, with a document of its own,
+`docs/mempool-ingestion.md`: what a peer names is asked of the pool, what
+the pool has not decided on is requested, and what arrives is offered at
+once (`memberOffer`), one transaction to an offer, each after those that
+it spends from and that the server is still getting. The offer reads the
+outputs that a transaction spends from the server's view at the tip or
+from the pool. One whose outputs are in neither is an orphan: the machine
+holds it for the transaction that it lacks, and offers it again when that
+one is in the pool.
 
 1. The server reads the fleet tip, and opens its own view of its database
    at that block. A server without that view offers nothing.
@@ -109,11 +112,10 @@ spend outputs that no longer exist. A confirmed transaction leaves alone:
 what spends it now spends a confirmed output.
 
 A server has no mempool of its own, so there is nothing for it to
-withdraw. What it heard and has not offered yet waits in memory, with the
-orphans, and is offered again at the next turn. An orphan is let go 20
-minutes after the server heard of it, as Bitcoin Core lets go of its own:
-a parent that has not come by then is not coming, and orphans kept for
-ever would fill every round.
+withdraw. What it holds and has not offered yet is in the machine
+(`Haskoin.Store.Ingest`), with the orphans. An orphan is let go 20 minutes
+after the server had it, as Bitcoin Core lets go of its own: a parent that
+has not come by then is not coming.
 
 ## When the tip moves
 
@@ -187,32 +189,37 @@ every live server reports. Then it fills the pool again.
 
 ## Filling the pool again
 
-When a server starts, it asks its peers for their mempools once, as below:
-a node announces a transaction to a peer once, so what it announced while
-the server was away, or before the server was in sync, the server would
-otherwise lack until a block confirmed it. What the fleet has seen is not
-fetched again, so a server that starts into a full pool fetches little.
+A server reads the whole mempool of its **sources** again and again: the
+peers whose node gives its mempool when asked. It does so when a source
+connects, since a node announces a transaction to a peer once and never
+one that it took before the peer connected; whenever it gave something up,
+for want of room, of an answer or of Redis; when the pool lost what it
+had; and every ten minutes besides. What the pool has is not fetched
+again: the server asks the pool about each id first, so a reading of a
+mempool that the pool already has costs the list of its ids and no more.
+`docs/mempool-ingestion.md` has the rules, and why they make every loss
+temporary.
 
-After a loss of Redis or a restart of the pool, each server:
+After a loss of Redis or a restart of the pool, each server also:
 
 - **reads its node's mempool over RPC**, with `--node-rpc`
   (`getrawmempool`, then `getrawtransaction`), 2,000 transactions every
   two seconds. Each goes through the offer as if a peer had sent it. This
   always works.
-- **asks its peers for their mempools**, once, the peers connected at that
-  time (`blockStoreRefill`), and fetches what they announce. Both nodes
-  answer a peer that they whitelist with the permission `mempool`, or any
-  peer when they serve Bloom filters (`-peerbloomfilters`, off by default
-  on Bitcoin Core, on by default on Bitcoin Cash Node). Any other peer that
-  asks, they disconnect. Asking the seeds and the discovered peers of
-  Bitcoin once lost them all: a store with no other peers dropped to none,
-  all at once, and answered 503 until it found new ones. So only a peer
-  whose node takes the request is asked. Every peer runs a model of its
-  node (haskoin-node's `Haskoin.Node.Peer.Remote`, on the state machines
-  that haskoin-core translates from both nodes). The model reads from the
-  version message of the node whether it serves Bloom filters, and has the
-  permissions that the operator says the nodes of `--peer` grant
-  (`--peer-permission mempool`, as `whitebind=mempool@…` grants).
+
+**Which peers are sources.** Both nodes answer a peer that they whitelist
+with the permission `mempool`, or any
+peer when they serve Bloom filters (`-peerbloomfilters`, off by default
+on Bitcoin Core, on by default on Bitcoin Cash Node). Any other peer that
+asks, they disconnect. Asking the seeds and the discovered peers of
+Bitcoin once lost them all: a store with no other peers dropped to none,
+all at once, and answered 503 until it found new ones. So only a peer
+whose node takes the request is asked. Every peer runs a model of its
+node (haskoin-node's `Haskoin.Node.Peer.Remote`, on the state machines
+that haskoin-core translates from both nodes). The model reads from the
+version message of the node whether it serves Bloom filters, and has the
+permissions that the operator says the nodes of `--peer` grant
+(`--peer-permission mempool`, as `whitebind=mempool@…` grants).
 
 A fleet without `--node-rpc`, and without a peer that serves Bloom filters
 or a `--peer` that grants `mempool`, gets back only what its peers announce

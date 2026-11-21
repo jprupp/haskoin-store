@@ -30,12 +30,12 @@
 --   starts the pool again ('wayBetween'), which every store then fills
 --   again ('noteRestarts').
 --
--- * __It offers to the shared pool what its peers send it__ ('memberReceived',
---   'offerMempool'), each
---   transaction with whether its inputs are unspent in the store's view at
---   the fleet tip, so that the pool only takes what is valid there. What
---   the pool decided on is seen by the fleet, in Redis, and no store
---   fetches it again when a peer announces it ('memberSeen').
+-- * __It offers a transaction to the shared pool__ ('memberOffer') when
+--   the path into the pool says ("Haskoin.Store.Ingest.Run"), with whether
+--   its inputs are unspent in the store's view at the fleet tip, so that
+--   the pool only takes what is valid there. What the pool decided on is
+--   settled for the fleet, in Redis, and no store fetches it when a peer
+--   names it ('memberSettled').
 --
 -- * __It answers from the view at the fleet tip with the pool on top__
 --   ('answering', 'redisPool'), or says that it is behind when it has no
@@ -95,10 +95,8 @@ module Haskoin.Store.Fleet.Member
     Way (..),
     farthest,
     changeBetween,
-    offerMempool,
-    offerOrder,
-    memberReceived,
-    memberSeen,
+    memberSettled,
+    memberOffer,
     mostSeen,
     memberPoolBody,
     memberNewest,
@@ -128,15 +126,13 @@ import Control.Monad (filterM, forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
-import Data.Either (rights)
+import Data.Either (lefts, rights)
 import Data.Functor ((<&>))
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
-import Data.HashSet (HashSet)
-import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (nub, partition, sortOn)
+import Data.List (nub)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Serialize (Serialize, decode, encode, get, getWord32be, putWord32be, runGet, runPut)
@@ -186,6 +182,7 @@ import Haskoin.Store.Exception (bracket, handleAny, tryAny)
 import Haskoin.Store.Fleet qualified as F
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.XPub
+import Haskoin.Store.Ingest qualified as I
 import Haskoin.Store.Outage (Outage, attempt, newOutage)
 import Haskoin.Store.XPub (EntryMoved (..), XPubReads (..))
 import Haskoin.Store.XPub.Indexer
@@ -313,12 +310,6 @@ data Member = Member
     reported :: !(TVar [BlockHash]),
     -- | the fleet tip, read after that report
     tip :: !(TVar (Maybe BlockHash)),
-    -- | the transactions that peers sent and that are still to offer: new,
-    -- refused as orphans, or with no time to offer them yet, with the times
-    -- at which the store heard of them; they are offered at the next turn.
-    -- What the pool has decided on is in the fleet's seen set instead
-    -- ('memberSeen'), which Redis keeps for every store.
-    waiting :: !(TVar (Map.Map TxHash (UnixTime, Tx))),
     -- | whether the store's own health checks pass. While they do not, the
     -- member does nothing, so that its lease runs out and a store that is
     -- stuck does not hold the fleet back.
@@ -329,11 +320,6 @@ data Member = Member
     -- | whether the store has a new best block since the last whole turn
     -- ('noteBest')
     newBest :: !(TVar Bool),
-    -- | the transactions that came to offer since the last turn
-    -- ('memberReceived'), which a turn of offers alone offers, a
-    -- v'Haskoin.Store.Fleet.Offers': the others that wait, orphans for
-    -- now, wait for a whole turn
-    fresh :: !(TVar (HashSet TxHash)),
     -- | the indexer that builds the entries of the xpubs that requests
     -- miss, one store of the fleet for each, holding its dibs in Redis
     indexer :: !(Indexer XPubSpec ()),
@@ -380,11 +366,9 @@ newMember config redis db = do
   recent <- newTVarIO []
   reported <- newTVarIO []
   tip <- newTVarIO Nothing
-  waiting <- newTVarIO Map.empty
   healthy <- newTVarIO True
   owed <- newTVarIO False
   newBest <- newTVarIO False
-  fresh <- newTVarIO HashSet.empty
   metrics <- mapM newCacheMetrics config.stats
   outage <- newOutage
   built <- newTVarIO HashMap.empty
@@ -455,9 +439,8 @@ memberAlive m =
       _ -> False
 
 -- | One round of what a member does: report, move the tip if the stores
--- agree on another block, offer what peers sent that it has not offered
--- yet, let go of old views, and trim what the fleet has seen
--- ('fleetTrimSeen'). Call it every second or two, and when
+-- agree on another block, let go of old views, and trim what the fleet
+-- has seen ('fleetTrimSeen'). Call it every second or two, and when
 -- the best block changes. A store whose own health checks fail must not
 -- call it: its lease then runs out, and the fleet goes on without it.
 memberTick :: Member -> IO ()
@@ -475,7 +458,6 @@ memberTick m = do
   prune m
   cacheGauges m
   unless moved (expirePool m)
-  offerMempool m Nothing
   void (fleetTrimSeen m.redis m.keys mostSeen)
   where
     decoded = either (const Nothing) Just . decode
@@ -485,9 +467,9 @@ memberTick m = do
 -- missing sets. A store that finds it missing or changed forgets its view
 -- of the fleet tip, so that it is
 -- unhealthy until a tip is set again, which its next turn does, since
--- every live store reports. It counts the loss in 'refills', and the web
--- server then asks the peers, and the node over RPC if it has one, for
--- their mempools, which fill the pool again through 'memberReceived'.
+-- every live store reports. It counts the loss in 'refills': the path
+-- into the pool then reads the mempools of its sources again, and the web
+-- server that of the node over RPC if it has one.
 -- Entries of the cache of extended public keys are built again on demand.
 --
 -- Without an epoch, a loss would show only in the count of restarts of
@@ -530,47 +512,37 @@ noteRestarts m = do
   when restarted . m.config.note LevelInfo $
     "The pool started again: it fills again from the node and the peers"
 
--- | Take the member's turns, for as long as the store runs, when the rule
--- of 'Haskoin.Store.Fleet.turn' says: a whole turn ('memberTick') every
--- two seconds, at each new best block and when the store is well again,
--- and an offer alone ('offerMempool') as soon as a transaction comes, all
--- of them only while the store's health checks pass. A turn that fails,
--- as when Redis is away, is tried again at the next, and logged as an
--- outage is ('attempt').
+-- | Take the member's turns ('memberTick'), for as long as the store runs,
+-- when the rule of 'Haskoin.Store.Fleet.turn' says: every two seconds, at
+-- each new best block and when the store is well again, only while the
+-- store's health checks pass. A turn that fails, as when Redis is away, is
+-- tried again at the next, and logged as an outage is ('attempt').
 --
 -- The member waits in one transaction for what wakes it, and clears in
--- the same transaction what the turn will see to: a block, a health or a
--- transaction that comes during the turn wakes it again after it, and
--- none is lost between the read and the clearing. Before, the member
--- waited for a block with a timer around it, and read the health after:
--- a store that the block made well took no turn for up to two seconds,
--- nor offered a transaction for as long.
+-- the same transaction what the turn will see to: a block or a health
+-- that comes during the turn wakes it again after it, and none is lost
+-- between the read and the clearing. Before, the member waited for a
+-- block with a timer around it, and read the health after: a store that
+-- the block made well took no turn for up to two seconds.
+--
+-- Transactions are not offered here: "Haskoin.Store.Ingest.Run" offers
+-- each as it comes ('memberOffer').
 memberLoop :: Member -> IO a
 memberLoop m = registerDelay 2000000 >>= go
   where
     go timer = do
-      t <- atomically $ do
+      atomically $ do
         wake <-
           F.Wake
             <$> readTVar m.healthy
             <*> readTVar m.owed
             <*> readTVar m.newBest
             <*> readTVar timer
-            <*> (not . HashSet.null <$> readTVar m.fresh)
-        t <- maybe retry return (F.turn wake)
-        new <- readTVar m.fresh
-        writeTVar m.fresh HashSet.empty
-        when (t == F.Whole) $ do
-          writeTVar m.owed False
-          writeTVar m.newBest False
-        return (t, new)
-      case t of
-        (F.Whole, _) -> do
-          void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m))
-          registerDelay 2000000 >>= go
-        (F.Offers, new) -> do
-          void (attempt m.outage m.config.note "offer to the pool" (offerMempool m (Just new)))
-          go timer
+        unless (F.turn wake) retry
+        writeTVar m.owed False
+        writeTVar m.newBest False
+      void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m))
+      registerDelay 2000000 >>= go
 
 -- | Hear what happens to the fleet, for as long as the store runs: each
 -- move of the tip and each transaction that enters or leaves the pool is
@@ -952,144 +924,105 @@ poolTx net td =
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)
           <> mapMaybe (address . (.script)) td.tx.outputs
 
--- | Offer to the pool the transactions that peers sent this store and that
--- it has not offered yet ('memberReceived'), each after those that it
--- spends from ('offerOrder'): all of them at a whole turn, and only those
--- given at an offer alone, which comes as soon as transactions arrive. A
--- store without a view of the fleet tip offers nothing: it cannot say
--- what is unspent there.
+-- | Of these transactions, which are settled: the pool has them, or the
+-- fleet remembers that the pool decided on them. 'Nothing' if Redis does
+-- not answer in five seconds.
 --
--- Orphans are tried again at whole turns only, every two seconds and at
--- each block, as before offers came at once: an offer for each arrival
--- that tried them all again read Redis for each of their parents, for
--- nothing, many times a second.
+-- It is what "Haskoin.Store.Ingest" asks before it gives a place to what a
+-- peer names ('Haskoin.Store.Ingest.Check'): a node names its whole
+-- mempool when asked, and nearly all of it is in the pool already. The
+-- ids go to Redis a thousand at a time, so that no call is long enough to
+-- hold up the others.
 --
--- A transaction whose inputs neither the tip nor the pool has, an orphan
--- for now, waits for the next round, as does everything after an offer
--- that the pool turned away because the tip had moved. An orphan is let go
--- 'orphanLife' after the store heard of it: its parent is not coming. One that conflicts
--- with transactions of the pool takes their place: a peer relayed it, so
--- its node took it in place of them.
+-- A block of the store may confirm a transaction that the pool never had.
+-- That is not looked up here, one read of the database for each of tens
+-- of thousands of ids: 'memberOffer' finds it for the few that are
+-- fetched.
+memberSettled :: Member -> [TxHash] -> IO (Maybe [Bool])
+memberSettled _ [] = return (Just [])
+memberSettled m hs =
+  handleAny (\_ -> return Nothing) . timeout 5000000 $
+    concat <$> mapM (fleetSettled m.redis m.keys . map encode) (thousands hs)
+  where
+    thousands [] = []
+    thousands xs = let (a, b) = splitAt 1000 xs in a : thousands b
+
+-- | Offer a transaction to the pool, with the time at which the store has
+-- it, and say what became of it, as "Haskoin.Store.Ingest" needs to know
+-- ('Haskoin.Store.Ingest.Offer'):
 --
--- A round offers 'mostOffers' transactions at most and leaves the rest
--- waiting, so that a store with many to offer still reports in time to
--- keep its lease.
-offerMempool :: Member -> Maybe (HashSet TxHash) -> IO ()
-offerMempool m only =
+-- * 'Haskoin.Store.Ingest.Settled': the pool took it or had it, or a block of the store's view
+--   at the fleet tip confirms it;
+--
+-- * 'Haskoin.Store.Ingest.Orphan' with the transactions that it spends from and that neither
+--   the tip nor the pool has;
+--
+-- * 'Haskoin.Store.Ingest.Again': there is no answer now. The store has no view of the fleet
+--   tip, the tip moved between the reading and the offer, or the
+--   transaction conflicts with the pool twice in a row.
+--
+-- The store says of each output that the transaction spends whether it is
+-- unspent in its view at the fleet tip, so that the pool only takes what
+-- is valid there. A transaction that conflicts with transactions of the
+-- pool takes their place: a peer relayed it, so its node took it in place
+-- of them.
+--
+-- One transaction to a call, and no list of those that wait: which to
+-- offer and when is for the machine to say. The member held them once and
+-- offered them oldest first by the second, so that a chain that a node
+-- took in one second was offered child first and took as many rounds as
+-- it had transactions.
+memberOffer :: Member -> UnixTime -> Tx -> IO (I.Verdict TxHash)
+memberOffer m time tx =
   readTVarIO m.tip >>= \case
-    Nothing -> return ()
-    Just tip -> void . withViewAt m.views tip $ \at -> do
-      now <- round <$> getPOSIXTime
-      held <- readTVarIO m.waiting
-      let chosen = maybe held (\hs -> Map.filterWithKey (\h _ -> HashSet.member h hs) held) only
-          todo = take mostOffers (offerOrder chosen)
-          pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
-      go now at pool tip todo
+    Nothing -> return I.Again
+    Just tip -> fmap (fromMaybe I.Again) . withViewAt m.views tip $ \at ->
+      Q.getTxData at h >>= \case
+        Just td | not td.deleted -> return I.Settled
+        _ -> do
+          let pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
+          found <- forM (zip [0 :: Int ..] tx.inputs) (spent at pool)
+          case lefts found of
+            [] -> do
+              unspent <- forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
+                isJust <$> Q.getUnspent at p
+              let td =
+                    TxData
+                      { block = MemRef time,
+                        tx,
+                        prevs = IntMap.fromList (catMaybes (rights found)),
+                        deleted = False,
+                        rbf = False,
+                        timestamp = time,
+                        spenders = IntMap.empty
+                      }
+                  offer = poolOffer m.redis m.keys 32 (Just (encode tip)) (poolTx m.db.net td) unspent
+                  answered second = \case
+                    Taken -> return I.Settled
+                    Known -> return I.Settled
+                    Orphan outs -> return (I.Orphan (nub [(op :: OutPoint).hash | Right op <- map decode outs]))
+                    Late -> return I.Again
+                    Conflict rivals
+                      | not second -> offer rivals >>= answered True
+                      | otherwise -> return I.Again
+              offer [] >>= answered False
+            missing -> return (I.Orphan (nub missing))
   where
-    go _ _ _ _ [] = return ()
-    go now at pool tip ((h, (time, tx)) : rest) =
-      txDataAt at pool time tx >>= \case
-        -- an input that neither the tip nor the pool has: an orphan for now
-        Nothing -> orphan now h time >> go now at pool tip rest
-        Just td -> do
-          unspent <- forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
-            isJust <$> Q.getUnspent at p
-          let offer = poolOffer m.redis m.keys 32 (Just (encode tip)) (poolTx m.db.net td) unspent
-              done = atomically (modifyTVar' m.waiting (Map.delete h))
-              -- what the answer to an offer leaves to do: the transaction is
-              -- let go only when the pool decided on it, or when it is an
-              -- orphan for too long; otherwise it waits for the next turn
-              answered second = \case
-                Taken -> done >> go now at pool tip rest
-                Known -> done >> go now at pool tip rest
-                Orphan _ -> orphan now h time >> go now at pool tip rest
-                Late -> return ()
-                -- a peer relayed it, so its node took it in place of what
-                -- it conflicts with: it replaces them in the pool too
-                Conflict rivals
-                  | not second -> offer rivals >>= answered True
-                  -- a new rival since: the next turn tries again. Letting
-                  -- it go here lost it for the fleet, which counts a
-                  -- conflict as seen, and fetches it no more
-                  | otherwise -> go now at pool tip rest
-          offer [] >>= answered False
-    orphan now h time =
-      when (now > time + orphanLife) $
-        atomically (modifyTVar' m.waiting (Map.delete h))
-
--- | A transaction that the store heard from a peer, to offer to the pool at
--- the next turn, with the time at which it was heard. There is no mempool
--- of the store's own: the pool in Redis is the mempool.
---
--- At most @mostWaiting@ wait. A transaction that comes when they are that
--- many is dropped, as if the store had never heard of it: the fleet has not
--- seen it, so the store, or another, fetches it at its next announcement.
--- With no bound, a Redis that was away for long, when nothing is offered,
--- or a read of a node's whole mempool, held every transaction in memory.
-memberReceived :: Member -> UnixTime -> Tx -> IO ()
-memberReceived m time tx = atomically $ do
-  held <- readTVar m.waiting
-  let h = txHash tx
-      new = not (Map.member h held)
-  when (not new || Map.size held < mostWaiting) $ do
-    writeTVar m.waiting (Map.insertWith (\_ old -> old) h (time, tx) held)
-    -- the member offers it at once ('F.turn'), if it is new: one that
-    -- waits already, an orphan, waits for a whole turn
-    when new $ modifyTVar' m.fresh (HashSet.insert h)
-
--- | The order in which to offer transactions that wait: each after those
--- of them that it spends from, and otherwise oldest first. The pool takes
--- a transaction only once it has every parent, so a child offered first
--- is refused as an orphan and waits for the next round. Times are whole
--- seconds, and the transactions of one second used to come in the order
--- of their ids: a chain of 24 that entered a mempool in one second, as
--- the mints of Runes on Bitcoin do, took up to 23 rounds, while each
--- round tried the 2,000 oldest, orphans first. A store that restarted
--- into such a stream fell minutes behind its node.
---
--- A depth-first walk from each transaction, oldest first, to the parents
--- that wait, which come out before it. A chain is as deep as a mempool
--- lets it be, a few dozen at most.
-offerOrder :: Map.Map TxHash (UnixTime, Tx) -> [(TxHash, (UnixTime, Tx))]
-offerOrder held = reverse . fst $ foldl' visit ([], HashSet.empty) (sortOn (fst . snd) (Map.toList held))
-  where
-    visit (out, done) (h, v)
-      | HashSet.member h done = (out, done)
+    h = txHash tx
+    -- the output that an input spends, from the view at the tip or from
+    -- the pool, or the transaction that should have it
+    spent at pool (n, i)
+      | i.outpoint == nullOutPoint = return (Right Nothing)
       | otherwise =
-          let parents =
-                [ (p, pv)
-                | i <- (snd v).inputs,
-                  let p = i.outpoint.hash,
-                  Just pv <- [Map.lookup p held]
-                ]
-              (out', done') = foldl' visit (out, HashSet.insert h done) parents
-           in ((h, v) : out', done')
-
--- | The most transactions that a store holds to offer ('memberReceived').
-mostWaiting :: Int
-mostWaiting = 100000
-
--- | Of these transactions, those that the block store need not fetch when
--- a peer announces them: those that this store holds to offer, and those
--- that the fleet has seen ('fleetTrimSeen'), asked of Redis in one round
--- trip. The fleet sees a transaction only once the pool has decided on it,
--- so what this store received and has not offered yet is known here alone.
--- Without an answer from Redis within a second, only what the store holds;
--- the store then fetches the rest, and finds out at the offer what the pool
--- has.
-memberSeen :: Member -> [TxHash] -> IO (HashSet TxHash)
-memberSeen m hs = do
-  held <- readTVarIO m.waiting
-  let (mine, others) = partition (`Map.member` held) hs
-  fleet <-
-    if null others
-      then return HashSet.empty
-      else
-        handleAny (\_ -> return HashSet.empty) $
-          timeout 1000000 (fleetSeen m.redis m.keys (map encode others)) <&> \case
-            Just flags -> HashSet.fromList [h | (h, True) <- zip others flags]
-            Nothing -> HashSet.empty
-  return (HashSet.union (HashSet.fromList mine) fleet)
+          Q.getUnspent at i.outpoint >>= \case
+            Just u -> return (Right (Just (n, Prev u.script u.value)))
+            Nothing ->
+              pool.bodies [i.outpoint.hash] >>= \case
+                [(Just parent, _)]
+                  | fromIntegral i.outpoint.index < length parent.tx.outputs ->
+                      let o = parent.tx.outputs !! fromIntegral i.outpoint.index
+                       in return (Right (Just (n, Prev o.script o.value)))
+                _ -> return (Left i.outpoint.hash)
 
 -- | How many transactions the fleet remembers having seen, the newest
 -- ('fleetTrimSeen'), trimmed at each turn of a member. A peer announces a transaction within seconds of having
@@ -1122,50 +1055,6 @@ memberNewest m =
         (redisPool m.db.net m.redis m.keys (encode tip) (return ())).page 0 1 <&> \case
           (t, _) : _ -> Just t
           [] -> Nothing
-
--- | A transaction with the outputs that it spends, from the view at the tip
--- or from the pool; 'Nothing' if one of them is in neither.
-txDataAt :: DatabaseReader -> PoolReads -> UnixTime -> Tx -> IO (Maybe TxData)
-txDataAt at pool time tx = do
-  prevs <- forM (zip [0 :: Int ..] tx.inputs) $ \(n, i) ->
-    if i.outpoint == nullOutPoint
-      then return (Just Nothing)
-      else
-        Q.getUnspent at i.outpoint >>= \case
-          Just u -> return (Just (Just (n, Prev u.script u.value)))
-          Nothing ->
-            pool.bodies [i.outpoint.hash] >>= \case
-              [(Just parent, _)]
-                | fromIntegral i.outpoint.index < length parent.tx.outputs ->
-                    let o = parent.tx.outputs !! fromIntegral i.outpoint.index
-                     in return (Just (Just (n, Prev o.script o.value)))
-              _ -> return Nothing
-  return $ do
-    ps <- sequence prevs
-    return
-      TxData
-        { block = MemRef time,
-          tx,
-          prevs = IntMap.fromList (catMaybes ps),
-          deleted = False,
-          rbf = False,
-          timestamp = time,
-          spenders = IntMap.empty
-        }
-
--- | How long, in seconds, a transaction waits for its parent before it is
--- let go: twenty minutes, as Bitcoin Core keeps its orphans. A parent comes
--- within seconds when it comes at all, in a block or from a peer; one that
--- has not come by then was replaced or never reached the network. Kept for
--- ever, such orphans would pile up, and once they were 'mostOffers', the
--- oldest first, a round would offer nothing else.
-orphanLife :: UnixTime
-orphanLife = 1200
-
--- | The most transactions that one round offers. An offer takes a tenth of
--- a millisecond or two, so this is well under the two seconds of a round.
-mostOffers :: Int
-mostOffers = 2000
 
 -- | Take out of the pool the transactions that entered a mempool longer
 -- ago than the configuration allows, with what spends them.

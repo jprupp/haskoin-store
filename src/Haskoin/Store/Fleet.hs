@@ -92,7 +92,6 @@ module Haskoin.Store.Fleet
 
     -- * When a store takes a turn
     Wake (..),
-    Turn (..),
     turn,
   )
 where
@@ -227,39 +226,24 @@ answer has fleet = case fleet.tip of
 data Wake = Wake
   { -- | the store's own health checks pass
     well :: !Bool,
-    -- | the store was found unwell since its last whole turn
+    -- | the store was found unwell since its last turn
     owed :: !Bool,
     -- | the store has a new best block
     block :: !Bool,
-    -- | two seconds went by since the last whole turn
-    due :: !Bool,
-    -- | a peer or a client gave the store a transaction to offer
-    offers :: !Bool
+    -- | two seconds went by since the last turn
+    due :: !Bool
   }
   deriving (Eq, Show)
 
--- | A turn of a member.
-data Turn
-  = -- | report, move the tip, and offer
-    Whole
-  | -- | offer what is waiting, and nothing else
-    Offers
-  deriving (Eq, Show)
-
--- | Which turn a member takes, if any. A store that is unwell takes none,
--- so that its lease runs out. One that is well takes a whole turn when
--- its best block changed, when two seconds went by, and as soon as it is
--- well again after it was not: the block that made it well woke it while
--- its health was still the old one, and without a turn then it waited
--- out the two seconds with the fleet behind it. Otherwise it offers the
--- transactions that came, at once, since the pool is the store's mempool
--- and a transaction is not listed before it is in the pool.
+-- | Whether a member takes a turn. A store that is unwell takes none, so
+-- that its lease runs out. One that is well takes a turn when its best
+-- block changed, when two seconds went by, and as soon as it is well
+-- again after it was not: the block that made it well woke it while its
+-- health was still the old one, and without a turn then it waited out the
+-- two seconds with the fleet behind it.
 --
--- A whole turn offers too, and comes before an offer alone: transactions
--- that keep coming never hold back a report, which keeps the lease.
-turn :: Wake -> Maybe Turn
-turn w
-  | not w.well = Nothing
-  | w.owed || w.block || w.due = Just Whole
-  | w.offers = Just Offers
-  | otherwise = Nothing
+-- A turn reports and moves the tip. It offers no transaction: the path of
+-- a transaction into the pool is a machine of its own,
+-- "Haskoin.Store.Ingest", which offers each as it comes.
+turn :: Wake -> Bool
+turn w = w.well && (w.owed || w.block || w.due)

@@ -94,6 +94,7 @@ module Haskoin.Store.Fleet.Redis
     -- * What the fleet has seen
     fleetTrimSeen,
     fleetSeen,
+    fleetSettled,
 
     -- * Scripts
     Script,
@@ -343,6 +344,25 @@ fleetSeen conn keys ts =
   where
     scores :: Redis (Either Reply [Maybe ByteString])
     scores = R.sendRequest ("ZMSCORE" : keys.prefix <> "fleet:seen" : ts)
+
+-- | Of these transactions, which are settled: the pool has them, or the
+-- fleet remembers that the pool decided on them ('fleetSeen'). Both are
+-- asked in one round trip.
+--
+-- What the fleet has seen is trimmed to the newest ('fleetTrimSeen'), and
+-- a pool larger than that has transactions that are no longer among them:
+-- those are found in the pool itself.
+fleetSettled :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
+fleetSettled _ _ [] = return []
+fleetSettled conn keys ts = do
+  (seen, held) <- run conn $ do
+    a <- scores "fleet:seen"
+    b <- scores "pool:time"
+    return ((,) <$> a <*> b)
+  return (zipWith (\x y -> isJust x || isJust y) seen held)
+  where
+    scores :: ByteString -> Redis (Either Reply [Maybe ByteString])
+    scores k = R.sendRequest ("ZMSCORE" : keys.prefix <> k : ts)
 
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the

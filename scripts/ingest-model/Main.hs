@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- The model checker of Haskoin.Store.Ingest as a program of its own, for
 -- scripts/check-ingest.sh: it goes through the worlds of
 -- Haskoin.Store.Ingest.Model, all of them or those numbered on the command

@@ -199,7 +199,7 @@ import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
 import Data.Time.Clock (getCurrentTime)
-import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32, Word64)
 import Database.RocksDB
@@ -227,7 +227,6 @@ import Haskoin.Node
     withSource,
   )
 import Haskoin.Script
-import Haskoin.Store.BlockStore
 import Haskoin.Store.Common hiding
   ( blockAtOrAfter,
     blockAtOrAfterMTP,
@@ -253,11 +252,11 @@ import Haskoin.Store.Fleet.Member
     memberEvents,
     memberNewest,
     memberPoolBody,
-    memberReceived,
     memberTip,
     setHealthy,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
+import Haskoin.Store.Ingest.Run (IngestState (..), ingestNamedSTM, ingestState, ingestSubmit)
 import Haskoin.Store.Manager
 import Haskoin.Store.Startup (explainListen, redisProblem)
 import Haskoin.Store.Web.Admission
@@ -2161,19 +2160,18 @@ askingLoop st = forever $ do
       (chainRead own.db).getTxData h >>= \case
         Just _ -> return True
         Nothing -> maybe (return False) (\m -> isJust <$> memberPoolBody m h) own.fleet
-    ask h = getPeers own.peerMgr >>= mapM_ (\op -> blockStoreTxHash op.mailbox [h] own.block)
+    ask h = getPeers own.peerMgr >>= mapM_ (\op -> atomically (ingestNamedSTM op.mailbox [h] own.ingest))
 
--- | Fill the pool again each time the member finds it emptied, because
--- Redis lost its data ('Haskoin.Store.Fleet.Member.noteEpoch') or the pool
--- started again ('Haskoin.Store.Fleet.Member.noteRestarts'): ask the peers
--- for their mempools, once ('blockStoreRefill'), and with the RPC of the
--- store's node (@--node-rpc@), read the node's whole mempool,
--- 'refillBatch' transactions every two seconds, a turn of the member, each
--- given to the member as if a peer had sent it ('memberReceived'). The
--- peers alone may not answer: Bitcoin Core answers only a peer that it
--- whitelists or when it serves bloom filters, which it does not by
--- default. The RPC answers in any case, and its transactions are offered
--- whether the fleet has seen them or not.
+-- | Fill the pool again from the RPC of the store's node (@--node-rpc@),
+-- each time the member finds the pool emptied, because Redis lost its data
+-- ('Haskoin.Store.Fleet.Member.noteEpoch') or the pool started again
+-- ('Haskoin.Store.Fleet.Member.noteRestarts'): read the node's whole
+-- mempool, 'refillBatch' transactions every two seconds, each given to
+-- the path into the pool as a transaction that came from no peer
+-- ('ingestSubmit'). That path reads the mempools of its sources again by
+-- itself ("Haskoin.Store.Ingest"), but a store may have none: Bitcoin
+-- Core answers only a peer that it whitelists or when it serves bloom
+-- filters, which it does not by default. The RPC answers in any case.
 refillLoop :: WebState -> IO ()
 refillLoop st = forM_ own.fleet $ \m -> go m 0
   where
@@ -2184,9 +2182,8 @@ refillLoop st = forM_ own.fleet $ \m -> go m 0
         n <- readTVar m.refills
         when (n == seen) retry
         return n
-      blockStoreRefill own.block
       forM_ st.config.nodeRpc $ \url ->
-        tryAny (refillFromNode st m url) >>= \case
+        tryAny (refillFromNode st url) >>= \case
           Left e -> logWarn say ("Could not read the mempool of the node over RPC: " <> cs (show e))
           Right k -> logInfo say ("Gave the pool " <> cs (show k) <> " transactions of the node's mempool")
       go m n
@@ -2198,17 +2195,16 @@ refillBatch = 2000
 -- | Give a member every transaction of the mempool of a node, read over its
 -- RPC (@getrawmempool@, then @getrawtransaction@ in batches of
 -- 'refillBatch'). Says how many it gave.
-refillFromNode :: WebState -> Member -> String -> IO Int
-refillFromNode st m url = do
+refillFromNode :: WebState -> String -> IO Int
+refillFromNode st url = do
   ids <-
     nodeCalls st url [("getrawmempool", [])] <&> \case
       [Just (A.Array a)] -> [h | A.String h <- Foldable.toList a]
       _ -> []
   fmap sum . forM (batches ids) $ \hs -> do
-    now <- fromIntegral . (floor :: POSIXTime -> Integer) <$> getPOSIXTime
     found <- nodeCalls st url [("getrawtransaction", [A.String h]) | h <- hs]
     let txs = [tx | Just (A.String hex) <- found, Just bytes <- [decodeHex hex], Right tx <- [decode bytes]]
-    mapM_ (memberReceived m now) txs
+    mapM_ (ingestSubmit st.config.store.ingest) txs
     threadDelay 2000000
     return (length txs)
   where
@@ -4061,7 +4057,7 @@ lastTxHealthCheck WebConfig {store = store', limits} = do
 -- | Transactions requested from peers and not received yet, and the maximum allowed.
 pendingTxsHealthCheck :: WebConfig -> IO MaxHealth
 pendingTxsHealthCheck cfg = do
-  n <- blockStorePendingTxs cfg.store.block
+  n <- (.pending) <$> atomically (ingestState cfg.store.ingest)
   return
     MaxHealth
       { max = fromIntegral cfg.maxPendingTxs,

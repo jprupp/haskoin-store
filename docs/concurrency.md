@@ -31,14 +31,13 @@ of state below names which:
 
 ## The block store
 
-One thread, the block store's, reads one mailbox: node events, blocks and
-transactions from peers, pongs, a clock tick, refill requests. It owns:
+One thread, the block store's, reads one mailbox: node events, blocks from
+peers, pongs, a clock tick. It owns:
 
 | State | Machine | Rule |
 | --- | --- | --- |
 | `sync`, the block download | `Haskoin.Store.BlockStore.Sync` | single owner |
-| `pending`, transactions on their way | `Haskoin.Store.BlockStore.Pending` | one transaction per change |
-| `refill`, `knows` | flags read and written by the owner | single owner |
+| `knows`, what each peer said it has | read and written by the owner | single owner |
 | the reservation of the syncing peer | haskoin-node's `Lock`, by the store's own `owner` | single owner |
 | the database | the writer, one RocksDB batch per block | single owner |
 
@@ -57,14 +56,23 @@ Readers of the database never see a block half written: a batch is one
 write, and the web reads through a snapshot taken right after the commit
 (`noteBest`), on the block store's thread.
 
-**Transactions announced by peers** wait, merged by peer, for a thread of
-their own (`askForTxs`), which takes all that wait in one transaction, asks
-Redis once whether the fleet has seen them, and requests the rest. It reads
-whether the store is in sync without changing anything (`inSyncNow`), and
-notes its requests in `pending` in the transaction that checks there is
-room for them: at most 2,000 wait for an answer (`requestWindow`). At most 100,000
-ids wait; more are dropped with a warning, since a node announces a
-transaction to a peer once.
+## The path of a transaction into the pool
+
+**What peers name and send** is no business of the block store. One
+thread, the runner of `Haskoin.Store.Ingest.Run`, owns one pure machine,
+`Haskoin.Store.Ingest`, and gives it everything that happens, in the order
+of one queue: a peer that comes or goes, what it names, a transaction, a
+`notfound`, the clock, whether the store is in sync, and the answers of
+the pool to what the machine asked. The machine decides; the runner
+carries out. `docs/mempool-ingestion.md` has what the machine guarantees
+and how each guarantee is established, by a proof, by a model checker that
+goes through every order of events, or by a test.
+
+| State | Owner | Rule |
+| --- | --- | --- |
+| the machine: where each id is, the window of each peer | the runner's thread | single owner; every change is `step` |
+| the queue of events | written by the thread that reads the node's events, read by the runner | events of peers are dropped past 20,000, and the machine is told that something was lost |
+| `state`, what `/health` reads | written by the runner after each step | one transaction per write |
 
 ## The fleet
 
@@ -92,15 +100,15 @@ The member's own state:
 | State | Owner | Rule |
 | --- | --- | --- |
 | `views`, with `recent`, `reported`, `tip` | the member and the block store both prune | one transaction per decision (`keepViews`) |
-| `waiting`, transactions to offer | written by the block store, read by the member | one transaction per change; at most `mostWaiting` |
 | `built`, announcements of builds | the listener and the requests that wait | one transaction per change; a key only while a request waits |
-| `healthy`, `owed`, `newBest`, `fresh`: what wakes the member | set by the web server's health check (`setHealthy`), the block store (`noteBest`) and whoever gives a transaction (`memberReceived`); cleared by the member | `memberLoop` reads them and clears what its turn sees to in one transaction, so a signal that comes during a turn wakes the next |
+| `healthy`, `owed`, `newBest`: what wakes the member | set by the web server's health check (`setHealthy`) and the block store (`noteBest`); cleared by the member | `memberLoop` reads them and clears what its turn sees to in one transaction, so a signal that comes during a turn wakes the next |
 
 The member's turns follow `Haskoin.Store.Fleet.turn`: none while the store
-is unwell, a whole turn at a new block, every two seconds and as soon as
-the store is well again, and an offer alone as soon as a transaction comes.
-`FleetSpec` replays any sequence of blocks, transactions, health changes
-and timers through it, and checks that a well store leaves nothing waiting.
+is unwell, one at a new block, every two seconds and as soon as the store
+is well again. `FleetSpec` replays any sequence of blocks, health changes
+and timers through it, and checks that a well store leaves nothing
+waiting. A turn offers no transaction: the path into the pool does, each
+as it comes (`memberOffer`).
 
 ## The web server
 
@@ -189,6 +197,14 @@ finding was checked against the code before it was fixed.
     1,000 dropped them for good, and a store asks its peers for their
     mempools when it starts, as their nodes do not announce again what the
     store missed while it was away.
+19. **The path of a transaction into the pool had no statement of what it
+    must do**, and items 15 to 18 were patches to five stages that each
+    lost transactions in their own way: the fixes of item 18 themselves
+    asked a node for 57,000 transactions at once, and lost its answer when
+    a header came first. The stages are gone. One machine,
+    `Haskoin.Store.Ingest`, replaces the queue of announcements, the set
+    of requests, the member's list of what waits and the question to the
+    peers at the start (`docs/mempool-ingestion.md`).
 
 **Known limits, left as they are:**
 
