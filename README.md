@@ -327,7 +327,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `-d`, `--dir` | `DIR` | `~/.haskoin-store` | Data directory |
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER` |
-| `--peer-permission` | `PEER_PERMISSIONS` | none | A permission that the nodes of `--peer` grant the store with `-whitelist` or `-whitebind`, by its name there: `mempool`, `noban`, `relay`, `forcerelay`, `download`, `bloomfilter`, `addr`; repeat for more, comma- or space-separated in `PEER_PERMISSIONS`. With `mempool`, the store asks them for their mempools when the pool fills again |
+| `--peer-permission` | `PEER_PERMISSIONS` | none | A permission that the nodes of `--peer` grant the store with `-whitelist` or `-whitebind`, by its name there: `mempool`, `noban`, `relay`, `forcerelay`, `download`, `bloomfilter`, `addr`; repeat for more, comma- or space-separated in `PEER_PERMISSIONS`. With `mempool`, the store asks them for their mempools when it starts and when the pool fills again |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
@@ -404,7 +404,8 @@ fleet of one. Every key starts with `hs2:<network>:`.
   blocks, the stores fill it again too.
 - **Filling the pool again** works best with `--node-rpc`: each store reads
   its node's mempool (`getrawmempool`), 2,000 transactions every two
-  seconds. Each also asks its peers for their mempools, once: the peers
+  seconds. Each also asks its peers for their mempools, once, as it does
+  when it starts: the peers
   whose node takes the request, which a node closes the connection over
   unless it offers Bloom filters or whitelists the store with `mempool`.
   The store knows which from a model of each peer's node

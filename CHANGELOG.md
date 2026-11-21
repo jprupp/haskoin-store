@@ -200,6 +200,26 @@ whitelist it must now say what they grant (`--peer-permission`, or
   is well (`Haskoin.Store.Fleet.turn`). Measured in a downstream regtest
   suite: 1.3 to 2.0 seconds for a transaction against 0.3 to 0.4 on
   1.12.1, and 2.0 seconds for 101 blocks after a start against 0.01.
+- **Chains of transactions enter the shared mempool in one round.** The
+  member offered what waited oldest first, by the second, and in the order
+  of the ids within a second: a chain of 24 Runes mints that a node takes
+  in one second was offered children first, each refused as an orphan
+  until its parent was in, and took up to 23 rounds. On groot's btc, after
+  the restart into 2.0.0, the pool fell some 9,000 transactions behind its
+  node, and caught up at 10 a second. Each transaction now comes after its
+  parents (`offerMempool`, `offerOrder`). An offer at an arrival offers only
+  what arrived; orphans are tried again at the turns, every two seconds and
+  at each block, instead of at every arrival.
+- **A store asks its peers for their mempools when it starts**, those whose
+  node takes the request (`--peer-permission mempool`, or a node that
+  serves Bloom filters). A node announces a transaction to a peer once: a
+  store whose one peer is its node lacked what was announced while it was
+  away until a block confirmed it.
+- **Announcements of transactions are no longer dropped when many come at
+  once.** Those of a peer are merged while the store asks Redis about the
+  last ones, up to 100,000 ids, where a queue of 1,000 announcements
+  dropped the rest for good, said so only at debug level, and assumed that
+  peers announce again. Requests for them go in messages of 1,000.
 - **A Bitcoin Cash Node with `--node-rpc` no longer waits half a minute
   when it stops.** The store kept its RPC connection open, and the node
   waited until it had been idle for `-rpcservertimeout`. Every RPC request

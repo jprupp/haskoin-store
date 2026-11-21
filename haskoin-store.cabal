@@ -313,6 +313,7 @@ test-suite spec
       Haskoin.Store.DownloadSpec
       Haskoin.Store.ExceptionSpec
       Haskoin.Store.Fleet.CacheSpec
+      Haskoin.Store.Fleet.MemberSpec
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
       Haskoin.Store.Fleet.XPubSpec

@@ -57,11 +57,13 @@ Readers of the database never see a block half written: a batch is one
 write, and the web reads through a snapshot taken right after the commit
 (`noteBest`), on the block store's thread.
 
-**Transactions announced by peers** go through a bounded queue to a thread
-of their own (`askForTxs`), which asks Redis whether the fleet has seen them
-and requests the rest. It reads whether the store is in sync without
-changing anything (`inSyncNow`), and notes its requests in `pending` in one
-transaction each. A full queue drops an announcement: peers announce again.
+**Transactions announced by peers** wait, merged by peer, for a thread of
+their own (`askForTxs`), which takes all that wait in one transaction, asks
+Redis once whether the fleet has seen them, and requests the rest. It reads
+whether the store is in sync without changing anything (`inSyncNow`), and
+notes its requests in `pending` in one transaction each. At most 100,000
+ids wait; more are dropped with a warning, since a node announces a
+transaction to a peer once.
 
 ## The fleet
 
@@ -91,7 +93,7 @@ The member's own state:
 | `views`, with `recent`, `reported`, `tip` | the member and the block store both prune | one transaction per decision (`keepViews`) |
 | `waiting`, transactions to offer | written by the block store, read by the member | one transaction per change; at most `mostWaiting` |
 | `built`, announcements of builds | the listener and the requests that wait | one transaction per change; a key only while a request waits |
-| `healthy`, `owed`, `newBest`, `offered`: what wakes the member | set by the web server's health check (`setHealthy`), the block store (`noteBest`) and whoever gives a transaction (`memberReceived`); cleared by the member | `memberLoop` reads them and clears what its turn sees to in one transaction, so a signal that comes during a turn wakes the next |
+| `healthy`, `owed`, `newBest`, `fresh`: what wakes the member | set by the web server's health check (`setHealthy`), the block store (`noteBest`) and whoever gives a transaction (`memberReceived`); cleared by the member | `memberLoop` reads them and clears what its turn sees to in one transaction, so a signal that comes during a turn wakes the next |
 
 The member's turns follow `Haskoin.Store.Fleet.turn`: none while the store
 is unwell, a whole turn at a new block, every two seconds and as soon as
@@ -174,6 +176,18 @@ finding was checked against the code before it was fixed.
     next turn before it was in the pool, so listed. The member now waits on
     all its signals in one transaction (`Fleet.turn`), takes a whole turn
     when the store is well again, and offers each transaction as it comes.
+18. **Chains of transactions entered the pool minutes late.** The member
+    offered what waited oldest first, by the second, and in the order of the
+    ids within a second: a chain of 24 Runes mints that a node took in one
+    second was offered children first, and took up to 23 rounds, each trying
+    the 2,000 oldest, orphans first. On groot's btc, after the restart into
+    2.0.0, it fell 9,000 transactions behind its node. Each transaction now
+    comes after its parents (`offerOrder`); an offer at an arrival offers
+    only what arrived, and orphans wait for the whole turns. Announcements
+    of a peer are merged instead of queued one by one, where a full queue of
+    1,000 dropped them for good, and a store asks its peers for their
+    mempools when it starts, as their nodes do not announce again what the
+    store missed while it was away.
 
 **Known limits, left as they are:**
 

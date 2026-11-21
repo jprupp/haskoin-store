@@ -36,9 +36,12 @@
 -- that peers announce and that no store of the fleet has seen ('toFetch'):
 -- what the fleet saw is a set in Redis, the same for every store and kept
 -- across restarts, so a transaction is fetched about once for the fleet.
--- It asks peers for their whole mempools only to fill the pool again
--- after it was emptied ('blockStoreRefill'): the pool outlives
--- the store, so a store that starts has nothing to ask for. A transaction
+-- It asks peers for their whole mempools when it starts, and to fill the
+-- pool again after it was emptied ('blockStoreRefill'). The pool outlives
+-- the store, but a node announces a transaction to a peer once: what it
+-- announced while the store was away, or before the store was in sync, it
+-- would not announce again, and a store whose one peer is its node lacked
+-- those until they were in a block. A transaction
 -- that arrives goes to 'onTx': the member of the fleet offers it to the
 -- pool that the fleet shares in Redis, which is the mempool
 -- ("Haskoin.Store.Fleet.Member"). The database holds the chain alone. The
@@ -100,18 +103,14 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
   ( STM,
-    TBQueue,
     TVar,
     atomically,
-    isFullTBQueue,
     modifyTVar',
-    newTBQueueIO,
     newTVarIO,
-    readTBQueue,
     readTVar,
     readTVarIO,
+    retry,
     stateTVar,
-    writeTBQueue,
     writeTVar,
   )
 import Control.Exception (Exception, throwIO, try)
@@ -237,7 +236,6 @@ import NQE
     send,
     sendSTM,
   )
-import Numeric.Natural (Natural)
 import System.Metrics.StatsD
 import System.Random (randomIO, randomRIO)
 
@@ -302,8 +300,18 @@ data BlockStore = BlockStore
     -- | who reserves the syncing peer, so that no one else releases it
     owner :: !Owner,
     -- | transactions that peers announced, for the thread that asks for
-    -- them ('askForTxs'); at most 'announcedRoom' announcements wait
-    announced :: !(TBQueue (Peer, [TxHash]))
+    -- them ('askForTxs'); at most 'announcedRoom' ids wait
+    announced :: !(TVar Announced)
+  }
+
+-- | The transactions that peers announced and that 'askForTxs' has not
+-- asked for yet: the ids of each peer, newest first, and how many there
+-- are in all. The announcements of a peer are merged, so that the thread
+-- asks for all that came while it was busy at once, with one question to
+-- Redis, whatever the number of announcements they came in.
+data Announced = Announced
+  { count :: !Int,
+    byPeer :: ![(Peer, [TxHash])]
   }
 
 -- | The blocks that a peer said it has. A peer is asked for a block only
@@ -553,12 +561,15 @@ withBlockStore ::
 withBlockStore cfg action = do
   pb <- newTVarIO . Sync.idle =<< getCurrentTime
   ts <- newTVarIO Pending.empty
-  refill <- newTVarIO False
+  -- a store that starts asks its peers for their mempools once, if they
+  -- answer such a request: what they announced while it was away, or
+  -- before it was in sync, they announce no more
+  refill <- newTVarIO True
   inbox <- newInbox
   metrics <- newStoreMetrics cfg
   owner <- (newOwner "block store")
   knows <- newTVarIO HashMap.empty
-  announced <- newTBQueueIO announcedRoom
+  announced <- newTVarIO (Announced 0 [])
   let r =
         BlockStore
           { mailbox = inboxToMailbox inbox,
@@ -807,11 +818,15 @@ toFetch pending seen stored hs = do
   have <- if null fresh then return HashSet.empty else seen fresh
   filterM (fmap not . stored) (filter (not . (`HashSet.member` have)) fresh)
 
--- | The most announcements of transactions that wait for 'askForTxs'. One
--- that comes when they are this many is dropped: a peer announces a
--- transaction again, and other peers do too.
-announcedRoom :: Natural
-announcedRoom = 1000
+-- | The most ids of transactions that wait for 'askForTxs'. Those of an
+-- announcement that comes when there is no room for them are dropped, and
+-- the log warns: Bitcoin Core and Bitcoin Cash Node announce a transaction
+-- to a peer once, so a store whose one peer is its node loses them until
+-- they are in a block. With the announcements of each peer merged, as a
+-- t'Announced' keeps them, it takes a Redis that is away for many seconds
+-- to come near it.
+announcedRoom :: Int
+announcedRoom = 100000
 
 -- | The thread that asks peers for the transactions that they announced
 -- ('processTxs'), apart from the block store's own. Whether the fleet has
@@ -824,9 +839,22 @@ announcedRoom = 1000
 -- transaction each.
 askForTxs :: BlockStore -> IO a
 askForTxs self = loopForever $ do
-  (p, hs) <- atomically (readTBQueue self.announced)
-  processTxs self p hs `catchAny` \e ->
-    logWarn self ("Could not ask for the transactions of peer " <> p.label <> ": " <> cs (show e))
+  waiting <- atomically $ do
+    a <- readTVar self.announced
+    when (a.count == 0) retry
+    writeTVar self.announced (Announced 0 [])
+    return a.byPeer
+  forM_ waiting $ \(p, hs) ->
+    processTxs self p (distinct (reverse hs)) `catchAny` \e ->
+      logWarn self ("Could not ask for the transactions of peer " <> p.label <> ": " <> cs (show e))
+  where
+    -- the first of each, in a pass, as a peer may announce one twice
+    distinct = go HashSet.empty
+      where
+        go _ [] = []
+        go seen (h : hs)
+          | HashSet.member h seen = go seen hs
+          | otherwise = h : go (HashSet.insert h seen) hs
 
 -- | Whether the best block in the database is the best header of the node,
 -- without changing anything: 'isInSync' for another thread than the block
@@ -859,9 +887,11 @@ processTxs self p hs =
       changePending self (Pending.requested now xs)
       let net = self.config.net
       let inv = if net.segWit then InvWitnessTx else InvTx
-          vec = map (InvVector inv . (.get)) xs
-          msg = MGetData (GetData vec)
-      msg `sendMessage` p
+      -- in messages of 1,000, well under the 50,000 that a node reads in one
+      forM_ (chunks xs) $ \some ->
+        MGetData (GetData (map (InvVector inv . (.get)) some)) `sendMessage` p
+    chunks [] = []
+    chunks ys = let (a, b) = splitAt 1000 ys in a : chunks b
 
 -- | Deal with peers that do not deliver: disconnect the syncing peer if it
 -- has been silent for the timeout, else look for another peer to ask for its
@@ -1268,12 +1298,20 @@ processBlockStoreMessage self (TxRefAvailable p ts) = do
       <> p.label
       <> ": "
       <> T.unwords (map txHashToHex ts)
-  queued <- atomically $ do
-    full <- isFullTBQueue self.announced
-    unless full (writeTBQueue self.announced (p, ts))
-    return (not full)
-  unless queued . logDebug self $
-    "Too many announcements wait: dropped " <> cs (show (length ts)) <> " from peer " <> p.label
+  queued <- atomically . stateTVar self.announced $ \a ->
+    if a.count + length ts > announcedRoom
+      then (False, a)
+      else (True, Announced (a.count + length ts) (merged a.byPeer))
+  unless queued . logWarn self $
+    "Too many announced transactions wait: dropped "
+      <> cs (show (length ts))
+      <> " from peer "
+      <> p.label
+      <> ", which will not announce them again"
+  where
+    merged byPeer = case break ((== p) . fst) byPeer of
+      (before, (_, hs) : after) -> before <> ((p, reverse ts <> hs) : after)
+      _ -> (p, reverse ts) : byPeer
 processBlockStoreMessage self (BlockPing r) = do
   logDebug self "Internal clock event"
   -- a request that no peer answered, as a node does not for a transaction

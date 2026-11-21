@@ -96,6 +96,7 @@ module Haskoin.Store.Fleet.Member
     farthest,
     changeBetween,
     offerMempool,
+    offerOrder,
     memberReceived,
     memberSeen,
     mostSeen,
@@ -328,9 +329,11 @@ data Member = Member
     -- | whether the store has a new best block since the last whole turn
     -- ('noteBest')
     newBest :: !(TVar Bool),
-    -- | whether a transaction came to offer since the last turn
-    -- ('memberReceived')
-    offered :: !(TVar Bool),
+    -- | the transactions that came to offer since the last turn
+    -- ('memberReceived'), which a turn of offers alone offers, a
+    -- v'Haskoin.Store.Fleet.Offers': the others that wait, orphans for
+    -- now, wait for a whole turn
+    fresh :: !(TVar (HashSet TxHash)),
     -- | the indexer that builds the entries of the xpubs that requests
     -- miss, one store of the fleet for each, holding its dibs in Redis
     indexer :: !(Indexer XPubSpec ()),
@@ -381,7 +384,7 @@ newMember config redis db = do
   healthy <- newTVarIO True
   owed <- newTVarIO False
   newBest <- newTVarIO False
-  offered <- newTVarIO False
+  fresh <- newTVarIO HashSet.empty
   metrics <- mapM newCacheMetrics config.stats
   outage <- newOutage
   built <- newTVarIO HashMap.empty
@@ -472,7 +475,7 @@ memberTick m = do
   prune m
   cacheGauges m
   unless moved (expirePool m)
-  offerMempool m
+  offerMempool m Nothing
   void (fleetTrimSeen m.redis m.keys mostSeen)
   where
     decoded = either (const Nothing) Just . decode
@@ -553,19 +556,20 @@ memberLoop m = registerDelay 2000000 >>= go
             <*> readTVar m.owed
             <*> readTVar m.newBest
             <*> readTVar timer
-            <*> readTVar m.offered
+            <*> (not . HashSet.null <$> readTVar m.fresh)
         t <- maybe retry return (F.turn wake)
-        writeTVar m.offered False
+        new <- readTVar m.fresh
+        writeTVar m.fresh HashSet.empty
         when (t == F.Whole) $ do
           writeTVar m.owed False
           writeTVar m.newBest False
-        return t
+        return (t, new)
       case t of
-        F.Whole -> do
+        (F.Whole, _) -> do
           void (attempt m.outage m.config.note "take a turn in the fleet" (memberTick m))
           registerDelay 2000000 >>= go
-        F.Offers -> do
-          void (attempt m.outage m.config.note "offer to the pool" (offerMempool m))
+        (F.Offers, new) -> do
+          void (attempt m.outage m.config.note "offer to the pool" (offerMempool m (Just new)))
           go timer
 
 -- | Hear what happens to the fleet, for as long as the store runs: each
@@ -949,9 +953,16 @@ poolTx net td =
           <> mapMaybe (address . (.script)) td.tx.outputs
 
 -- | Offer to the pool the transactions that peers sent this store and that
--- it has not offered yet ('memberReceived'), oldest first, so that each
--- comes after those that it spends from. A store without a view of the
--- fleet tip offers nothing: it cannot say what is unspent there.
+-- it has not offered yet ('memberReceived'), each after those that it
+-- spends from ('offerOrder'): all of them at a whole turn, and only those
+-- given at an offer alone, which comes as soon as transactions arrive. A
+-- store without a view of the fleet tip offers nothing: it cannot say
+-- what is unspent there.
+--
+-- Orphans are tried again at whole turns only, every two seconds and at
+-- each block, as before offers came at once: an offer for each arrival
+-- that tried them all again read Redis for each of their parents, for
+-- nothing, many times a second.
 --
 -- A transaction whose inputs neither the tip nor the pool has, an orphan
 -- for now, waits for the next round, as does everything after an offer
@@ -963,14 +974,15 @@ poolTx net td =
 -- A round offers 'mostOffers' transactions at most and leaves the rest
 -- waiting, so that a store with many to offer still reports in time to
 -- keep its lease.
-offerMempool :: Member -> IO ()
-offerMempool m =
+offerMempool :: Member -> Maybe (HashSet TxHash) -> IO ()
+offerMempool m only =
   readTVarIO m.tip >>= \case
     Nothing -> return ()
     Just tip -> void . withViewAt m.views tip $ \at -> do
       now <- round <$> getPOSIXTime
       held <- readTVarIO m.waiting
-      let todo = take mostOffers (sortOn (fst . snd) (Map.toList held))
+      let chosen = maybe held (\hs -> Map.filterWithKey (\h _ -> HashSet.member h hs) held) only
+          todo = take mostOffers (offerOrder chosen)
           pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
       go now at pool tip todo
   where
@@ -1016,12 +1028,42 @@ offerMempool m =
 -- or a read of a node's whole mempool, held every transaction in memory.
 memberReceived :: Member -> UnixTime -> Tx -> IO ()
 memberReceived m time tx = atomically $ do
-  modifyTVar' m.waiting $ \held ->
-    if Map.size held >= mostWaiting && not (Map.member (txHash tx) held)
-      then held
-      else Map.insertWith (\_ old -> old) (txHash tx) (time, tx) held
-  -- the member offers it at once ('F.turn')
-  writeTVar m.offered True
+  held <- readTVar m.waiting
+  let h = txHash tx
+      new = not (Map.member h held)
+  when (not new || Map.size held < mostWaiting) $ do
+    writeTVar m.waiting (Map.insertWith (\_ old -> old) h (time, tx) held)
+    -- the member offers it at once ('F.turn'), if it is new: one that
+    -- waits already, an orphan, waits for a whole turn
+    when new $ modifyTVar' m.fresh (HashSet.insert h)
+
+-- | The order in which to offer transactions that wait: each after those
+-- of them that it spends from, and otherwise oldest first. The pool takes
+-- a transaction only once it has every parent, so a child offered first
+-- is refused as an orphan and waits for the next round. Times are whole
+-- seconds, and the transactions of one second used to come in the order
+-- of their ids: a chain of 24 that entered a mempool in one second, as
+-- the mints of Runes on Bitcoin do, took up to 23 rounds, while each
+-- round tried the 2,000 oldest, orphans first. A store that restarted
+-- into such a stream fell minutes behind its node.
+--
+-- A depth-first walk from each transaction, oldest first, to the parents
+-- that wait, which come out before it. A chain is as deep as a mempool
+-- lets it be, a few dozen at most.
+offerOrder :: Map.Map TxHash (UnixTime, Tx) -> [(TxHash, (UnixTime, Tx))]
+offerOrder held = reverse . fst $ foldl' visit ([], HashSet.empty) (sortOn (fst . snd) (Map.toList held))
+  where
+    visit (out, done) (h, v)
+      | HashSet.member h done = (out, done)
+      | otherwise =
+          let parents =
+                [ (p, pv)
+                | i <- (snd v).inputs,
+                  let p = i.outpoint.hash,
+                  Just pv <- [Map.lookup p held]
+                ]
+              (out', done') = foldl' visit (out, HashSet.insert h done) parents
+           in ((h, v) : out', done')
 
 -- | The most transactions that a store holds to offer ('memberReceived').
 mostWaiting :: Int

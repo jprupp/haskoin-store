@@ -55,10 +55,11 @@ changes them together or not at all.
 
 A server hands each transaction that a peer sends it to its member of the
 fleet (`memberReceived`), which offers it at once (`offerMempool`), with
-whatever else is waiting, reading the outputs that each spends from its
-view at the tip or from the pool. One whose outputs are in neither waits,
-as an orphan, and is offered again with the next, and at each turn, every
-two seconds and at each block.
+the others that arrived meanwhile, reading the outputs that each spends from
+its view at the tip or from the pool. Each comes after those of them that it
+spends from (`offerOrder`): a chain that a node took in one second enters in
+one round. One whose outputs are in neither waits, as an orphan, and is
+offered again at each turn, every two seconds and at each block.
 
 1. The server reads the fleet tip, and opens its own view of its database
    at that block. A server without that view offers nothing.
@@ -185,6 +186,12 @@ unhealthy until the fleet has a tip again; the first turn sets one, since
 every live server reports. Then it fills the pool again.
 
 ## Filling the pool again
+
+When a server starts, it asks its peers for their mempools once, as below:
+a node announces a transaction to a peer once, so what it announced while
+the server was away, or before the server was in sync, the server would
+otherwise lack until a block confirmed it. What the fleet has seen is not
+fetched again, so a server that starts into a full pool fetches little.
 
 After a loss of Redis or a restart of the pool, each server:
 
