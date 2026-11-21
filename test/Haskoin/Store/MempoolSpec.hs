@@ -159,6 +159,13 @@ atTheTip bed = withRamDir $ \dir -> do
           modifyIORef' worst $ \(p, seen, lost) ->
             (max p (count "pending-txs"), seen || there, lost || (seen && not there))
     convergesWith sample bed server 120
+    -- the store may have its node's mempool before its health is next
+    -- checked, which is when it first says that it has a peer: look until
+    -- it does, for longer than the time between two checks
+    let awaited n = do
+          (_, seen, _) <- readIORef worst
+          unless (seen || n <= (0 :: Int)) (threadDelay 500000 >> sample >> awaited (n - 1))
+    awaited 120
     (pending, seen, lost) <- readIORef worst
     -- what the health check of a store allows, by default
     pending `shouldSatisfy` (<= 10000)
