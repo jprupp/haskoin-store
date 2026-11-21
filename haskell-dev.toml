@@ -15,4 +15,6 @@ slow-specs = [
   "Haskoin.Store.Mempool",
   # each world of the model checker is a group
   "Haskoin.Store.Ingest",
+  # each test of what a node does has a pod of its own
+  "Haskoin.Store.NodeAxioms",
 ]

@@ -325,6 +325,7 @@ test-suite spec
       Haskoin.Store.IntegrationSpec
       Haskoin.Store.LogicSpec
       Haskoin.Store.MempoolSpec
+      Haskoin.Store.NodeAxiomsSpec
       Haskoin.Store.OutageSpec
       Haskoin.Store.TestBlocks
       Haskoin.Store.Web.AdmissionSpec

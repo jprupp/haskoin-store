@@ -54,8 +54,9 @@ whitelist it must now say what they grant (`--peer-permission`, or
   own, `Haskoin.Store.Ingest.Ledger`),
   checked through every order of events of small worlds by a model
   checker in the test suite (`Haskoin.Store.Ingest.Model`,
-  `scripts/check-ingest.sh`), or tested against Bitcoin Core in Podman
-  (`Haskoin.Store.MempoolSpec`). A store with no source, as one whose
+  `scripts/check-ingest.sh`), or tested against Bitcoin Core and Bitcoin
+  Cash Node in Podman (`Haskoin.Store.MempoolSpec`, and
+  `Haskoin.Store.NodeAxiomsSpec` for what is assumed of a node). A store with no source, as one whose
   peers are all strangers on Bitcoin, says so in its log.
 - **`/health` says in words what it found.** Each check has a `text`,
   such as "The database is 4 blocks behind the best header, at height

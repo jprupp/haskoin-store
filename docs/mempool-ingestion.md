@@ -39,8 +39,10 @@ what had to hold from end to end, so nothing could be proved.
 
 These are the axioms: what the proofs take from the world. Each is a rule
 of the nodes that haskoin-core's protocol notes translate from their
-source (`doc/protocol/bitcoin-core.md`, `bitcoin-cash-node.md`), and each
-gets a test against the real node in Podman.
+source (`doc/protocol/bitcoin-core.md`, `bitcoin-cash-node.md`). A1, A2,
+A3 and A5 have a test against both nodes in Podman
+(`Haskoin.Store.NodeAxiomsSpec`), so that a release of a node that
+changes one of them is noticed.
 
 | | Assumption |
 | --- | --- |
@@ -193,15 +195,31 @@ states.
 **Sampled**, which is weaker: 3,000 runs of a larger world (two chains of
 three, three peers, every disturbance) keep the same rules and converge.
 
-**Tested against the real programs**, Podman and Bitcoin Core
-(`Haskoin.Store.MempoolSpec`): six situations in which a store must end
-with the mempool of its node, one of them with its Valkey stopped and
-started again under it (R2), with the machine and its runner in the
-store. Three of them fail on the version that fell behind on the server,
-so they can see that failure, and one failed one run in three on the path
-before this one, a race. They do not decide the order of events, and so
-cannot find a race by themselves: that is what the model checker is for.
-Tests of each axiom, A1 to A6, against both nodes are still to write.
+**Tested against the real programs**, Bitcoin Core and Bitcoin Cash Node
+in Podman:
+
+- **The store end to end** (`Haskoin.Store.MempoolSpec`): six situations
+  in which a store must end with exactly the mempool of its node, on each
+  node. It starts from nothing; it starts at the tip with an empty pool
+  and a large mempool; it was away while transactions came, with and
+  without a block; its Valkey is stopped and started again under it (R2);
+  its node takes chains while it finds blocks. Three of them fail on the
+  version that fell behind on the server, so they can see that failure,
+  and one failed one run in three on the path before this one, a race.
+  They do not decide the order of events, and so cannot find a race by
+  themselves: that is what the model checker is for.
+- **The assumptions** (`Haskoin.Store.NodeAxiomsSpec`), with a peer of the
+  tests' own that keeps what a node sends: a node names a transaction to
+  a peer once, and never one that it took before the peer connected (A1);
+  asked for its mempool by a peer that it allows, it names all of it,
+  each transaction after those it spends from, sends one that is asked
+  for, and says `notfound` for one that it never had (A2, A3, A5); asked
+  by a peer with no permission, Bitcoin Core closes the connection and
+  Bitcoin Cash Node, which serves Bloom filters, answers (A2).
+- **Not tested:** that a node stops sending to a peer that stops reading
+  (A4), and that it says nothing of what it drops (A6), which is an
+  absence. The limit of 50,000 names to a message is not reached by a
+  test.
 
 ## What the checks have found
 

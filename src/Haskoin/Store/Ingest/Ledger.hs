@@ -189,6 +189,7 @@ data Ledger p h b = Ledger Int Int (Map h (Place p h b)) Int
 
 -- | The id that an output says is gone, if it says so of one: what the
 -- proof of 'leave' is stated with.
+
 {-@ measure goneOf @-}
 goneOf :: Output p h b -> Set h
 goneOf (Gone h _) = Set.singleton h
@@ -199,21 +200,25 @@ goneOf (Offer _ _) = Set.empty
 
 -- | A ledger with nothing in it, with room for so many ids, and for so
 -- many transactions held.
+
 {-@ newLedger :: Nat -> Nat -> Ledger p h b @-}
 newLedger :: Int -> Int -> Ledger p h b
 newLedger room heldRoom = Ledger room heldRoom mEmpty 0
 
 -- | The places of the ids.
+
 {-@ placesOf :: Ledger p h b -> Map h (Place p h b) @-}
 placesOf :: Ledger p h b -> Map h (Place p h b)
 placesOf (Ledger _ _ places _) = places
 
 -- | How many transactions are held.
+
 {-@ heldOf :: l:Ledger p h b -> {n:Nat | n <= lHeldRoom l} @-}
 heldOf :: Ledger p h b -> Int
 heldOf (Ledger _ _ _ held) = held
 
 -- | Whether an id has a place.
+
 {-@ hasPlace :: (Ord h) => h -> Ledger p h b -> Bool @-}
 hasPlace :: (Ord h) => h -> Ledger p h b -> Bool
 hasPlace h (Ledger _ _ places _) = isJust (mLookup h places)
@@ -225,6 +230,7 @@ isHeld _ = False
 -- | Give an id a place, or another place: 'Nothing' when there is no room
 -- for one more id, or for one more transaction held. No id loses its
 -- place.
+
 {-@ put :: (Ord h) => x:h -> Place p h b -> l:Ledger p h b
       -> Maybe ({n:Ledger p h b | mkeys (lPlaces n) = Set_cup (mkeys (lPlaces l)) (Set_sng x)}) @-}
 put :: (Ord h) => h -> Place p h b -> Ledger p h b -> Maybe (Ledger p h b)
@@ -249,6 +255,7 @@ put h new (Ledger room heldRoom places held) =
 -- | Another place for an id that has one and is not a transaction held,
 -- when the new place is not one of those either: wanted, or asked of a
 -- peer. Anything else is left as it is. Every id keeps a place.
+
 {-@ retarget :: (Ord h) => h -> Place p h b -> l:Ledger p h b
       -> {n:Ledger p h b | mkeys (lPlaces n) = mkeys (lPlaces l)} @-}
 retarget :: (Ord h) => h -> Place p h b -> Ledger p h b -> Ledger p h b
@@ -258,6 +265,7 @@ retarget h new (Ledger room heldRoom places held)
 
 -- | What a transaction that is held waits for. An id that is not held is
 -- left as it is. Every id keeps a place.
+
 {-@ rehold :: (Ord h) => h -> Hold h -> l:Ledger p h b
       -> {n:Ledger p h b | mkeys (lPlaces n) = mkeys (lPlaces l)} @-}
 rehold :: (Ord h) => h -> Hold h -> Ledger p h b -> Ledger p h b
@@ -269,6 +277,7 @@ rehold h hold (Ledger room heldRoom places held) =
 
 -- | Every time in the ledger, changed by a function. Every id keeps its
 -- place.
+
 {-@ retime :: (Tick -> Tick) -> l:Ledger p h b
       -> {n:Ledger p h b | mkeys (lPlaces n) = mkeys (lPlaces l)} @-}
 retime :: (Tick -> Tick) -> Ledger p h b -> Ledger p h b
@@ -283,6 +292,7 @@ retime f (Ledger room heldRoom places held) = Ledger room heldRoom (mMap place p
 -- | The one way out: an id loses its place, and an output says so and how,
 -- at the head of those said so far. An id that had no place is said to be
 -- gone too: it was learned and let go in one step.
+
 {-@ leave :: (Ord h) => x:h -> End -> l:Ledger p h b -> os:[Output p h b]
       -> ( {n:Ledger p h b | mkeys (lPlaces n) = Set_dif (mkeys (lPlaces l)) (Set_sng x)},
            {ns:[Output p h b] | goneOf (head ns) == Set_sng x && tail ns == os} ) @-}

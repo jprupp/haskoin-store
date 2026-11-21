@@ -19,7 +19,8 @@
   again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 65 seconds in eight processes, against 140 to 210
+- The tests take about 115 seconds in eight processes (65 before the
+  tests of the mempool against real nodes), against 140 to 210
   with every spec module in a process of its own. Most of it is
   `Haskoin.Store.IntegrationSpec`, whose five environments are groups at the
   top of the module, so that each runs in its own process; keep a new
@@ -36,6 +37,11 @@
   real one, not a mock. SELinux lets the tests connect to a socket that a
   container made, not a container connect to one that the tests made: such
   a container runs with `--security-opt label=disable` (`tlsTest`).
+- `Haskoin.Store.MempoolSpec` and `Haskoin.Store.NodeAxiomsSpec` are the
+  tests of the path into the shared mempool against Bitcoin Core and
+  Bitcoin Cash Node: a store that must end with its node's mempool, and
+  what the path assumes of a node. Each test is a group with a pod of its
+  own. They read `/mempool?limit=1000000`: the default page is 100.
 - A store that does not sync with its node in time, which happened a
   few times on Bitcoin Cash Node without being understood yet, prints what
   the node and the store say of their sync and the last 400 lines of the

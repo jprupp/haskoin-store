@@ -24,7 +24,19 @@
 --
 -- A test is a group with a pod of its own, so that they run at the same
 -- time, each in a process (@haskell-dev.toml@).
-module Haskoin.Store.MempoolSpec (spec) where
+module Haskoin.Store.MempoolSpec
+  ( spec,
+
+    -- * For the specs of what a node does
+    Bed (..),
+    withBed,
+    withBedOf,
+    chainOf,
+    fund,
+    send,
+    submit,
+  )
+where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (forConcurrently_, link, withAsync)
@@ -83,19 +95,24 @@ spec = do
   usable <- runIO podmanUsable
   case usable of
     Left why -> describe "The mempool of a store and that of its node" $ it "are the same" (pendingWith why)
-    Right () -> do
-      describe "A store that starts from nothing" $
-        it "has the mempool of its node once it has its blocks" (withBed BitcoinCore fromNothing)
-      describe "A store that starts at the tip with an empty pool" $
-        it "takes the whole mempool of its node, and stays healthy and connected" (withBed BitcoinCore atTheTip)
-      describe "A store that was away while transactions came" $
-        it "has them when it is back" (withBed BitcoinCore (away False))
-      describe "A store that was away while transactions and a block came" $
-        it "has what the block left in the mempool when it is back" (withBed BitcoinCore (away True))
-      describe "A store whose Valkey is stopped and started again under it" $
-        it "has the mempool of its node again, without being started again" (withBed BitcoinCore valkeyRestart)
-      describe "A store whose node takes chains while it finds blocks" $
-        it "has every transaction that no block confirmed" (withBed BitcoinCore busy)
+    Right () -> forM_ [BitcoinCore, BitcoinCashNode] $ \kind -> do
+      -- a group for each test on each node, with a pod of its own
+      let on what = describe (what <> ", on " <> name kind)
+      on "A store that starts from nothing" $
+        it "has the mempool of its node once it has its blocks" (withBed kind fromNothing)
+      on "A store that starts at the tip with an empty pool" $
+        it "takes the whole mempool of its node, and stays healthy and connected" (withBed kind atTheTip)
+      on "A store that was away while transactions came" $
+        it "has them when it is back" (withBed kind (away False))
+      on "A store that was away while transactions and a block came" $
+        it "has what the block left in the mempool when it is back" (withBed kind (away True))
+      on "A store whose Valkey is stopped and started again under it" $
+        it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
+      on "A store whose node takes chains while it finds blocks" $
+        it "has every transaction that no block confirmed" (withBed kind busy)
+  where
+    name BitcoinCore = "Bitcoin Core"
+    name BitcoinCashNode = "Bitcoin Cash Node"
 
 -------------------------------------------------------------------------------
 -- The tests
@@ -355,8 +372,13 @@ data Bed = Bed
   }
 
 withBed :: NodeKind -> (Bed -> IO ()) -> IO ()
-withBed kind go =
-  withPod (pod "mempool" [redisContainer, nodeContainer kind]) {readyWithin = 120} $ \p -> do
+withBed kind = withBedOf (nodeContainer kind) kind
+
+-- | 'withBed' with the container of the node given, for a node that is
+-- started with other options.
+withBedOf :: ContainerSpec -> NodeKind -> (Bed -> IO ()) -> IO ()
+withBedOf nodeSpec kind go =
+  withPod (pod "mempool" [redisContainer, nodeSpec]) {readyWithin = 120} $ \p -> do
     node <- nodeOf kind p
     waitRpc node
     ensureWallet node
