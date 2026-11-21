@@ -48,7 +48,10 @@ whitelist it must now say what they grant (`--peer-permission`, or
   - What peers name while the store is a block behind is kept, and asked
     for once it is in sync, where it was dropped.
   The document says what the path guarantees and how each claim is
-  established: by construction, proved by Liquid Haskell (`proofs/`),
+  established: by construction, proved by Liquid Haskell for every state
+  (`proofs/`: that nothing leaves in silence, the bounds on memory, and
+  that every step ends, with where each id is kept in a module of its
+  own, `Haskoin.Store.Ingest.Ledger`),
   checked through every order of events of small worlds by a model
   checker in the test suite (`Haskoin.Store.Ingest.Model`,
   `scripts/check-ingest.sh`), or tested against Bitcoin Core in Podman

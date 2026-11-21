@@ -9,7 +9,10 @@ description:
 
 library
   hs-source-dirs:     ../src
-  exposed-modules:    Haskoin.Store.Ingest
+  exposed-modules:
+    Haskoin.Store.Ingest
+    Haskoin.Store.Ingest.Ledger
+
   build-depends:
     , base
     , containers

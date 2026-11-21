@@ -72,6 +72,7 @@ library
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.XPub
       Haskoin.Store.Ingest
+      Haskoin.Store.Ingest.Ledger
       Haskoin.Store.Ingest.Run
       Haskoin.Store.Logic
       Haskoin.Store.Manager

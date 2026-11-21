@@ -20,6 +20,7 @@ ghc-9.12.4 -O1 -Wall -rtsopts "-with-rtsopts=-M4g" \
   -XGHC2024 -XDuplicateRecordFields -XNoFieldSelectors -XOverloadedRecordDot -XOverloadedStrings \
   -outputdir "$out/o" -i"$root/src" -i"$root/test" -o "$out/model" \
   "$root/scripts/ingest-model/Main.hs" \
+  "$root/src/Haskoin/Store/Ingest/Ledger.hs" \
   "$root/src/Haskoin/Store/Ingest.hs" \
   "$root/test/Haskoin/Store/Ingest/Model.hs" > "$out/build.log" 2>&1 \
   || { cat "$out/build.log"; exit 1; }

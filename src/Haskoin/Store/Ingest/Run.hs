@@ -78,13 +78,14 @@ import Control.Concurrent.STM
     writeTVar,
   )
 import Control.Monad (forM_, unless, when)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find, nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
@@ -101,10 +102,10 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (LogLevel (..), Logger, Peer, logAt, sendMessage)
+import Haskoin.Store.Exception (catchAny)
 import Haskoin.Store.Fleet.Member (Member, memberOffer, memberSettled)
 import Haskoin.Store.Ingest
 import System.Metrics.StatsD (StatCounter, StatGauge, Stats, incrementCounter, newStatCounter, newStatGauge, setGauge)
-import Haskoin.Store.Exception (catchAny)
 
 -- | What the runner needs of the store.
 data IngestConfig = IngestConfig
@@ -311,13 +312,22 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
       synced <- if looks then cfg.inSync else return wasSynced
       -- one attempt at the pool a pass while it fails
       failing <- newIORef False
+      -- what the machine gives up in this pass, by reason
+      lostNow <- newIORef Map.empty
       let all' =
             [Emptied | lost > 0]
               <> [Synced synced | synced /= wasSynced]
               <> inputs
               <> [Tick now | tick]
-      machine <- drive run'.peers failing run'.machine all'
+      machine <- drive run'.peers failing lostNow run'.machine all'
       publish machine
+      -- what was given up and that a node may still have is said, once a
+      -- pass: it makes the store read its sources again, and without the
+      -- reason nobody can tell why it did
+      gaveUp <- Map.toList . Map.delete NodeHasNot <$> readIORef lostNow
+      unless (null gaveUp) . say LevelInfo $
+        "Gave up transactions on their way to the pool, and will read the sources again: "
+          <> T.intercalate ", " [shown n <> " " <> cs (reasonName why) | (why, n) <- gaveUp]
       go synced (if tick then now else lastTick) run' {machine}
     -- what an event is to the machine, with the peers named
     inputsOf run = \case
@@ -346,12 +356,12 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
     keyOf run p = fst <$> find ((== p) . snd) (Map.toList run.peers)
     -- give the machine inputs, and carry out what it says; what the pool
     -- answers goes in after the inputs that are there already
-    drive _ _ m [] = return m
-    drive peers failing m (i : is) = do
+    drive _ _ _ m [] = return m
+    drive peers failing lostNow m (i : is) = do
       let (m', outs) = step parentsOf i m
-      answers <- concat <$> mapM (perform peers failing) outs
-      drive peers failing m' (is <> answers)
-    perform peers failing = \case
+      answers <- concat <$> mapM (perform peers failing lostNow) outs
+      drive peers failing lostNow m' (is <> answers)
+    perform peers failing lostNow = \case
       Get k hs -> do
         forM_ (Map.lookup k peers) $ \p ->
           MGetData (GetData [InvVector kind h.get | h <- hs]) `sendMessage` p
@@ -384,6 +394,7 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
         case end of
           Done -> forM_ metrics $ \m -> incrementCounter m.settled 1
           GaveUp why -> do
+            modifyIORef' lostNow (Map.insertWith (+) why (1 :: Int))
             forM_ metrics $ \m -> forM_ (Map.lookup why m.gaveUp) (`incrementCounter` 1)
             say LevelDebug ("Gave up " <> shown h <> ": " <> cs (reasonName why))
         return []

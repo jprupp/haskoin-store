@@ -28,7 +28,9 @@
 -- * __Every id has one place__ ('Place'): wanted, asked of a peer, or
 --   held with its body. The places are the values of one map, so an id is
 --   never in two, and it leaves the map through one function, which says
---   why in an output ('Gone'). Nothing leaves in silence.
+--   why in an output ('Gone'). Nothing leaves in silence. The map is in
+--   "Haskoin.Store.Ingest.Ledger", which this module cannot reach into:
+--   that is what lets Liquid Haskell prove it of every state.
 --
 -- * __An id gets a place once the pool says that it has not decided on
 --   it__ ('Check', 'Checked'). What a peer names is first asked of the
@@ -99,9 +101,22 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-
--- | A moment, in milliseconds of a clock that does not go back.
-type Tick = Int
+import Haskoin.Store.Ingest.Ledger
+  ( End (..),
+    Hold (..),
+    Ledger,
+    Output (..),
+    Place (..),
+    Reason (..),
+    Tick,
+    heldOf,
+    newLedger,
+    placesOf,
+    rehold,
+    retarget,
+    retime,
+  )
+import Haskoin.Store.Ingest.Ledger qualified as L
 
 -- | The bounds and the waits of a machine.
 data Config = Config
@@ -147,30 +162,6 @@ defaultConfig =
       sweepEvery = 600000
     }
 
--- | Where an id is.
-data Place p h b
-  = -- | not settled, and to request from one of these peers, each with
-    -- the time since which it is wanted of that peer
-    Wanted !(Map p Tick)
-  | -- | requested of a peer at a time; the others named it too
-    Asked !p !Tick !(Set p)
-  | -- | its body is here, since a time
-    Held !b !Tick !(Hold h)
-  deriving (Eq, Ord, Show)
-
--- | What a transaction that is held waits for.
-data Hold h
-  = -- | to be offered at the next occasion
-    Ready
-  | -- | the pool's verdict on an offer
-    Offering
-  | -- | these transactions that it spends from, and a time to offer it
-    -- again whether they came or not
-    Waiting !(Set h) !Tick
-  | -- | the next tick, after an offer that could not be judged
-    Later
-  deriving (Eq, Ord, Show)
-
 -- | What the machine knows of a peer.
 data Link h = Link
   { -- | whether it gives its whole mempool when asked
@@ -198,7 +189,9 @@ data Ingest p h b = Ingest
     now :: !Tick,
     -- | whether the store has the blocks of its nodes
     synced :: !Bool,
-    places :: !(Map h (Place p h b)),
+    -- | where each id is, and how many transactions are held: what
+    -- only "Haskoin.Store.Ingest.Ledger" can change
+    ledger :: !(Ledger p h b),
     links :: !(Map p (Link h)),
     -- | for a transaction, those held that wait for it
     waiters :: !(Map h (Set h)),
@@ -208,8 +201,6 @@ data Ingest p h b = Ingest
     ready :: !(Set h),
     -- | those held whose offer could not be judged
     later :: !(Set h),
-    -- | how many bodies are held
-    nHeld :: !Int,
     -- | whether something was given up that a node may still have
     dirty :: !Bool
   }
@@ -252,45 +243,6 @@ data Verdict h
     Again
   deriving (Eq, Ord, Show)
 
--- | What the runner is to do.
-data Output p h b
-  = -- | request these transactions of a peer (@getdata@)
-    Get !p ![h]
-  | -- | ask a peer for its mempool (@mempool@)
-    Sweep !p
-  | -- | find out which of these, that a peer named, the pool has decided
-    -- on
-    Check !p ![h]
-  | -- | offer a transaction to the pool
-    Offer !h !b
-  | -- | an id left the machine, and how
-    Gone !h !End
-  deriving (Eq, Ord, Show)
-
--- | How an id left.
-data End
-  = -- | the pool decided on it
-    Done
-  | -- | given up
-    GaveUp !Reason
-  deriving (Eq, Ord, Show)
-
--- | Why an id was given up.
-data Reason
-  = -- | every peer that named it says it does not have it
-    NodeHasNot
-  | -- | a request for it got no answer, and no other peer named it
-    Unanswered
-  | -- | there was no room for it
-    NoRoom
-  | -- | the peers that named it are gone
-    PeerGone
-  | -- | what it spends from did not come
-    WaitedTooLong
-  | -- | the pool could not say whether it had decided on it
-    Unjudged
-  deriving (Eq, Ord, Show, Enum, Bounded)
-
 -- | A machine with nothing in it and no peer, at a time.
 start :: Config -> Tick -> Ingest p h b
 start config now =
@@ -298,23 +250,31 @@ start config now =
     { config,
       now,
       synced = False,
-      places = Map.empty,
+      ledger = newLedger (max 0 config.room) (max 0 config.heldRoom),
       links = Map.empty,
       waiters = Map.empty,
       tries = Set.empty,
       ready = Set.empty,
       later = Set.empty,
-      nHeld = 0,
       dirty = False
     }
 
+-- | The places of the ids.
+places :: Ingest p h b -> Map h (Place p h b)
+places s = placesOf s.ledger
+
+-- | Change the ledger of a machine with one of the functions that keep
+-- every id in its place.
+edit :: (Ledger p h b -> Ledger p h b) -> Ingest p h b -> Ingest p h b
+edit f s = s {ledger = f s.ledger}
+
 -- | Where an id is, if the machine has it.
 placeOf :: (Ord h) => h -> Ingest p h b -> Maybe (Place p h b)
-placeOf h s = Map.lookup h s.places
+placeOf h s = Map.lookup h (places s)
 
 -- | The ids that the machine has a place for.
 ids :: Ingest p h b -> Set h
-ids s = Map.keysSet s.places
+ids s = Map.keysSet (places s)
 
 -- | How many requests are out: what the health check of a store counts.
 pending :: Ingest p h b -> Int
@@ -322,7 +282,7 @@ pending s = sum (map (.out) (Map.elems s.links))
 
 -- | How many bodies are held.
 holding :: Ingest p h b -> Int
-holding s = s.nHeld
+holding s = heldOf s.ledger
 
 -- | Whether something was given up that a node may still have, and a
 -- source has not been read since, or there is none to read.
@@ -379,7 +339,7 @@ react parents input s = case input of
         -- what has a place is named by one more peer; the rest is asked
         -- of the pool before it gets one
         let one (st, new) h
-              | Map.member h st.places = (also p h st, new)
+              | Map.member h (places st) = (also p h st, new)
               | otherwise = (st, h : new)
             (s', fresh) = foldl' one (s, []) hs
          in (s', [Check p (reverse fresh) | not (null fresh)])
@@ -395,26 +355,27 @@ react parents input s = case input of
   Emptied -> (s {dirty = True}, [])
   where
     done (s', outs) = (s', reverse outs)
-    known h (s', _) = Map.member h s'.places
+    known h (s', _) = Map.member h (places s')
 
 -- | One more peer named an id that has a place.
 also :: (Ord p, Ord h) => p -> h -> Ingest p h b -> Ingest p h b
-also p h s = case Map.lookup h s.places of
+also p h s = case Map.lookup h (places s) of
   Just (Wanted ms) | Map.notMember p ms -> queued p h (put (Wanted (Map.insert p s.now ms)))
   Just (Asked q t ps) | p /= q -> put (Asked q t (Set.insert p ps))
   _ -> s
   where
-    put place = s {places = Map.insert h place s.places}
+    put place = edit (retarget h place) s
 
 -- | Put an id, wanted of a peer since now, among those to ask it for.
 queued :: (Ord p, Ord h) => p -> h -> Ingest p h b -> Ingest p h b
 queued p h s = s {links = Map.adjust (\l -> l {queue = Set.insert (s.now, h) l.queue}) p s.links}
 
--- | An id is wanted of these peers, since now.
+-- | An id that has a place and is not held is wanted of these peers, since
+-- now.
 want :: (Ord p, Ord h) => h -> Set p -> Ingest p h b -> Ingest p h b
 want h ps s = foldl' (\st p -> queued p h st) placed ps
   where
-    placed = s {places = Map.insert h (Wanted (Map.fromSet (const s.now) ps)) s.places}
+    placed = edit (retarget h (Wanted (Map.fromSet (const s.now) ps))) s
 
 -- | An id is no longer wanted of the peers that it was wanted of: it is
 -- out of their queues. Its place is for the caller to change.
@@ -437,15 +398,16 @@ forget why h acc =
 leave :: (Ord p, Ord h) => h -> End -> Acc p h b -> Acc p h b
 leave h end (s, said) =
   let s' = unplace h s
-   in (s' {places = Map.delete h s'.places}, Gone h end : said)
+      (ledger, said') = L.leave h end s'.ledger said
+   in (s' {ledger}, said')
 
 -- | Take an id out of every index that its place puts it in. Its place
 -- is for the caller to change or to delete.
 unplace :: (Ord p, Ord h) => h -> Ingest p h b -> Ingest p h b
-unplace h s = case Map.lookup h s.places of
+unplace h s = case Map.lookup h (places s) of
   Just (Wanted ms) -> unwant h ms s
   Just (Asked p t _) -> answered p t h s
-  Just (Held _ _ hold) -> unhold h hold s {nHeld = s.nHeld - 1}
+  Just (Held _ _ hold) -> unhold h hold s
   _ -> s
 
 -- | A request to a peer is no longer out.
@@ -477,17 +439,12 @@ wake :: (Ord h) => h -> Acc p h b -> Acc p h b
 wake h (s, said) = (foldl' free s {waiters = Map.delete h s.waiters} children, said)
   where
     children = maybe [] Set.toList (Map.lookup h s.waiters)
-    free st c = case Map.lookup c st.places of
-      Just (Held b since (Waiting ps t)) ->
+    free st c = case Map.lookup c (places st) of
+      Just (Held _ _ (Waiting ps t)) ->
         let rest = Set.delete h ps
          in if Set.null rest
-              then
-                st
-                  { places = Map.insert c (Held b since Ready) st.places,
-                    tries = Set.delete (t, c) st.tries,
-                    ready = Set.insert c st.ready
-                  }
-              else st {places = Map.insert c (Held b since (Waiting rest t)) st.places}
+              then (edit (rehold c Ready) st) {tries = Set.delete (t, c) st.tries, ready = Set.insert c st.ready}
+              else edit (rehold c (Waiting rest t)) st
       _ -> st
 
 -- | The pool has not decided on an id that a peer named: it is wanted of
@@ -495,21 +452,22 @@ wake h (s, said) = (foldl' free s {waiters = Map.delete h s.waiters} children, s
 unsettled' :: (Ord p, Ord h) => p -> Acc p h b -> h -> Acc p h b
 unsettled' p acc@(s, said) h
   -- the peer left while the pool was asked: it cannot be asked for it
-  | Map.notMember p s.links = if Map.member h s.places then acc else forget PeerGone h acc
-  | Map.member h s.places = (also p h s, said)
-  | Map.size s.places >= s.config.room = forget NoRoom h acc
-  | otherwise = (want h (Set.singleton p) s, said)
+  | Map.notMember p s.links = if Map.member h (places s) then acc else forget PeerGone h acc
+  | Map.member h (places s) = (also p h s, said)
+  | otherwise = case L.put h (Wanted (Map.singleton p s.now)) s.ledger of
+      Just ledger -> (queued p h s {ledger}, said)
+      Nothing -> forget NoRoom h acc
 
 -- | A request of a peer got no answer, or the answer that the peer does
 -- not have it: the id is wanted of the others that named it, or given up.
 -- Says whether to give the peer a smaller window.
 unanswered :: (Ord p, Ord h) => Reason -> Bool -> p -> Acc p h b -> h -> Acc p h b
-unanswered why shrink p acc@(s, said) h = case Map.lookup h s.places of
+unanswered why shrink p acc@(s, said) h = case Map.lookup h (places s) of
   Just (Asked q t ps)
     | q == p ->
         let s1 = narrowed (answered p t h s)
          in if Set.null ps
-              then forget why h (s1 {places = Map.insert h (Wanted Map.empty) s1.places}, said)
+              then forget why h (edit (retarget h (Wanted Map.empty)) s1, said)
               else (want h ps s1, said)
   _ -> acc
   where
@@ -524,30 +482,29 @@ grown p s = s {links = Map.adjust (\l -> l {window = min s.config.maxWindow (l.w
 -- | A transaction came. It is held: to offer, or to wait for those that it
 -- spends from and that the machine is still getting.
 body :: (Ord p, Ord h) => (b -> [h]) -> Maybe p -> h -> b -> Acc p h b -> Acc p h b
-body parents from h b acc@(s, said) = case Map.lookup h s.places of
+body parents from h b acc@(s, said) = case Map.lookup h (places s) of
   Just (Held {}) -> acc
   Just (Asked q _ _) -> hold (credit q (unplace h s))
   Just _ -> hold (unplace h s)
-  Nothing
-    | Map.size s.places >= s.config.room -> forget NoRoom h acc
-    | otherwise -> hold s
+  Nothing -> hold s
   where
     -- the peer that was asked answered, if it is the one that sent this
     credit q st = if from == Just q then grown q st else st
-    hold st
-      | st.nHeld >= st.config.heldRoom =
-          -- no room for the body: the id goes, from wherever it was
-          gone st
-      | otherwise =
-          let waits = Set.fromList [p | p <- parents b, p /= h, Map.member p st.places]
-              st' = st {nHeld = st.nHeld + 1}
-           in if Set.null waits
-                then (makeReady h b st.now st', said)
-                else
-                  if mayWait st
-                    then (wait h b st.now waits st', said)
-                    else gone st
-    gone st = forget NoRoom h (st {places = Map.insert h (Wanted Map.empty) st.places}, said)
+    -- the body is held if the ledger has room: for one more id if this
+    -- one is new, and for one more body
+    hold st = case holdAs st of
+      Just (how, indexed)
+        | Just ledger <- L.put h (Held b st.now how) st.ledger -> (indexed {ledger}, said)
+      _ -> gone st
+    -- what the body waits for, with the indexes that say so
+    holdAs st
+      | Set.null waits = Just (Ready, st {ready = Set.insert h st.ready})
+      | mayWait st = let (t, st') = waiting h st.now waits st in Just (Waiting waits t, st')
+      | otherwise = Nothing
+      where
+        waits = Set.fromList [p | p <- parents b, p /= h, Map.member p (places st)]
+    -- no room for the body: the id goes, from wherever it was
+    gone st = forget NoRoom h (edit (retarget h (Wanted Map.empty)) st, said)
 
 -- | Whether one more transaction may be held to wait for others: never
 -- the last of the room for bodies, which is kept for those that can be
@@ -557,55 +514,59 @@ mayWait :: Ingest p h b -> Bool
 mayWait s = Set.size s.tries < s.config.heldRoom - 1
 
 -- | A held transaction is ready to offer.
-makeReady :: (Ord h) => h -> b -> Tick -> Ingest p h b -> Ingest p h b
-makeReady h b since s = s {places = Map.insert h (Held b since Ready) s.places, ready = Set.insert h s.ready}
+makeReady :: (Ord h) => h -> Ingest p h b -> Ingest p h b
+makeReady h s = (edit (rehold h Ready) s) {ready = Set.insert h s.ready}
 
--- | Hold a transaction for others, and offer it again in any case after a
--- time that grows with how long it has been held.
-wait :: (Ord h) => h -> b -> Tick -> Set h -> Ingest p h b -> Ingest p h b
-wait h b since ps s =
+-- | Note that a held transaction waits for others, and when to offer it
+-- again in any case: after a time that grows with how long it has been
+-- held. Gives that time; its place is for the caller to set.
+waiting :: (Ord h) => h -> Tick -> Set h -> Ingest p h b -> (Tick, Ingest p h b)
+waiting h since ps s =
   let t = s.now + max s.config.retry (s.now - since)
-   in s
-        { places = Map.insert h (Held b since (Waiting ps t)) s.places,
-          tries = Set.insert (t, h) s.tries,
-          waiters = foldl' (\w p -> Map.insertWith Set.union p (Set.singleton h) w) s.waiters ps
-        }
+   in ( t,
+        s
+          { tries = Set.insert (t, h) s.tries,
+            waiters = foldl' (\w p -> Map.insertWith Set.union p (Set.singleton h) w) s.waiters ps
+          }
+      )
 
 -- | The pool's verdict on an offer.
 offered :: (Ord p, Ord h) => h -> Verdict h -> Acc p h b -> Acc p h b
-offered h v acc@(s, said) = case Map.lookup h s.places of
-  Just (Held b since Offering) -> case v of
+offered h v acc@(s, said) = case Map.lookup h (places s) of
+  Just (Held _ since Offering) -> case v of
     Settled -> settle acc h
     Orphan ps
       | s.now - since > s.config.orphanLife -> forget WaitedTooLong h acc
       | otherwise -> case Set.delete h (Set.fromList ps) of
           waits
-            | Set.null waits -> again b since
-            | mayWait s -> (wait h b since waits s, said)
+            | Set.null waits -> again
+            | mayWait s ->
+                let (t, s') = waiting h since waits s
+                 in (edit (rehold h (Waiting waits t)) s', said)
             | otherwise -> forget NoRoom h acc
-    Again -> again b since
+    Again -> again
   _ -> acc
   where
-    again b since = (s {places = Map.insert h (Held b since Later) s.places, later = Set.insert h s.later}, said)
+    again = ((edit (rehold h Later) s) {later = Set.insert h s.later}, said)
 
 -- | A peer is gone: what was asked of it is wanted of the others, and
 -- what only it named is given up.
 peerDown :: (Ord p, Ord h) => p -> Acc p h b -> Acc p h b
 peerDown p (s, said)
   | Map.notMember p s.links = (s, said)
-  | otherwise = foldl' one (s {links = Map.delete p s.links}, said) (Map.toList s.places)
+  | otherwise = foldl' one (s {links = Map.delete p s.links}, said) (Map.toList (places s))
   where
     one acc@(st, o) (h, place) = case place of
       Wanted ms
         | Map.member p ms ->
             let rest = Map.delete p ms
-             in if Map.null rest then gone acc h else (st {places = Map.insert h (Wanted rest) st.places}, o)
+             in if Map.null rest then gone acc h else (edit (retarget h (Wanted rest)) st, o)
       Asked q t ps
         | q == p ->
             if Set.null ps
-              then gone (st {places = Map.insert h (Wanted Map.empty) st.places}, o) h
+              then gone (edit (retarget h (Wanted Map.empty)) st, o) h
               else (want h ps st, o)
-        | Set.member p ps -> (st {places = Map.insert h (Asked q t (Set.delete p ps)) st.places}, o)
+        | Set.member p ps -> (edit (retarget h (Asked q t (Set.delete p ps))) st, o)
       _ -> acc
     gone acc h = forget PeerGone h acc
 
@@ -624,19 +585,17 @@ onTick t acc0 = retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).lin
       Nothing -> acc
     -- offers that could not be judged are ready again
     laterOnes (s, said) =
-      let again st h = case Map.lookup h st.places of
-            Just (Held b since Later) -> makeReady h b since st
+      let again st h = case Map.lookup h (places st) of
+            Just (Held _ _ Later) -> makeReady h st
             _ -> st
        in (foldl' again s {later = Set.empty} s.later, said)
     -- held transactions whose time to be offered again has come: those
     -- whose time it is now, each once
     retried acc@(s0, _) = foldl' retry1 acc (takeWhile ((<= t) . fst) (Set.toAscList s0.tries))
-    retry1 acc@(s, said) (at, h) = case Map.lookup h s.places of
-      Just (Held b since hold@(Waiting _ _))
+    retry1 acc@(s, said) (at, h) = case Map.lookup h (places s) of
+      Just (Held _ since hold@(Waiting _ _))
         | t - since > s.config.orphanLife -> forget WaitedTooLong h acc
-        | otherwise ->
-            let s' = unhold h hold s
-             in (s' {places = Map.insert h (Held b since Ready) s'.places, ready = Set.insert h s'.ready}, said)
+        | otherwise -> (makeReady h (unhold h hold s), said)
       _ -> (s {tries = Set.delete (at, h) s.tries}, said)
 
 -- | What the machine can do as it is: read its sources if something is
@@ -664,16 +623,12 @@ requests p s = case Map.lookup p s.links of
   Just l -> foldl' ask (s, []) (take (l.window - l.out) (map snd (Set.toAscList l.queue)))
   Nothing -> (s, [])
   where
-    ask (st, got) h = case Map.lookup h st.places of
+    ask (st, got) h = case Map.lookup h (places st) of
       Just (Wanted ms) ->
         let s1 = unwant h ms st
             out l = l {out = l.out + 1, asks = Set.insert (st.now, h) l.asks}
-         in ( s1
-                { places = Map.insert h (Asked p st.now (Set.delete p (Map.keysSet ms))) s1.places,
-                  links = Map.adjust out p s1.links
-                },
-              h : got
-            )
+            asked = Asked p st.now (Set.delete p (Map.keysSet ms))
+         in ((edit (retarget h asked) s1) {links = Map.adjust out p s1.links}, h : got)
       _ -> (st, got)
 
 -- | Ask the sources for their mempools: each one when it connects, when
@@ -706,11 +661,8 @@ sweep s0
 offer :: (Ord h) => Ingest p h b -> (Ingest p h b, [Output p h b])
 offer s = (foldl' mark s {ready = Set.empty} offers, [Offer h b | (h, b) <- offers])
   where
-    offers = [(h, b) | h <- Set.toList s.ready, Just (Held b _ Ready) <- [Map.lookup h s.places]]
-    mark st (h, _) = st {places = Map.adjust offering h st.places}
-    offering = \case
-      Held b since Ready -> Held b since Offering
-      place -> place
+    offers = [(h, b) | h <- Set.toList s.ready, Just (Held b _ Ready) <- [Map.lookup h (places s)]]
+    mark st (h, _) = edit (rehold h Offering) st
 
 -- | What is wrong with a machine, if anything: the invariant that every
 -- step keeps (@Haskoin.Store.IngestSpec@). Each line is something that
@@ -718,9 +670,9 @@ offer s = (foldl' mark s {ready = Set.empty} offers, [Offer h b | (h, b) <- offe
 wellFormed :: (Ord p, Ord h) => Ingest p h b -> [String]
 wellFormed s =
   concat
-    [ ["more ids than there is room for" | Map.size s.places > s.config.room],
-      ["more bodies than there is room for" | s.nHeld > s.config.heldRoom],
-      ["the count of bodies is wrong" | s.nHeld /= length [() | Held {} <- Map.elems s.places]],
+    [ ["more ids than there is room for" | length placed > s.config.room],
+      ["more bodies than there is room for" | heldOf s.ledger > s.config.heldRoom],
+      ["the count of bodies is wrong" | heldOf s.ledger /= length [() | Held {} <- map snd placed]],
       ["the count of requests out to a peer is wrong" | l <- Map.elems s.links, l.out /= Set.size l.asks],
       [ "a window out of its bounds"
       | l <- Map.elems s.links,
@@ -728,41 +680,43 @@ wellFormed s =
       ],
       ["more requests out than the most a window allows" | l <- Map.elems s.links, l.out > s.config.maxWindow],
       ["a peer that is gone is still named" | ps <- namers, not (ps `Set.isSubsetOf` Map.keysSet s.links)],
-      ["an id that nobody named is waiting to be asked for" | Wanted ms <- Map.elems s.places, Map.null ms],
+      ["an id that nobody named is waiting to be asked for" | Wanted ms <- map snd placed, Map.null ms],
       ["every body held waits for another" | s.config.heldRoom > 0, Set.size s.tries >= s.config.heldRoom],
       [ "the ids to ask a peer for are not those wanted of it"
       | (p, l) <- Map.toList s.links,
-        l.queue /= Set.fromList [(t, h) | (h, Wanted ms) <- Map.toList s.places, Just t <- [Map.lookup p ms]]
+        l.queue /= Set.fromList [(t, h) | (h, Wanted ms) <- placed, Just t <- [Map.lookup p ms]]
       ],
       [ "the requests out to a peer are not those asked of it"
       | (p, l) <- Map.toList s.links,
-        l.asks /= Set.fromList [(t, h) | (h, Asked q t _) <- Map.toList s.places, q == p]
+        l.asks /= Set.fromList [(t, h) | (h, Asked q t _) <- placed, q == p]
       ],
       [ "the transactions to offer are not those ready"
-      | s.ready /= Set.fromList [h | (h, Held _ _ Ready) <- Map.toList s.places]
+      | s.ready /= Set.fromList [h | (h, Held _ _ Ready) <- placed]
       ],
       [ "the transactions to offer later are not those"
-      | s.later /= Set.fromList [h | (h, Held _ _ Later) <- Map.toList s.places]
+      | s.later /= Set.fromList [h | (h, Held _ _ Later) <- placed]
       ],
       [ "the times to offer again are not those of what waits"
-      | s.tries /= Set.fromList [(t, h) | (h, Held _ _ (Waiting _ t)) <- Map.toList s.places]
+      | s.tries /= Set.fromList [(t, h) | (h, Held _ _ (Waiting _ t)) <- placed]
       ],
-      ["a transaction waits for nothing" | Held _ _ (Waiting ps _) <- Map.elems s.places, Set.null ps],
+      ["a transaction waits for nothing" | Held _ _ (Waiting ps _) <- map snd placed, Set.null ps],
       [ "the index of what waits for a transaction is wrong"
       | s.waiters
           /= Map.fromListWith
             Set.union
-            [(p, Set.singleton h) | (h, Held _ _ (Waiting ps _)) <- Map.toList s.places, p <- Set.toList ps]
+            [(p, Set.singleton h) | (h, Held _ _ (Waiting ps _)) <- placed, p <- Set.toList ps]
       ]
     ]
   where
+    -- the places, read once
+    placed = Map.toList (places s)
     namers =
       concat
         [ case place of
             Wanted ms -> [Map.keysSet ms]
             Asked p _ ps -> [Set.insert p ps]
             Held {} -> []
-        | place <- Map.elems s.places
+        | place <- map snd placed
         ]
 
 -- | The same machine with its clock at 0 and every time counted from
@@ -774,18 +728,11 @@ rebase :: (Ord h) => Tick -> Ingest p h b -> Ingest p h b
 rebase bound s =
   s
     { now = 0,
-      places = Map.map place s.places,
+      ledger = retime rel s.ledger,
       links = Map.map link s.links,
       tries = Set.map (\(t, h) -> (rel t, h)) s.tries
     }
   where
     rel t = max (negate bound) (t - s.now)
-    place = \case
-      Wanted ms -> Wanted (Map.map rel ms)
-      Asked p t ps -> Asked p (rel t) ps
-      Held b since hold -> Held b (rel since) (held hold)
-    held = \case
-      Waiting ps t -> Waiting ps (rel t)
-      other -> other
     link l = l {queue = times l.queue, asks = times l.asks, swept = rel <$> l.swept}
     times = Set.map (\(t, h) -> (rel t, h))

@@ -142,17 +142,38 @@ never called proved, and what is not done yet is said.
 **By construction: the types leave no other possibility.**
 
 - An id is in one place (T1): the places are the values of one map.
+- The machine cannot change that map. It is inside an abstract type,
+  `Ledger`, of a module of its own (`Haskoin.Store.Ingest.Ledger`), which
+  gives the machine five functions and nothing else to change it with.
 
 **Proved for every state and every input**, by Liquid Haskell
-(`proofs/`, `cabal build` there):
+(`proofs/`, `cabal build` there, two minutes):
 
-- `step` is total and always ends. It has an answer for every input in
-  every state, well formed or not, and no loop of it depends on the
+- **Nothing leaves in silence (T1).** Of the five functions of the
+  ledger, four keep every id in its place, and the fifth, `leave`, takes
+  one id away and puts the output that says so at the head of the
+  outputs, in the same call. So whatever the machine does with them, an
+  id that it had and no longer has was said to be gone.
+- **The two bounds on memory (T2).** A ledger never has more ids than its
+  room, and never counts more transactions held than its room for those.
+  `put` is the one function that adds, and it refuses when there is no
+  room.
+- **`step` is total and always ends.** It has an answer for every input
+  in every state, well formed or not, and no loop of it depends on the
   indexes being right. The first version had three loops that did: with a
   wrong index they would have spun for ever. They are folds over a
   snapshot now.
-- **Not proved yet:** the accounting of what leaves (T1) and the bounds
-  (T2) as refinement types. Until then they rest on the level below.
+- Four bugs planted in the ledger, one for each of its claims, are each
+  rejected.
+
+What those proofs assume: seven facts about `Data.Map`, written as
+`assume` lines in the ledger module, such as that an insert adds its key
+and at most one to the size.
+
+**Not proved, and resting on the level below:** that the count of
+transactions held is the number of places that hold one; that the other
+indexes say what the map says; the windows (T4); and convergence (T3),
+which is a property of the machine in a world and not of a function.
 
 **Checked for every order of events, in small worlds**: a model checker
 in the test suite (`Haskoin.Store.Ingest.Model`) runs `step` itself in
@@ -173,8 +194,9 @@ states.
 three, three peers, every disturbance) keep the same rules and converge.
 
 **Tested against the real programs**, Podman and Bitcoin Core
-(`Haskoin.Store.MempoolSpec`): five situations in which a store must end
-with the mempool of its node, with the machine and its runner in the
+(`Haskoin.Store.MempoolSpec`): six situations in which a store must end
+with the mempool of its node, one of them with its Valkey stopped and
+started again under it (R2), with the machine and its runner in the
 store. Three of them fail on the version that fell behind on the server,
 so they can see that failure, and one failed one run in three on the path
 before this one, a race. They do not decide the order of events, and so

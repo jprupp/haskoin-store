@@ -68,7 +68,14 @@ each claim is established. The path is one pure machine,
   the store. A new rule of the machine gets a check in
   `Haskoin.Store.Ingest.Model`, and a planted bug that the check finds.
 - Liquid Haskell passes: `cabal build` in `proofs/`, with GHCup's GHC
-  9.12.4 and `z3` on the `PATH`.
+  9.12.4 and `z3` on the `PATH`, in about two minutes. It checks the
+  refinement types of `Haskoin.Store.Ingest.Ledger`, the only module that
+  can change where a transaction id is, and that every function of the
+  machine is total and ends. Liquid Haskell does not see through the dot
+  of a record field: what it has to reason about is read by matching. It
+  checks a module again only when GHC compiles it again. A function that
+  reads the same thing many times through a function call can make the
+  check take hours: bind it once.
 - The document says what is now proved, checked, sampled or only tested.
   Never write "proved" for what is tested.
 

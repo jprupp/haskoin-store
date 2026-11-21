@@ -76,7 +76,7 @@ import Haskoin.Store.Startup (redisConnectInfo)
 import Network.HTTP.Client (HttpException)
 import System.IO (hPutStrLn, stderr)
 import Test.Hspec
-import Test.Podman (PodSpec (..), pod, podmanUsable, withPod)
+import Test.Podman (ContainerSpec (..), Pod, PodSpec (..), containerName, pod, podman, podmanUsable, withPod)
 
 spec :: Spec
 spec = do
@@ -92,6 +92,8 @@ spec = do
         it "has them when it is back" (withBed BitcoinCore (away False))
       describe "A store that was away while transactions and a block came" $
         it "has what the block left in the mempool when it is back" (withBed BitcoinCore (away True))
+      describe "A store whose Valkey is stopped and started again under it" $
+        it "has the mempool of its node again, without being started again" (withBed BitcoinCore valkeyRestart)
       describe "A store whose node takes chains while it finds blocks" $
         it "has every transaction that no block confirmed" (withBed BitcoinCore busy)
 
@@ -118,16 +120,20 @@ atTheTip bed = withRamDir $ \dir -> do
   submit bed (map (chainOf 24) roots)
   flush bed
   withMemberIn bed dir $ \_ server -> do
-    worst <- newIORef (0 :: Integer, 1 :: Integer)
+    -- the most requests out, whether the peer was seen, and whether it
+    -- was lost after that
+    worst <- newIORef (0 :: Integer, False, False)
     let sample = do
           (_, h) <- getJSON server "/health"
           let count k = fromMaybe 0 (field k h >>= field "count" >>= number)
-          modifyIORef' worst (\(p, n) -> (max p (count "pending-txs"), min n (count "peers")))
+              there = count "peers" > 0
+          modifyIORef' worst $ \(p, seen, lost) ->
+            (max p (count "pending-txs"), seen || there, lost || (seen && not there))
     convergesWith sample bed server 120
-    (pending, peers) <- readIORef worst
+    (pending, seen, lost) <- readIORef worst
     -- what the health check of a store allows, by default
     pending `shouldSatisfy` (<= 10000)
-    peers `shouldBe` 1
+    (seen, lost) `shouldBe` (True, False)
   where
     number = \case
       Number n -> Just (round n)
@@ -149,6 +155,23 @@ away block bed = withRamDir $ \dir -> do
   when block . void $ generateTo bed.node 1 bed.miner
   submit bed (map (drop 12) chains)
   withMemberIn bed dir $ \_ server -> converges bed server 60
+
+-- | A store whose Valkey is stopped and started again while it runs, as
+-- when the package of Valkey is upgraded on a server. The Valkey of the
+-- tests keeps nothing, so it comes back empty: every connection of the
+-- store is broken at once, the pool is gone, and the store has to notice
+-- both, and fill the pool again from its node, by itself. Half of the
+-- transactions come before the restart and half after.
+valkeyRestart :: Bed -> IO ()
+valkeyRestart bed = do
+  roots <- fund bed 40
+  let (before, after) = splitAt 20 roots
+  withMember bed $ \_ server -> do
+    submit bed (map (chainOf 24) before)
+    converges bed server 60
+    void (podman ["restart", "--time", "1", containerName bed.pod redisContainer.name])
+    submit bed (map (chainOf 24) after)
+    converges bed server 120
 
 -- | A store that runs while its node takes chains and finds blocks at the
 -- same time, round after round: an announcement may reach the store while
@@ -318,7 +341,9 @@ submit bed chains = forConcurrently_ (transpose (groups chains)) (mapM_ (mapM_ (
 -- | A node that whitelists the store, with 150 blocks, and a Valkey, in a
 -- pod: what a store needs, without the store.
 data Bed = Bed
-  { node :: !Node,
+  { -- | the pod, to stop and start its containers
+    pod :: !Pod,
+    node :: !Node,
     net :: !Network,
     -- | address of the wallet of the node, to mine to
     miner :: !Text,
@@ -340,7 +365,8 @@ withBed kind go =
     withTestLog $ \logger logTail ->
       go
         Bed
-          { node,
+          { pod = p,
+            node,
             net = nodeNetwork kind,
             miner,
             redisURL = Valkey.redisURL p,
