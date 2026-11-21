@@ -14,6 +14,15 @@ module Haskoin.Store.Fleet.Oracle
     luaTrim,
     luaCommit,
     luaRestart,
+
+    -- * The cache of extended public keys
+    luaBuild,
+    luaBegin,
+    luaPiece,
+    luaAbort,
+    luaDrop,
+    luaEvict,
+    luaHave,
   )
 where
 
@@ -26,6 +35,8 @@ import Database.Redis (Connection, Redis, Reply)
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
 import Haskoin.Store.Fleet.Redis
+import Haskoin.Store.Fleet.XPub.Decide (Addition (..), Began (..), Piece (..), Step (..))
+import Haskoin.Store.XPub (greedyLua)
 
 luaOffer :: Connection -> FleetKeys -> Int -> Maybe ByteString -> PoolTx -> [Bool] -> [ByteString] -> IO Offered
 luaOffer conn keys tsize seen tx unspents replaced =
@@ -128,3 +139,74 @@ run conn f = R.runRedis conn f >>= either (fail . ("Redis error: " <>) . show) r
 poolScript :: Script
 poolScript = script $(makeRelativeToProject "test/Haskoin/Store/Fleet/pool.lua" >>= embedFile)
 {-# NOINLINE poolScript #-}
+
+-- | The script of the cache of extended public keys as it was when it
+-- wrote as well as read ("Haskoin.Store.Fleet.XPub.Decide" writes now).
+xpubScript :: Script
+xpubScript = script (greedyLua <> $(makeRelativeToProject "test/Haskoin/Store/Fleet/xpub.lua" >>= embedFile))
+{-# NOINLINE xpubScript #-}
+
+xpub :: Connection -> FleetKeys -> ByteString -> [ByteString] -> IO [ByteString]
+xpub conn keys what args = run conn (evalScript xpubScript [] (what : keys.prefix : "4" : args))
+
+-- | A whole number of a score, as the script takes it.
+whole :: Double -> ByteString
+whole s = num (round s :: Integer)
+
+luaHave :: Connection -> FleetKeys -> ByteString -> IO (Integer, Integer)
+luaHave conn keys i =
+  run conn (evalScript xpubScript [] ["have", keys.prefix, "4", i]) >>= \case
+    [n0, n1] -> return (n0, n1)
+    other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [Integer]))
+
+luaBuild ::
+  Connection -> FleetKeys -> ByteString -> ByteString -> (Integer, Integer) -> Integer -> [Addition] -> IO Step
+luaBuild conn keys tip i (n0, n1) cost additions =
+  xpub conn keys "build" ([tip, i, num n0, num n1, num cost, num (length additions)] <> concatMap one additions)
+    >>= \case
+      ["ok"] -> return StepAdded
+      ["raced"] -> return StepRaced
+      ["behind"] -> return StepBehind
+      ["changed"] -> return StepChanged
+      ["busy"] -> return StepBusy
+      other -> fail ("Unexpected answer of the xpub script: " <> show other)
+  where
+    one (a :: Addition) =
+      [a.address, a.path, a.balance, num (length a.txs)]
+        <> concat [[t, whole s] | (t, s) <- a.txs]
+        <> [num (length a.outs)]
+        <> concat [[o, whole s, amount, sc] | (o, s, amount, sc) <- a.outs]
+
+luaBegin :: Connection -> FleetKeys -> ByteString -> ByteString -> IO Began
+luaBegin conn keys token seen =
+  xpub conn keys "begin" [token, seen] >>= \case
+    ["ok"] -> return BeganMove
+    ["busy"] -> return OtherMoving
+    ["raced"] -> return TipElsewhere
+    other -> fail ("Unexpected answer of the xpub script: " <> show other)
+
+luaPiece :: Connection -> FleetKeys -> ByteString -> ByteString -> [Piece] -> IO Bool
+luaPiece conn keys token seen pieces =
+  xpub conn keys "piece" ([token, seen, num (length pieces)] <> concatMap one pieces) >>= \case
+    ["ok"] -> return True
+    ["raced"] -> return False
+    other -> fail ("Unexpected answer of the xpub script: " <> show other)
+  where
+    one (p :: Piece) =
+      [p.address, p.balance, num (length p.abandoned)]
+        <> p.abandoned
+        <> [num (length p.added)]
+        <> concat [[t, whole s] | (t, s) <- p.added]
+        <> [num (length p.gone)]
+        <> p.gone
+        <> [num (length p.unspent)]
+        <> concat [[o, whole s, amount, sc] | (o, s, amount, sc) <- p.unspent]
+
+luaAbort :: Connection -> FleetKeys -> ByteString -> IO ()
+luaAbort conn keys token = () <$ xpub conn keys "abort" [token]
+
+luaDrop :: Connection -> FleetKeys -> ByteString -> IO ()
+luaDrop conn keys i = () <$ xpub conn keys "drop" [i]
+
+luaEvict :: Connection -> FleetKeys -> Int -> IO Integer
+luaEvict conn keys most = run conn (evalScript xpubScript [] ["evict", keys.prefix, "4", num most])

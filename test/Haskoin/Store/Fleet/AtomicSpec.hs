@@ -157,7 +157,7 @@ anOp =
   oneof
     [ Set "s1" <$> word,
       return (Del "s1"),
-      return (Incr "n1"),
+      IncrBy "n1" <$> choose (-3, 3),
       return (Del "n1"),
       HSet <$> hash <*> field <*> word,
       HDel <$> hash <*> field,
@@ -191,7 +191,8 @@ everyQuestion :: [Query]
 everyQuestion =
   [Get "s1", Get "n1", Exists "s1", Exists "x1", Exists "nothing"]
     <> concat
-      [ [HGetAll h, Exists h, HGet h "c1", HExists h "c1"] <> concat [[HGet h f, HExists h f] | f <- ["a", "b"]]
+      [ [HGetAll h, HKeys h, Exists h, HGet h "c1", HExists h "c1"]
+          <> concat [[HGet h f, HExists h f] | f <- ["a", "b"]]
       | h <- ["h1", "h2"]
       ]
     <> [SMembers "g1", Exists "g1"]
@@ -210,7 +211,7 @@ under :: ByteString -> Op -> Op
 under p = \case
   Set k v -> Set (p <> k) v
   Del k -> Del (p <> k)
-  Incr k -> Incr (p <> k)
+  IncrBy k n -> IncrBy (p <> k) n
   HSet k f v -> HSet (p <> k) f v
   HDel k f -> HDel (p <> k) f
   HIncrBy k f n -> HIncrBy (p <> k) f n
@@ -230,6 +231,7 @@ questionUnder p = \case
   HGet k f -> HGet (p <> k) f
   HExists k f -> HExists (p <> k) f
   HGetAll k -> HGetAll (p <> k)
+  HKeys k -> HKeys (p <> k)
   SIsMember k x -> SIsMember (p <> k) x
   SMembers k -> SMembers (p <> k)
   ZScore k x -> ZScore (p <> k) x

@@ -60,4 +60,3 @@ evalScript sc keys args =
         Right sha -> do
           liftIO (writeIORef sc.digest (Just sha))
           R.evalsha sha keys args
-

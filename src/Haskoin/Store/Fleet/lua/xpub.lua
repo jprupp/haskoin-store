@@ -1,7 +1,12 @@
--- The cache of extended public keys of a fleet: xpubScript in
--- Haskoin.Store.Fleet.XPub, which says what an entry is and why, after
--- greedy.lua. The pool (Haskoin.Store.Fleet.Pool.Decide) keeps the part
--- of each entry that comes from the shared mempool.
+-- The reads of the cache of extended public keys of a fleet: xpubScript
+-- in Haskoin.Store.Fleet.XPub, which says what an entry is and why, after
+-- greedy.lua. Nothing here writes an entry: building, moving with the tip,
+-- dropping and evicting are decisions made in Haskell
+-- (Haskoin.Store.Fleet.XPub.Decide), and the pool keeps the part of each
+-- entry that comes from the shared mempool
+-- (Haskoin.Store.Fleet.Pool.Decide). A script that failed among the
+-- thousands of rows of a build left an entry half written. The one write
+-- here is the note that a key was used, a single command.
 --
 -- ARGV[1] is what to do, ARGV[2] the prefix of the keys, and ARGV[3] the
 -- size of a transaction id in bytes. An output is the id of the transaction
@@ -16,7 +21,7 @@
 -- caller has them. They answer {'raced'} if the fleet tip is another block,
 -- {'miss'} if the cache is not where the tip is, if it does not have the key,
 -- or if it has it with other addresses, {'marked'} while a move of the tip
--- is writing the entry in pieces ('piece'), and {'ok', version, ...}
+-- is writing the entry in pieces, and {'ok', version, ...}
 -- otherwise. A reader that gets 'marked' waits a moment and asks again: it
 -- never sees an entry half moved.
 --
@@ -41,67 +46,21 @@
 -- 'have': the id. The two numbers of the entry, whatever block the cache is
 -- at: {n0, n1}.
 --
--- 'build': the tip, the id, the two numbers that the entry is to have
--- before, what the addresses added cost to read, in tokens, the number of
--- addresses to add, and for
--- each: the address, its path, its balance in the chain or '', the number
--- of its transactions in the chain, a transaction and a score for each, the
--- number of its unspent outputs in the chain, and an output, a score, an
--- amount and a script for each. What the pool has for the address is added
--- from the pool. Returns {'ok'}; {'raced'} if the fleet tip is another
--- block; {'behind'} if the cache is at another block; {'changed'} if the
--- entry does not have those two numbers of addresses; {'busy'} while a
--- move of the tip is under way.
---
--- 'drop': the id. Deletes the entry.
---
 -- 'tracked': addresses. A string with '1' for each address that an entry
 -- has and '0' for the others.
 --
--- = Moving the tip with the cache
---
--- A move of the fleet tip changes the chain's layer of the entries in the
--- same commit as the pool and the tip: the last step is the advance of
--- the pool, which takes the pool to the new block, stamps a new version on
--- every entry that the move wrote, and puts the cache at the new place of
--- the tip. What comes before it is written in pieces, each a short script,
--- so that a large block does not hold Redis for long:
---
--- 'begin': a token of the move and the tip that the mover saw. Marks that
--- a move is under way: builds wait until it is done, so that every entry
--- is either among those that the move brings along or built after it.
--- Returns {'ok'}, {'raced'} if the fleet tip is another block, or {'busy'}
--- if another store is moving it.
---
--- 'piece': the token, the tip that the mover saw, the number of addresses,
--- and for each: the address, its balance in the chain at the new block or
--- '', the number of transactions of the abandoned blocks, those
--- transactions, the number of transactions of the new blocks, a
--- transaction and a score for each, the number of outputs that are no
--- longer unspent in the chain, those outputs, the number of outputs that
--- are unspent in the chain at the new block, and an output, a score, an
--- amount and a script for each. Every entry that has the address is marked
--- and changed: what is taken out is only what has a score of the chain, at
--- or above zero, so that the pool's layer stays as it is. Returns {'ok'} or
--- {'raced'}.
---
--- 'abort': the token. Drops the entries that the pieces of that move
--- marked, and ends the move: for a mover whose advance was refused.
---
--- A move whose mover went quiet for ten seconds is aborted by whoever finds
--- it: its marked entries are dropped, one at a time, to be built again.
+-- An entry that a move of the tip is writing in pieces is marked, and a
+-- read of it answers {'marked'} until the move is committed. A move whose
+-- store wrote nothing for ten seconds is no move any more: a read of an
+-- entry that it marked is a miss, and the build that follows a miss ends
+-- the move and drops what it wrote.
 --
 -- 'size': nothing. The number of entries, and the number of addresses that
 -- they have between them: {entries, addresses}.
---
--- 'evict': how many entries to keep. Deletes those of the lowest priority
--- past that many, by GreedyDual, and says how many it deleted.
 local what, prefix, tsize = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local key = {
   fleet = prefix .. 'fleet:tip',
   tip = prefix .. 'fx:tip',
-  -- times of last use, of versions before GreedyDual
-  lru = prefix .. 'fx:lru',
   prio = prefix .. 'fx:prio',
   level = prefix .. 'fx:level',
   addrs = prefix .. 'fx:addrs',
@@ -129,27 +88,9 @@ local function before(a, b)
   return #a < #b
 end
 
-local function kept(a, amount, script)
-  return amount .. ' ' .. #a .. ' ' .. a .. script
-end
-
-local function drop(id)
-  local e = key.entry .. id .. ':'
-  local had = redis.call('HKEYS', e .. 'addrs')
-  for _, a in ipairs(had) do
-    redis.call('SREM', key.of .. a, id)
-  end
-  if #had > 0 then
-    redis.call('DECRBY', key.addrs, #had)
-  end
-  redis.call('DEL', e .. 'addrs', e .. 'meta', e .. 'txs', e .. 'outs', e .. 'oval')
-  redis.call('ZREM', key.prio, id)
-  redis.call('ZREM', key.lru, id)
-end
-
 -- the number of entries
 local function entries()
-  return redis.call('ZCARD', key.prio) + redis.call('ZCARD', key.lru)
+  return redis.call('ZCARD', key.prio)
 end
 
 local function now()
@@ -157,17 +98,8 @@ local function now()
   return t[1] * 1000 + math.floor(t[2] / 1000)
 end
 
--- end a move of the tip that did not finish: what its pieces wrote is
--- dropped, entry by entry
-local function abort()
-  for _, id in ipairs(redis.call('SMEMBERS', key.marked)) do
-    drop(id)
-  end
-  redis.call('DEL', key.marked, key.moving)
-end
-
 -- the token of the move of the tip under way, if there is one; a move that
--- wrote nothing for ten seconds is aborted
+-- wrote nothing for ten seconds is none
 local function moving()
   local v = redis.call('GET', key.moving)
   if not v then
@@ -175,7 +107,6 @@ local function moving()
   end
   local space = string.find(v, ' ', 1, true)
   if now() - tonumber(string.sub(v, space + 1)) > 10000 then
-    abort()
     return nil
   end
   return string.sub(v, 1, space - 1)
@@ -189,9 +120,6 @@ end
 if what == 'have' then
   local n0, n1 = numbers(key.entry .. ARGV[4] .. ':')
   return {n0, n1}
-elseif what == 'drop' then
-  drop(ARGV[4])
-  return {'ok'}
 elseif what == 'tracked' then
   local flags = {}
   for i = 4, #ARGV do
@@ -200,9 +128,6 @@ elseif what == 'tracked' then
   return table.concat(flags)
 elseif what == 'size' then
   return {entries(), tonumber(redis.call('GET', key.addrs) or '0')}
-elseif what == 'evict' then
-  greedy_migrate(key.lru, key.prio, key.level)
-  return greedy_evict(key.prio, key.level, tonumber(ARGV[4]), drop)
 end
 
 local fleet = redis.call('GET', key.fleet) or ''
@@ -218,155 +143,11 @@ local function place(n, block)
 end
 local here = place(moves, fleet)
 
-if what == 'abort' then
-  if moving() == ARGV[4] then
-    abort()
-  end
-  return {'ok'}
-elseif what == 'begin' then
-  if fleet ~= ARGV[5] then
-    return {'raced'}
-  end
-  local other = moving()
-  if other and other ~= ARGV[4] then
-    return {'busy'}
-  end
-  redis.call('SET', key.moving, ARGV[4] .. ' ' .. now())
-  return {'ok'}
-elseif what == 'piece' then
-  if fleet ~= ARGV[5] or moving() ~= ARGV[4] then
-    return {'raced'}
-  end
-  redis.call('SET', key.moving, ARGV[4] .. ' ' .. now())
-  local ver = redis.call('INCR', prefix .. 'fleet:xver')
-  -- take out what has a score of the chain, and leave the pool's layer
-  local function chained(z, m)
-    local s = redis.call('ZSCORE', z, m)
-    return s and tonumber(s) >= 0
-  end
-  local i = 7
-  for _ = 1, tonumber(ARGV[6]) do
-    local a, bal = ARGV[i], ARGV[i + 1]
-    local old, new, gone, unspent = {}, {}, {}, {}
-    local n = tonumber(ARGV[i + 2])
-    i = i + 3
-    for _ = 1, n do
-      old[#old + 1] = ARGV[i]
-      i = i + 1
-    end
-    n = tonumber(ARGV[i])
-    i = i + 1
-    for _ = 1, n do
-      new[#new + 1] = {ARGV[i], ARGV[i + 1]}
-      i = i + 2
-    end
-    n = tonumber(ARGV[i])
-    i = i + 1
-    for _ = 1, n do
-      gone[#gone + 1] = ARGV[i]
-      i = i + 1
-    end
-    n = tonumber(ARGV[i])
-    i = i + 1
-    for _ = 1, n do
-      unspent[#unspent + 1] = {ARGV[i], ARGV[i + 1], kept(a, ARGV[i + 2], ARGV[i + 3])}
-      i = i + 4
-    end
-    for _, id in ipairs(redis.call('SMEMBERS', key.of .. a)) do
-      local e = key.entry .. id .. ':'
-      redis.call('SADD', key.marked, id)
-      redis.call('HSET', e .. 'meta', 'ver', ver)
-      local row = redis.call('HGET', e .. 'addrs', a)
-      if row then
-        redis.call('HSET', e .. 'addrs', a, string.sub(row, 1, 5) .. bal)
-      end
-      for _, t in ipairs(old) do
-        if chained(e .. 'txs', t) then
-          redis.call('ZREM', e .. 'txs', t)
-        end
-      end
-      for _, t in ipairs(new) do
-        redis.call('ZADD', e .. 'txs', t[2], t[1])
-      end
-      for _, o in ipairs(gone) do
-        if chained(e .. 'outs', o) then
-          redis.call('ZREM', e .. 'outs', o)
-          redis.call('HDEL', e .. 'oval', o)
-        end
-      end
-      for _, o in ipairs(unspent) do
-        redis.call('ZADD', e .. 'outs', o[2], o[1])
-        redis.call('HSET', e .. 'oval', o[1], o[3])
-      end
-    end
-  end
-  return {'ok'}
-end
-
 -- everything else is for a store that answers from the fleet tip
 local tip, id = ARGV[4], ARGV[5]
 local e = key.entry .. id .. ':'
 if fleet ~= tip then
   return {'raced'}
-end
-
-if what == 'build' then
-  if moving() then
-    return {'busy'}
-  end
-  local at = redis.call('GET', key.tip)
-  if not at then
-    -- nothing is cached yet: the cache starts here
-    redis.call('SET', key.tip, here)
-  elseif at ~= here then
-    return {'behind'}
-  end
-  local n0, n1 = numbers(e)
-  if n0 ~= tonumber(ARGV[6]) or n1 ~= tonumber(ARGV[7]) then
-    return {'changed'}
-  end
-  -- a build is for a request that missed: a use, at the cost so far
-  greedy_use(key.prio, key.level, id, redis.call('HINCRBY', e .. 'meta', 'cost', ARGV[8]), false)
-  local i = 10
-  for _ = 1, tonumber(ARGV[9]) do
-    local a, path, bal = ARGV[i], ARGV[i + 1], ARGV[i + 2]
-    redis.call('HSET', e .. 'addrs', a, path .. bal)
-    redis.call('SADD', key.of .. a, id)
-    if string.byte(path, 1) == 0 then
-      n0 = n0 + 1
-    else
-      n1 = n1 + 1
-    end
-    local n = tonumber(ARGV[i + 3])
-    i = i + 4
-    for _ = 1, n do
-      redis.call('ZADD', e .. 'txs', ARGV[i + 1], ARGV[i])
-      i = i + 2
-    end
-    n = tonumber(ARGV[i])
-    i = i + 1
-    for _ = 1, n do
-      redis.call('ZADD', e .. 'outs', ARGV[i + 1], ARGV[i])
-      redis.call('HSET', e .. 'oval', ARGV[i], kept(a, ARGV[i + 2], ARGV[i + 3]))
-      i = i + 4
-    end
-    -- what the pool has for the address, which the pool keeps up from now
-    local rows = redis.call('ZRANGE', key.atx .. a, 0, -1, 'WITHSCORES')
-    for j = 1, #rows, 2 do
-      redis.call('ZADD', e .. 'txs', rows[j + 1], rows[j])
-    end
-    rows = redis.call('ZRANGE', key.aout .. a, 0, -1, 'WITHSCORES')
-    for j = 1, #rows, 2 do
-      local o = rows[j]
-      local value = redis.call('HGET', key.aval .. a, o)
-      local space = string.find(value, ' ', 1, true)
-      redis.call('ZADD', e .. 'outs', rows[j + 1], o)
-      redis.call('HSET', e .. 'oval', o, kept(a, string.sub(value, 1, space - 1), string.sub(value, space + 1)))
-    end
-  end
-  redis.call('HSET', e .. 'meta', 'n0', n0, 'n1', n1, 'ver', redis.call('INCR', prefix .. 'fleet:xver'))
-  redis.call('INCRBY', key.addrs, tonumber(ARGV[9]))
-  return {'ok'}
 end
 
 if (redis.call('GET', key.tip) or '') ~= here then

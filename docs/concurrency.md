@@ -96,8 +96,11 @@ tip, the pool, the leases and reports, the seen set, the cache of xpubs, the
 events) is written only in single steps, each a decision that checks again
 what it depends on. The pool, the seen set, the events of the pool and the
 move of the tip with the pool are written by the decisions of
-`Haskoin.Store.Fleet.Pool.Decide`; the reports, the move of the tip alone
-and the cache of xpubs by the Lua scripts of `src/Haskoin/Store/Fleet/lua`.
+`Haskoin.Store.Fleet.Pool.Decide`, and the cache of xpubs by those of
+`Haskoin.Store.Fleet.XPub.Decide`; the reports and the move of the tip
+alone by two short Lua scripts of `src/Haskoin/Store/Fleet/lua`. The
+reads of the pool and of the cache are scripts too: they write nothing,
+but for the note that an entry of the cache was used.
 The pure model is `Haskoin.Store.Fleet` (tip agreement, leases, who may
 empty the pool) and `Haskoin.Store.Fleet.Pool` (the pool), and `RedisSpec`
 runs both against the model step by step.
@@ -143,7 +146,8 @@ What it rests on, and how each part is established:
 | A decision whose answers changed writes nothing | tested against a Valkey, with a set and a hash of 200 members in whatever order Redis lists them |
 | No change is lost when many decide at once | tested: eight threads, four hundred additions to one number |
 | Each key has one kind, so a plain write cannot be refused | by convention of `Haskoin.Store.Fleet.Pool.Decide`, not by a type |
-| The decisions do what the script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
+| The decisions of the pool do what its script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
+| The decisions of the cache of xpubs do what its script did | tested the same way: 300 drawn sequences of builds, moves begun, written in pieces, given up, gone quiet and committed, entries dropped and evicted, with the pool changing under them (`Haskoin.Store.Fleet.XPubDecideSpec`) |
 
 None of this is proved. What changed is where a fault can be: in a pure
 function, where it is an exception before any write, and no longer in
@@ -151,9 +155,16 @@ the middle of a script.
 
 What it costs. An offer that is taken is two calls to Redis where it was
 one, and Redis spends about 137 microseconds on it where the script took
-74 (Valkey's own count, 2,000 offers). A decision is gone through more
-than once to learn what it asks, so that Redis is asked in a few calls
-and not once for each question.
+74 (Valkey's own count, 2,000 offers). A build of a key with 20 addresses
+and 300 rows is two calls where it was one, and about 1.5 milliseconds
+of Redis where the script took 1.0. A decision is gone through more than
+once to learn what it asks, so that Redis is asked in a few calls and not
+once for each question.
+
+One thing changed in what the cache does. A move of the tip that its
+store left for ten seconds was ended by whoever came across it, a read
+too. A read writes nothing now: an entry that such a move marked is a
+miss to it, and the build that follows the miss ends the move.
 
 Stores that keep the pool in this way have keys that start with `hs3:`,
 and those that ran the script `hs2:`: on one Redis they are two fleets.
@@ -306,7 +317,9 @@ finding was checked against the code before it was fixed.
 - A change to a Lua script is tested against Redis (`Haskoin.Store.Fleet.*`
   specs), and the pure model changes with it.
 - A change to a decision of the pool is tested against the pure model
-  (`RedisSpec`). `DecideSpec` then fails, since the script that it
-  compares with has not changed: say there what differs and why, or drop
-  the comparison once the script is no longer what the stores should do.
+  (`RedisSpec`), and one to a decision of the cache against the stores
+  that read it (`CacheSpec`). `DecideSpec` or `XPubDecideSpec` then
+  fails, since the script that it compares with has not changed: say
+  there what differs and why, or drop the comparison once the script is
+  no longer what the stores should do.
 - A decision writes to a key only as the kind that the key has.

@@ -27,9 +27,9 @@
 --   them;
 --
 -- * __the pool's layer__: the transactions of the shared pool that touch
---   those addresses and the outputs that it pays to them. The script of the
---   pool puts them in and takes them out in the step in which it changes
---   the pool, so this layer is the pool, always.
+--   those addresses and the outputs that it pays to them. The pool puts
+--   them in and takes them out in the step in which it changes, so this
+--   layer is the pool, always.
 --
 -- Transactions and outputs of both layers are in one list each, ordered as
 -- the API orders them, so a page is a range of a sorted set. A balance is
@@ -54,7 +54,7 @@
 -- * __The tip and the cache move in one commit.__ The store that moves the
 --   tip first writes what the blocks in between did at the addresses that
 --   entries have ('tipMoves'), in pieces that mark the entries they touch
---   ('cachePieces'); readers wait for a marked entry. Then one script moves
+--   ('cachePieces'); readers wait for a marked entry. Then one step moves
 --   the pool, the fleet tip and the cache together, gives each marked entry
 --   a new version and clears the marks ('Haskoin.Store.Fleet.Redis.fleetCommit').
 --   No request finds the tip without its cache, or an entry half moved.
@@ -182,7 +182,10 @@ import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Database.Query.Pooled (From (..), PoolReads (..), applySummary, emptyPool, pooledRead)
 import Haskoin.Store.Database.Reader (DatabaseReader (..), Derived (..), derivedAddrs)
 import Haskoin.Store.Database.Types (MemSummary (..))
+import Haskoin.Store.Fleet.Atomic (Atomic)
+import Haskoin.Store.Fleet.Atomic.Redis (insist, transact)
 import Haskoin.Store.Fleet.Redis (FleetKeys (..), Script, evalScript, script)
+import Haskoin.Store.Fleet.XPub.Decide qualified as X
 import Haskoin.Store.XPub (greedyLua, indexCost)
 
 -------------------------------------------------------------------------------
@@ -460,9 +463,7 @@ cacheHave conn keys spec =
 
 -- | Delete the entry of a key.
 cacheDrop :: Connection -> FleetKeys -> XPubSpec -> IO ()
-cacheDrop conn keys spec = do
-  _ <- run conn (evalScript xpubScript [] ["drop", keys.prefix, "32", xpubId spec]) :: IO [ByteString]
-  return ()
+cacheDrop conn keys spec = insist conn (X.drop (X.cacheKeys keys.prefix) (xpubId spec))
 
 -- | Build the entry of a key, or add to it the addresses that the key has
 -- gained: given the tip that the fleet is at, the database as it was at
@@ -516,21 +517,31 @@ cacheBuild conn keys tip r pool spec = do
               (sum [length txs | (_, _, txs, _) <- now'])
               (sum [length outs | (_, _, _, outs) <- now'])
               0
-          args =
-            [tip, xpubId spec, num n0, num n1, num cost, num (length now')]
-              <> concatMap address now'
+          additions = map address now'
           count m = length [() | (XPubBal {path = m' : _}, _, _, _) <- now', m' == m]
-      run conn (evalScript xpubScript [] ("build" : keys.prefix : "32" : args)) >>= \case
-        ["ok"] -> go (n0 + count 0, n1 + count 1) (added + length now') later
-        ["busy"] -> return Busy
-        [why] | why `elem` ["raced", "behind", "changed"] -> return Abandoned
-        other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 (other :: [ByteString])))
+          step :: (Monad m) => Atomic m X.Step
+          step =
+            X.build
+              (X.cacheKeys keys.prefix)
+              tip
+              (xpubId spec)
+              (toInteger n0, toInteger n1)
+              (toInteger cost)
+              additions
+      -- one that other stores change the ground of five times is given up,
+      -- as one that found the entry changed
+      transact conn 5 step >>= \case
+        Just X.StepAdded -> go (n0 + count 0, n1 + count 1) (added + length now') later
+        Just X.StepBusy -> return Busy
+        _ -> return Abandoned
     address (b, bal, txs, outs) =
-      [encode b.balance.address, path b.path, maybe "" encode (bal >>= real)]
-        <> [num (length txs)]
-        <> concat [[encode t.txid, num (score t.block)] | t <- txs]
-        <> [num (length outs)]
-        <> concat [[encode u.outpoint, num (score u.block), num u.value, u.script] | u <- outs]
+      X.Addition
+        { address = encode b.balance.address,
+          path = path b.path,
+          balance = maybe "" encode (bal >>= real),
+          txs = [(encode t.txid, fromIntegral (score t.block)) | t <- txs],
+          outs = [(encode u.outpoint, fromIntegral (score u.block), num u.value, u.script) | u <- outs]
+        }
     real b = if nullBalance b then Nothing else Just b
     path = \case
       [m, n] -> runPut (putWord8 (fromIntegral m) >> putWord32be n)
@@ -624,18 +635,17 @@ data Begun
 -- comes across it.
 cacheBegin :: Connection -> FleetKeys -> ByteString -> ByteString -> IO Begun
 cacheBegin conn keys token seen =
-  run conn (evalScript xpubScript [] ["begin", keys.prefix, "32", token, seen]) >>= \case
-    ["ok"] -> return Begun
-    ["busy"] -> return Moving
-    ["raced"] -> return BeginRaced
-    other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [ByteString]))
+  transact conn 5 (X.begin (X.cacheKeys keys.prefix) token seen) <&> \case
+    Just X.BeganMove -> Begun
+    Just X.TipElsewhere -> BeginRaced
+    -- another store moves the tip, or others kept changing what this
+    -- asked about: the store tries at its next turn
+    _ -> Moving
 
 -- | End a move of the cache that will not be committed, dropping the
 -- entries that its pieces wrote, to be built again.
 cacheAbort :: Connection -> FleetKeys -> ByteString -> IO ()
-cacheAbort conn keys token = do
-  _ <- run conn (evalScript xpubScript [] ["abort", keys.prefix, "32", token]) :: IO [ByteString]
-  return ()
+cacheAbort conn keys token = insist conn (X.abort (X.cacheKeys keys.prefix) token)
 
 -- | What a move of the tip does to the chain's layer of an address that
 -- entries have: its balance in the chain at the new tip, the transactions
@@ -699,36 +709,37 @@ cachePieces conn keys token seen = go
     go [] = return True
     go moves = do
       let (now', later) = batch chunk moves
-          args = ["piece", keys.prefix, "32", token, seen, num (length now')] <> concatMap one now'
-      run conn (evalScript xpubScript [] args) >>= \case
-        ["ok"] -> go later
-        ["raced"] -> return False
-        other -> fail ("Unexpected answer of the xpub script: " <> show (other :: [ByteString]))
+          pieces = map one now'
+          written :: (Monad m) => Atomic m Bool
+          written = X.piece (X.cacheKeys keys.prefix) token seen pieces
+      -- a piece that other stores change the ground of five times is not
+      -- written, and the caller aborts the move
+      transact conn 5 written >>= \case
+        Just True -> go later
+        _ -> return False
     weight x = 1 + length x.abandoned + length x.added + length x.gone + length x.unspent
     batch _ [] = ([], [])
     batch room (x : xs)
       | room <= 0 = ([], x : xs)
       | otherwise = let (now', later) = batch (room - weight x) xs in (x : now', later)
     one x =
-      [encode x.address, maybe "" encode (x.balance >>= real), num (length x.abandoned)]
-        <> map encode x.abandoned
-        <> [num (length x.added)]
-        <> concat [[encode h, num (score ref)] | (h, ref) <- x.added]
-        <> [num (length x.gone)]
-        <> map encode x.gone
-        <> [num (length x.unspent)]
-        <> concat [[encode o.outpoint, num (score o.block), num o.value, o.script] | o <- x.unspent]
+      X.Piece
+        { address = encode x.address,
+          balance = maybe "" encode (x.balance >>= real),
+          abandoned = map encode x.abandoned,
+          added = [(encode h, fromIntegral (score ref)) | (h, ref) <- x.added],
+          gone = map encode x.gone,
+          unspent = [(encode o.outpoint, fromIntegral (score o.block), num o.value, o.script) | o <- x.unspent]
+        }
     real b = if nullBalance b then Nothing else Just b
 
 -- | Delete entries past so many by GreedyDual, those of the lowest priority
--- first, raising the level to each ('Haskoin.Store.XPub.greedyLua'). A use
--- of an entry gave it the level plus its cost, so a large key outlives
--- small ones used as recently, and any key goes once it is not used for
--- long enough. Entries of a version that ordered them by last use are given
--- the level first, so they go first. Says how many it deleted.
+-- first, raising the level to each ('Haskoin.Store.Fleet.XPub.Decide.evict').
+-- A use of an entry gave it the level plus its cost, so a large key
+-- outlives small ones used as recently, and any key goes once it is not
+-- used for long enough. Says how many it deleted.
 cacheEvict :: Connection -> FleetKeys -> Int -> IO Int
-cacheEvict conn keys most =
-  fromInteger <$> run conn (evalScript xpubScript [] ["evict", keys.prefix, "32", num most])
+cacheEvict conn keys most = fromInteger <$> insist conn (X.evict (X.cacheKeys keys.prefix) most)
 
 -- | How large the cache is: the number of its entries, one for each
 -- extended public key, and the number of addresses that they have between
@@ -774,7 +785,9 @@ run conn f =
     Right x -> return x
     Left e -> fail ("Redis error: " <> show e)
 
--- | The script of the cache; see its header for what it takes and gives.
+-- | The script of the reads of the cache; see its header for what it
+-- takes and gives. What writes the cache is
+-- "Haskoin.Store.Fleet.XPub.Decide".
 xpubScript :: Script
 xpubScript = script (greedyLua <> $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/xpub.lua" >>= embedFile))
 {-# NOINLINE xpubScript #-}

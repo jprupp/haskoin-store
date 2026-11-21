@@ -121,7 +121,7 @@ import Database.Redis (Connection, Redis, Reply (..))
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
 import Haskoin.Store.Fleet.Atomic (Atomic)
-import Haskoin.Store.Fleet.Atomic.Redis (transact)
+import Haskoin.Store.Fleet.Atomic.Redis (insist, transact)
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Pool.Types
 import Haskoin.Store.Fleet.Script (Script, evalScript, script)
@@ -204,13 +204,13 @@ poolOffer conn keys tsize seen tx unspents replaced =
 -- | Take transactions out of the pool, with all that spends them. Gives
 -- those that left.
 poolWithdraw :: Connection -> FleetKeys -> Int -> [ByteString] -> IO [ByteString]
-poolWithdraw conn keys tsize ts = decided conn (D.withdraw (D.poolKeys keys.prefix tsize) ts)
+poolWithdraw conn keys tsize ts = insist conn (D.withdraw (D.poolKeys keys.prefix tsize) ts)
 
 -- | Take out of the pool what has been in it since before a time, in
 -- seconds of the clock of Redis, so many at most, with all that spends
 -- them, choosing and withdrawing them in one call. Gives those that left.
 poolExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
-poolExpire conn keys tsize before most = decided conn (D.expire (D.poolKeys keys.prefix tsize) before most)
+poolExpire conn keys tsize before most = insist conn (D.expire (D.poolKeys keys.prefix tsize) before most)
 
 -- | Keep the newest of the transactions that the fleet has seen, so
 -- many. Gives how many are kept.
@@ -228,7 +228,7 @@ poolExpire conn keys tsize before most = decided conn (D.expire (D.poolKeys keys
 -- trimmed here, when it has grown a hundredth past its bound, and not on
 -- every addition.
 fleetTrimSeen :: Connection -> FleetKeys -> Int -> IO Integer
-fleetTrimSeen conn keys most = decided conn (D.trim (D.poolKeys keys.prefix 0) most)
+fleetTrimSeen conn keys most = insist conn (D.trim (D.poolKeys keys.prefix 0) most)
 
 -- | Of these transactions, which the fleet has seen ('fleetTrimSeen'), in one
 -- round trip.
@@ -359,13 +359,6 @@ advance conn keys tsize clock seen target how (path, token) =
   where
     decision :: (Monad m) => Atomic m Moved
     decision = D.advance (D.poolKeys keys.prefix tsize) seen target (fromIntegral <$> clock) keys.size how path token
-
--- | Carry out a decision that has to be: one that other stores keep
--- changing the ground of is decided again, a hundred times before this
--- gives up with an exception. Nothing was written then.
-decided :: Connection -> (forall m. (Monad m) => Atomic m a) -> IO a
-decided conn decision =
-  transact conn 100 decision >>= maybe (fail "The fleet changed under a decision a hundred times") return
 
 -- | Read from the pool as it is at a tip: given the size of a transaction
 -- id, the tip that the caller answers from, what to read and its arguments,

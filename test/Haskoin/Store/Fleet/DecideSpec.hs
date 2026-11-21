@@ -2,7 +2,7 @@
 -- beside the script that they replace ("Haskoin.Store.Fleet.Oracle"), in
 -- a Redis: the same steps by each, under two prefixes, and all that Redis
 -- has under each compared after every step.
-module Haskoin.Store.Fleet.DecideSpec (spec) where
+module Haskoin.Store.Fleet.DecideSpec (spec, Dump, everything) where
 
 import Control.Monad (foldM_, forM, forM_, when)
 import Data.ByteString (ByteString)
@@ -62,6 +62,7 @@ watched conn (keys :: FleetKeys) = do
     go (Redis.sadd (key ("fx:of:" <> address a)) (NonEmpty.fromList ids))
   go (Redis.zadd (key "fx:e:x1:txs") [(5, block 3)])
   go (Redis.zadd (key "fx:e:x1:outs") [(5, out 3 0)])
+
 -- carry a step out by the script under one prefix and by the decision
 -- in Haskell under another, and compare what each said and all that
 -- Redis has under each
@@ -137,6 +138,7 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
   here <- everything conn ours.prefix
   versions here0 here `shouldBe` versions there0 there
   return (there, here, tip', n')
+
 -- the version of an entry of the cache as whether it is new since the
 -- step before. Every change to an address gives the entries that have
 -- it a new version, the next number: when transactions that spend from
@@ -149,6 +151,7 @@ versions earlier now =
       else (key, v)
   | (key, v) <- now
   ]
+
 -- all that Redis has under a prefix. Of what the pool keeps of a
 -- transaction to take it out again, which each writes in its own way,
 -- only for which transactions; of what the fleet saw, not when; of the

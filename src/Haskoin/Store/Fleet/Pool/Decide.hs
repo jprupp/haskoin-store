@@ -51,8 +51,7 @@ import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
-import Data.List (nub)
-import Data.List (sort)
+import Data.List (nub, sort)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Serialize
@@ -337,7 +336,7 @@ account k t at es sign = do
   watched <- nub . concat <$> forM touched (\a -> Set.toList <$> smembers (k.watchers <> a))
   unless (null watched) $ do
     before <- maybe 0 (maybe 0 fst . C.readInteger) <$> get k.xver
-    write (Incr k.xver)
+    write (IncrBy k.xver 1)
     forM_ watched $ \i -> write (HSet (k.entry <> i <> ":meta") "ver" (num (before + 1)))
   -- the transaction in the lists of the categories that it moves, and in
   -- the count of each address that it moves tokens of
@@ -663,7 +662,7 @@ advance k saw target given bsize how path token = do
           ids <- Set.toList <$> smembers k.marked
           unless (null ids) $ do
             version <- number <$> get k.xver
-            write (Incr k.xver)
+            write (IncrBy k.xver 1)
             forM_ ids $ \i -> do
               there <- exists (k.entry <> i <> ":meta")
               when there (write (HSet (k.entry <> i <> ":meta") "ver" (num (version + 1))))
@@ -676,10 +675,10 @@ advance k saw target given bsize how path token = do
     emptied at after = do
       write (Wipe (k.prefix <> "pool:"))
       write (Del k.seen)
-      unless (B.null at) (write (Incr k.restarts))
+      unless (B.null at) (write (IncrBy k.restarts 1))
       settle True "" after
       write (Set k.tip target)
-      write (Incr k.moves)
+      write (IncrBy k.moves 1)
       emit k "b" target
       return (MovedTo target)
     changed change before after = do
@@ -739,7 +738,7 @@ advance k saw target given bsize how path token = do
           write (ZRem k.lostat t)
       settle False before after
       write (Set k.tip target)
-      write (Incr k.moves)
+      write (IncrBy k.moves 1)
       -- the blocks that the tip moved through, oldest first, if the store
       -- that moves it gave them, and the block that it is at now otherwise
       forM_ (if null path then [target] else path) (emit k "b")

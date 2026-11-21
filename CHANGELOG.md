@@ -167,8 +167,17 @@ whitelist it must now say what they grant (`--peer-permission`, or
     started with `hs2:`. Stores of this version and older ones on one
     Redis are two fleets, each with its own pool. Upgrade every store of
     a fleet together; the keys under `hs2:` can be deleted afterwards.
-  The scripts of the reports, of the move of the tip without the pool and
-  of the cache of extended public keys are as they were.
+  - **The cache of extended public keys is written the same way**
+    (`Haskoin.Store.Fleet.XPub.Decide`): building an entry, moving it
+    with the tip in pieces, dropping and evicting. A script that failed
+    among the thousands of rows of a build left an entry half written. A
+    build of a key with 20 addresses costs Redis about 1.5 milliseconds
+    where it cost 1.0. Its reads are still one script and one call, and
+    write nothing but the note that a key was used: a move of the tip
+    that its store left for ten seconds is no longer ended by a read, but
+    by the build that follows the miss.
+  The scripts of the reports and of the move of the tip without the pool
+  are as they were.
 - **The testnet3 of Bitcoin Cash is `--net bchtest3`**, no longer
   `bchtest`, as haskoin-core 3.0 renames it after `bchtest4`. Bitcoin Cash
   Node still runs testnet3, and the store keeps it, as it keeps Bitcoin

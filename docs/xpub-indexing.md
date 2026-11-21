@@ -22,15 +22,15 @@ An entry has, for the addresses that a scan of the key reads:
 
 A read answers only when the request's tip, the fleet tip and the cache's
 tip are the same block, and when the scan needs no address that the entry
-lacks. Every script that edits an entry stamps a new version; a request
+lacks. Every change to an entry stamps a new version; a request
 reads one version of each entry, and is answered again if one changes.
 
 ## The tip move
 
 The member that moves the fleet tip writes the cache's part first, in
 pieces (`cacheBegin`, then `cachePieces`), each marking the entries that it
-touches. Then one step (`fleetCommit`, the decision `advance`) moves the pool, the
-fleet tip and the cache tip together, stamps the marked entries and clears
+touches. Then one step (`fleetCommit`, the decision `advance`) moves the
+pool, the fleet tip and the cache tip together, stamps the marked entries and clears
 the marks. A read of a marked entry waits up to two seconds, then has the
 request answered again: no request sees half a move. A move with no piece
 for ten seconds is aborted by whoever finds it.

@@ -1076,6 +1076,7 @@ entry as soon as the pool takes it. `docs/xpub-indexing.md` has the design.
 | `Haskoin.Store.Fleet.Redis` | Those rules carried out in Redis, each change in one step |
 | `Haskoin.Store.Fleet.Atomic` | A decision made in Haskell from what Redis says, and carried out only if Redis still says the same |
 | `Haskoin.Store.Fleet.Pool.Decide` | Every change to the shared mempool, as such decisions |
+| `Haskoin.Store.Fleet.XPub.Decide` | Every change to the cache of extended public keys, the same way |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |
 | `Haskoin.Store.Web.Router` | Routing of requests to handlers, directly over WAI |
 | `Haskoin.Store.Web.Docs` | The API reference that the server serves at its root |

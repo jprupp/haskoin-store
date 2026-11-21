@@ -76,6 +76,7 @@ library
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.Script
       Haskoin.Store.Fleet.XPub
+      Haskoin.Store.Fleet.XPub.Decide
       Haskoin.Store.Ingest
       Haskoin.Store.Ingest.Ledger
       Haskoin.Store.Ingest.Run
@@ -325,6 +326,7 @@ test-suite spec
       Haskoin.Store.Fleet.Oracle
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec
+      Haskoin.Store.Fleet.XPubDecideSpec
       Haskoin.Store.Fleet.XPubSpec
       Haskoin.Store.FleetSpec
       Haskoin.Store.Histories

@@ -95,6 +95,7 @@ module Haskoin.Store.Fleet.Atomic
     hget,
     hexists,
     hgetall,
+    hkeys,
     sismember,
     smembers,
     zscore,
@@ -119,11 +120,11 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Control.Monad.Trans.Reader (ReaderT, ask, runReaderT)
 import Control.Monad.Trans.State.Strict (StateT, gets, modify', runStateT)
-import Data.Functor.Identity (Identity (..))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Foldable (toList)
+import Data.Functor.Identity (Identity (..))
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -154,6 +155,8 @@ data Query
     HExists !Key !ByteString
   | -- | @HGETALL@
     HGetAll !Key
+  | -- | @HKEYS@
+    HKeys !Key
   | -- | @SISMEMBER@
     SIsMember !Key !ByteString
   | -- | @SMEMBERS@
@@ -177,7 +180,7 @@ data Answer
     Flag !Bool
   | -- | to 'HGetAll'
     Fields !(Map ByteString ByteString)
-  | -- | to 'SMembers'
+  | -- | to 'SMembers' and 'HKeys'
     Members !(Set ByteString)
   | -- | to 'ZScore'
     Scored !(Maybe Score)
@@ -195,8 +198,8 @@ data Op
     Set !Key !ByteString
   | -- | @DEL@
     Del !Key
-  | -- | @INCR@
-    Incr !Key
+  | -- | @INCRBY@
+    IncrBy !Key !Integer
   | -- | @HSET@
     HSet !Key !ByteString !ByteString
   | -- | @HDEL@
@@ -229,6 +232,7 @@ queryKey = \case
   HGet k _ -> k
   HExists k _ -> k
   HGetAll k -> k
+  HKeys k -> k
   SIsMember k _ -> k
   SMembers k -> k
   ZScore k _ -> k
@@ -241,7 +245,7 @@ opKey :: Op -> Either ByteString Key
 opKey = \case
   Set k _ -> Right k
   Del k -> Right k
-  Incr k -> Right k
+  IncrBy k _ -> Right k
   HSet k _ _ -> Right k
   HDel k _ -> Right k
   HIncrBy k _ _ -> Right k
@@ -277,6 +281,7 @@ replay q before ops = case (q, before) of
   (HGet _ f, Text v) -> Text <$> foldM' (field f) v
   (HExists _ f, Flag b) -> Flag <$> foldM' (has f) b
   (HGetAll _, Fields m) -> Fields <$> foldM' fields m
+  (HKeys _, Members s) -> Members <$> foldM' names s
   (SIsMember _ x, Flag b) -> Flag <$> foldM' (isIn x) b
   (SMembers _, Members s) -> Members <$> foldM' members s
   (ZScore _ x, Scored s) -> Scored <$> foldM' (score x) s
@@ -305,7 +310,7 @@ replay q before ops = case (q, before) of
     text v = \case
       Set _ x -> Right (Just x)
       Del _ -> Right Nothing
-      Incr _ -> Just . C.pack . show . (+ 1) <$> number v
+      IncrBy _ n -> Just . C.pack . show . (+ n) <$> number v
       op -> wrong op
     field f v = \case
       HSet _ g x | g == f -> Right (Just x)
@@ -326,6 +331,12 @@ replay q before ops = case (q, before) of
       HDel _ g -> Right (Map.delete g m)
       HIncrBy _ g n -> (\v -> Map.insert g (C.pack (show (v + n))) m) <$> number (Map.lookup g m)
       Del _ -> Right Map.empty
+      op -> wrong op
+    names s = \case
+      HSet _ g _ -> Right (Set.insert g s)
+      HDel _ g -> Right (Set.delete g s)
+      HIncrBy _ g _ -> Right (Set.insert g s)
+      Del _ -> Right Set.empty
       op -> wrong op
     isIn x b = \case
       SAdd _ y | y == x -> Right True
@@ -395,7 +406,7 @@ sortedOp = \case
   _ -> False
 makes = \case
   Set {} -> True
-  Incr {} -> True
+  IncrBy {} -> True
   HSet {} -> True
   HIncrBy {} -> True
   SAdd {} -> True
@@ -464,8 +475,13 @@ newtype Stop = Cannot Unanswerable
 
 -- | The clock of Redis, in milliseconds: read once in a decision, and the
 -- same every time after. The script does not compare it, as it compares
--- answers: a decision may use it for what it writes, and must not let it
--- change what it decides.
+-- answers, and it is a moment earlier than the script.
+--
+-- So a decision may use it for what it writes, and may judge by it only
+-- what stays true as time goes on, or what a moment does not matter to:
+-- that a lease has run out, or that a move went quiet for ten seconds, is
+-- as true a moment later; that a lease has not run out yet is what a
+-- script that ran a moment earlier would have found.
 clock :: (Monad m) => Atomic m Integer
 clock =
   session (gets (.clockAt)) >>= \case
@@ -492,6 +508,7 @@ nothing = \case
   HGet _ _ -> Text Nothing
   HExists _ _ -> Flag False
   HGetAll _ -> Fields Map.empty
+  HKeys _ -> Members Set.empty
   SIsMember _ _ -> Flag False
   SMembers _ -> Members Set.empty
   ZScore _ _ -> Scored Nothing
@@ -628,6 +645,13 @@ hgetall k =
     Fields v -> return v
     _ -> mismatch (HGetAll k)
 
+-- | @HKEYS@.
+hkeys :: (Monad m) => Key -> Atomic m (Set ByteString)
+hkeys k =
+  query (HKeys k) >>= \case
+    Members v -> return v
+    _ -> mismatch (HKeys k)
+
 -- | @SISMEMBER@.
 sismember :: (Monad m) => Key -> ByteString -> Atomic m Bool
 sismember k x =
@@ -701,6 +725,7 @@ answer db = \case
   HGet k f -> Text (Map.lookup f (hash k))
   HExists k f -> Flag (Map.member f (hash k))
   HGetAll k -> Fields (hash k)
+  HKeys k -> Members (Map.keysSet (hash k))
   SIsMember k x -> Flag (Set.member x (group k))
   SMembers k -> Members (group k)
   ZScore k x -> Scored (Map.lookup x (sorted k))
@@ -720,7 +745,7 @@ perform :: Op -> Db -> Db
 perform = \case
   Set k v -> Map.insert k (Bytes v)
   Del k -> Map.delete k
-  Incr k -> Map.alter (Just . Bytes . C.pack . show . (+ 1) . maybe 0 numberOf) k
+  IncrBy k n -> Map.alter (Just . Bytes . C.pack . show . (+ n) . maybe 0 numberOf) k
   HSet k f v -> onHash k (Map.insert f v)
   HDel k f -> onHash k (Map.delete f)
   HIncrBy k f n -> onHash k (\m -> Map.insert f (C.pack (show (maybe 0 integer (Map.lookup f m) + n))) m)

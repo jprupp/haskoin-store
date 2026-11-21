@@ -63,14 +63,16 @@ spec. Change shared state only from its owner, or in one STM transaction
 that reads what the decision depends on.
 
 The shared mempool in Redis is changed only by the decisions of
-`Haskoin.Store.Fleet.Pool.Decide`: Haskell that asks Redis questions and
-lists writes, which `lua/atomic.lua` carries out only if every answer is
-still the same. Do not write a rule of the fleet in Lua: a script that
+`Haskoin.Store.Fleet.Pool.Decide`, and the cache of extended public keys
+by those of `Haskoin.Store.Fleet.XPub.Decide`: Haskell that asks Redis
+questions and lists writes, which `lua/atomic.lua` carries out only if
+every answer is still the same. Do not write a rule of the fleet in Lua: a script that
 fails after its first write leaves Redis half changed. A decision writes
 to a key only as the kind that the key has. `Haskoin.Store.Fleet.DecideSpec`
-holds the decisions to the script that they replaced
-(`test/Haskoin/Store/Fleet/pool.lua`); a change to a decision makes it
-fail, and has to say there what differs and why.
+and `Haskoin.Store.Fleet.XPubDecideSpec` hold the decisions to the
+scripts that they replaced (`pool.lua` and `xpub.lua` in
+`test/Haskoin/Store/Fleet`); a change to a decision makes one fail, and
+has to say there what differs and why.
 
 ## The path into the shared mempool
 

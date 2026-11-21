@@ -24,6 +24,7 @@
 -- at one moment.
 module Haskoin.Store.Fleet.Atomic.Redis
   ( transact,
+    insist,
     Failure (..),
     atomicScript,
 
@@ -86,6 +87,14 @@ transact conn tries decision
       commit conn planned >>= \case
         True -> return (Just planned.result)
         False -> transact conn (tries - 1) decision
+
+-- | Carry out a decision that has to be: one that other stores keep
+-- changing the ground of is decided again, a hundred times before this
+-- gives up with an exception. Nothing was written then.
+insist :: Connection -> (forall m. (Monad m) => Atomic m a) -> IO a
+insist conn decision =
+  transact conn 100 decision
+    >>= maybe (throwIO (Unheard "The fleet changed under a decision a hundred times")) return
 
 -- | What a decision decided, from what Redis said: nothing is changed yet.
 data Planned a = Planned
@@ -172,6 +181,7 @@ asked q = shape : num (length ws) : ws
       HGet k f -> ("p", ["HGET", k, f])
       HExists k f -> ("p", ["HEXISTS", k, f])
       HGetAll k -> ("h", ["HGETALL", k])
+      HKeys k -> ("u", ["HKEYS", k])
       SIsMember k x -> ("p", ["SISMEMBER", k, x])
       SMembers k -> ("u", ["SMEMBERS", k])
       ZScore k x -> ("p", ["ZSCORE", k, x])
@@ -193,7 +203,7 @@ command :: Op -> [ByteString]
 command = \case
   Set k v -> ["SET", k, v]
   Del k -> ["DEL", k]
-  Incr k -> ["INCR", k]
+  IncrBy k n -> ["INCRBY", k, C.pack (show n)]
   HSet k f v -> ["HSET", k, f, v]
   HDel k f -> ["HDEL", k, f]
   HIncrBy k f n -> ["HINCRBY", k, f, C.pack (show n)]
@@ -258,6 +268,7 @@ readAnswer q raw = do
     (Exists _, Number n) -> Right (Flag (n /= 0))
     (HGetAll _, Listed ps) -> maybe wrong (Right . Fields . Map.fromList) (mapM pair ps)
     (SMembers _, Listed xs) -> maybe wrong (Right . Members . Set.fromList) (mapM bytes xs)
+    (HKeys _, Listed xs) -> maybe wrong (Right . Members . Set.fromList) (mapM bytes xs)
     (ZScore _ _, None) -> Right (Scored Nothing)
     (ZScore _ _, Bytes' v) -> maybe wrong (Right . Scored . Just) (score v)
     (ZCard _, Number n) -> Right (Count n)
