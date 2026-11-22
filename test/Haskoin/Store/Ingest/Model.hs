@@ -38,6 +38,10 @@
 --
 -- = Steps of two kinds
 --
+-- A node asked for a transaction sends it if it has it, whether it named
+-- it to the peer or not: the machine asks for what a transaction spends
+-- from when the pool lacks it (A7).
+--
 -- * __Things that go well__: a message is delivered, the pool answers,
 --   the store is in sync again, time passes while nothing else can.
 -- * __Disturbances__: a node takes or drops a transaction, a block
@@ -204,6 +208,10 @@ feed sc input w = do
         Body _ h _ -> [h]
         Checked _ yes no -> yes <> no
         Unchecked _ hs -> hs
+        -- what the pool lacks of what a transaction spends from is
+        -- learned when it gets a place, to be asked for; without one it
+        -- is what the transaction waits for, and nothing of its own
+        Offered _ (Orphan ps) -> filter (`Set.member` ids after) ps
         _ -> []
       gone = Set.fromList [h | Gone h _ <- outs]
   -- T1: nothing leaves in silence, and nothing comes from nowhere
@@ -218,6 +226,16 @@ feed sc input w = do
           check "a named id has no place and the pool is not asked" $
             all (\h -> Set.member h (ids after) || h `elem` concat [cs | Check _ cs <- outs]) hs
     _ -> return ()
+  -- T6: what the pool lacks of what a held transaction spends from has a
+  -- place, to be asked for, if there is a peer to ask and room
+  case input of
+    Offered h (Orphan ps)
+      | Just (Held _ _ (Waiting _ _)) <- placeOf h after,
+        any (\(p, _) -> windowOf p after /= Nothing) sc.peers,
+        Set.size (ids after) < sc.config.room ->
+          check "the pool lacks what a held transaction spends from, and it is not asked for" $
+            all (`Set.member` ids after) (filter (/= h) ps)
+    _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
     [] -> return ()
@@ -229,12 +247,16 @@ feed sc input w = do
   return w' {machine = rebase (horizon sc) after}
   where
     check what ok = if ok then Right () else Left (what <> ", after " <> show input)
+    -- the transactions that another spends from
+    spentFrom = Set.fromList (concat (Map.elems sc.txs))
     send o x = case o of
       Get p hs -> do
         node <- maybe (Left "asked a peer that is not there") Right (Map.lookup p x.nodes)
-        -- T4: only a peer that is there, only for what it named, within its window
+        -- T4: only a peer that is there, only for what it named or for
+        -- what a transaction spends from, within its window
         check "asked a peer that is gone" node.online
-        check "asked a peer for what it did not name" (all (`Set.member` node.told) hs)
+        check "asked a peer for what it did not name and nothing spends from" $
+          all (\h -> Set.member h node.told || Set.member h spentFrom) hs
         check "asked for nothing" (not (null hs))
         return x {toNode = Map.adjust (|> MGet hs) p x.toNode}
       Sweep p -> do

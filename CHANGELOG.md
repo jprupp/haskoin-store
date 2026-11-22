@@ -190,6 +190,25 @@ whitelist it must now say what they grant (`--peer-permission`, or
     through a block in the benchmark, and more on a server. Deciding the
     move over 4,000 transactions takes 1.3 seconds where it took 4.4,
     on a desktop, and decides the same.
+  - **A store takes whatever its node has.** A transaction that a node
+    names is fetched and offered unless the pool has it. It was also left
+    alone if the fleet remembered having seen it, among the newest
+    100,000: a transaction that the pool had let go, for another that
+    took its place, and that the node took again later, stayed out of
+    the store for as long, through every reading of the node's mempool.
+    On a server one stayed out for hours. Two stores of a fleet whose
+    nodes hold transactions in conflict now each offer their own again
+    at every reading; the pool holds the one offered last.
+  - **A store asks its node for what a transaction spends from** when
+    the pool lacks it, at once. It waited for it to come by itself,
+    trying the transaction again after two seconds, four, eight, up to
+    twenty minutes, and a node names a transaction to a peer once: a
+    parent that a store had lost kept everything that spent from it out
+    of the pool until the next reading of the node's mempool. Bitcoin
+    Core sends a transaction that it never named to the peer; Bitcoin
+    Cash Node says that it has it not, and there the store waits as it
+    did. The rule is in the model of the path, with a check that a
+    machine without it fails, and Liquid Haskell passes.
   - **`rbf` is true for every unconfirmed transaction on Bitcoin, and
     false elsewhere.** The nodes of Bitcoin take a replacement of any
     unconfirmed transaction, whatever it signals, since Bitcoin Core 28,

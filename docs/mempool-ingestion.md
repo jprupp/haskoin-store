@@ -40,7 +40,7 @@ what had to hold from end to end, so nothing could be proved.
 These are the axioms: what the proofs take from the world. Each is a rule
 of the nodes that haskoin-core's protocol notes translate from their
 source (`doc/protocol/bitcoin-core.md`, `bitcoin-cash-node.md`). A1, A2,
-A3, A5 and F1 have a test against both nodes in Podman
+A3, A5, A7 and F1 have a test against both nodes in Podman
 (`Haskoin.Store.NodeAxiomsSpec`), so that a release of a node that
 changes one of them is noticed.
 
@@ -52,6 +52,7 @@ changes one of them is noticed.
 | A4 | A node sends in order, and stops sending to a peer that stops reading. It never asks again by itself. |
 | A5 | A node names a transaction after the transactions that it spends from, within one answer. Across answers and across peers there is no order. |
 | A6 | A node drops transactions from its mempool without saying so: confirmed, replaced, evicted, expired. |
+| A7 | A node that has a transaction has those that it spends from, unless a block has confirmed them. Asked for one of them that it never named to the peer, Bitcoin Core sends it, and Bitcoin Cash Node says `notfound`, though it has it. Neither drops the peer for asking. |
 | F1 | The RPC of a node is a source as a peer is one: `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from, and `getrawtransaction` gives a transaction or the error -5 for one that the node has not. Any other answer, or none, says nothing of what the node has. |
 | R1 | A Redis script runs alone, start to end. |
 | R2 | Redis may lose all its data, and the store finds out (the epoch). It may be away for any time. |
@@ -93,11 +94,20 @@ checker has a world that shows this, and that must fail.
    with less room than its node's mempool has transactions takes it in
    rounds.
 4. **T4, the store keeps its node.** It asks a peer only for what that
-   peer named, never for more at once than a window that follows what the
-   peer delivers, and it sends nothing that the model of the node
-   (`Haskoin.Node.judgeMessage`) says gets it dropped.
+   peer named, or for what a transaction that the store holds spends
+   from and the pool lacks (A7), never for more at once than a window
+   that follows what the peer delivers, and it sends nothing that the
+   model of the node (`Haskoin.Node.judgeMessage`) says gets it dropped.
 5. **T5, what the store says is true.** The count of pending
    transactions in `/health` is the number of requests out.
+6. **T6, a transaction does not wait for what can be asked for.** When
+   the pool says that it lacks a transaction that a held one spends
+   from, the store asks its peers for it at once, if it has a peer and
+   room. It does not wait for it to come by itself.
+7. **T7, the pool takes what the node has.** Whether a transaction that
+   a node names is settled is whether the pool has it, and nothing else:
+   not whether the fleet saw it before. A store never turns away, for
+   something that it remembers, a transaction that its own node holds.
 
 ## What is not promised
 
@@ -113,11 +123,17 @@ checker has a world that shows this, and that must fail.
   it or the pool's own limit of age takes it out. Each store of a fleet
   has a node of its own, so the pool is the union of what they hold, and
   no single node can say that a transaction is gone.
-- **What the pool let go.** The fleet remembers what the pool decided on,
-  the newest 100,000 (`fleet:seen`), and the store does not fetch those
-  again. A transaction that the pool let go for its age, or turned away
-  for one that conflicts with it, stays out while it is remembered, even
-  if a node still has it.
+- **Nodes that disagree.** Two stores of a fleet whose nodes hold
+  transactions in conflict cannot both have theirs in the pool: it holds
+  one, the one offered last, and each store offers its own again when it
+  next reads its node's mempool. The fleet remembered what its pool had
+  let go, once, and did not fetch it again (`fleet:seen`); that kept a
+  store from taking back what its own node held, which is worse, and
+  the set is no longer asked (T7). A fleet with one node for each
+  network, as most are, has no such conflict.
+- **A transaction with no children that the store lost** without knowing
+  it is back at the next reading of the source, every ten minutes, and
+  not before: nothing spends from it, so nothing asks for it (T6).
 - **Time.** T3 bounds steps, not seconds: a node or a Redis that answers
   slowly makes it slow, never wrong.
 
@@ -152,6 +168,13 @@ checker has a world that shows this, and that must fail.
 - **A transaction held for a parent is found by that parent**, and tried
   when the parent settles, in place of every held transaction at every
   turn.
+- **A parent that the pool lacks is asked for**, of every peer, when the
+  pool says so (`seek`). The store waited for it to come by itself once,
+  and tried the child again after two seconds, four, eight, up to twenty
+  minutes: a node names a transaction to a peer once (A1), so a parent
+  that the store had lost was never named again, and everything that
+  spent from it stayed out with it. The pool has just said that it lacks
+  the parent, so the parent gets a place without the pool being asked.
 - **A pure step function and a runner.** Every decision is in
   `step :: Input -> Ingest -> (Ingest, [Output])`. The runner reads an
   input, calls `step`, and carries out the outputs. It decides nothing.
@@ -205,12 +228,21 @@ states.
 
 - In every state: nothing leaves in silence and what a peer names has a
   place or is asked of the pool (T1); the invariant, with the bounds and
-  the exact indexes (T2); a peer is asked only for what it named, a
-  source only for its mempool (T4); the count of requests out (T5).
+  the exact indexes (T2); a peer is asked only for what it named or for
+  what a transaction spends from, a source only for its mempool (T4);
+  the count of requests out (T5); what the pool lacks of what a held
+  transaction spends from has a place, to be asked for, when there is a
+  peer and room (T6).
 - From every state, with nothing more going wrong: every run ends, and
   ends with the mempool of every connected source in the pool (T3).
-- Four bugs planted in `step`, one for each kind of check, are each
-  found. A check that has never failed is not known to work.
+- Five bugs planted in `step`, one for each kind of check, are each
+  found. A check that has never failed is not known to work. The fifth
+  is a machine that does not ask for what the pool lacks: it fails in
+  every world that has a chain.
+- The nodes of these worlds send what they have when asked, named or not
+  (A7 as Bitcoin Core does it). That a Bitcoin Cash Node says `notfound`
+  for what it did not name is not in them: the store then waits for the
+  next reading, as it did, which the worlds without the new rule passed.
 - One world breaks an assumption and must fail: a source that names a
   child first, with room for one id (A5). The search finds the store going
   round for ever there, and the program of `scripts/check-ingest.sh` ends
@@ -222,12 +254,17 @@ three, three peers, every disturbance) keep the same rules and converge.
 **Tested against the real programs**, Bitcoin Core and Bitcoin Cash Node
 in Podman:
 
-- **The store end to end** (`Haskoin.Store.MempoolSpec`): six situations
-  in which a store must end with exactly the mempool of its node, on each
-  node. It starts from nothing; it starts at the tip with an empty pool
-  and a large mempool; it was away while transactions came, with and
-  without a block; its Valkey is stopped and started again under it (R2);
-  its node takes chains while it finds blocks. Three of them fail on the
+- **The store end to end** (`Haskoin.Store.MempoolSpec`): eight
+  situations in which a store must end with exactly the mempool of its
+  node, on each node. It starts from nothing; it starts at the tip with
+  an empty pool and a large mempool; it was away while transactions
+  came, with and without a block; its Valkey is stopped and started
+  again under it (R2); its node takes chains while it finds blocks; its
+  pool lost transactions that its node then takes children of (T6); its
+  pool let go of transactions that its node still has (T7). The last two
+  fail without their rule. On Bitcoin Core, a ninth: the node replaces
+  transactions by ones that pay more, and the store has the
+  replacements and nothing of what they replaced. Three of them fail on the
   version that fell behind on the server, so they can see that failure,
   and one failed one run in three on the path before this one, a race.
   They do not decide the order of events, and so cannot find a race by
@@ -244,7 +281,9 @@ in Podman:
   each transaction after those it spends from, sends one that is asked
   for, and says `notfound` for one that it never had (A2, A3, A5); asked
   by a peer with no permission, Bitcoin Core closes the connection and
-  Bitcoin Cash Node, which serves Bloom filters, answers (A2). Over its
+  Bitcoin Cash Node, which serves Bloom filters, answers (A2); asked for
+  what a transaction that it named spends from, and that it never named,
+  Bitcoin Core sends it and Bitcoin Cash Node says `notfound` (A7). Over its
   RPC, a node gives the id of every transaction of its mempool, each
   after those it spends from, the transactions asked for, and its word
   for one that it never had; a node that nobody listens for, or that does
@@ -282,6 +321,21 @@ kind that the stores had, and none showed in an example.
    world had failed.** It printed the failure and ended as a success.
    Found by breaking A5 on purpose to see what the order of names is
    needed for.
+
+Two more were found on a server, by comparing the mempool of the node
+with that of the store, id by id, and neither by a check here:
+
+7. **A transaction that the fleet remembered and the pool did not have
+   was never fetched again.** A server did not take a transaction that
+   its node held for hours, through every reading of the node's mempool:
+   the pool had let it go once, and "settled" meant "in the pool, or
+   seen before". The model took the pool's word for what is settled, and
+   the store asked something else. It asks the pool alone now (T7).
+8. **Transactions waited twenty minutes for a parent that nobody was
+   fetching.** A test ended with 84 held behind four that the store had
+   lost. The parent is asked for now (T6). How those four were lost is
+   not known: the test passed 17 times after, and once again where it
+   had failed.
 
 The same search showed where the first model of the world was wrong: it
 used the name of a peer again for a later connection, which haskoin-node

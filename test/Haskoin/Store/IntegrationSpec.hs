@@ -74,7 +74,7 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
-import Data.List (nub, sort, sortOn)
+import Data.List (isInfixOf, nub, sort, sortOn)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
@@ -405,11 +405,25 @@ withTestLogger f = withTestLog (\logger _ -> f logger)
 -- to the action: what a test prints when the store does something it should
 -- not, such as stop syncing, which happens too seldom to be run again with
 -- the log on ('syncDiagnostics').
+--
+-- It keeps as many lines again of those above the level of debugging, and
+-- gives them first. A store that is stuck goes on answering the test and
+-- waiting for events, a line of debugging for each, and what made it
+-- stuck is soon out of the last lines: a test of the mempool failed with
+-- four hundred lines of a store that did nothing, and nothing of the
+-- half minute before, in which it lost four transactions.
 withTestLog :: (Logger -> IO [String] -> IO a) -> IO a
 withTestLog f = do
   kept <- newIORef Seq.empty
-  let keep line = atomicModifyIORef' kept $ \q -> (Seq.drop (Seq.length q + 1 - tailLines) (q Seq.|> line), ())
-      recent = toList <$> readIORef kept
+  said <- newIORef Seq.empty
+  let after ref line = atomicModifyIORef' ref $ \q -> (Seq.drop (Seq.length q + 1 - tailLines) (q Seq.|> line), ())
+      keep line = do
+        after kept line
+        unless ("[Debug" `isInfixOf` line) (after said line)
+      recent = do
+        above <- toList <$> readIORef said
+        every <- toList <$> readIORef kept
+        return (["--- above the level of debugging"] <> above <> ["--- at every level"] <> every)
       recording printed =
         Logger
           { level = LevelDebug,

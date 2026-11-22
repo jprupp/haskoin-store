@@ -41,14 +41,12 @@ knows nothing of the mempool, and is unhealthy.
   entered it, that an offer found in it or in conflict with it, and that
   left it unconfirmed. The pool adds them in the step that decides, and
   each server trims the set at its turn when it grows a hundredth past its
-  bound. A server checks every announcement against it in one call
-  (`ZMSCORE`), and against what it holds to offer, and fetches none of
-  them. It is the same for every server and outlives a restart, so a
-  transaction is fetched about once for the fleet, and one that another
-  server dropped is not fetched and offered again. What a server received
-  and has not offered is not in it: if the server stops before the offer,
-  another fetches the transaction. Without an answer from Redis, a server
-  fetches what is announced.
+  bound. Nothing decides by it any more. A server checked every
+  announcement against it once, and fetched nothing that the fleet had
+  seen: a transaction that the pool had let go and that a node still
+  held was then never fetched again. A server now checks an announcement
+  against the pool alone, in one call (`ZMSCORE`), and against what it
+  holds to offer (`docs/mempool-ingestion.md`, T7).
 
 The pool and the tip are written only by the decisions of the pool
 (`Haskoin.Store.Fleet.Pool.Decide`), each carried out in one step: they
@@ -88,9 +86,9 @@ What the server does with each answer:
 
 | Answer | What the server does |
 | --- | --- |
-| Taken, or already known | Lets it go; the fleet has seen it, so no server fetches it again |
-| Orphan | Keeps it waiting, and tries again next round, for 20 minutes at most |
-| Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place. If that offer is not decided either, as when a new rival came, it waits for the next round: the fleet counts a conflict as seen, so no other server would fetch it |
+| Taken, or already known | Lets it go; the pool has it, so no server fetches it again |
+| Orphan | Asks its peers for the transactions that it spends from and the pool lacks, keeps it waiting for them, and tries again after two seconds, four, eight, for 20 minutes at most |
+| Conflict | Offers it again naming the rivals as replaced: a peer relayed it, so its node took it in their place. If that offer is not decided either, as when a new rival came, it waits for the next round |
 | Late | Stops; the next round offers it again at the new tip |
 
 **Replacement by fee** works through the conflict rule. A peer relays Y

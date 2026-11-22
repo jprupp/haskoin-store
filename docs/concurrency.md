@@ -322,7 +322,7 @@ The invariants the fleet relies on:
 | I3 | The tip moves only to a block that every live store has a view of | `report.lua` takes a report only from a store with a view of the tip, or alone; the advance checks the agreed block |
 | I4 | The pool is emptied only when no live store could say the way | the advance empties for a way that the caller does not know only if the caller is the one live store (`mayEmptyAlone`), and only a store whose report was taken moves the tip |
 | I5 | A store keeps a view of the fleet tip while it is live | `prune` decides what to keep in the transaction that lets views go, and a block joins the recent ones before its view is taken |
-| I6 | A transaction is in the seen set only if some store will not need to fetch it again | a transaction in conflict stays waiting until the pool decides on it; expiry chooses and withdraws in one step |
+| I6 | Whether a transaction that a node names is fetched is whether the pool has it | the stores ask the pool alone (`fleetSettled`). They asked what the fleet had seen too, once, and the invariant was that a transaction was in that set only if no store would need to fetch it again; it did not hold for a transaction that the pool let go and a node took again, which then stayed out (`docs/mempool-ingestion.md`, T7) |
 
 The member's own state:
 

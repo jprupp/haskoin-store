@@ -73,6 +73,8 @@ spec = do
       let on what = describe (name kind <> " " <> what)
       on "names a transaction to a peer" $
         it "once, and never one that it took before the peer connected (A1)" (withBed kind namesOnce)
+      on "asked for what a transaction that it named spends from" $
+        it "sends it though it never named it, or says that it has it not (A7)" (withBed kind (sendsParents kind))
       on "asked for its mempool by a peer that it allows" $
         it "names all of it, each after those it spends from, and sends or says it has not (A2, A3, A5)" $
           withBed kind namesAll
@@ -100,6 +102,37 @@ namesOnce bed = do
         named <- namedIn <$> collect p 10
         filter (== txHash new) named `shouldBe` [txHash new]
         filter (== txHash old) named `shouldBe` []
+    _ -> expectationFailure "Not two transactions"
+
+-- | A7. The node takes a transaction, a peer connects, and the node takes
+-- one that spends from the first: the peer is told of the second only
+-- (A1). Asked for the first, Bitcoin Core sends it, and Bitcoin Cash Node
+-- says that it has it not, though it has: it sends a peer what it named
+-- to that peer and nothing else.
+--
+-- The path into the pool asks for what a transaction spends from when
+-- the pool lacks it (@seek@ in "Haskoin.Store.Ingest"). With Bitcoin Core
+-- that brings it at once. With Bitcoin Cash Node it brings it only if the
+-- node named it on this connection, and otherwise the transaction waits,
+-- as it did before, for the next reading of the node's mempool, which a
+-- store of Bitcoin Cash always has a source for (A2).
+sendsParents :: NodeKind -> Bed -> IO ()
+sendsParents kind bed = do
+  roots <- fund bed 1
+  case concatMap (chainOf 2) roots of
+    [parent, child] -> do
+      send bed parent
+      withProbe bed $ \p -> do
+        send bed child
+        named <- namedIn <$> collect p 10
+        named `shouldBe` [txHash child]
+        tell p (MGetData (GetData [InvVector InvTx (txHash parent).get]))
+        answers <- collect p 6
+        let sent = [txHash tx | MTx tx <- answers]
+            denied = [TxHash h | MNotFound (NotFound ivs) <- answers, InvVector _ h <- ivs]
+        (sent, denied) `shouldBe` case kind of
+          BitcoinCore -> ([txHash parent], [])
+          BitcoinCashNode -> ([], [txHash parent])
     _ -> expectationFailure "Not two transactions"
 
 -- | A2, A3 and A5. A peer that the node allows asks for its mempool: the

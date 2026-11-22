@@ -220,8 +220,10 @@ poolExpire conn keys tsize before most = insist conn (D.expire (D.poolKeys keys.
 -- The fleet keeps, in one sorted set, each transaction that the pool has
 -- decided on: each that entered it, that an offer found in it or in
 -- conflict with it, and that left it unconfirmed, by the time at which it
--- was first seen. No store fetches one of them when a peer announces it
--- ('fleetSeen'). The pool's script adds them, with @ZADD NX@, in the step
+-- was first seen. No store fetched one of them when a peer announced it,
+-- once; whether a store fetches is now whether the pool has the
+-- transaction ('fleetSettled'), and nothing decides by this set. The
+-- pool's decisions add them, with @ZADD NX@, in the step
 -- that decides, so a transaction that a store received and has not offered
 -- is not in the set: if the store stops first, another fetches it. In
 -- Redis, the set is the same for every store and outlives a store that
@@ -242,24 +244,26 @@ fleetSeen conn keys ts =
     scores :: Redis (Either Reply [Maybe ByteString])
     scores = R.sendRequest ("ZMSCORE" : keys.prefix <> "fleet:seen" : ts)
 
--- | Of these transactions, which are settled: the pool has them, or the
--- fleet remembers that the pool decided on them ('fleetSeen'). Both are
--- asked in one round trip.
+-- | Of these transactions, which are settled: those that the pool has.
 --
--- What the fleet has seen is trimmed to the newest ('fleetTrimSeen'), and
--- a pool larger than that has transactions that are no longer among them:
--- those are found in the pool itself.
+-- A node names a transaction because it has it, and the pool is to have
+-- what the nodes of its stores have. So a transaction that a node names
+-- and that the pool has not is fetched and offered, whatever became of it
+-- before: the pool, with the chain as the store has it, then says what it
+-- is ('Haskoin.Store.Fleet.Member.memberOffer').
+--
+-- What the fleet remembered having seen ('fleetSeen') counted as settled
+-- too, once, so that no store fetched what the pool had decided on. A
+-- transaction that was remembered and that the pool did not have was then
+-- never fetched again, whichever way it had come to that: a server did
+-- not take a transaction that its own node held for hours, and read the
+-- whole mempool of the node again without taking it.
 fleetSettled :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
 fleetSettled _ _ [] = return []
-fleetSettled conn keys ts = do
-  (seen, held) <- run conn $ do
-    a <- scores "fleet:seen"
-    b <- scores "pool:time"
-    return ((,) <$> a <*> b)
-  return (zipWith (\x y -> isJust x || isJust y) seen held)
+fleetSettled conn keys ts = map isJust <$> run conn held
   where
-    scores :: ByteString -> Redis (Either Reply [Maybe ByteString])
-    scores k = R.sendRequest ("ZMSCORE" : keys.prefix <> k : ts)
+    held :: Redis (Either Reply [Maybe ByteString])
+    held = R.sendRequest ("ZMSCORE" : keys.prefix <> "pool:time" : ts)
 
 -- | Move the tip to a block and bring the pool there, in one step: given
 -- the tip that the caller saw, the block, which must be the one that the

@@ -55,6 +55,10 @@
 --   transactions that arrives in any order is offered root first, one
 --   offer each.
 --
+-- * __What the pool lacks of what a held transaction spends from is asked
+--   for__ (@seek@), of every peer, at once. It is not waited for: nothing
+--   says that it will come by itself.
+--
 -- = What the runner does
 --
 -- 'step' takes an 'Input' and gives 'Output's. The runner turns messages
@@ -546,13 +550,42 @@ offered h v acc@(s, said) = case Map.lookup h (places s) of
           waits
             | Set.null waits -> again
             | mayWait s ->
-                let (t, s') = waiting h since waits s
+                let (t, s') = waiting h since waits (foldl' seek s waits)
                  in (edit (rehold h (Waiting waits t)) s', said)
             | otherwise -> forget NoRoom h acc
     Again -> again
   _ -> acc
   where
     again = ((edit (rehold h Later) s) {later = Set.insert h s.later}, said)
+
+-- | The pool lacks a transaction that a held one spends from. If the
+-- machine has no place for it, it is wanted of every peer, since now, as
+-- if each had named it: a node that has a transaction has what it spends
+-- from, or a block has confirmed that.
+--
+-- The machine waited for it to come by itself once, trying the held
+-- transaction again after two seconds, then four, then eight, and giving
+-- it up after twenty minutes, to read the sources again. A transaction
+-- that the store had lost without knowing it, which happened, then kept
+-- all that spent from it out of the pool for as long: 84 transactions
+-- behind four, in one test. Asking costs a request, and a node that has
+-- it not says so.
+--
+-- The pool has just said that it lacks the transaction, so it is not
+-- asked again whether it has decided on it, as it is for what a peer
+-- names ('Check'): what the fleet remembers having seen, and no longer
+-- has, would stay away for that.
+--
+-- With no peer to ask, or no room, nothing is done here, and the held
+-- transaction waits as it did.
+seek :: (Ord p, Ord h) => Ingest p h b -> h -> Ingest p h b
+seek s p
+  | Map.member p (places s) || Set.null peers = s
+  | otherwise = case L.put p (Wanted (Map.fromSet (const s.now) peers)) s.ledger of
+      Just ledger -> foldl' (\st q -> queued q p st) s {ledger} peers
+      Nothing -> s
+  where
+    peers = Map.keysSet s.links
 
 -- | A peer is gone: what was asked of it is wanted of the others, and
 -- what only it named is given up.

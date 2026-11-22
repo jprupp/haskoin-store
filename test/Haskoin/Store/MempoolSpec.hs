@@ -71,7 +71,8 @@ import Haskoin
     txHash,
   )
 import Haskoin.Node (Logger, Permissions)
-import Haskoin.Store (Store, WebConfig (..), runWebSocket, withStore)
+import Haskoin.Store (Store, WebConfig (..), cachePrefix, runWebSocket, withStore)
+import Haskoin.Store.Fleet.Redis (fleetKeys, poolWithdraw)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Temp (withRamDir)
 import Haskoin.Store.Integration.Valkey (redisContainer)
@@ -111,10 +112,17 @@ spec = do
           it "has what the block left in the mempool when it is back" (withBed kind (away True))
         on "A store whose Valkey is stopped and started again under it" $
           it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
+        on "A store whose pool let transactions go that its node still has" $
+          it "has them again when it next reads the mempool of its node" (withBed kind letGo)
+        on "A store whose pool lost transactions that its node then takes children of" $
+          it "asks its node for them, and has them and their children" (withBed kind bereft)
         on "A store whose node takes chains while it finds blocks" $
           it "has every transaction that no block confirmed" (withBed kind busy)
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
+      -- Bitcoin Cash Node replaces nothing by fee
+      describe "A store whose node replaces transactions by ones that pay more, on Bitcoin Core" $
+        it "has the replacements, and nothing of what they replaced" (withBed BitcoinCore outbid)
       -- Bitcoin Cash Node gives its mempool to any peer, so only a store
       -- of Bitcoin Core can have no peer that is a source
       forM_ [False, True] $ \block ->
@@ -192,6 +200,71 @@ away block bed = withRamDir $ \dir -> do
   submit bed (map (take 12) chains)
   when block . void $ generateTo bed.node 1 bed.miner
   submit bed (map (drop 12) chains)
+  withMemberIn bed dir $ \_ server -> converges bed server 60
+
+-- | A node that takes chains of transactions, and then, for the first of
+-- each chain, another that spends the same output and pays more: it
+-- replaces the first and drops what spent from it (replace-by-fee, which
+-- a node of Bitcoin does for any unconfirmed transaction). The store has
+-- to follow: a node is the judge of what is in its mempool, and a store
+-- that kept what its node dropped, or turned away what its node took,
+-- would answer what no node would. The replacements pay ten times the
+-- fees of what they replace.
+outbid :: Bed -> IO ()
+outbid bed = do
+  roots <- fund bed 8
+  withMember bed $ \_ server -> do
+    submit bed (map (chainOf 3) roots)
+    converges bed server 60
+    forM_ roots $ \(op, value) -> send bed (spend op [TxOut 0 note, TxOut (value - 30 * fee) lock])
+    converges bed server 60
+
+-- | A store that runs while its pool loses transactions, without the
+-- store being told, and whose node then takes a transaction that spends
+-- from each. The node named the lost ones once and will not name them
+-- again, so nothing brings them back but the store asking for them when
+-- the pool says that it lacks what a child spends from (@seek@ in
+-- "Haskoin.Store.Ingest").
+--
+-- Without that the children waited, tried again after two seconds, four,
+-- eight, and were given up after twenty minutes, when the store read the
+-- mempool of its node again: a test ended with 84 transactions waiting
+-- behind four.
+bereft :: Bed -> IO ()
+bereft bed = do
+  roots <- fund bed 6
+  let chains = map (chainOf 2) roots
+  withMember bed $ \_ server -> do
+    submit bed (map (take 1) chains)
+    converges bed server 60
+    conn <- Redis.checkedConnect (either error id (redisConnectInfo bed.redisURL))
+    left <- poolWithdraw conn (fleetKeys (cachePrefix bed.net) 32) 32 [encode (txHash tx) | tx : _ <- chains]
+    Redis.disconnect conn
+    length left `shouldBe` 6
+    submit bed (map (drop 1) chains)
+    converges bed server 60
+
+-- | A store that stops, whose pool then lets go of the first transaction
+-- of each chain and of all that spends it, as when another transaction
+-- took their place and was itself taken out later, and that starts
+-- again: the node has them all, so the store has them all again.
+--
+-- The fleet remembers what its pool decided on, the transactions that it
+-- let go among them, and a store did not fetch what the fleet remembered:
+-- on a server, a transaction that the node held for hours stayed out of
+-- the store through every reading of the node's mempool. Only what the
+-- pool has counts as settled now.
+letGo :: Bed -> IO ()
+letGo bed = withRamDir $ \dir -> do
+  roots <- fund bed 6
+  let chains = map (chainOf 3) roots
+  withMemberIn bed dir $ \_ server -> do
+    submit bed chains
+    converges bed server 60
+  conn <- Redis.checkedConnect (either error id (redisConnectInfo bed.redisURL))
+  left <- poolWithdraw conn (fleetKeys (cachePrefix bed.net) 32) 32 [encode (txHash tx) | tx : _ <- chains]
+  Redis.disconnect conn
+  length left `shouldBe` 18
   withMemberIn bed dir $ \_ server -> converges bed server 60
 
 -- | A store whose Valkey is stopped and started again while it runs, as

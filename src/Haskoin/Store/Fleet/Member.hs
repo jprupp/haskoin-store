@@ -1164,9 +1164,9 @@ memberOffer m time tx =
                 _ -> return (Left i.outpoint.hash)
 
 -- | How many transactions the fleet remembers having seen, the newest
--- ('fleetTrimSeen'), trimmed at each turn of a member. A peer announces a transaction within seconds of having
--- it, so a hundred thousand covers far more than the time in which the
--- peers of the fleet announce one, at any rate that Bitcoin carries.
+-- ('fleetTrimSeen'), trimmed at each turn of a member. Nothing decides
+-- by what the fleet has seen any more ('fleetSettled'): the bound keeps
+-- the set from growing.
 mostSeen :: Int
 mostSeen = 100000
 
