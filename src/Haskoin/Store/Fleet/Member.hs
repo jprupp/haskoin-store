@@ -97,7 +97,6 @@ module Haskoin.Store.Fleet.Member
     changeBetween,
     memberSettled,
     memberOffer,
-    mostSeen,
     memberPoolBody,
     memberNewest,
     expirePool,
@@ -445,9 +444,8 @@ memberAlive m =
       _ -> False
 
 -- | One round of what a member does: report, move the tip if the stores
--- agree on another block, let go of old views, and trim what the fleet
--- has seen ('fleetTrimSeen'). Call it every second or two, and when
--- the best block changes. A store whose own health checks fail must not
+-- agree on another block, and let go of old views. Call it every second
+-- or two, and when the best block changes. A store whose own health checks fail must not
 -- call it: its lease then runs out, and the fleet goes on without it.
 memberTick :: Member -> IO ()
 memberTick m = do
@@ -464,7 +462,6 @@ memberTick m = do
   prune m
   cacheGauges m
   unless moved (expirePool m)
-  void (fleetTrimSeen m.redis m.keys mostSeen)
   where
     decoded = either (const Nothing) Just . decode
 
@@ -1063,9 +1060,8 @@ poolTx net td =
         mapMaybe (address . (.script)) (IntMap.elems td.prevs)
           <> mapMaybe (address . (.script)) td.tx.outputs
 
--- | Of these transactions, which are settled: the pool has them, or the
--- fleet remembers that the pool decided on them. 'Nothing' if Redis does
--- not answer in five seconds.
+-- | Of these transactions, which are settled: the pool has them
+-- ('fleetSettled'). 'Nothing' if Redis does not answer in five seconds.
 --
 -- It is what "Haskoin.Store.Ingest" asks before it gives a place to what a
 -- peer names ('Haskoin.Store.Ingest.Check'): a node names its whole
@@ -1162,13 +1158,6 @@ memberOffer m time tx =
                       let o = parent.tx.outputs !! fromIntegral i.outpoint.index
                        in return (Right (Just (n, Prev o.script o.value)))
                 _ -> return (Left i.outpoint.hash)
-
--- | How many transactions the fleet remembers having seen, the newest
--- ('fleetTrimSeen'), trimmed at each turn of a member. Nothing decides
--- by what the fleet has seen any more ('fleetSettled'): the bound keeps
--- the set from growing.
-mostSeen :: Int
-mostSeen = 100000
 
 -- | The body of a transaction of the pool, for the filters of @/events@.
 memberPoolBody :: Member -> TxHash -> IO (Maybe TxData)

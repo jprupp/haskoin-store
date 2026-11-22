@@ -102,9 +102,7 @@ module Haskoin.Store.Fleet.Redis
     poolBody,
     poolRead,
 
-    -- * What the fleet has seen
-    fleetTrimSeen,
-    fleetSeen,
+    -- * What is settled
     fleetSettled,
 
     -- * Scripts
@@ -214,36 +212,6 @@ poolWithdraw conn keys tsize ts = insist conn (D.withdraw (D.poolKeys keys.prefi
 poolExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
 poolExpire conn keys tsize before most = insist conn (D.expire (D.poolKeys keys.prefix tsize) before most)
 
--- | Keep the newest of the transactions that the fleet has seen, so
--- many. Gives how many are kept.
---
--- The fleet keeps, in one sorted set, each transaction that the pool has
--- decided on: each that entered it, that an offer found in it or in
--- conflict with it, and that left it unconfirmed, by the time at which it
--- was first seen. No store fetched one of them when a peer announced it,
--- once; whether a store fetches is now whether the pool has the
--- transaction ('fleetSettled'), and nothing decides by this set. The
--- pool's decisions add them, with @ZADD NX@, in the step
--- that decides, so a transaction that a store received and has not offered
--- is not in the set: if the store stops first, another fetches it. In
--- Redis, the set is the same for every store and outlives a store that
--- restarts; in the memory of each store, as it was before, every store
--- fetched each transaction once, and again after a restart. The set is
--- trimmed here, when it has grown a hundredth past its bound, and not on
--- every addition.
-fleetTrimSeen :: Connection -> FleetKeys -> Int -> IO Integer
-fleetTrimSeen conn keys most = insist conn (D.trim (D.poolKeys keys.prefix 0) most)
-
--- | Of these transactions, which the fleet has seen ('fleetTrimSeen'), in one
--- round trip.
-fleetSeen :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
-fleetSeen _ _ [] = return []
-fleetSeen conn keys ts =
-  map isJust <$> run conn scores
-  where
-    scores :: Redis (Either Reply [Maybe ByteString])
-    scores = R.sendRequest ("ZMSCORE" : keys.prefix <> "fleet:seen" : ts)
-
 -- | Of these transactions, which are settled: those that the pool has.
 --
 -- A node names a transaction because it has it, and the pool is to have
@@ -252,12 +220,13 @@ fleetSeen conn keys ts =
 -- before: the pool, with the chain as the store has it, then says what it
 -- is ('Haskoin.Store.Fleet.Member.memberOffer').
 --
--- What the fleet remembered having seen ('fleetSeen') counted as settled
--- too, once, so that no store fetched what the pool had decided on. A
--- transaction that was remembered and that the pool did not have was then
--- never fetched again, whichever way it had come to that: a server did
--- not take a transaction that its own node held for hours, and read the
--- whole mempool of the node again without taking it.
+-- The fleet kept a set of what its pool had decided on, once, the newest
+-- hundred thousand (@fleet:seen@), and what was in it counted as settled
+-- too, so that no store fetched it again. A transaction that was
+-- remembered and that the pool did not have was then never fetched,
+-- whichever way it had come to that: a server did not take a transaction
+-- that its own node held for hours, and read the whole mempool of the
+-- node again without taking it. The set is no longer kept.
 fleetSettled :: Connection -> FleetKeys -> [ByteString] -> IO [Bool]
 fleetSettled _ _ [] = return []
 fleetSettled conn keys ts = map isJust <$> run conn held
@@ -348,9 +317,8 @@ fleetCommitTelling tell conn keys tsize clock store seen target known path token
 -- none would ever say what the blocks did, and the tip would stay where it
 -- is for good: a fleet whose stores came back together after half a day
 -- away answered nothing from then on. Emptying the pool costs the
--- transactions that were in it until the stores fill it again: what the
--- fleet has seen is forgotten with it, and the count of 'fleetRestarts'
--- goes up, so that each store reads the mempool of its node and asks its
+-- transactions that were in it until the stores fill it again: the
+-- count of 'fleetRestarts' goes up, so that each store reads the mempool of its node and asks its
 -- peers for theirs.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =

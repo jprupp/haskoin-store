@@ -295,9 +295,8 @@ undisturbed how earlier during confirmed =
         let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
          in decided at (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
       Take ts -> decided at (D.withdraw k (map block ts))
-      Go back dead done used ->
+      Go back dead done _ ->
         decided at (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
-          . decided at (D.trim k (length used))
           . decided at (X.evict kx (length done))
           . decided at (X.drop kx "x1")
           . decided at (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
@@ -464,8 +463,6 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
       expected <- luaExpire conn lua 4 cutoff most
       got <- transact conn 1 (D.expire k cutoff most)
       fmap Set.fromList got `shouldBe` Just (Set.fromList expected)
-      kept <- luaTrim conn lua (length used)
-      transact conn 1 (D.trim k (length used)) `shouldReturn` Just kept
       return (if moved == MovedTo target then Just target else tip, n + 1)
   there <- everything conn lua.prefix
   here <- everything conn ours.prefix
@@ -487,14 +484,16 @@ versions earlier now =
 
 -- all that Redis has under a prefix. Of what the pool keeps of a
 -- transaction to take it out again, which each writes in its own way,
--- only for which transactions; of what the fleet saw, not when; of the
--- events, not their numbers nor their order
+-- only for which transactions; of the events, not their numbers nor
+-- their order. What the fleet saw is left out: the script kept a set of
+-- it, by which the stores decided what to fetch, and the decisions keep
+-- none, since a store fetches whatever the pool has not
 everything :: Redis.Connection -> ByteString -> IO Dump
 everything conn p = do
   let list :: Redis.Redis (Either Redis.Reply a) -> IO a
       list = fmap (either (error . show) id) . Redis.runRedis conn
       name = B.drop (B.length p)
-  ks <- sort <$> list (Redis.keys (p <> "*"))
+  ks <- sort . filter ((/= "fleet:seen") . name) <$> list (Redis.keys (p <> "*"))
   forM ks $ \key ->
     (name key,) <$> do
       kind <- list (Redis.getType key)
@@ -504,9 +503,8 @@ everything conn p = do
           | name key == "pool:entries" -> sort . map fst <$> list (Redis.hgetall key)
           | otherwise -> sort . map (\(f, v) -> f <> " = " <> v) <$> list (Redis.hgetall key)
         Redis.Set -> sort <$> list (Redis.smembers key)
-        Redis.ZSet
-          | name key == "fleet:seen" -> sort . map fst <$> list (Redis.zrangeWithscores key 0 (-1))
-          | otherwise -> map (\(x, sc) -> x <> " @ " <> C.pack (show sc)) <$> list (Redis.zrangeWithscores key 0 (-1))
+        Redis.ZSet ->
+          map (\(x, sc) -> x <> " @ " <> C.pack (show sc)) <$> list (Redis.zrangeWithscores key 0 (-1))
         -- transactions that spend from the same one leave in the
         -- order in which Redis lists a set, which is no order
         Redis.Stream ->

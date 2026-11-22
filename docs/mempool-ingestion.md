@@ -129,7 +129,7 @@ checker has a world that shows this, and that must fail.
   next reads its node's mempool. The fleet remembered what its pool had
   let go, once, and did not fetch it again (`fleet:seen`); that kept a
   store from taking back what its own node held, which is worse, and
-  the set is no longer asked (T7). A fleet with one node for each
+  the set is no longer kept (T7). A fleet with one node for each
   network, as most are, has no such conflict.
 - **A transaction with no children that the store lost** without knowing
   it is back at the next reading of the source, every ten minutes, and

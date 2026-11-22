@@ -100,28 +100,30 @@ spec = do
           `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
-      it "sees what the pool decided on, and keeps the newest" $ \(conn, fresh) -> do
+      it "counts as settled what the pool has, and nothing that it had or turned away" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
         fleetMove conn keys Nothing Nothing `shouldReturn` MovedTo (block 1)
         let at = Just (block 1)
-        -- taken, known and in conflict are seen; late and orphans are not
+        -- what the pool took is settled; what it found in conflict, late
+        -- or an orphan is not: a node that names one has it, and the pool
+        -- is to be offered it again
         poolOffer conn keys 4 at (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
         poolOffer conn keys 4 at (txOf 7 [out 0 0]) [True] [] `shouldReturn` Known
         poolOffer conn keys 4 at (txOf 8 [out 0 0]) [True] [] `shouldReturn` Conflict [block 7]
         poolOffer conn keys 4 Nothing (txOf 9 [out 0 1]) [True] [] `shouldReturn` Late
         poolOffer conn keys 4 at (txOf 10 [out 5 0]) [False] [] `shouldReturn` Orphan [out 5 0]
-        fleetSeen conn keys (map block [7 .. 10]) `shouldReturn` [True, True, False, False]
-        -- withdrawn is seen
+        fleetSettled conn keys (map block [7 .. 10]) `shouldReturn` [True, False, False, False]
+        -- nor is what the pool let go: the fleet remembered that once,
+        -- and a server did not take a transaction that its node held
         poolOffer conn keys 4 at (txOf 11 [out 0 2]) [True] [] `shouldReturn` Taken
+        fleetSettled conn keys [block 11] `shouldReturn` [True]
         poolWithdraw conn keys 4 [block 11] `shouldReturn` [block 11]
-        fleetSeen conn keys [block 11] `shouldReturn` [True]
-        fleetSeen conn keys [] `shouldReturn` []
-        -- a bound of 20 is trimmed past 21, to the newest
-        forM_ [100 .. 129] $ \i -> poolOffer conn keys 4 at (txOf i [out 1 i]) [True] [] `shouldReturn` Taken
-        fleetTrimSeen conn keys 40 `shouldReturn` 33
-        fleetTrimSeen conn keys 20 `shouldReturn` 20
-        drop 10 <$> fleetSeen conn keys (map block [100 .. 129]) `shouldReturn` replicate 20 True
+        fleetSettled conn keys [block 11] `shouldReturn` [False]
+        fleetSettled conn keys [] `shouldReturn` []
+        -- and the pool keeps no list of what it has seen
+        (Redis.runRedis conn (Redis.keys (keys.prefix <> "fleet:seen")) >>= either (fail . show) return)
+          `shouldReturn` []
       it "takes out a transaction that pays an output of value 0, as an anchor does" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
@@ -189,12 +191,12 @@ spec = do
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
-      it "empties the pool and what the fleet saw for any store when the way is too long" $ \(conn, fresh) -> do
+      it "empties the pool for any store when the way is too long" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
         fleetAdvance conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
-        fleetSeen conn keys [block 7] `shouldReturn` [True]
+        fleetSettled conn keys [block 7] `shouldReturn` [True]
         fleetRestarts conn keys `shouldReturn` 0
         -- two stores that both have a view of the tip, so both are live,
         -- at a block that neither will say the way to
@@ -211,7 +213,7 @@ spec = do
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
         -- the stores fetch its transactions again, and fill it again
-        fleetSeen conn keys [block 7] `shouldReturn` [False]
+        fleetSettled conn keys [block 7] `shouldReturn` [False]
         fleetRestarts conn keys `shouldReturn` 1
         -- still only to the block that the live stores agree on, and only
         -- from the tip that the store saw

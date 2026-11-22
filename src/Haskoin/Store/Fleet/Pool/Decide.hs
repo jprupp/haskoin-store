@@ -46,7 +46,6 @@ module Haskoin.Store.Fleet.Pool.Decide
     offer,
     withdraw,
     expire,
-    trim,
     How (..),
     advance,
   )
@@ -93,7 +92,6 @@ data Keys = Keys
     -- | the recent blocks of each store, newest first
     recent :: !(K 'Hash),
     events :: !(K 'Stream),
-    seen :: !(K 'Sorted),
     xver :: !(K 'Number),
     -- | the outputs that each transaction spends, one after the other
     spends :: !(K 'Hash),
@@ -157,7 +155,6 @@ poolKeys p tsize =
       lease = named (p <> "fleet:lease"),
       recent = named (p <> "fleet:recent"),
       events = named (p <> "fleet:events"),
-      seen = named (p <> "fleet:seen"),
       xver = named (p <> "fleet:xver"),
       spends = named (p <> "pool:spends"),
       spender = named (p <> "pool:spender"),
@@ -217,13 +214,6 @@ maker k = B.take k.tsize
 -- store serves the same events in the same order.
 emit :: (Monad m) => Keys -> ByteString -> ByteString -> Atomic m ()
 emit k kind what = xadd k.events 10000 [("k", kind), ("h", what)]
-
--- | The fleet has seen a transaction: the pool decided on it. Kept by the
--- time at which it was first seen, on the clock of Redis.
-sawIt :: (Monad m) => Keys -> ByteString -> Atomic m ()
-sawIt k t = do
-  now <- clock
-  zaddNew k.seen (fromIntegral now) t
 
 -- | Whether a transaction is in the pool.
 member :: (Monad m) => Keys -> ByteString -> Atomic m Bool
@@ -486,9 +476,7 @@ remove k quiet t =
   hget k.spends t >>= \case
     Nothing -> return ()
     Just inputs -> do
-      unless quiet $ do
-        emit k "d" t
-        sawIt k t
+      unless quiet (emit k "d" t)
       (at, es) <- maybe (0, []) kept <$> hget k.entries t
       account k t at es (-1)
       hdel k.entries t
@@ -514,7 +502,6 @@ insert k tx = do
   zadd k.ids 0 t
   account k t tx.time tx.entries 1
   emit k "t" t
-  sawIt k t
 
 -- | Whether a store has the floor: it began a move of the tip
 -- ('Haskoin.Store.Fleet.XPub.Decide.begin'), and said in the last ten
@@ -573,17 +560,6 @@ expire k before most = do
   old <- zrangeByScore k.time (At 0) (At (fromIntegral before)) (Just most)
   withdraw k (map fst old)
 
--- | Keep the newest so many of the transactions that the fleet has seen:
--- how many are kept. Trimmed only when the set has grown a hundredth past
--- its bound, so that most calls cost a count.
-trim :: (Monad m) => Keys -> Int -> Atomic m Integer
-trim k most = do
-  n <- zcard k.seen
-  let bound = toInteger most
-  if n > bound + max 1 (bound `div` 100)
-    then zremRangeByRank k.seen 0 (n - bound - 1) >> return bound
-    else return n
-
 -- | Offer a transaction, which the store checked against a tip: the tip
 -- that it saw or nothing, whether each output that the transaction spends
 -- is unspent at that tip, the transactions that it replaces, and the
@@ -607,14 +583,14 @@ offer k saw unspent replaces tx = do
     else do
       known <- member k tx.txid
       if known
-        then sawIt k tx.txid >> return Known
+        then return Known
         else do
           leaving <- descendants k replaces
           let left = Set.fromList leaving
           spenders <- forM tx.inputs (hget k.spender)
           let rivals = nub [s | Just s <- spenders, Set.notMember s left]
           if not (null rivals)
-            then sawIt k tx.txid >> return (Conflict rivals)
+            then return (Conflict rivals)
             else do
               made <- forM tx.inputs $ \o -> (&& Set.notMember (maker k o) left) <$> member k (maker k o)
               let orphans = [o | (o, ours, free) <- zip3 tx.inputs made (unspent <> repeat False), not ours, not free]
@@ -797,12 +773,10 @@ advance k saw target given bsize how path token = do
           del k.moving
           del k.beat
       set k.xtip after
-    -- the pool starts again. What it decided on is gone, so the fleet
-    -- forgets what it saw, and a counter tells the stores to fill the
-    -- pool again; the first tip of a fleet empties nothing.
+    -- the pool starts again, and a counter tells the stores to fill it
+    -- again; the first tip of a fleet empties nothing.
     emptied at after = do
       wipe (k.prefix <> "pool:")
-      del k.seen
       unless (B.null at) (incrBy k.restarts 1)
       settle True "" after
       set k.tip target

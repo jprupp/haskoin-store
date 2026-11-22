@@ -11,7 +11,6 @@ module Haskoin.Store.Fleet.Oracle
   ( luaOffer,
     luaWithdraw,
     luaExpire,
-    luaTrim,
     luaCommit,
     luaRestart,
 
@@ -58,10 +57,6 @@ luaWithdraw conn keys tsize ts =
 luaExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
 luaExpire conn keys tsize before most =
   run conn (evalScript poolScript [] ["expire", keys.prefix, num tsize, C.pack (show before), num most])
-
-luaTrim :: Connection -> FleetKeys -> Int -> IO Integer
-luaTrim conn keys most =
-  run conn (evalScript poolScript [] ["trim", keys.prefix, "0", num most])
 
 -- | The commit of a move of the tip: by a store that says what the blocks
 -- did, or by one that does not know and may empty the pool if it is alone.

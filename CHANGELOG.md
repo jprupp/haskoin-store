@@ -198,7 +198,10 @@ whitelist it must now say what they grant (`--peer-permission`, or
     the store for as long, through every reading of the node's mempool.
     On a server one stayed out for hours. Two stores of a fleet whose
     nodes hold transactions in conflict now each offer their own again
-    at every reading; the pool holds the one offered last.
+    at every reading; the pool holds the one offered last. The set of
+    what the fleet saw (`fleet:seen`) is no longer kept: an offer writes
+    one thing less, and a member no longer trims it at each turn. The
+    key of an older store is left unread, and can be deleted.
   - **A store asks its node for what a transaction spends from** when
     the pool lacks it, at once. It waited for it to come by itself,
     trying the transaction again after two seconds, four, eight, up to

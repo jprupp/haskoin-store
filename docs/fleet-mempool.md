@@ -36,17 +36,13 @@ knows nothing of the mempool, and is unhealthy.
   times the pool was started again.
 - **A stream of events**: what entered, what left, which blocks the tip
   went through.
-- **What the fleet saw** (`fleet:seen`): the newest 100,000 transactions
-  that the pool decided on, by the time each was first seen: those that
-  entered it, that an offer found in it or in conflict with it, and that
-  left it unconfirmed. The pool adds them in the step that decides, and
-  each server trims the set at its turn when it grows a hundredth past its
-  bound. Nothing decides by it any more. A server checked every
-  announcement against it once, and fetched nothing that the fleet had
-  seen: a transaction that the pool had let go and that a node still
-  held was then never fetched again. A server now checks an announcement
-  against the pool alone, in one call (`ZMSCORE`), and against what it
-  holds to offer (`docs/mempool-ingestion.md`, T7).
+- **No list of what the fleet saw.** There was one (`fleet:seen`), the
+  newest 100,000 transactions that the pool had decided on, and a server
+  fetched nothing that was in it: a transaction that the pool had let go
+  and that a node still held was then never fetched again. A server now
+  checks an announcement against the pool alone, in one call
+  (`ZMSCORE`), and against what it holds to offer
+  (`docs/mempool-ingestion.md`, T7), and the list is no longer kept.
 
 The pool and the tip are written only by the decisions of the pool
 (`Haskoin.Store.Fleet.Pool.Decide`), each carried out in one step: they
@@ -178,9 +174,8 @@ A server goes through 50 blocks at most. Two cases are past that:
 - **The way is longer than 50 blocks.** That is true for every server, so
   any of them may empty the pool and move the tip.
 
-Either way the script also empties the xpub cache, whose pool layer is
-gone, and the fleet's seen set, since what the pool decided on is gone
-too, and counts the restart (`fleet:restarts`). Each server sees the count
+Either way the decision also empties the xpub cache, whose pool layer is
+gone, and counts the restart (`fleet:restarts`). Each server sees the count
 change at its turn (`noteRestarts`) and fills the pool again as after a
 loss of Redis, below.
 
@@ -229,8 +224,7 @@ permissions that the operator says the nodes of `--peer` grant
 A fleet without `--node-rpc`, and without a peer that serves Bloom filters
 or a `--peer` that grants `mempool`, has no source. It gets back only what
 its peers announce from then on: new transactions, and those wallets
-broadcast again. After a loss of the pool the seen set was emptied with
-it, so none of those is skipped. Each of its servers says in `/health`
+broadcast again. Each of its servers says in `/health`
 (`mempool`) that it has no source.
 
 ## Reading
@@ -337,7 +331,7 @@ uses, and cannot be better without knowing what miners will do.
   offered, mined and unwound (3,000 random histories).
 - `Haskoin.Store.Fleet.RedisSpec`: the scripts against a real Redis, step
   by step against the model, the tokens included, plus the emptying
-  rules, the events, and the set of what the fleet saw.
+  rules, the events, and what counts as settled.
 - `Haskoin.Store.Fleet.CacheSpec`: two members on one chain and a real
   Redis: random histories of payments, blocks, reorganisations and builds,
   each cached entry held to the queries at the tip and the pool; a

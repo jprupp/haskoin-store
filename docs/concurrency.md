@@ -92,9 +92,9 @@ every order of events, or by a test.
 ## The fleet
 
 Each store is a member of a fleet, alone or not. The state in Redis (the
-tip, the pool, the leases and reports, the seen set, the cache of xpubs, the
+tip, the pool, the leases and reports, the cache of xpubs, the
 events) is written only in single steps, each a decision that checks again
-what it depends on. The pool, the seen set, the events of the pool and the
+what it depends on. The pool, the events of the pool and the
 move of the tip with the pool are written by the decisions of
 `Haskoin.Store.Fleet.Pool.Decide`, and the cache of xpubs by those of
 `Haskoin.Store.Fleet.XPub.Decide`; the reports and the move of the tip
@@ -322,7 +322,7 @@ The invariants the fleet relies on:
 | I3 | The tip moves only to a block that every live store has a view of | `report.lua` takes a report only from a store with a view of the tip, or alone; the advance checks the agreed block |
 | I4 | The pool is emptied only when no live store could say the way | the advance empties for a way that the caller does not know only if the caller is the one live store (`mayEmptyAlone`), and only a store whose report was taken moves the tip |
 | I5 | A store keeps a view of the fleet tip while it is live | `prune` decides what to keep in the transaction that lets views go, and a block joins the recent ones before its view is taken |
-| I6 | Whether a transaction that a node names is fetched is whether the pool has it | the stores ask the pool alone (`fleetSettled`). They asked what the fleet had seen too, once, and the invariant was that a transaction was in that set only if no store would need to fetch it again; it did not hold for a transaction that the pool let go and a node took again, which then stayed out (`docs/mempool-ingestion.md`, T7) |
+| I6 | Whether a transaction that a node names is fetched is whether the pool has it | the stores ask the pool alone (`fleetSettled`). They asked a set of what the fleet had seen too, once, and the invariant was that a transaction was in that set only if no store would need to fetch it again; it did not hold for a transaction that the pool let go and a node took again, which then stayed out (`docs/mempool-ingestion.md`, T7). The set is no longer kept |
 
 The member's own state:
 
@@ -462,8 +462,8 @@ finding was checked against the code before it was fixed.
 
 - **Redis that fails over to a replica that lags**, or restarts from an old
   snapshot, keeps its epoch: the stores do not notice, and what was offered
-  since is gone from the pool and from the seen set. The pool fills again
-  from new announcements. Run Redis without replicas that can be promoted
+  since is gone from the pool. The pool fills again from new
+  announcements and from the next reading of the nodes' mempools. Run Redis without replicas that can be promoted
   behind, or flush it, which the stores notice.
 - **The stream of events keeps 10,000 entries.** A listener further behind
   loses what was trimmed, without an error.

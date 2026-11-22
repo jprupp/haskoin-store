@@ -572,9 +572,8 @@ offered h v acc@(s, said) = case Map.lookup h (places s) of
 -- it not says so.
 --
 -- The pool has just said that it lacks the transaction, so it is not
--- asked again whether it has decided on it, as it is for what a peer
--- names ('Check'): what the fleet remembers having seen, and no longer
--- has, would stay away for that.
+-- asked again whether it has it, as it is for what a peer names
+-- ('Check').
 --
 -- With no peer to ask, or no room, nothing is done here, and the held
 -- transaction waits as it did.
