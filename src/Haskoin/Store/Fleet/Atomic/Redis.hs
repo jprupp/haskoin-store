@@ -37,6 +37,7 @@
 module Haskoin.Store.Fleet.Atomic.Redis
   ( transact,
     transactTelling,
+    Attempt (..),
     insist,
     Failure (..),
     atomicScript,
@@ -57,7 +58,7 @@ module Haskoin.Store.Fleet.Atomic.Redis
 where
 
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, evaluate, throwIO)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Builder qualified as BB
@@ -67,7 +68,9 @@ import Data.FileEmbed (embedFile, makeRelativeToProject)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Data.Word (Word64)
 import Database.Redis (Connection, Redis, Reply, runRedis)
+import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin.Store.Fleet.Atomic
 import Haskoin.Store.Fleet.Script (Script, evalScript, script)
 import Numeric (showFFloat)
@@ -99,29 +102,68 @@ atomicScript = script $(makeRelativeToProject "src/Haskoin/Store/Fleet/lua/atomi
 transact :: Connection -> Int -> (forall m. (Monad m) => Atomic m a) -> IO (Maybe a)
 transact conn tries = transactTelling conn tries (\_ -> return ())
 
--- | 'transact', telling of each time that the decision was not carried
--- out which question has another answer now: the first of them, in the
--- order in which the decision asked.
+-- | 'transact', telling of each try what it cost and how it ended, as
+-- an t'Attempt'.
 --
 -- A decision that is refused says nothing of why, and one that is refused
 -- time after time has a cause: a move of the tip was refused for hours on
 -- a server, and which of its sixty thousand answers had changed had to be
--- guessed.
+-- guessed. And a decision that is slow says nothing of where its time
+-- goes: the same move took ten seconds on that server, of which Redis had
+-- less than one.
 transactTelling ::
   Connection ->
   Int ->
-  (Query -> IO ()) ->
+  (Attempt -> IO ()) ->
   (forall m. (Monad m) => Atomic m a) ->
   IO (Maybe a)
 transactTelling conn tries tell decision
   | tries <= 0 = return Nothing
   | otherwise = do
+      began <- getMonotonicTimeNSec
       planned <- plan conn decision
-      carry conn planned >>= \case
+      answers <- evaluate (length planned.guards)
+      written <- evaluate (length planned.writes)
+      decided <- getMonotonicTimeNSec
+      outcome <- carry conn planned
+      ended <- getMonotonicTimeNSec
+      tell
+        Attempt
+          { passes = planned.rounds,
+            answers,
+            written,
+            planning = decided - began,
+            waiting = planned.waited,
+            carrying = ended - decided,
+            changed = either Just (const Nothing) outcome
+          }
+      case outcome of
         Right () -> return (Just planned.result)
-        Left changed -> do
-          tell changed
-          transactTelling conn (tries - 1) tell decision
+        Left _ -> transactTelling conn (tries - 1) tell decision
+
+-- | What one try of a decision cost, and how it ended. The times are in
+-- nanoseconds, on the clock of the store.
+data Attempt = Attempt
+  { -- | how many times Redis was asked
+    passes :: !Int,
+    -- | how many answers the decision depends on
+    answers :: !Int,
+    -- | how many writes it decided on
+    written :: !Int,
+    -- | the time to decide, from the first question to the last write
+    planning :: !Word64,
+    -- | how much of that went by in calls to Redis: sending the
+    -- questions, Redis answering, and reading the answers. The rest is
+    -- the decision itself, gone through once for each time that Redis
+    -- was asked.
+    waiting :: !Word64,
+    -- | the time to carry it out: putting the answers and the writes as
+    -- the script takes them, and the one call
+    carrying :: !Word64,
+    -- | the first question that had another answer, if it was refused
+    changed :: !(Maybe Query)
+  }
+  deriving (Show)
 
 -- | Carry out a decision that has to be: one that other stores keep
 -- changing the ground of is decided again, a hundred times before this
@@ -140,7 +182,9 @@ data Planned a = Planned
     writes :: ![Op],
     -- | how many times Redis was asked: with one, all that the decision
     -- knows Redis said at one moment
-    rounds :: !Int
+    rounds :: !Int,
+    -- | how long the calls to Redis took between them, in nanoseconds
+    waited :: !Word64
   }
 
 -- | Make a decision, and change nothing. Throws a t'Failure' if Redis does
@@ -149,11 +193,17 @@ plan :: Connection -> (forall m. (Monad m) => Atomic m a) -> IO (Planned a)
 plan conn decision = do
   heard <- newIORef Map.empty
   now <- newIORef Nothing
+  spent <- newIORef (0 :: Word64)
   -- The clock of a decision is that of Redis when the decision first
   -- asked it anything, whenever the decision first reads the clock
   -- ('clock').
-  let fetch qs = do
-        (t, raws) <- reading conn qs
+  let timed call = do
+        from <- getMonotonicTimeNSec
+        got <- call
+        to <- getMonotonicTimeNSec
+        got <$ modifyIORef' spent (+ (to - from))
+      fetch qs = do
+        (t, raws) <- timed (reading conn qs)
         modifyIORef' now (<|> Just t)
         modifyIORef' heard (\m -> foldr (uncurry Map.insert) m (zip qs raws))
         either (throwIO . Unheard) return (mapM (uncurry readAnswer) (zip qs raws))
@@ -161,7 +211,7 @@ plan conn decision = do
         readIORef now >>= \case
           Just t -> return t
           Nothing -> do
-            t <- fst <$> reading conn []
+            t <- fst <$> timed (reading conn [])
             modifyIORef' now (<|> Just t)
             return t
   runAtomic Backend {fetch, time} decision >>= \case
@@ -169,7 +219,8 @@ plan conn decision = do
     Decided result depends writes rounds -> do
       raws <- readIORef heard
       let guards = [(q, raw) | (q, _) <- depends, Just raw <- [Map.lookup q raws]]
-      return Planned {result, guards, writes, rounds}
+      waited <- readIORef spent
+      return Planned {result, guards, writes, rounds, waited}
 
 -- | Carry out what a decision decided, if the answers that it depends on
 -- are still true: whether it was carried out. If not, nothing changed.

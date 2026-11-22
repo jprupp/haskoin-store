@@ -144,6 +144,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import Database.Redis qualified as R
 import GHC.Clock (getMonotonicTimeNSec)
+import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Haskoin
   ( BlockHash,
     BlockHeader (..),
@@ -662,10 +663,13 @@ moveTip m = do
     -- the pool, the tip and the cache together
     moveWith seen token target = do
       began <- getMonotonicTimeNSec
-      changed <- newIORef Nothing
+      collected <- collector
+      tried <- newIORef []
+      cacheAt <- newIORef Nothing
       way <- case (traverse decode seen, decode target) of
         (Right from, Right to) -> wayBetween m.views m.db from to
         _ -> return NoWay
+      found <- getMonotonicTimeNSec
       let between = case way of
             Way b -> Just b
             _ -> Nothing
@@ -675,7 +679,9 @@ moveTip m = do
       written <- case (way, decode target) of
         (Way b, Right to) ->
           withViewAt m.views to (\r -> tipMoves m.redis m.keys r b.abandoned b.added) >>= \case
-            Just moves -> cachePieces m.redis m.keys token (fromMaybe "" seen) moves
+            Just moves -> do
+              getMonotonicTimeNSec >>= writeIORef cacheAt . Just
+              cachePieces m.redis m.keys token (fromMaybe "" seen) moves
             Nothing -> return False
         (Way _, _) -> return False
         -- the store's chain moved since its report: not this turn
@@ -683,6 +689,7 @@ moveTip m = do
         -- what the abandoned blocks held cannot be read: not this turn
         (Unreadable, _) -> return False
         _ -> return True
+      pieced <- getMonotonicTimeNSec
       moved <-
         if not written
           then return Raced
@@ -697,7 +704,7 @@ moveTip m = do
               fleetRestart m.redis m.keys 32 Nothing seen target
             _ ->
               fleetCommitTelling
-                (writeIORef changed . Just)
+                (\a -> modifyIORef' tried (a :))
                 m.redis
                 m.keys
                 32
@@ -709,11 +716,61 @@ moveTip m = do
                 path
                 token
       ended <- getMonotonicTimeNSec
-      why <- readIORef changed
-      let took = shown ((ended - began) `div` 1000000) <> " ms"
+      attempts <- reverse <$> readIORef tried
+      collecting <- collector
+      readAt <- fromMaybe pieced <$> readIORef cacheAt
+      let ms a b = shown ((b - a) `div` 1000000)
+          millis n = shown (n `div` 1000000)
+          took = ms began ended <> " ms"
           -- what Redis answered otherwise when the move was to be carried
           -- out, if it was decided and then refused
-          refusal = maybe "" (\q -> ", refused for the answer to " <> T.pack (show q)) why
+          refusal = case mapMaybe (.changed) attempts of
+            [] -> ""
+            qs -> ", refused for the answer to " <> T.pack (show (last qs))
+          -- Where the time went. Transactions wait for as long as a move
+          -- takes, and what would shorten it depends on which part is
+          -- long: reading the blocks from the database, the cache, the
+          -- decision, which is gone through once for each time that Redis
+          -- is asked, or Redis.
+          parts =
+            T.intercalate ", " $
+              [ "over " <> shown (maybe 0 (length . (.pool.confirmed)) between) <> " transactions",
+                "the blocks read in " <> ms began found <> " ms",
+                "the cache read in " <> ms found readAt <> " and written in " <> ms readAt pieced <> " ms"
+              ]
+                <> [ mconcat
+                       [ "decided in ",
+                         millis a.planning,
+                         " ms, ",
+                         millis a.waiting,
+                         " of them in ",
+                         shown a.passes,
+                         " calls to Redis, with ",
+                         shown a.answers,
+                         " answers and ",
+                         shown a.written,
+                         " writes, and ",
+                         maybe "carried out" (const "refused") a.changed,
+                         " in ",
+                         millis a.carrying,
+                         " ms"
+                       ]
+                   | a <- attempts
+                   ]
+                -- every thread waits while the collector runs, this one
+                -- too: a store with a large heap may spend most of a move
+                -- there, whatever the move does
+                <> [ mconcat
+                       [ "the collector ran for ",
+                         shown ((after.gc_elapsed_ns - before.gc_elapsed_ns) `div` 1000000),
+                         " ms meanwhile, in ",
+                         shown (after.gcs - before.gcs),
+                         " collections, ",
+                         shown (after.major_gcs - before.major_gcs),
+                         " of the whole heap"
+                       ]
+                   | (Just before, Just after) <- [(collected, collecting)]
+                   ]
       m.config.note LevelDebug . mconcat $
         [ "Fleet tip from ",
           maybe "none" blockName seen,
@@ -725,6 +782,9 @@ moveTip m = do
             Raced -> ": not moved, another store did it first or has to",
           " in ",
           took,
+          " (",
+          parts,
+          ")",
           refusal,
           case way of
             Way _ -> ""
@@ -743,7 +803,7 @@ moveTip m = do
           -- one is said: half of the ten seconds that the floor lasts
           -- without a word is slow
           when (ended - began >= 5000000000) . m.config.note LevelInfo $
-            "The fleet tip moved to " <> blockName target <> " in " <> took
+            "The fleet tip moved to " <> blockName target <> " in " <> took <> ": " <> parts
           atomically (writeTVar m.refused 0)
           return True
         _ -> do
@@ -762,9 +822,18 @@ moveTip m = do
               blockName target,
               ": the store answers from the block that it is at. The last took ",
               took,
+              " (",
+              parts,
+              ")",
               refusal
             ]
           False <$ cacheAbort m.redis m.keys token
+    -- what the collector has done so far, if the store keeps count
+    -- (@+RTS -T@)
+    collector =
+      getRTSStatsEnabled >>= \case
+        True -> Just <$> getRTSStats
+        False -> return Nothing
     redis' :: R.Redis (Either R.Reply a) -> IO a
     redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
     chunks bytes

@@ -244,7 +244,12 @@ A move that is not over in ten minutes has gone wrong, and its store
 stops saying that it is at it. A store whose move is refused five turns
 in a row says so in its log, at the level of a warning, with how long the
 last took and which answer had changed; one whose move took five seconds
-or more says how long, since transactions wait meanwhile.
+or more says how long, since transactions wait meanwhile. Both say where
+the time went: the blocks read from the database, the cache read and
+written, the decision with how much of it was calls to Redis, the call
+that carries it out, and how long the garbage collector ran meanwhile.
+What would shorten a move depends on which of those is long, and that is
+measured on the server and not guessed.
 
 The move costs in proportion to its block, by going through the writes to
 one cell only for a question about that cell

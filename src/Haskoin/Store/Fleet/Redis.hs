@@ -92,6 +92,7 @@ module Haskoin.Store.Fleet.Redis
     fleetAdvance,
     fleetCommit,
     fleetCommitTelling,
+    Attempt (..),
     fleetRestart,
     fleetRestarts,
     FleetEvent (..),
@@ -121,8 +122,8 @@ import Data.Maybe (fromMaybe, isJust)
 import Database.Redis (Connection, Redis, Reply (..))
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
-import Haskoin.Store.Fleet.Atomic (Atomic, Query)
-import Haskoin.Store.Fleet.Atomic.Redis (insist, transact, transactTelling)
+import Haskoin.Store.Fleet.Atomic (Atomic)
+import Haskoin.Store.Fleet.Atomic.Redis (Attempt (..), insist, transact, transactTelling)
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Pool.Types
 import Haskoin.Store.Fleet.Script (Script, evalScript, script)
@@ -314,11 +315,12 @@ fleetCommit ::
   IO Moved
 fleetCommit = fleetCommitTelling (\_ -> return ())
 
--- | 'fleetCommit', telling of each time that the move was decided and not
--- carried out which question had another answer by then
--- ('transactTelling'): what a store says of a tip that does not move.
+-- | 'fleetCommit', telling of each time that the move was decided what
+-- that cost and, if it was not carried out, which question had another
+-- answer by then ('transactTelling'): what a store says of a tip that
+-- does not move, or moves slowly.
 fleetCommitTelling ::
-  (Query -> IO ()) ->
+  (Attempt -> IO ()) ->
   Connection ->
   FleetKeys ->
   Int ->
@@ -364,7 +366,7 @@ fleetRestarts conn keys =
 -- what the decision asked about makes it be decided again, three times at
 -- most: then the move is 'Raced', and the store tries at its next turn.
 advance ::
-  (Query -> IO ()) ->
+  (Attempt -> IO ()) ->
   Connection ->
   FleetKeys ->
   Int ->

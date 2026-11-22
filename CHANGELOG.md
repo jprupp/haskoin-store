@@ -177,7 +177,10 @@ whitelist it must now say what they grant (`--peer-permission`, or
     decision also judges time by one clock, read at its start, where it
     read the clock again each time it asked Redis, and so found its own
     lease of ten seconds run out. A store says in its log when a move
-    took five seconds or more: transactions wait meanwhile.
+    took five seconds or more, since transactions wait meanwhile, and
+    where the time went: reading the blocks, reading and writing the
+    cache, deciding, the calls to Redis, carrying it out, and the
+    garbage collector.
   - **A decision of any size is carried out.** Its questions and writes
     go to Redis a thousand to an argument, without the writes that a
     later delete undoes and with one command for many members of a key.
