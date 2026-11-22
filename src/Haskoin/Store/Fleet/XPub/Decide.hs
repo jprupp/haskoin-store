@@ -61,62 +61,93 @@ import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
-import Haskoin.Store.Fleet.Atomic
+import Haskoin.Store.Fleet.Atomic.Keys
+import Haskoin.Store.Fleet.Pool.Decide qualified as P
 import Prelude hiding (drop)
 
 -- | The keys of the cache and of what it reads beside itself, under the
--- prefix of a fleet. A key that ends in a colon is the start of a key for
--- each address or entry.
+-- prefix of a fleet, each with the kind of what it holds.
 data Keys = Keys
   { -- | the fleet tip
-    fleet :: !ByteString,
+    fleet :: !(K 'Text),
     -- | how many times the tip moved
-    moves :: !ByteString,
+    moves :: !(K 'Number),
     -- | the version that the last change of an entry got
-    xver :: !ByteString,
+    xver :: !(K 'Number),
     -- | the place of the tip that the cache is at: a move and its block
-    place :: !ByteString,
+    place :: !(K 'Text),
     -- | the entries by their priority, lowest first to go
-    prio :: !ByteString,
+    prio :: !(K 'Sorted),
     -- | the priority of the last entry that was evicted
-    level :: !ByteString,
+    level :: !(K 'Number),
     -- | how many addresses the entries have between them
-    addrs :: !ByteString,
+    addrs :: !(K 'Number),
     -- | the entries that have each address
-    watchers :: !ByteString,
-    -- | the start of the keys of each entry
-    entry :: !ByteString,
+    watchers :: !(Family 'Group),
+    -- | the keys of the pool, for those of each entry (@entryOf@)
+    pool :: !P.Keys,
     -- | the move of the tip under way: its token and when it last wrote
-    moving :: !ByteString,
+    moving :: !(K 'Text),
     -- | the entries that the move under way wrote
-    marked :: !ByteString,
+    marked :: !(K 'Group),
     -- | the transactions of the pool at each address, the outputs that it
     -- pays to each, and what it keeps for each output
-    atx :: !ByteString,
-    aout :: !ByteString,
-    aval :: !ByteString
+    atx :: !(Family 'Sorted),
+    aout :: !(Family 'Sorted),
+    aval :: !(Family 'Hash)
   }
 
--- | The keys under a prefix.
+-- | The keys under a prefix. Those that the pool has too, the tip, the
+-- count of its moves, the version of the entries, the move under way, the
+-- entries that have each address and what the pool holds at each, are
+-- taken from the keys of the pool: each has one name and one kind.
 cacheKeys :: ByteString -> Keys
 cacheKeys p =
   Keys
-    { fleet = p <> "fleet:tip",
-      moves = p <> "fleet:moves",
-      xver = p <> "fleet:xver",
-      place = p <> "fx:tip",
-      prio = p <> "fx:prio",
-      level = p <> "fx:level",
-      addrs = p <> "fx:addrs",
-      watchers = p <> "fx:of:",
-      entry = p <> "fx:e:",
-      moving = p <> "fx:moving",
-      marked = p <> "fx:marked",
-      atx = p <> "pool:atx:",
-      aout = p <> "pool:aout:",
-      aval = p <> "pool:aval:"
+    { fleet = pool.tip,
+      moves = pool.moves,
+      xver = pool.xver,
+      place = pool.xtip,
+      prio = named (p <> "fx:prio"),
+      level = named (p <> "fx:level"),
+      addrs = named (p <> "fx:addrs"),
+      watchers = pool.watchers,
+      pool,
+      moving = pool.moving,
+      marked = pool.marked,
+      atx = pool.atx,
+      aout = pool.aout,
+      aval = pool.aval
+    }
+  where
+    -- the size of a transaction id is not asked of these keys
+    pool = P.poolKeys p 0
+
+-- | The keys of one entry: its addresses, each with its path and its
+-- balance in the chain; its numbers, which are how many addresses it has
+-- in each chain of the key, its version and what it cost; its
+-- transactions and its outputs, in the order of the lists; and what it
+-- keeps for each output.
+data Entry = Entry
+  { addrs :: !(K 'Hash),
+    meta :: !(K 'Counts),
+    txs :: !(K 'Sorted),
+    outs :: !(K 'Sorted),
+    oval :: !(K 'Hash)
+  }
+
+-- | The keys of the entry of a key. The pool writes four of them too, and
+-- they are its keys.
+entryOf :: Keys -> ByteString -> Entry
+entryOf k i =
+  Entry
+    { addrs = named (k.pool.entry <> i <> ":addrs"),
+      meta = P.entryMeta k.pool i,
+      txs = P.entryTxs k.pool i,
+      outs = P.entryOuts k.pool i,
+      oval = P.entryOval k.pool i
     }
 
 -- | An output in a list of an entry: the output, its place in the list,
@@ -180,28 +211,24 @@ data Step
 num :: (Show a) => a -> ByteString
 num = C.pack . show
 
--- | A number that Redis keeps as text, or 0.
-number :: Maybe ByteString -> Integer
-number = maybe 0 (maybe 0 fst . C.readInteger)
-
 -- | What an entry keeps for an output: its amount, the length of its
 -- address, the address and the script.
 keptFor :: ByteString -> ByteString -> ByteString -> ByteString
 keptFor a amount script = amount <> " " <> num (B.length a) <> " " <> a <> script
 
--- | The keys of an entry start with this.
-entryOf :: Keys -> ByteString -> ByteString
-entryOf k i = k.entry <> i <> ":"
-
 -- | Delete the entry of a key.
 drop :: (Monad m) => Keys -> ByteString -> Atomic m ()
 drop k i = do
   let e = entryOf k i
-  had <- Set.toList <$> hkeys (e <> "addrs")
-  forM_ had $ \a -> write (SRem (k.watchers <> a) i)
-  unless (null had) (write (IncrBy k.addrs (negate (toInteger (length had)))))
-  forM_ ["addrs", "meta", "txs", "outs", "oval"] $ \part -> write (Del (e <> part))
-  write (ZRem k.prio i)
+  had <- Set.toList <$> hkeys e.addrs
+  forM_ had $ \a -> srem (k.watchers `under` a) i
+  unless (null had) (incrBy k.addrs (negate (toInteger (length had))))
+  del e.addrs
+  del e.meta
+  del e.txs
+  del e.outs
+  del e.oval
+  zrem k.prio i
 
 -- | End a move of the tip that did not finish: what its pieces wrote is
 -- dropped, entry by entry.
@@ -209,8 +236,8 @@ ended :: (Monad m) => Keys -> Atomic m ()
 ended k = do
   ids <- smembers k.marked
   forM_ (Set.toList ids) (drop k)
-  write (Del k.marked)
-  write (Del k.moving)
+  del k.marked
+  del k.moving
 
 -- | The token of the move of the tip under way, if there is one. A move
 -- that wrote nothing for ten seconds is ended here, and there is none
@@ -222,7 +249,7 @@ moving k =
     Just v -> do
       let (token, wrote) = B.breakSubstring " " v
       now <- clock
-      if now - number (Just (B.drop 1 wrote)) > 10000
+      if now - maybe 0 fst (C.readInteger (B.drop 1 wrote)) > 10000
         then ended k >> return Nothing
         else return (Just token)
 
@@ -230,8 +257,8 @@ moving k =
 -- (GreedyDual).
 used :: (Monad m) => Keys -> ByteString -> Integer -> Atomic m ()
 used k i cost = do
-  lowest <- number <$> get k.level
-  write (ZAdd k.prio (fromIntegral (lowest + cost)) i)
+  lowest <- getNumber k.level
+  zadd k.prio (fromIntegral (lowest + cost)) i
 
 -- | Delete the entries of the lowest priority past so many, raising the
 -- level to that of each: how many were deleted.
@@ -242,9 +269,9 @@ evict k most = do
     then return 0
     else do
       lowest <- zrangeByScore k.prio MinusInf PlusInf (Just (fromInteger n - most))
-      start <- fromIntegral . number <$> get k.level
+      start <- fromIntegral <$> getNumber k.level
       let go bar (i, p) = do
-            when (p > bar) (write (Set k.level (num (round p :: Integer))))
+            when (p > bar) (setNumber k.level (round p))
             drop k i
             return (max bar p)
       _ <- foldM go (start :: Score) lowest
@@ -254,8 +281,8 @@ evict k most = do
 -- whose commit was refused.
 abort :: (Monad m) => Keys -> ByteString -> Atomic m ()
 abort k token = do
-  under <- moving k
-  when (under == Just token) (ended k)
+  under' <- moving k
+  when (under' == Just token) (ended k)
 
 -- | Begin a move of the tip under a token, from the tip that the store
 -- saw. Builds wait until it is done, so that every entry is one that the
@@ -266,12 +293,12 @@ begin k token saw = do
   if at /= saw
     then return TipElsewhere
     else do
-      under <- moving k
-      if isJust under && under /= Just token
+      under' <- moving k
+      if isJust under' && under' /= Just token
         then return OtherMoving
         else do
           now <- clock
-          write (Set k.moving (token <> " " <> num now))
+          set k.moving (token <> " " <> num now)
           return BeganMove
 
 -- | Write what a move of the tip does at addresses into every entry that
@@ -283,34 +310,34 @@ begin k token saw = do
 piece :: (Monad m) => Keys -> ByteString -> ByteString -> [Piece] -> Atomic m Bool
 piece k token saw pieces = do
   at <- fromMaybe "" <$> get k.fleet
-  under <- if at /= saw then return Nothing else moving k
-  if at /= saw || under /= Just token
+  under' <- if at /= saw then return Nothing else moving k
+  if at /= saw || under' /= Just token
     then return False
     else do
       now <- clock
-      write (Set k.moving (token <> " " <> num now))
-      version <- (+ 1) . number <$> get k.xver
-      write (IncrBy k.xver 1)
+      set k.moving (token <> " " <> num now)
+      version <- (+ 1) <$> getNumber k.xver
+      incrBy k.xver 1
       forM_ pieces $ \p -> do
-        ids <- smembers (k.watchers <> p.address)
+        ids <- smembers (k.watchers `under` p.address)
         forM_ (Set.toList ids) $ \i -> do
           let e = entryOf k i
-          write (SAdd k.marked i)
-          write (HSet (e <> "meta") "ver" (num version))
-          row <- hget (e <> "addrs") p.address
-          forM_ row $ \r -> write (HSet (e <> "addrs") p.address (B.take 5 r <> p.balance))
+          sadd k.marked i
+          hsetNumber e.meta "ver" version
+          row <- hget e.addrs p.address
+          forM_ row $ \r -> hset e.addrs p.address (B.take 5 r <> p.balance)
           forM_ p.abandoned $ \t -> do
-            ours <- chained (e <> "txs") t
-            when ours (write (ZRem (e <> "txs") t))
-          forM_ p.added $ \(t, s) -> write (ZAdd (e <> "txs") s t)
+            ours <- chained e.txs t
+            when ours (zrem e.txs t)
+          forM_ p.added $ \(t, s) -> zadd e.txs s t
           forM_ p.gone $ \o -> do
-            ours <- chained (e <> "outs") o
+            ours <- chained e.outs o
             when ours $ do
-              write (ZRem (e <> "outs") o)
-              write (HDel (e <> "oval") o)
+              zrem e.outs o
+              hdel e.oval o
           forM_ p.unspent $ \(o, s, amount, script) -> do
-            write (ZAdd (e <> "outs") s o)
-            write (HSet (e <> "oval") o (keptFor p.address amount script))
+            zadd e.outs s o
+            hset e.oval o (keptFor p.address amount script)
       return True
   where
     chained z x = maybe False (>= 0) <$> zscore z x
@@ -330,51 +357,50 @@ build k tip i expected cost additions = do
   if at /= tip
     then return StepRaced
     else do
-      under <- moving k
-      if isJust under
+      under' <- moving k
+      if isJust under'
         then return StepBusy
         else do
-          count <- number <$> get k.moves
+          count <- getNumber k.moves
           let here = num count <> "@" <> at
           place <- get k.place
-          when (place == Nothing) (write (Set k.place here))
+          when (isNothing place) (set k.place here)
           if maybe False (/= here) place
             then return StepBehind
             else do
-              n0 <- number <$> hget meta "n0"
-              n1 <- number <$> hget meta "n1"
+              n0 <- fromMaybe 0 <$> hgetNumber e.meta "n0"
+              n1 <- fromMaybe 0 <$> hgetNumber e.meta "n1"
               if (n0, n1) /= expected
                 then return StepChanged
                 else do
-                  spent <- (+ cost) . number <$> hget meta "cost"
-                  write (HIncrBy meta "cost" cost)
+                  spent <- (+ cost) . fromMaybe 0 <$> hgetNumber e.meta "cost"
+                  hincrBy e.meta "cost" cost
                   used k i spent
                   (m0, m1) <- foldM add (n0, n1) additions
-                  version <- (+ 1) . number <$> get k.xver
-                  write (IncrBy k.xver 1)
-                  write (HSet meta "n0" (num m0))
-                  write (HSet meta "n1" (num m1))
-                  write (HSet meta "ver" (num version))
-                  write (IncrBy k.addrs (toInteger (length additions)))
+                  version <- (+ 1) <$> getNumber k.xver
+                  incrBy k.xver 1
+                  hsetNumber e.meta "n0" m0
+                  hsetNumber e.meta "n1" m1
+                  hsetNumber e.meta "ver" version
+                  incrBy k.addrs (toInteger (length additions))
                   return StepAdded
   where
     e = entryOf k i
-    meta = e <> "meta"
     add (n0, n1) a = do
-      write (HSet (e <> "addrs") a.address (a.path <> a.balance))
-      write (SAdd (k.watchers <> a.address) i)
-      forM_ a.txs $ \(t, s) -> write (ZAdd (e <> "txs") s t)
+      hset e.addrs a.address (a.path <> a.balance)
+      sadd (k.watchers `under` a.address) i
+      forM_ a.txs $ \(t, s) -> zadd e.txs s t
       forM_ a.outs $ \(o, s, amount, script) -> do
-        write (ZAdd (e <> "outs") s o)
-        write (HSet (e <> "oval") o (keptFor a.address amount script))
+        zadd e.outs s o
+        hset e.oval o (keptFor a.address amount script)
       -- what the pool has for the address
-      theirs <- zrangeByScore (k.atx <> a.address) MinusInf PlusInf Nothing
-      forM_ theirs $ \(t, s) -> write (ZAdd (e <> "txs") s t)
-      paid <- zrangeByScore (k.aout <> a.address) MinusInf PlusInf Nothing
+      theirs <- zrangeByScore (k.atx `under` a.address) MinusInf PlusInf Nothing
+      forM_ theirs $ \(t, s) -> zadd e.txs s t
+      paid <- zrangeByScore (k.aout `under` a.address) MinusInf PlusInf Nothing
       forM_ paid $ \(o, s) -> do
-        value <- hget (k.aval <> a.address) o
+        value <- hget (k.aval `under` a.address) o
         forM_ value $ \v -> do
           let (amount, script) = B.breakSubstring " " v
-          write (ZAdd (e <> "outs") s o)
-          write (HSet (e <> "oval") o (keptFor a.address amount (B.drop 1 script)))
+          zadd e.outs s o
+          hset e.oval o (keptFor a.address amount (B.drop 1 script))
       return (if B.take 1 a.path == "\0" then (n0 + 1, n1) else (n0, n1 + 1))

@@ -145,7 +145,7 @@ What it rests on, and how each part is established:
 | The pure model of Redis says what Redis says | tested against a Valkey: any writes, then every question |
 | A decision whose answers changed writes nothing | tested against a Valkey, with a set and a hash of 200 members in whatever order Redis lists them |
 | No change is lost when many decide at once | tested: eight threads, four hundred additions to one number |
-| Each key has one kind, so a plain write cannot be refused | by convention of `Haskoin.Store.Fleet.Pool.Decide`, not by a type |
+| No write is refused for the kind of its key | by type: a key has its kind in its type (`Haskoin.Store.Fleet.Atomic.Keys`), given once where the key is named, and each write takes keys of one kind. A hash to a set, or an addition to what is no number, does not compile; three such writes were tried. The decisions of the pool and of the cache import that module and not the writes without kinds. A key that both write is named once: the cache takes it from the record of the pool |
 | The decisions of the pool do what its script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
 | The decisions of the cache of xpubs do what its script did | tested the same way: 300 drawn sequences of builds, moves begun, written in pieces, given up, gone quiet and committed, entries dropped and evicted, with the pool changing under them (`Haskoin.Store.Fleet.XPubDecideSpec`) |
 
@@ -323,4 +323,6 @@ finding was checked against the code before it was fixed.
   fails, since the script that it compares with has not changed: say
   there what differs and why, or drop the comparison once the script is
   no longer what the stores should do.
-- A decision writes to a key only as the kind that the key has.
+- A new key of the pool or of the cache is named in its record of keys,
+  with its kind. A decision imports `Haskoin.Store.Fleet.Atomic.Keys`,
+  never the writes of `Haskoin.Store.Fleet.Atomic`.

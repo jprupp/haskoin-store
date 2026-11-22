@@ -1076,6 +1076,7 @@ entry as soon as the pool takes it. `docs/xpub-indexing.md` has the design.
 | `Haskoin.Store.Fleet.Redis` | Those rules carried out in Redis, each change in one step |
 | `Haskoin.Store.Fleet.Atomic` | A decision made in Haskell from what Redis says, and carried out only if Redis still says the same |
 | `Haskoin.Store.Fleet.Atomic.Cells` | What a write does to one cell, said once, with the proof that a decision sees its own writes as the model of Redis has them |
+| `Haskoin.Store.Fleet.Atomic.Keys` | The questions and writes of a decision, with the kind of each key in its type |
 | `Haskoin.Store.Fleet.Pool.Decide` | Every change to the shared mempool, as such decisions |
 | `Haskoin.Store.Fleet.XPub.Decide` | Every change to the cache of extended public keys, the same way |
 | `Haskoin.Store.Web`, `Haskoin.Store.Web.Events` | The web server, and `/events` |

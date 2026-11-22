@@ -69,6 +69,7 @@ library
       Haskoin.Store.Fleet
       Haskoin.Store.Fleet.Atomic
       Haskoin.Store.Fleet.Atomic.Cells
+      Haskoin.Store.Fleet.Atomic.Keys
       Haskoin.Store.Fleet.Atomic.Redis
       Haskoin.Store.Fleet.Member
       Haskoin.Store.Fleet.Pool

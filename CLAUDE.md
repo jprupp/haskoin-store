@@ -74,8 +74,11 @@ The shared mempool in Redis is changed only by the decisions of
 by those of `Haskoin.Store.Fleet.XPub.Decide`: Haskell that asks Redis
 questions and lists writes, which `lua/atomic.lua` carries out only if
 every answer is still the same. Do not write a rule of the fleet in Lua: a script that
-fails after its first write leaves Redis half changed. A decision writes
-to a key only as the kind that the key has. `Haskoin.Store.Fleet.DecideSpec`
+fails after its first write leaves Redis half changed. A decision imports
+`Haskoin.Store.Fleet.Atomic.Keys`, where a key has its kind in its type
+and a write of another kind does not compile, and never the writes of
+`Haskoin.Store.Fleet.Atomic`; a new key is named, with its kind, in the
+record of keys of its module. `Haskoin.Store.Fleet.DecideSpec`
 and `Haskoin.Store.Fleet.XPubDecideSpec` hold the decisions to the
 scripts that they replaced (`pool.lua` and `xpub.lua` in
 `test/Haskoin/Store/Fleet`); a change to a decision makes one fail, and

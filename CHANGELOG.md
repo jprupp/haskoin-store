@@ -184,6 +184,12 @@ whitelist it must now say what they grant (`--peer-permission`, or
     writes, that the cell in the model after them is what the decision
     works out (`proofs/`). It assumes four facts of `Data.Map`. The rest
     of what a decision can ask is tested, as before.
+  - **A write of the wrong kind to a key does not compile.** The script
+    that carries out a decision cannot fail half way unless Redis
+    refuses a command, which it does for a key of another kind and for an
+    addition to what is no number. A key now has its kind in its type
+    (`Haskoin.Store.Fleet.Atomic.Keys`), and the decisions are written
+    with questions and writes that each take keys of one kind.
   The scripts of the reports and of the move of the tip without the pool
   are as they were.
 - **The testnet3 of Bitcoin Cash is `--net bchtest3`**, no longer
