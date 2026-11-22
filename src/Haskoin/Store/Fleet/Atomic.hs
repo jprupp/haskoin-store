@@ -46,6 +46,17 @@
 -- them. An error in a decision is an exception in Haskell, before Redis is
 -- told anything.
 --
+-- = What this does not give: a turn
+--
+-- A decision that loses the race is made again, and may lose again. One
+-- that asks a few questions wins soon. One that asks tens of thousands,
+-- over a second or more, while others write several times a second,
+-- loses every time: it is right whenever it is carried out, and it never
+-- is. Nothing here prevents that. A decision that reads much has to be
+-- given the floor by the others, as the move of the tip is
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'), and has to be tested
+-- while others write.
+--
 -- = A decision sees what it wrote
 --
 -- A script reads back what it has written, and a decision here does too:
@@ -96,6 +107,7 @@ module Haskoin.Store.Fleet.Atomic
     hexists,
     hgetall,
     hkeys,
+    habove,
     sismember,
     smembers,
     zscore,
@@ -167,6 +179,11 @@ data Query
     HGetAll !Key
   | -- | @HKEYS@
     HKeys !Key
+  | -- | the fields of a hash whose value is a whole number above a bound.
+    -- A decision that only needs to know which leases still run asks this,
+    -- and so does not depend on when each runs out: a lease that is
+    -- renewed is the same answer.
+    HAbove !Key !Integer
   | -- | @SISMEMBER@
     SIsMember !Key !ByteString
   | -- | @SMEMBERS@
@@ -243,6 +260,7 @@ queryKey = \case
   HExists k _ -> k
   HGetAll k -> k
   HKeys k -> k
+  HAbove k _ -> k
   SIsMember k _ -> k
   SMembers k -> k
   ZScore k _ -> k
@@ -300,6 +318,9 @@ replay q before ops = case (q, before) of
   (HExists _ f, Flag b) -> Flag <$> foldM' (\x op -> (\o -> thereAt unmarked f o x) <$> kind hashOp op) b
   (HGetAll _, Fields m) -> Fields <$> foldM' fields m
   (HKeys _, Members s) -> Members . Map.keysSet <$> foldM' (those nameOp) (Map.fromSet (const ()) s)
+  (HAbove _ _, Members _)
+    | null ops -> Right before
+    | otherwise -> no "which numbers of a hash are above a bound, after the hash was written to"
   (SIsMember _ x, Flag b) -> Flag <$> foldM' (\y op -> (\o -> thereAt unmarked x o y) <$> kind groupOp op) b
   (SMembers _, Members s) -> Members . Map.keysSet <$> foldM' (those groupOp) (Map.fromSet (const ()) s)
   (ZScore _ x, Scored s) -> Scored <$> foldM' (score x) s
@@ -487,6 +508,11 @@ data Session = Session
     next :: !Int,
     -- | the writes to each key, each with its number among all
     byKey :: !(Map Key (Seq (Int, Op))),
+    -- | of those, the writes to one cell of a key: a field of a hash, a
+    -- member of a set or of a sorted set
+    byCell :: !(Map (Key, ByteString) (Seq (Int, Op))),
+    -- | and those to all the cells of a key at once
+    byWhole :: !(Map Key (Seq (Int, Op))),
     -- | the wipes, each with its number
     wipes :: !(Seq (Int, ByteString)),
     -- | every write, in order
@@ -557,6 +583,7 @@ nothing = \case
   HExists _ _ -> Flag False
   HGetAll _ -> Fields Map.empty
   HKeys _ -> Members Set.empty
+  HAbove _ _ -> Members Set.empty
   SIsMember _ _ -> Flag False
   SMembers _ -> Members Set.empty
   ZScore _ _ -> Scored Nothing
@@ -569,7 +596,7 @@ nothing = \case
 query :: (Monad m) => Query -> Atomic m Answer
 query q = do
   s <- session (gets id)
-  let written = writesTo (queryKey q) s
+  let written = writesTo q s
   case Map.lookup q s.said of
     Just before -> do
       session (modify' (\x -> x {used = Set.insert q x.used}))
@@ -584,18 +611,57 @@ query q = do
 queries :: (Monad m) => [Query] -> Atomic m [Answer]
 queries = mapM query
 
--- | The writes of a decision to a key, in order, a wipe that takes the key
--- being a 'Del' of it.
-writesTo :: Key -> Session -> [Op]
-writesTo k s = map snd (merge (toList own) wiped)
+-- | The writes of a decision that a question has to go through, in
+-- order, a wipe that takes the key being a 'Del' of it.
+--
+-- For a question about one cell, a field of a hash, a member of a set or
+-- the score of a member, those are the writes to that cell and the writes
+-- to all the cells of the key: the writes to its other cells change
+-- nothing for it ('Haskoin.Store.Fleet.Atomic.Cells.skipOthers'). A
+-- decision that takes thousands of transactions out of the pool writes to
+-- thousands of fields of one hash, and asks about each: going through all
+-- the writes to the key for each question took time that grew with the
+-- square of the block. For any other question they are all the writes to
+-- its key.
+writesTo :: Query -> Session -> [Op]
+writesTo q s = map snd (merge (toList own) wiped)
   where
-    own = fromMaybe Seq.empty (Map.lookup k s.byKey)
+    k = queryKey q
+    own = case cellOf q of
+      Just c -> mergeSeq (found (k, c) s.byCell) (found k s.byWhole)
+      Nothing -> found k s.byKey
+    found :: (Ord a) => a -> Map a (Seq (Int, Op)) -> Seq (Int, Op)
+    found x = fromMaybe Seq.empty . Map.lookup x
+    mergeSeq a b = Seq.fromList (merge (toList a) (toList b))
     wiped = [(n, Del k) | (n, p) <- toList s.wipes, p `B.isPrefixOf` k]
     merge xs [] = xs
     merge [] ys = ys
     merge (x : xs) (y : ys)
       | fst x <= fst y = x : merge xs (y : ys)
       | otherwise = y : merge (x : xs) ys
+
+-- | The cell that a question is about, if it is about one.
+cellOf :: Query -> Maybe ByteString
+cellOf = \case
+  HGet _ f -> Just f
+  HExists _ f -> Just f
+  SIsMember _ x -> Just x
+  ZScore _ x -> Just x
+  _ -> Nothing
+
+-- | The cell that a write is to, if it is to one; nothing for a write to
+-- all the cells of its key, or to a key that has none.
+cellOfOp :: Op -> Maybe ByteString
+cellOfOp = \case
+  HSet _ f _ -> Just f
+  HDel _ f -> Just f
+  HIncrBy _ f _ -> Just f
+  SAdd _ x -> Just x
+  SRem _ x -> Just x
+  ZAdd _ _ x -> Just x
+  ZAddNX _ _ x -> Just x
+  ZRem _ x -> Just x
+  _ -> Nothing
 
 -- | Add a write to those of the decision. Nothing is changed in Redis
 -- until the decision ends and the script finds its answers still true.
@@ -604,7 +670,12 @@ write op = session . modify' $ \s ->
   let n = s.next
       s' = s {next = n + 1, ops = s.ops |> op}
    in case opKey op of
-        Right k -> s' {byKey = Map.insertWith (flip (<>)) k (Seq.singleton (n, op)) s.byKey}
+        Right k ->
+          let one = Seq.singleton (n, op)
+              s'' = s' {byKey = Map.insertWith (flip (<>)) k one s.byKey}
+           in case cellOfOp op of
+                Just c -> s'' {byCell = Map.insertWith (flip (<>)) (k, c) one s.byCell}
+                Nothing -> s'' {byWhole = Map.insertWith (flip (<>)) k one s.byWhole}
         Left p -> s' {wipes = s.wipes |> (n, p)}
 
 -- | How a decision ended.
@@ -651,6 +722,8 @@ runAtomic with (Atomic f) = go Map.empty (0 :: Int)
           missed = Set.empty,
           next = 0,
           byKey = Map.empty,
+          byCell = Map.empty,
+          byWhole = Map.empty,
           wipes = Seq.empty,
           ops = Seq.empty,
           clockAt = Nothing
@@ -699,6 +772,13 @@ hkeys k =
   query (HKeys k) >>= \case
     Members v -> return v
     _ -> mismatch (HKeys k)
+
+-- | The fields of a hash whose value is a whole number above a bound.
+habove :: (Monad m) => Key -> Integer -> Atomic m (Set ByteString)
+habove k n =
+  query (HAbove k n) >>= \case
+    Members v -> return v
+    _ -> mismatch (HAbove k n)
 
 -- | @SISMEMBER@.
 sismember :: (Monad m) => Key -> ByteString -> Atomic m Bool
@@ -775,6 +855,7 @@ answer db = \case
   HExists k f -> Flag (Map.member f (hash (Map.lookup k db)))
   HGetAll k -> Fields (hash (Map.lookup k db))
   HKeys k -> Members (Map.keysSet (hash (Map.lookup k db)))
+  HAbove k n -> Members (Map.keysSet (Map.filter (maybe False ((> n) . fst) . C.readInteger) (hash (Map.lookup k db))))
   SIsMember k x -> Flag (Map.member x (group (Map.lookup k db)))
   SMembers k -> Members (Map.keysSet (group (Map.lookup k db)))
   ZScore k x -> Scored (Map.lookup x (sorted (Map.lookup k db)))

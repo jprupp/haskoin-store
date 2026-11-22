@@ -17,8 +17,10 @@
 --
 -- A question is a letter for the shape of its answer, the number of words
 -- of its command, and the words: 'p' for an answer to take as it is, 'u'
--- for a list in no order, as the members of a set, and 'h' for the fields
--- of a hash with their values.
+-- for a list in no order, as the members of a set, 'h' for the fields of
+-- a hash with their values, and 'k' for the fields of a hash whose value
+-- is a number above a bound, which is then the first of the words, before
+-- the command.
 --
 -- An answer is given as a string that says all of it, so that two answers
 -- are the same when their strings are: 'n' for none, 'i' a number and ';',
@@ -79,8 +81,22 @@ local function ask(at)
   for i = 1, n do
     words[i] = ARGV[at + 1 + i]
   end
+  local above
+  if shape == 'k' then
+    above = tonumber(table.remove(words, 1))
+  end
   local r = redis.call(unpack(words))
-  if shape == 'u' then
+  if shape == 'k' then
+    -- of a hash, the fields whose value is a number above the bound
+    local keyed = {}
+    for i = 1, #r, 2 do
+      local n = tonumber(r[i + 1])
+      if n and n > above then
+        keyed[#keyed + 1] = {r[i], r[i]}
+      end
+    end
+    r = ordered(keyed)
+  elseif shape == 'u' then
     local keyed = {}
     for i, member in ipairs(r) do
       keyed[i] = {member, member}

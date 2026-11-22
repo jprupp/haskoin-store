@@ -191,7 +191,7 @@ everyQuestion :: [Query]
 everyQuestion =
   [Get "s1", Get "n1", Exists "s1", Exists "x1", Exists "nothing"]
     <> concat
-      [ [HGetAll h, HKeys h, Exists h, HGet h "c1", HExists h "c1"]
+      [ [HGetAll h, HKeys h, HAbove h 0, HAbove h (-2), Exists h, HGet h "c1", HExists h "c1"]
           <> concat [[HGet h f, HExists h f] | f <- ["a", "b"]]
       | h <- ["h1", "h2"]
       ]
@@ -232,6 +232,7 @@ questionUnder p = \case
   HExists k f -> HExists (p <> k) f
   HGetAll k -> HGetAll (p <> k)
   HKeys k -> HKeys (p <> k)
+  HAbove k n -> HAbove (p <> k) n
   SIsMember k x -> SIsMember (p <> k) x
   SMembers k -> SMembers (p <> k)
   ZScore k x -> ZScore (p <> k) x

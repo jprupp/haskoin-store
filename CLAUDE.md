@@ -19,13 +19,15 @@
   again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 115 seconds in eight processes (65 before the
+- The tests take about 160 seconds in eight processes (65 before the
   tests of the mempool against real nodes), against 140 to 210
   with every spec module in a process of its own. Most of it is
   `Haskoin.Store.IntegrationSpec`, whose five environments are groups at the
   top of the module, so that each runs in its own process; keep a new
-  environment at the top too. The longest, Bitcoin Cash Node, takes about 64
-  seconds. Eight processes at once use about 1.2 GB more than one, with the
+  environment at the top too. The longest is the store of Bitcoin Core
+  whose node never stops taking transactions (`unceasing` in
+  `Haskoin.Store.MempoolSpec`); of the environments, Bitcoin Cash Node
+  takes about 64 seconds. Eight processes at once use about 1.2 GB more than one, with the
   containers. `Haskoin.Store.DownloadSpec` has the downloads of a store from
   real nodes, a group with a pod of its own for each test.
 - Tests name no address or port of the machine. A node, Valkey or any other
@@ -78,7 +80,18 @@ fails after its first write leaves Redis half changed. A decision imports
 `Haskoin.Store.Fleet.Atomic.Keys`, where a key has its kind in its type
 and a write of another kind does not compile, and never the writes of
 `Haskoin.Store.Fleet.Atomic`; a new key is named, with its kind, in the
-record of keys of its module. `Haskoin.Store.Fleet.DecideSpec`
+record of keys of its module.
+
+A decision is carried out only if nothing that it read has changed, which
+makes it right and does not make it happen: one that reads much loses
+every race to those that read little. The move of the tip has the floor
+for that (`docs/concurrency.md`, "The floor"). A new decision that writes
+to the pool or to the cache gives way to it (`floorHeld`), and one that
+reads much needs a turn of its own. Test a decision at the size and under
+the traffic of a full block: `crowded` in `Haskoin.Store.Fleet.DecideSpec`
+and `unceasing` in `Haskoin.Store.MempoolSpec` are the examples. A test
+that lets the node go quiet before it looks does not see a store that
+cannot keep up. `Haskoin.Store.Fleet.DecideSpec`
 and `Haskoin.Store.Fleet.XPubDecideSpec` hold the decisions to the
 scripts that they replaced (`pool.lua` and `xpub.lua` in
 `test/Haskoin/Store/Fleet`); a change to a decision makes one fail, and

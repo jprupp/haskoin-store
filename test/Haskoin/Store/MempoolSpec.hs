@@ -113,6 +113,8 @@ spec = do
           it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
         on "A store whose node takes chains while it finds blocks" $
           it "has every transaction that no block confirmed" (withBed kind busy)
+        on "A store whose node never stops taking transactions" $
+          it "answers from each new block within seconds of it" (withBed kind unceasing)
       -- Bitcoin Cash Node gives its mempool to any peer, so only a store
       -- of Bitcoin Core can have no peer that is a source
       forM_ [False, True] $ \block ->
@@ -228,6 +230,65 @@ busy bed = do
   where
     pieces _ [] = []
     pieces n xs = let (a, b) = splitAt n xs in a : pieces n b
+
+-- | A block that confirms thousands of transactions of the pool comes
+-- while the node goes on taking transactions without a pause, about sixty
+-- a second, as the node of a busy network always does. The store has to
+-- answer from the block within seconds, while they keep coming.
+--
+-- The other situations here let the node go quiet before they look, and so
+-- passed on a store that could not move its tip while anything was
+-- offered: on a server, such a store imported every block and answered
+-- from an old one for as long as it ran, with its health saying that all
+-- was well. Taking the block's transactions out of the pool is one
+-- decision, carried out only if nothing that it read has changed, and
+-- every transaction offered meanwhile changed something
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld').
+unceasing :: Bed -> IO ()
+unceasing bed = do
+  -- fewer in the first load than Bitcoin Core remembers having named to
+  -- a peer, 3,500: asked for one that it named before those, it says
+  -- that it has it not
+  roots <- fund bed 160
+  let (first, rest) = splitAt 100 roots
+  withMember bed $ \_ server -> do
+    submit bed (map (chainOf 24) first)
+    converges bed server 180
+    -- four chains at a time, the transactions of each in their order, with
+    -- a pause after each: about sixty a second between them
+    let slowly tx = send bed tx >> threadDelay 60000
+        trickle = forConcurrently_ (lanes 4 (map (chainOf 24) rest)) (mapM_ slowly . concat)
+    withAsync trickle $ \sending -> do
+      link sending
+      forM_ [1 :: Int, 2] $ \_ -> do
+        threadDelay 3000000
+        void (generateTo bed.node 1 bed.miner)
+        best <- bestBlockHash bed.node
+        follows server best 20
+    converges bed server 180
+  where
+    lanes n xs = [[x | (i, x) <- zip [0 :: Int ..] xs, i `mod` n == l] | l <- [0 .. n - 1]]
+    -- within so many seconds, the store answers from a block
+    follows server best seconds = do
+      start <- getPOSIXTime
+      let go = do
+            (_, b) <- getJSON server "/block/best?notx=true"
+            now <- getPOSIXTime
+            if textField "hash" b == Just best
+              then return ()
+              else
+                if now - start > fromIntegral (seconds :: Int)
+                  then
+                    expectationFailure . unwords $
+                      [ "After",
+                        show seconds,
+                        "seconds, with transactions still coming, the store answers from",
+                        maybe "no block" T.unpack (textField "hash" b),
+                        "and not from the best block of its node,",
+                        T.unpack best
+                      ]
+                  else threadDelay 250000 >> go
+      go
 
 -------------------------------------------------------------------------------
 -- Convergence

@@ -4,33 +4,59 @@
 -- has under each compared after every step.
 module Haskoin.Store.Fleet.DecideSpec (spec, Dump, everything) where
 
-import Control.Monad (foldM_, forM, forM_, when)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (withAsync)
+import Control.Monad (foldM_, forM, forM_, forever, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Containers.ListUtils (nubOrd, nubOrdOn)
+import Data.Functor.Identity (runIdentity)
 import Data.List (sort)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Serialize (encode)
 import Data.Set qualified as Set
 import Data.Word (Word32)
 import Database.Redis qualified as Redis
+import Haskoin.Store.Fleet.Atomic
+  ( Atomic,
+    Backend (..),
+    Db,
+    Op (..),
+    Outcome (..),
+    answer,
+    emptyDb,
+    perform,
+    runAtomic,
+    runPure,
+  )
 import Haskoin.Store.Fleet.Atomic.Redis (transact)
 import Haskoin.Store.Fleet.Oracle
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.RedisSpec (PoolStep (..), address, block, number, out, timeOf, txOf, withRedis)
+import Haskoin.Store.Fleet.XPub (Begun (..), cacheBegin)
+import Haskoin.Store.Fleet.XPub.Decide qualified as X
 import Test.Hspec
-import Test.Hspec.QuickCheck (modifyMaxSuccess)
+import Test.Hspec.QuickCheck (modifyMaxSuccess, prop)
 import Test.Podman (podmanUsable)
 import Test.QuickCheck
 
 spec :: Spec
 spec = do
+  describe "a move of the tip, in the model of Redis" $ do
+    modifyMaxSuccess (const 2000) $
+      prop "has no answer changed by what others decide while its store has the floor" $
+        \earlier during confirmed -> undisturbed True earlier during confirmed
+    modifyMaxSuccess (const 2000) $
+      prop "has answers changed by them when no store has the floor" $
+        \earlier during confirmed -> expectFailure (undisturbed False earlier during confirmed)
   usable <- runIO podmanUsable
   describe "the shared mempool in Redis" $ case usable of
     Left why -> it "is decided in Haskell as the script decides it" (pendingWith why)
     Right () -> aroundAll withRedis $ do
+      it "moves the tip over a full block while transactions are offered, stores report and keys are built" $
+        \(conn, fresh) -> crowded conn =<< fresh
       modifyMaxSuccess (const 300) $
         it "is decided in Haskell as the script decides it, state by state" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do
@@ -38,6 +64,140 @@ spec = do
             ours <- fresh
             forM_ [lua, ours] (watched conn)
             foldM_ (both conn lua ours) ([], [], Nothing, 0) (steps :: [PoolStep])
+
+-- | A move of the tip is decided, and before it is carried out other
+-- decisions are: transactions offered, withdrawn and expired, what the
+-- fleet saw trimmed, entries of the cache built, dropped and evicted,
+-- another store that tries to move the tip, and one that renews its
+-- lease. Every answer that the move depends on must be the same after
+-- them: then the script carries the move out, whatever the others did.
+--
+-- With the floor ('Haskoin.Store.Fleet.XPub.Decide.begin'), that holds:
+-- all of them give way. Without it, it does not, which the second
+-- property says, so that the first is known to see what it is for.
+undisturbed :: Bool -> [PoolStep] -> [PoolStep] -> [Word32] -> Property
+undisturbed held earlier during confirmed =
+  case runIdentity (runAtomic (inModel begun) move) of
+    Stuck why -> counterexample (show why) False
+    Decided _ depends _ _ ->
+      conjoin [counterexample (show q) (answer later q === a) | (q, a) <- depends]
+  where
+    now = 5000
+    k = D.poolKeys "" 4
+    kx = X.cacheKeys ""
+    target = block 1000
+    inModel db = Backend {fetch = return . map (answer db), time = return now}
+    -- two live stores that agree on the block, cached keys at three of
+    -- the four addresses, and a pool
+    start =
+      foldl
+        (flip perform)
+        emptyDb
+        ( [HSet "fleet:lease" store "900000" | store <- ["a", "b"]]
+            <> [HSet "fleet:recent" store target | store <- ["a", "b"]]
+            <> [SAdd ("fx:of:" <> address a) i | (a, ids) <- [(0, ["x1"]), (1, ["x1", "x2"]), (2, ["x2"])], i <- ids]
+        )
+    pool = foldl (flip others) start earlier
+    begun = if held then decided (X.begin kx "mover" "") pool else pool
+    move :: (Monad m) => Atomic m Moved
+    move =
+      D.advance
+        k
+        Nothing
+        target
+        (Just now)
+        4
+        (D.Changing (PoolChange [] [] (map block confirmed) [] (Just 100) []))
+        []
+        (if held then "mover" else "")
+    -- the other store renews its lease, and the rest decide
+    later = foldl (flip others) (perform (HSet "fleet:lease" "b" "950000") begun) during
+    decided :: (forall m. (Monad m) => Atomic m a) -> Db -> Db
+    decided decision db = either (error . show) snd (runPure now decision db)
+    others :: PoolStep -> Db -> Db
+    others step = case step of
+      Give t inputs replaced ->
+        let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
+         in decided (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
+      Take ts -> decided (D.withdraw k (map block ts))
+      Go back dead done used ->
+        decided (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
+          . decided (D.trim k (length used))
+          . decided (X.evict kx (length done))
+          . decided (X.drop kx "x1")
+          . decided (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
+          . decided (X.begin kx "other" "")
+          . decided (X.piece kx "other" "" [X.Piece (address (fromIntegral (length back))) "" [] [] [] []])
+          . decided (X.abort kx "other")
+    added a = X.Addition {address = address a, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}
+
+-- | A move of the tip that takes eight hundred transactions out of the
+-- pool, while three others write without a pause: transactions that spend
+-- from those are offered, another store renews its lease, and entries of
+-- the cache are built at the addresses of the block. The move is one
+-- decision that is carried out only if nothing that it read has changed,
+-- so each of the three alone had it refused, every time: on a server the
+-- tip stopped at the first block that confirmed a few thousand
+-- transactions of the pool. The store that moves the tip has the floor
+-- now, and the others give way.
+crowded :: Redis.Connection -> FleetKeys -> IO ()
+crowded conn keys = do
+  forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
+  forM_ ["a", "b"] $ \store -> fleetReport conn keys Nothing 60000 store [target] [] `shouldReturn` True
+  -- some of the addresses are those of cached keys already
+  forM_ [1 .. 20] built
+  withAsync (forM_ (cycle [1 .. n]) (\c -> offered c >> threadDelay 5000)) $ \_ ->
+    withAsync (forever (fleetReport conn keys Nothing 60000 "b" [target] [] >> threadDelay 5000)) $ \_ ->
+      withAsync (forM_ (cycle [21 .. n]) (\c -> built c >> threadDelay 5000)) $ \_ -> do
+        threadDelay 300000
+        cacheBegin conn keys "token" "" `shouldReturn` Begun
+        fleetCommit conn keys 4 Nothing "a" Nothing target (Just change) [] "token" `shouldReturn` MovedTo target
+  fleetTip conn keys `shouldReturn` Just target
+  left <- map fst <$> poolSpends conn keys
+  filter (`elem` map (.txid) txs) left `shouldBe` []
+  where
+    n = 800 :: Word32
+    target = block 77
+    txs = map one [1 .. n]
+    change = PoolChange [] [] (map (.txid) txs) [] (Just 100) []
+    addr c = C.pack ("addr" <> show c)
+    one c =
+      PoolTx
+        { txid = encode c,
+          time = 1700000000 + fromIntegral c,
+          inputs = [encode (1000000 + c) <> encode (0 :: Word32)],
+          body = B.replicate 250 7,
+          signals = False,
+          entries =
+            [ PoolTouches (addr c),
+              PoolPays (addr c) (encode c <> encode (0 :: Word32)) 1000 "script",
+              PoolTouches (addr (c + 1)),
+              PoolSpends (addr (c + 1)) (encode (1000000 + c) <> encode (0 :: Word32)) 1000
+            ]
+        }
+    -- a transaction that spends the output of one of the block's, at its
+    -- address: taken, late or an orphan, as the move goes
+    offered c = void (poolOffer conn keys 4 Nothing (child c) [False] [])
+    child c =
+      PoolTx
+        { txid = encode (5000000 + c),
+          time = 1700009000,
+          inputs = [encode c <> encode (0 :: Word32)],
+          body = B.replicate 250 7,
+          signals = False,
+          entries = [PoolTouches (addr c), PoolSpends (addr c) (encode c <> encode (0 :: Word32)) 1000]
+        }
+    -- a cached key with one address of the block
+    built c = void (transact conn 1 (building c))
+    building :: (Monad m) => Word32 -> Atomic m X.Step
+    building c =
+      X.build
+        (X.cacheKeys keys.prefix)
+        ""
+        (C.pack ("key" <> show c))
+        (0, 0)
+        1
+        [X.Addition {address = addr c, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}]
 
 -- | All that Redis has under a prefix: each key with what it holds.
 type Dump = [(ByteString, [ByteString])]

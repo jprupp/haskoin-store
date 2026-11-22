@@ -87,6 +87,7 @@ module Haskoin.Store.Fleet.Atomic.Keys
     hgetNumber,
     hsetNumber,
     hincrBy,
+    hfieldsAbove,
 
     -- * A set
     sismember,
@@ -253,6 +254,12 @@ hsetNumber (K k) f n = write (HSet k f (num n))
 -- | @HINCRBY@.
 hincrBy :: (Monad m) => K 'Counts -> ByteString -> Integer -> Atomic m ()
 hincrBy (K k) f n = write (HIncrBy k f n)
+
+-- | The fields whose number is above a bound: for a decision that needs
+-- to know which leases still run and not when each runs out, so that a
+-- lease that is renewed meanwhile changes nothing for it.
+hfieldsAbove :: (Monad m) => K 'Counts -> Integer -> Atomic m (Set ByteString)
+hfieldsAbove (K k) = A.habove k
 
 -- | @SISMEMBER@.
 sismember :: (Monad m) => K 'Group -> ByteString -> Atomic m Bool

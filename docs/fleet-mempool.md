@@ -53,7 +53,9 @@ knows nothing of the mempool, and is unhealthy.
 The pool and the tip are written only by the decisions of the pool
 (`Haskoin.Store.Fleet.Pool.Decide`), each carried out in one step: they
 change together or not at all, and a decision that fails has written
-nothing.
+nothing. While a server moves the tip, the others' offers are late and
+are made again a moment after: the move has the floor
+(`docs/concurrency.md`, "The floor").
 
 ## Getting in: the offer
 

@@ -163,13 +163,28 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (tip, under, n) step = do
         forM_ v $ \moving ->
           go keys (Redis.set (keys.prefix <> "fx:moving") (C.takeWhile (/= ' ') moving <> " 0"))
       return (tip, under, n)
+    -- Where the decisions differ from the script, on purpose: while a
+    -- store is moving the tip, an entry is neither dropped nor evicted,
+    -- so that nothing changes what the move has read
+    -- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'). The script dropped
+    -- and evicted at any time, since nothing could come between its
+    -- reading and its writing. So while a move is under way the script is
+    -- not asked, and the decision has to change nothing.
     Drop i -> do
-      luaDrop conn lua (name i)
-      transact conn 1 (X.drop k (name i)) `shouldReturn` Just ()
+      held <- transact conn 1 (P.floorHeld (P.poolKeys ours.prefix 4))
+      if held == Just True
+        then transact conn 1 (X.drop k (name i)) `shouldReturn` Just ()
+        else do
+          luaDrop conn lua (name i)
+          transact conn 1 (X.drop k (name i)) `shouldReturn` Just ()
       return (tip, under, n)
     Evict most -> do
-      evicted <- luaEvict conn lua most
-      transact conn 1 (X.evict k most) `shouldReturn` Just evicted
+      held <- transact conn 1 (P.floorHeld (P.poolKeys ours.prefix 4))
+      if held == Just True
+        then transact conn 1 (X.evict k most) `shouldReturn` Just 0
+        else do
+          evicted <- luaEvict conn lua most
+          transact conn 1 (X.evict k most) `shouldReturn` Just evicted
       return (tip, under, n)
     -- the pool under both is kept by the same decisions
     Offer t inputs -> do
@@ -199,7 +214,6 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (tip, under, n) step = do
           b `shouldBe` a
           return (if a == MovedTo target then (Just target, under, n + 1) else (tip, under, n + 1))
         _ -> fail "Two fleets"
-    Astray _ -> fail "Astray twice"
   there <- everything conn lua.prefix
   here <- everything conn ours.prefix
   quietly here `shouldBe` quietly there
@@ -211,8 +225,3 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (tip, under, n) step = do
 -- the time at which it last wrote.
 quietly :: Dump -> Dump
 quietly dump = [(key, if key == "fx:moving" then map (C.takeWhile (/= ' ')) v else v) | (key, v) <- dump]
-
--- | Not used by a spec: the pool's keys of a prefix, for whoever reads
--- this to find them.
-_poolKeys :: FleetKeys -> P.Keys
-_poolKeys keys = P.poolKeys keys.prefix 4

@@ -170,6 +170,69 @@ miss to it, and the build that follows the miss ends the move.
 Stores that keep the pool in this way have keys that start with `hs3:`,
 and those that ran the script `hs2:`: on one Redis they are two fleets.
 
+### The floor: a long decision gets its turn
+
+Carrying a decision out only if nothing that it read has changed makes it
+right, and does not make it happen. A short decision loses a race now and
+then and is made again. A long one can lose every time.
+
+Moving the tip over a block is the long one: it takes thousands of
+transactions out of the pool, reads what tens of thousands of questions
+say, and takes a second or more. Transactions are offered several times a
+second, and each offer changes an answer or two. So on a network with
+traffic the move was refused at every try. It happened on a server on 22
+November 2026, with the first block that a store of this design met on
+Bitcoin: the store imported every block and went on answering from the
+one before, its health, which looks at the database, saying that all was
+well. The script that this replaced could not be interrupted, and the
+tests moved the tip over a dozen transactions with nothing else writing.
+
+So the store that moves the tip **has the floor**, as it had before it
+for the cache of xpubs (`Haskoin.Store.Fleet.XPub.Decide.begin`): it
+writes a mark with its token, and writes again at each piece. Whatever
+else writes gives way while the mark is less than ten seconds old
+(`Haskoin.Store.Fleet.Pool.Decide.floorHeld`):
+
+| Decision | While another store has the floor |
+| --- | --- |
+| an offer | is late, and is made again by the path into the pool |
+| a withdrawal, an expiry | takes nothing out; the next turn does |
+| a build of an entry of the cache | is busy, as before |
+| a drop, an eviction | leaves the entries; whoever asked finds them there |
+| another move of the tip | does not begin |
+
+Each of those reads the mark, so one that was decided before the floor
+was taken and would be carried out after it is refused by the script, and
+decided again. From the moment the mark is written, nothing but the mover
+changes what the move reads.
+
+Two things still write under a floor, and the move does not read them in
+a way that they change. A store renews its lease at every turn: the move
+asks which leases still run and not when each runs out (`HAbove`), so a
+renewal is the same answer. And a read of the cache notes that a key was
+used, in a list that the move does not read.
+
+A mover that stops leaves a mark that is ten seconds old soon enough, and
+the others go on. A move that takes longer than that to decide can be
+raced again: the move is made to cost in proportion to its block, by
+going through the writes to one cell only for a question about that cell
+(`Haskoin.Store.Fleet.Atomic.Cells.skipOthers`, proved), where it grew
+with the square of the block. A store whose move is refused five turns
+in a row says so in its log, at the level of a warning.
+
+How this is established:
+
+| Claim | How |
+| --- | --- |
+| Under the floor, no other decision changes an answer that a move depends on | checked in the model of Redis on 2,000 drawn cases: a pool, a move decided, then any mix of offers, withdrawals, expiries, trims, builds, drops, evictions, another move begun, written and given up, and a lease renewed; every answer of the move is the same after them. Without the floor the same property fails, which is checked too |
+| A move over a full block is carried out at its first try while others write | tested against a Valkey: 800 transactions out of the pool, with offers that spend from them, another store's reports and builds at their addresses every 5 ms. It fails if nobody gives way, and if the move depends on when a lease runs out |
+| A store answers from each new block while its node never stops taking transactions | tested against Bitcoin Core and Bitcoin Cash Node in Podman (`Haskoin.Store.MempoolSpec`): a block that confirms 2,400 transactions of the pool while about sixty a second keep coming. It fails without the floor |
+
+Not established: that a move always wins within a bound when stores of a
+fleet report different blocks at once, which changes what they agree on
+and so, rightly, has the move decided again; and how long a move takes on
+a slow machine against the ten seconds.
+
 The invariants the fleet relies on:
 
 | | Invariant | Why it holds |
@@ -291,6 +354,14 @@ finding was checked against the code before it was fixed.
     `Haskoin.Store.Ingest`, replaces the queue of announcements, the set
     of requests, the member's list of what waits and the question to the
     peers at the start (`docs/mempool-ingestion.md`).
+20. **A move of the tip could be refused for ever.** The decisions that
+    replaced the script of the pool are carried out only if nothing that
+    they read has changed, and the move of the tip reads for a second or
+    more: with transactions offered all the time it lost every race, and
+    the store answered from an old block while its health said that all
+    was well. The store that moves the tip has the floor now, and what
+    else writes gives way ("The floor", above). A test moves the tip
+    while others write, as no test did.
 
 **Known limits, left as they are:**
 

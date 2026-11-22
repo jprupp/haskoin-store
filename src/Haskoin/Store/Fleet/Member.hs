@@ -119,6 +119,7 @@ import Control.Concurrent.STM
     readTVarIO,
     registerDelay,
     retry,
+    stateTVar,
     writeTVar,
   )
 import Control.Exception (Exception, handle, throwIO)
@@ -344,6 +345,9 @@ data Member = Member
     -- lost its data or the pool started again: the web server fills the
     -- pool again each time ('Haskoin.Store.Web')
     refills :: !(TVar Int),
+    -- | how many moves of the tip in a row this store tried and did not
+    -- make: what it warns of ('moveTip')
+    refused :: !(TVar Int),
     -- | the last tip that Redis was seen to have, and when, by the clock of
     -- 'getMonotonicTimeNSec': a request that read nothing of the pool
     -- takes it for the tip for 'seenFor', instead of asking Redis
@@ -375,6 +379,7 @@ newMember config redis db = do
   epoch <- newTVarIO Nothing
   restarts <- newTVarIO Nothing
   refills <- newTVarIO 0
+  refused <- newTVarIO 0
   seen <- newIORef ("", 0)
   lock <- redisLock (defaultLockConfig (config.prefix <> "fleet:") config.name) redis xpubId
   fixIO $ \m -> do
@@ -692,8 +697,25 @@ moveTip m = do
                 Way _ -> False
                 _ -> True
           when restarted $ wasEmptied m target "the shared mempool started again"
+          atomically (writeTVar m.refused 0)
           return True
-        _ -> False <$ cacheAbort m.redis m.keys token
+        _ -> do
+          -- A move that is refused once is nothing: another store made
+          -- it, or the store was not ready. Refused turn after turn, the
+          -- store answers from an old block while its database goes on,
+          -- and its health, which looks at the database, says that all
+          -- is well. That happened, in silence, so it is said.
+          n <- atomically (stateTVar m.refused (\x -> (x + 1, x + 1)))
+          when (n == 5 || n `mod` 150 == 0) . m.config.note LevelWarn . mconcat $
+            [ "The fleet tip has not moved in ",
+              shown n,
+              " turns of this store, from ",
+              maybe "none" blockName seen,
+              " to ",
+              blockName target,
+              ": the store answers from the block that it is at"
+            ]
+          False <$ cacheAbort m.redis m.keys token
     redis' :: R.Redis (Either R.Reply a) -> IO a
     redis' f = R.runRedis m.redis f >>= either (fail . ("Redis error: " <>) . show) return
     chunks bytes

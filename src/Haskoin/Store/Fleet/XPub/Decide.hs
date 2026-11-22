@@ -216,9 +216,17 @@ num = C.pack . show
 keptFor :: ByteString -> ByteString -> ByteString -> ByteString
 keptFor a amount script = amount <> " " <> num (B.length a) <> " " <> a <> script
 
--- | Delete the entry of a key.
+-- | Delete the entry of a key, unless a store is moving the tip: the
+-- entry stays then, and whoever wanted it gone finds it there and asks
+-- again ('Haskoin.Store.Fleet.Pool.Decide.floorHeld').
 drop :: (Monad m) => Keys -> ByteString -> Atomic m ()
 drop k i = do
+  held <- P.floorHeld k.pool
+  unless held (dropped k i)
+
+-- | Delete the entry of a key, whoever has the floor.
+dropped :: (Monad m) => Keys -> ByteString -> Atomic m ()
+dropped k i = do
   let e = entryOf k i
   had <- Set.toList <$> hkeys e.addrs
   forM_ had $ \a -> srem (k.watchers `under` a) i
@@ -235,7 +243,7 @@ drop k i = do
 ended :: (Monad m) => Keys -> Atomic m ()
 ended k = do
   ids <- smembers k.marked
-  forM_ (Set.toList ids) (drop k)
+  forM_ (Set.toList ids) (dropped k)
   del k.marked
   del k.moving
 
@@ -261,18 +269,20 @@ used k i cost = do
   zadd k.prio (fromIntegral (lowest + cost)) i
 
 -- | Delete the entries of the lowest priority past so many, raising the
--- level to that of each: how many were deleted.
+-- level to that of each: how many were deleted. None while a store is
+-- moving the tip.
 evict :: (Monad m) => Keys -> Int -> Atomic m Integer
 evict k most = do
+  held <- P.floorHeld k.pool
   n <- zcard k.prio
-  if n <= toInteger most
+  if held || n <= toInteger most
     then return 0
     else do
       lowest <- zrangeByScore k.prio MinusInf PlusInf (Just (fromInteger n - most))
       start <- fromIntegral <$> getNumber k.level
       let go bar (i, p) = do
             when (p > bar) (setNumber k.level (round p))
-            drop k i
+            dropped k i
             return (max bar p)
       _ <- foldM go (start :: Score) lowest
       return (toInteger (length lowest))

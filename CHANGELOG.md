@@ -159,6 +159,14 @@ whitelist it must now say what they grant (`--peer-permission`, or
     drawn sequences of offers, withdrawals, expiries and moves of the
     tip, with all that Redis has compared after every step
     (`Haskoin.Store.Fleet.DecideSpec`).
+  - **The store that moves the tip has the floor.** A move of the tip
+    over a block reads for a second or more, and a decision is carried
+    out only if nothing that it read has changed: with transactions
+    offered all the time it would lose every race. So while a store moves
+    the tip, an offer is late and is made again, and withdrawals,
+    expiries, and drops and evictions of the cache wait for the next
+    turn. A move costs in proportion to its block. A store whose move is
+    refused five turns in a row warns in its log.
   - **It costs Redis more:** an offer that is taken is two calls where it
     was one, and about 137 microseconds of Redis where the script took 74
     (Valkey's own count). That leaves room for some seven thousand offers

@@ -42,6 +42,7 @@ module Haskoin.Store.Fleet.Pool.Decide
     entryOuts,
     entryOval,
     entryMeta,
+    floorHeld,
     offer,
     withdraw,
     expire,
@@ -55,8 +56,7 @@ import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
-import Data.List (nub, sort)
-import Data.Map.Strict qualified as Map
+import Data.List (nub)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Serialize
   ( Get,
@@ -89,7 +89,7 @@ data Keys = Keys
     -- | how many times the pool was emptied
     restarts :: !(K 'Number),
     -- | until when each store is live
-    lease :: !(K 'Hash),
+    lease :: !(K 'Counts),
     -- | the recent blocks of each store, newest first
     recent :: !(K 'Hash),
     events :: !(K 'Stream),
@@ -462,9 +462,42 @@ insert k tx = do
   emit k "t" t
   sawIt k t
 
--- | Withdraw transactions and all that spends them: those that left.
+-- | Whether a store has the floor: it began a move of the tip
+-- ('Haskoin.Store.Fleet.XPub.Decide.begin'), and wrote in the last ten
+-- seconds.
+--
+-- A move of the tip is one decision that reads what tens of thousands of
+-- questions say, over seconds, and is carried out only if every answer
+-- still holds. Transactions are offered several times a second, and each
+-- offer changes some of those answers: left to themselves, offers would
+-- have every move refused, and the tip would never move. So whatever else
+-- writes to the pool or to the cache gives way while a store has the
+-- floor, as everything gave way to the script that moved the tip, which
+-- Redis ran alone. An offer is 'Late' then, and is made again.
+--
+-- Giving way for no reason costs a moment, and the clock can only do
+-- that: a move that looks under way and has just gone quiet. A move that
+-- has gone quiet at the clock of this decision has still gone quiet when
+-- the decision is carried out, if it wrote nothing since, which the
+-- script checks.
+floorHeld :: (Monad m) => Keys -> Atomic m Bool
+floorHeld k =
+  get k.moving >>= \case
+    Nothing -> return False
+    Just v -> do
+      now <- clock
+      return (now - number (Just (B.drop 1 (snd (B.breakSubstring " " v)))) <= 10000)
+
+-- | Withdraw transactions and all that spends them: those that left. None
+-- while a store is moving the tip.
 withdraw :: (Monad m) => Keys -> [ByteString] -> Atomic m [ByteString]
 withdraw k from = do
+  held <- floorHeld k
+  if held then return [] else withdrawn k from
+
+-- | 'withdraw' whoever has the floor: for the move of the tip itself.
+withdrawn :: (Monad m) => Keys -> [ByteString] -> Atomic m [ByteString]
+withdrawn k from = do
   order <- descendants k from
   forM_ order (remove k False)
   return order
@@ -498,11 +531,16 @@ trim k most = do
 -- output that it spends is made by a transaction of the pool or unspent
 -- at the tip. What it replaces leaves first, with all that spends it, but
 -- only if it is taken.
+--
+-- It is 'Late' while a store is moving the tip ('floorHeld'), as it is
+-- when the tip is no longer the one that the store saw: the store offers
+-- it again.
 offer :: (Monad m) => Keys -> Maybe ByteString -> [Bool] -> [ByteString] -> PoolTx -> Atomic m Offered
 offer k saw unspent replaces tx = do
   prefetch (likely k tx <> map (askingWhetherField k.spends) replaces)
   at <- get k.tip
-  if fromMaybe "" at /= fromMaybe "" saw
+  held <- floorHeld k
+  if held || fromMaybe "" at /= fromMaybe "" saw
     then return Late
     else do
       known <- member k tx.txid
@@ -533,6 +571,7 @@ offer k saw unspent replaces tx = do
 likely :: Keys -> PoolTx -> [Query]
 likely k tx =
   [ asking k.tip,
+    asking k.moving,
     askingWhetherField k.spends t,
     askingField k.spends t,
     askingMember k.own t,
@@ -649,8 +688,9 @@ advance k saw target given bsize how path token = do
         then return Stays
         else do
           now <- maybe clock return given
-          leases <- hgetall k.lease
-          let live = sort [store | (store, expiry) <- Map.toList leases, number (Just expiry) > now]
+          -- which stores are live, and not until when: a store that
+          -- renews its lease while this is decided changes nothing for it
+          live <- Set.toAscList <$> hfieldsAbove k.lease now
           reports <- forM live (fmap (pieces bsize . fromMaybe "") . hget k.recent)
           let agreed = case reports of
                 first : others -> take 1 [b | b <- first, all (elem b) others]
@@ -714,7 +754,7 @@ advance k saw target given bsize how path token = do
         ours <- member k tx.txid
         unless ours $ do
           rivals <- forM tx.inputs (hget k.spender)
-          _ <- withdraw k [s | Just s <- rivals]
+          _ <- withdrawn k [s | Just s <- rivals]
           insert k tx
       -- what the store has as replaced of the abandoned blocks waits for
       -- the transaction that replaced it
@@ -727,7 +767,7 @@ advance k saw target given bsize how path token = do
         zadd k.lostat (heightOf k value) t
       -- what spends from those that are gone for good leaves
       orphaned <- concat <$> forM change.gone (fmap Set.toList . smembers . under k.kids)
-      _ <- withdraw k orphaned
+      _ <- withdrawn k orphaned
       -- the new blocks: what they confirm leaves alone
       forM_ change.confirmed (remove k True)
       -- what waited for a transaction that they confirm was replaced
@@ -745,7 +785,7 @@ advance k saw target given bsize how path token = do
         let (o, by) = B.splitAt (k.tsize + 4) item
         s <- hget k.spender o
         forM_ s $ \rival -> do
-          left <- withdraw k [rival]
+          left <- withdrawn k [rival]
           forM_ left (\t -> replaced k t by)
       -- forget what was replaced, or waits, 2016 blocks before the block
       -- of the tip

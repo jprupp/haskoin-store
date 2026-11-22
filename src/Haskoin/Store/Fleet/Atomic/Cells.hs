@@ -101,6 +101,12 @@ module Haskoin.Store.Fleet.Atomic.Cells
     thereStep,
     thereAtStep,
     thereAtAllSame,
+
+    -- * Only the writes that reach a cell
+    reaches,
+    onlyAt,
+    skipOthers,
+    skipOthersThere,
   )
 where
 
@@ -121,6 +127,7 @@ data CellOp b = Put b | Clear | Plus Integer
 type Add b = Integer -> Maybe b -> b
 
 -- | What a cell holds after a write, from what it held.
+
 {-@ reflect cellAfter @-}
 cellAfter :: Add b -> CellOp b -> Maybe b -> Maybe b
 cellAfter _ (Put x) _ = Just x
@@ -128,6 +135,7 @@ cellAfter _ Clear _ = Nothing
 cellAfter add (Plus n) v = Just (add n v)
 
 -- | Whether there is something in a cell after a write, from whether there was.
+
 {-@ reflect thereAfter @-}
 thereAfter :: CellOp b -> Bool -> Bool
 thereAfter (Put _) _ = True
@@ -136,6 +144,7 @@ thereAfter (Plus _) _ = True
 
 -- | Whether a cell holds something after a write is what 'thereAfter'
 -- says, from whether it did.
+
 {-@ thereStep :: add:Add b -> c:CellOp b -> v:Maybe b -> {isJust (cellAfter add c v) == thereAfter c (isJust v)} @-}
 thereStep :: Add b -> CellOp b -> Maybe b -> ()
 thereStep _ (Put _) _ = ()
@@ -148,6 +157,7 @@ thereStep _ (Plus _) _ = ()
 data RankOp s = Rank s | RankNew s | Unrank
 
 -- | The score of a member after a write, from the score that it had.
+
 {-@ reflect rankAfter @-}
 rankAfter :: RankOp s -> Maybe s -> Maybe s
 rankAfter (Rank s) _ = Just s
@@ -165,6 +175,7 @@ data MapOp p k c = On k c | All | Under p
 -- | The cell of a key after a write to the map, from what the cell was:
 -- what a decision takes its answer through. Given are what marks a key
 -- and what a write does to a cell.
+
 {-@ reflect at @-}
 at :: (Eq k) => (p -> k -> Bool) -> (c -> Maybe v -> Maybe v) -> k -> MapOp p k c -> Maybe v -> Maybe v
 at _ cell x (On y c) v = if y == x then cell c v else v
@@ -172,6 +183,7 @@ at _ _ _ All _ = Nothing
 at marks _ x (Under p) v = if marks p x then Nothing else v
 
 -- | 'at' for writes one after the other.
+
 {-@ reflect atAll @-}
 atAll :: (Eq k) => (p -> k -> Bool) -> (c -> Maybe v -> Maybe v) -> k -> [MapOp p k c] -> Maybe v -> Maybe v
 atAll _ _ _ [] v = v
@@ -205,28 +217,33 @@ mLess :: (p -> k -> Bool) -> p -> Map k v -> Map k v
 mLess marks q = Map.filterWithKey (\k _ -> not (marks q k))
 
 -- | Assumed: a lookup after a cell was put at a key gives that cell.
+
 {-@ assume selSame :: m:Map k v -> x:k -> c:Maybe v -> {sel (put m x c) x == c} @-}
 selSame :: Map k v -> k -> Maybe v -> ()
 selSame _ _ _ = ()
 
 -- | Assumed: a lookup at another key gives what was there before.
+
 {-@ assume selOther :: m:Map k v -> x:k -> c:Maybe v -> y:{k | y /= x} -> {sel (put m x c) y == sel m y} @-}
 selOther :: Map k v -> k -> Maybe v -> k -> ()
 selOther _ _ _ _ = ()
 
 -- | Assumed: the empty map has no cell.
+
 {-@ assume selNone :: m:{Map k v | none m} -> x:k -> {sel m x == Nothing} @-}
 selNone :: Map k v -> k -> ()
 selNone _ _ = ()
 
 -- | Assumed: a map without the keys that something marks has no cell at
 -- such a key, and at any other the cell that it had.
+
 {-@ assume selLess :: marks:(p -> k -> Bool) -> m:Map k v -> q:p -> x:k
       -> {sel (less m q) x == (if marks q x then Nothing else sel m x)} @-}
 selLess :: (p -> k -> Bool) -> Map k v -> p -> k -> ()
 selLess _ _ _ _ = ()
 
 -- | Whether a write is to the cell of one key.
+
 {-@ measure isOn @-}
 isOn :: MapOp p k c -> Bool
 isOn (On _ _) = True
@@ -234,6 +251,7 @@ isOn All = False
 isOn (Under _) = False
 
 -- | Whether a write is to every cell.
+
 {-@ measure isAll @-}
 isAll :: MapOp p k c -> Bool
 isAll (On _ _) = False
@@ -241,6 +259,7 @@ isAll All = True
 isAll (Under _) = False
 
 -- | Whether a write is to the cells of the keys that something marks.
+
 {-@ measure isUnder @-}
 isUnder :: MapOp p k c -> Bool
 isUnder (On _ _) = False
@@ -248,18 +267,21 @@ isUnder All = False
 isUnder (Under _) = True
 
 -- | The key of a write to one cell.
+
 {-@ measure onKey @-}
 {-@ onKey :: {op:MapOp p k c | isOn op} -> k @-}
 onKey :: MapOp p k c -> k
 onKey (On y _) = y
 
 -- | What a write to one cell does to it.
+
 {-@ measure onCell @-}
 {-@ onCell :: {op:MapOp p k c | isOn op} -> c @-}
 onCell :: MapOp p k c -> c
 onCell (On _ c) = c
 
 -- | What marks the keys of a write to marked cells.
+
 {-@ measure underWhat @-}
 {-@ underWhat :: {op:MapOp p k c | isUnder op} -> p @-}
 underWhat :: MapOp p k c -> p
@@ -269,6 +291,7 @@ underWhat (Under q) = q
 -- keys of Redis and for the fields, members and scores inside a key. Its
 -- type says which map that is for each kind of write, in the names of
 -- "Data.Map" above.
+
 {-@ mapAfter :: (Ord k) => marks:(p -> k -> Bool) -> cell:(c -> Maybe v -> Maybe v) -> op:MapOp p k c -> m:Map k v
       -> {n:Map k v | (isAll op => none n)
                       && (isOn op => n == put m (onKey op) (cell (onCell op) (sel m (onKey op))))
@@ -280,6 +303,7 @@ mapAfter marks _ (Under q) m = mLess marks q m
 
 -- | One write: the cell of a key, in any map that is what 'mapAfter' gives,
 -- is what 'at' says, from what the cell was.
+
 {-@ step :: (Ord k) => marks:(p -> k -> Bool) -> cell:(c -> Maybe v -> Maybe v) -> x:k -> op:MapOp p k c -> m:Map k v
       -> n:{Map k v | (isAll op => none n)
                       && (isOn op => n == put m (onKey op) (cell (onCell op) (sel m (onKey op))))
@@ -294,6 +318,7 @@ step marks _ x (Under q) m _ = selLess marks m q x
 
 -- | Any writes, one after the other: the cell of a key in the map after
 -- them is what the cell was, taken through 'at' for each write.
+
 {-@ cellAfterAll :: (Ord k) => marks:(p -> k -> Bool) -> cell:(c -> Maybe v -> Maybe v) -> x:k -> ops:[MapOp p k c]
       -> m:Map k v -> {r:Maybe v | r == atAll marks cell x ops (sel m x)} @-}
 cellAfterAll :: (Ord k) => (p -> k -> Bool) -> (c -> Maybe v -> Maybe v) -> k -> [MapOp p k c] -> Map k v -> Maybe v
@@ -308,6 +333,7 @@ cellAfterAll marks cell x (op : ops) m =
 
 -- | Whether the cell of a key holds something after a write to the map,
 -- from whether it did: 'at' for a question that asks no more.
+
 {-@ reflect thereAt @-}
 thereAt :: (Eq k) => (p -> k -> Bool) -> k -> MapOp p k (CellOp b) -> Bool -> Bool
 thereAt _ x (On y c) b = if y == x then thereAfter c b else b
@@ -315,6 +341,7 @@ thereAt _ _ All _ = False
 thereAt marks x (Under p) b = if marks p x then False else b
 
 -- | 'thereAt' for writes one after the other.
+
 {-@ reflect thereAtAll @-}
 thereAtAll :: (Eq k) => (p -> k -> Bool) -> k -> [MapOp p k (CellOp b)] -> Bool -> Bool
 thereAtAll _ _ [] b = b
@@ -322,6 +349,7 @@ thereAtAll marks x (op : ops) b = thereAtAll marks x ops (thereAt marks x op b)
 
 -- | One write: whether the cell holds something after it, by 'at', is what
 -- 'thereAt' says.
+
 {-@ thereAtStep :: (Eq k) => marks:(p -> k -> Bool) -> add:Add b -> x:k -> op:MapOp p k (CellOp b) -> v:Maybe b
       -> {isJust (at marks (cellAfter add) x op v) == thereAt marks x op (isJust v)} @-}
 thereAtStep :: (Eq k) => (p -> k -> Bool) -> Add b -> k -> MapOp p k (CellOp b) -> Maybe b -> ()
@@ -335,9 +363,56 @@ thereAtStep marks _ x (Under p) _
 
 -- | Whether a cell holds something after any writes is known from whether
 -- it did before them, without what it held.
+
 {-@ thereAtAllSame :: (Eq k) => marks:(p -> k -> Bool) -> add:Add b -> x:k -> ops:[MapOp p k (CellOp b)] -> v:Maybe b
       -> {isJust (atAll marks (cellAfter add) x ops v) == thereAtAll marks x ops (isJust v)} @-}
 thereAtAllSame :: (Eq k) => (p -> k -> Bool) -> Add b -> k -> [MapOp p k (CellOp b)] -> Maybe b -> ()
 thereAtAllSame _ _ _ [] _ = ()
 thereAtAllSame marks add x (op : ops) v =
   thereAtStep marks add x op v `seq` thereAtAllSame marks add x ops (at marks (cellAfter add) x op v)
+
+-------------------------------------------------------------------------------
+-- only the writes that reach a cell
+-------------------------------------------------------------------------------
+
+-- | Whether a write can change the cell of a key: one to that cell, to
+-- every cell, or to marked cells. A write to the cell of another key
+-- cannot.
+
+{-@ reflect reaches @-}
+reaches :: (Eq k) => k -> MapOp p k c -> Bool
+reaches x (On y _) = y == x
+reaches _ All = True
+reaches _ (Under _) = True
+
+-- | Of writes, those that can change the cell of a key, in their order.
+
+{-@ reflect onlyAt @-}
+onlyAt :: (Eq k) => k -> [MapOp p k c] -> [MapOp p k c]
+onlyAt _ [] = []
+onlyAt x (op : ops) = if reaches x op then op : onlyAt x ops else onlyAt x ops
+
+-- | A decision that has written to ten thousand cells of one key need not
+-- go through all of those writes for a question about one cell: the
+-- writes to the other cells change nothing for it. So what a decision
+-- sees of its own writes costs what the cell was written, not what the key
+-- was.
+
+{-@ skipOthers :: (Eq k) => marks:(p -> k -> Bool) -> cell:(c -> Maybe v -> Maybe v) -> x:k -> ops:[MapOp p k c]
+      -> v:Maybe v -> {atAll marks cell x (onlyAt x ops) v == atAll marks cell x ops v} @-}
+skipOthers :: (Eq k) => (p -> k -> Bool) -> (c -> Maybe v -> Maybe v) -> k -> [MapOp p k c] -> Maybe v -> ()
+skipOthers _ _ _ [] _ = ()
+skipOthers marks cell x (op : ops) v
+  | reaches x op = skipOthers marks cell x ops (at marks cell x op v)
+  | otherwise = skipOthers marks cell x ops v
+
+-- | 'skipOthers' for a question that only asks whether a cell holds
+-- something.
+
+{-@ skipOthersThere :: (Eq k) => marks:(p -> k -> Bool) -> x:k -> ops:[MapOp p k (CellOp b)] -> b:Bool
+      -> {thereAtAll marks x (onlyAt x ops) b == thereAtAll marks x ops b} @-}
+skipOthersThere :: (Eq k) => (p -> k -> Bool) -> k -> [MapOp p k (CellOp b)] -> Bool -> ()
+skipOthersThere _ _ [] _ = ()
+skipOthersThere marks x (op : ops) b
+  | reaches x op = skipOthersThere marks x ops (thereAt marks x op b)
+  | otherwise = skipOthersThere marks x ops b
