@@ -117,7 +117,9 @@ advance conn keys tsize clock seen target how change (path, token) =
 -- | A transaction as the arguments of the pool script.
 txArgs :: PoolTx -> [ByteString]
 txArgs tx =
-  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, if tx.signals then "1" else "0", num (length tx.entries)]
+  -- the script took whether a transaction says that it can be replaced by
+  -- fee, and kept which could be: no transaction says so any more
+  [tx.txid, num tx.time, B.concat tx.inputs, tx.body, "0", num (length tx.entries)]
     <> concatMap entry tx.entries
   where
     entry = \case

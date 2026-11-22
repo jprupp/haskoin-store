@@ -24,9 +24,9 @@
 -- address that the pool spends and '0' for the others.
 --
 -- 'bodies': transactions, of the pool or not. For each: its body or '',
--- '1' if it can be replaced by fee or '0', the number of its outputs that
--- the pool spends, and for each of those the output, the transaction that
--- spends it and the number of its input that does.
+-- the number of its outputs that the pool spends, and for each of those
+-- the output, the transaction that spends it and the number of its input
+-- that does.
 --
 -- 'spenders': outputs. For each, the transaction that spends it and the
 -- number of its input that does, or two ''.
@@ -140,7 +140,6 @@ elseif what == 'spent' then
 elseif what == 'bodies' then
   for _, t in ipairs(split(ARGV[5], tsize)) do
     answer[#answer + 1] = redis.call('HGET', prefix .. 'pool:body', t) or ''
-    answer[#answer + 1] = tostring(redis.call('SISMEMBER', prefix .. 'pool:rbf', t))
     -- what spends its outputs: the inputs of the transactions of the pool
     -- that spend from it
     local spent = {}

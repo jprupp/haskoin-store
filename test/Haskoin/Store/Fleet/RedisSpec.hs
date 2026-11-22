@@ -304,12 +304,11 @@ spec = do
         Just [flags] <- poolRead conn keys 4 tip "spent" [a, B.concat [o | (_, o, _) <- mine.paid]]
         C.unpack flags `shouldBe` [if Map.member o mine.spent then '1' else '0' | (_, o, _) <- mine.paid]
         -- bodies, spenders with the number of the input, and ids by prefix
-        -- bodies come with whether they can be replaced by fee, and with
-        -- what spends their outputs: the fifth says itself that it can be
-        -- replaced and nothing spends from it; the second does not say so,
-        -- and the second input of the fifth spends its first output
+        -- bodies come with what spends their outputs: nothing spends from
+        -- the fifth, and the second input of the fifth spends the first
+        -- output of the second
         poolRead conn keys 4 tip "bodies" [block 4 <> block 99 <> block 1]
-          `shouldReturn` Just ["body", "1", "0", "", "0", "0", "body", "0", "1", out 1 0, block 4, "1"]
+          `shouldReturn` Just ["body", "0", "", "0", "body", "1", out 1 0, block 4, "1"]
         poolRead conn keys 4 tip "spenders" [out 1 0 <> out 0 0 <> out 5 0]
           `shouldReturn` Just [block 4, "1", block 4, "0", "", ""]
         poolRead conn keys 4 tip "ids" [B.take 3 (block 4)] `shouldReturn` Just (map block [0 .. 8])
@@ -434,10 +433,10 @@ spec = do
       forM_ (Map.toList model.children) $ \(t, expected) -> do
         members <- list (Redis.smembers (key ("pool:kids:" <> t)))
         Set.fromList members `shouldBe` expected
-      -- those that can be replaced by fee are those that say so and what
-      -- spends from them
-      canBe <- list (Redis.smembers (key "pool:rbf"))
-      Set.fromList canBe `shouldBe` P.replaceable signalling maker model
+      -- which can be replaced by fee is not kept: it is a fact of the
+      -- network, and no longer of the transaction and its parents
+      list (Redis.keys (key "pool:rbf")) `shouldReturn` []
+      list (Redis.keys (key "pool:own")) `shouldReturn` []
       -- and what it holds for each address is what the entries of its
       -- transactions come to
       let members = [(t, timeOf (number t), entriesOf (number t) os) | (t, os) <- Map.toList model.spends]
@@ -630,8 +629,6 @@ category n = C.pack ("cat " <> show n)
 
 -- | Whether a transaction of the tests says itself that it can be replaced
 -- by fee: one in four does.
-signalling :: ByteString -> Bool
-signalling t = number t `mod` 4 == 0
 
 -- | A transaction of the tests as the pool takes it.
 txOf :: Word32 -> [ByteString] -> PoolTx
@@ -641,7 +638,6 @@ txOf t spends =
       time = timeOf t,
       inputs = spends,
       body = "body",
-      signals = signalling (block t),
       entries = map entry (entriesOf t spends)
     }
   where

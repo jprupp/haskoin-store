@@ -22,11 +22,9 @@
 -- Redis.
 --
 -- A transaction has INPUTS inputs (3) and OUTPUTS outputs (3), each at an
--- address of its own. Two in three say that they can be replaced by fee.
--- One in five spends an output of the one before it, which the block
--- confirms too, and one in ten has a child that stays in the pool: those
--- are what make a real block ask Redis more times than a block of
--- unrelated transactions.
+-- address of its own. One in five spends an output of the one before it,
+-- which the block confirms too, and one in ten has a child that stays in
+-- the pool, as blocks of Bitcoin have.
 --
 -- For each run it prints how long each pass over the decision took and
 -- how many questions it ended with, the answers that the decision depends
@@ -116,7 +114,6 @@ poolTx shape c =
       time = 1795000000 + fromIntegral c,
       inputs = map fst spent,
       body = B.replicate 400 7,
-      signals = c `mod` 3 /= 0,
       entries =
         [PoolTouches a | (_, a) <- spent]
           <> [PoolTouches (address 1 c i) | i <- [0 .. shape.outs - 1]]
@@ -150,7 +147,6 @@ child c =
       time = 1795000900,
       inputs = [o],
       body = B.replicate 250 7,
-      signals = False,
       entries =
         [ PoolTouches (address 1 c 1),
           PoolTouches (address 2 c 0),

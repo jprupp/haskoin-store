@@ -1264,6 +1264,14 @@ endpointsTest env = do
   map (textField "hash") hs `shouldBe` [Just best]
   tx <- plainJSON env ("/transaction/" <> cs t1)
   textField "txid" tx `shouldBe` Just t1
+  -- Whether a transaction can be replaced by fee is a fact of its
+  -- network and of whether a block confirms it: every unconfirmed one can
+  -- on Bitcoin, whatever it signals, none on Bitcoin Cash, and none that
+  -- is confirmed. The second payment signals nothing.
+  field "rbf" tx `shouldBe` Just (Bool False)
+  waitFor "the second payment in the store" ((== 200) . fst <$> getJSON env.plain ("/transaction/" <> cs t2))
+  unconfirmed <- plainJSON env ("/transaction/" <> cs t2)
+  field "rbf" unconfirmed `shouldBe` Just (Bool env.net.replaceByFee)
   rawNode <- rpc env.node "getrawtransaction" [String t1, Bool False]
   raw <- plainJSON env ("/transaction/" <> cs t1 <> "/raw")
   field "result" raw `shouldBe` Just rawNode

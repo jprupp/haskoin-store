@@ -1674,18 +1674,19 @@ compacted.
 costs to decide, without Redis: transactions that are offered wait for as
 long as a move takes (`docs/concurrency.md`, "The floor"). It fills the
 pure model of Redis with a pool of 20,000 transactions and decides the
-move over a block of 4,000 of them, some in chains and two in three
-replaceable by fee, as on Bitcoin. It prints the time of each pass over
+move over a block of 4,000 of them, some in chains, as on Bitcoin. It
+prints the time of each pass over
 the decision, its answers and writes, the time for each of those in a
 pass, which is the number to compare between two builds, and what was
 allocated. Run it with `+RTS -T` for the last.
 
 On a desktop of 2026 the move over 4,000 transactions of three inputs and
-three outputs is decided in about 1.3 seconds: five passes, one of which
+three outputs is decided in about 1.1 seconds: four passes, one of which
 goes through the whole block, and about a microsecond and a kilobyte
 allocated for each answer or write of a pass. It took 4.4 seconds in
 eight passes, five of them through the block, before the move named its
-questions ahead (`docs/concurrency.md`, "The floor").
+questions ahead and while the pool worked out which transactions could
+be replaced by fee (`docs/concurrency.md`, "The floor").
 
 ### Contributing
 

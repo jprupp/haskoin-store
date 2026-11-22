@@ -52,7 +52,7 @@ module Haskoin.Store.Fleet.Pool.Decide
   )
 where
 
-import Control.Monad (foldM, forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -108,10 +108,6 @@ data Keys = Keys
     -- | every transaction by the time it entered a mempool
     time :: !(K 'Sorted),
     ids :: !(K 'Sorted),
-    -- | those that say themselves that they can be replaced
-    own :: !(K 'Group),
-    -- | those that can be replaced
-    rbf :: !(K 'Group),
     atx :: !(Family 'Sorted),
     aout :: !(Family 'Sorted),
     aval :: !(Family 'Hash),
@@ -170,8 +166,6 @@ poolKeys p tsize =
       entries = named (p <> "pool:entries"),
       time = named (p <> "pool:time"),
       ids = named (p <> "pool:ids"),
-      own = named (p <> "pool:own"),
-      rbf = named (p <> "pool:rbf"),
       atx = family (p <> "pool:atx:"),
       aout = family (p <> "pool:aout:"),
       aval = family (p <> "pool:aval:"),
@@ -440,8 +434,7 @@ departing k t es =
 -- be named: the tip; then what is asked of each transaction that the
 -- blocks confirm and of each output that they spend, and which stores
 -- are live; then, of each transaction, what taking it out asks about its
--- addresses ('departing'), and its children if it could be replaced; then
--- what is asked of each child, and of what each child spends from.
+-- addresses ('departing'), and of each cached key at one of them.
 --
 -- These are the questions of a move with nothing to undo, which is
 -- nearly all of them. One that brings transactions back, or finds a
@@ -477,36 +470,8 @@ foreseen k saw target now change =
     confirmed t =
       [ only (askingField k.spends t),
         only (askingMembers (under k.lostby t)),
-        thenField k.entries t (maybe [] (departing k t . snd . kept)),
-        thenMember k.rbf t $ \could ->
-          [thenMembers (under k.kids t) (concatMap child . Set.toList) | could]
+        thenField k.entries t (maybe [] (departing k t . snd . kept))
       ]
-    -- whether a child can still be replaced is worked out again
-    -- ('replaceable')
-    child c =
-      [ thenField k.spends c (map (only . askingMember k.rbf . maker k) . outputs k . fromMaybe ""),
-        only (askingMember k.own c),
-        only (askingMember k.rbf c),
-        only (askingMembers (under k.kids c))
-      ]
-
--- | Work out again whether a transaction of the pool can be replaced by
--- fee, which it can if it says so itself or spends from one of the pool
--- that can, and if that changed, the same for what spends it.
-replaceable :: (Monad m) => Keys -> ByteString -> Atomic m ()
-replaceable k t =
-  hget k.spends t >>= \case
-    Nothing -> return ()
-    Just inputs -> do
-      says <- sismember k.own t
-      can <- if says then return True else anyM (sismember k.rbf . maker k) (outputs k inputs)
-      was <- sismember k.rbf t
-      when (can /= was) $ do
-        if can then sadd k.rbf t else srem k.rbf t
-        children <- smembers (under k.kids t)
-        forM_ (Set.toList children) (replaceable k)
-  where
-    anyM p = foldM (\found x -> if found then return True else p x) False
 
 -- | The outputs that are written one after the other.
 outputs :: Keys -> ByteString -> [ByteString]
@@ -534,12 +499,6 @@ remove k quiet t =
         srem (under k.kids (maker k o)) t
       hdel k.spends t
       hdel k.body t
-      srem k.own t
-      could <- sismember k.rbf t
-      when could $ do
-        srem k.rbf t
-        children <- smembers (under k.kids t)
-        forM_ (Set.toList children) (replaceable k)
 
 -- | Put a transaction in.
 insert :: (Monad m) => Keys -> PoolTx -> Atomic m ()
@@ -554,8 +513,6 @@ insert k tx = do
   zadd k.time (fromIntegral tx.time) t
   zadd k.ids 0 t
   account k t tx.time tx.entries 1
-  when tx.signals (sadd k.own t)
-  replaceable k t
   emit k "t" t
   sawIt k t
 
@@ -678,13 +635,10 @@ likely k tx =
   [ asking k.tip,
     asking k.moving,
     askingWhetherField k.spends t,
-    askingField k.spends t,
-    askingMember k.own t,
-    askingMember k.rbf t,
-    askingMembers (under k.kids t)
+    askingField k.spends t
   ]
     <> concat
-      [ [askingField k.spender o, askingWhetherField k.spends (maker k o), askingMember k.rbf (maker k o)]
+      [ [askingField k.spender o, askingWhetherField k.spends (maker k o)]
       | o <- tx.inputs
       ]
     <> concatMap entry tx.entries

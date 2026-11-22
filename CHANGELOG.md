@@ -190,6 +190,18 @@ whitelist it must now say what they grant (`--peer-permission`, or
     through a block in the benchmark, and more on a server. Deciding the
     move over 4,000 transactions takes 1.3 seconds where it took 4.4,
     on a desktop, and decides the same.
+  - **`rbf` is true for every unconfirmed transaction on Bitcoin, and
+    false elsewhere.** The nodes of Bitcoin take a replacement of any
+    unconfirmed transaction, whatever it signals, since Bitcoin Core 28,
+    and Bitcoin Cash has no such rule. The field said whether a
+    transaction signalled replace-by-fee (BIP 125) or spent an
+    unconfirmed one that did, which the pool worked out for every
+    transaction and kept right as parents were confirmed and came back:
+    two sets in Redis, and questions about the children of every
+    transaction that a block confirmed. None of that is kept or asked
+    any more; the sets `pool:own` and `pool:rbf` of an older store are
+    left unread. The move over 4,000 transactions is decided in 1.1
+    seconds.
   - **A decision of any size is carried out.** Its questions and writes
     go to Redis a thousand to an argument, without the writes that a
     later delete undoes and with one command for many members of a key.

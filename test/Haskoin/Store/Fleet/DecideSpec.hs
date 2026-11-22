@@ -80,7 +80,7 @@ spec = do
       it "asks Redis no more times about a large block than about a small one" $ \(conn, fresh) -> do
         let asked related n = do
               keys <- fresh
-              let txs = [(blockTx c) {signals = related} | c <- [1 .. n]]
+              let txs = map blockTx [1 .. n]
                   change =
                     PoolChange
                       { returned = [],
@@ -190,7 +190,6 @@ childTx c =
       time = 1700009000,
       inputs = [encode c <> encode (0 :: Word32)],
       body = B.replicate 250 7,
-      signals = False,
       entries =
         [ PoolTouches (C.pack ("addr" <> show c)),
           PoolSpends (C.pack ("addr" <> show c)) (encode c <> encode (0 :: Word32)) 1000
@@ -206,7 +205,6 @@ blockTx c =
       time = 1700000000 + fromIntegral c,
       inputs = [encode (1000000 + c) <> encode (0 :: Word32)],
       body = B.replicate 250 7,
-      signals = False,
       entries =
         [ PoolTouches (addr c),
           PoolPays (addr c) (encode c <> encode (0 :: Word32)) 1000 "script",
@@ -344,7 +342,6 @@ crowded conn keys = do
           time = 1700000000 + fromIntegral c,
           inputs = [encode (1000000 + c) <> encode (0 :: Word32)],
           body = B.replicate 250 7,
-          signals = False,
           entries =
             [ PoolTouches (addr c),
               PoolPays (addr c) (encode c <> encode (0 :: Word32)) 1000 "script",
@@ -361,7 +358,6 @@ crowded conn keys = do
           time = 1700009000,
           inputs = [encode c <> encode (0 :: Word32)],
           body = B.replicate 250 7,
-          signals = False,
           entries = [PoolTouches (addr c), PoolSpends (addr c) (encode c <> encode (0 :: Word32)) 1000]
         }
     -- a cached key with one address of the block

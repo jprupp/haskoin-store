@@ -436,7 +436,7 @@ importChainTx wr br time p = do
       Nothing -> do
         logError wr $ "Attempted to import a tx missing UTXO: " <> txHashToHex p.txid
         throwIO Orphan
-  let td = prepareTxData False br time p.tx us
+  let td = prepareTxData br time p.tx us
   addChainTx wr p td us
   return td
 
@@ -511,16 +511,16 @@ revertBlock wr bh = do
 -- The chain's column families
 -------------------------------------------------------------------------------
 
--- | Data of a new transaction, from its replace-by-fee flag, position, time and
--- the outputs it spends.
-prepareTxData :: Bool -> BlockRef -> Word64 -> Tx -> [Unspent] -> TxData
-prepareTxData rbf br tt tx us =
+-- | Data of a new transaction of a block, from its position, time and the
+-- outputs it spends. It cannot be replaced by fee: a block confirms it.
+prepareTxData :: BlockRef -> Word64 -> Tx -> [Unspent] -> TxData
+prepareTxData br tt tx us =
   TxData
     { block = br,
       tx = tx,
       prevs = ps,
       deleted = False,
-      rbf = rbf,
+      rbf = False,
       timestamp = tt,
       spenders = I.empty
     }

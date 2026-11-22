@@ -1015,7 +1015,6 @@ poolTx net td =
       time,
       inputs = [encode op | op <- spent],
       body = encode (td :: TxData) {block = MemRef time, deleted = False, spenders = IntMap.empty},
-      signals = net.replaceByFee && any ((< 0xffffffff - 1) . (.sequence)) td.tx.inputs,
       entries =
         [PoolTouches (encode a) | a <- touched]
           <> [ PoolSpends (encode a) (encode i.outpoint) p.value
@@ -1561,10 +1560,9 @@ redisPool net conn keys tip checked =
     groups n rows
       | null rows = []
       | otherwise = take n rows : groups n (drop n rows)
-    -- for each transaction: its body, whether it can be replaced by fee,
-    -- how many of its outputs the pool spends, and those with what spends
-    -- them
-    transactions (bytes : flag : count : rest) =
+    -- for each transaction: its body, how many of its outputs the pool
+    -- spends, and those with what spends them
+    transactions (bytes : count : rest) =
       let (spent, more) = splitAt (3 * number count) rest
           inputs =
             IntMap.fromList
@@ -1573,7 +1571,7 @@ redisPool net conn keys tip checked =
                 Right p <- [outpoint o],
                 Just s <- [spender t i]
               ]
-       in (body bytes (flag == "1"), inputs) : transactions more
+       in (body bytes, inputs) : transactions more
     transactions _ = []
     outpoint :: ByteString -> Either String OutPoint
     outpoint = decode
@@ -1609,11 +1607,16 @@ redisPool net conn keys tip checked =
     summary row = case map number (C.words row) of
       [txs, paid, paidCount, spent, spentCount, both, bothCount] -> Just MemSummary {..}
       _ -> Nothing
-    -- whether a transaction can be replaced by fee is what the pool says
-    -- now, not what the store that offered it found then
-    body bytes can
+    -- Whether a transaction of the pool can be replaced by fee is a fact
+    -- of its network: every one can on Bitcoin, whose nodes take a
+    -- replacement of any unconfirmed transaction since Bitcoin Core 28,
+    -- whatever the transaction says of itself, and none can on Bitcoin
+    -- Cash, which has no such rule. The pool worked it out once, from
+    -- what each transaction signalled and what it spent from (BIP 125),
+    -- and kept that right as parents were confirmed and came back.
+    body bytes
       | B.null bytes = Nothing
-      | otherwise = either (const Nothing) (\td -> Just (td :: TxData) {rbf = can}) (decode bytes)
+      | otherwise = either (const Nothing) (\td -> Just (td :: TxData) {rbf = net.replaceByFee}) (decode bytes)
     spender t i
       | B.null t = Nothing
       | otherwise = either (const Nothing) (\h -> Just Spender {txid = h, index = number i}) (decode t)

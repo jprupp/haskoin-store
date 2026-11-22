@@ -6647,8 +6647,12 @@ components:
           type: boolean
           description: |
             Whether the transaction can still be replaced by one paying a higher fee:
-            it signals replace-by-fee (BIP 125), or spends an unconfirmed transaction
-            that does. Only meaningful while unconfirmed, and on BTC.
+            true for every unconfirmed transaction on BTC, whose nodes take a
+            replacement of any unconfirmed transaction whatever it signals (full
+            replace-by-fee, the rule of Bitcoin Core since version 28), and false for
+            every confirmed transaction and on BCH, which has no such rule. Until
+            version 2.0 it said whether the transaction signalled replace-by-fee
+            (BIP 125) or spent an unconfirmed transaction that did.
         weight:
           type: integer
           description: |
