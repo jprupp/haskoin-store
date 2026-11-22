@@ -166,7 +166,24 @@ whitelist it must now say what they grant (`--peer-permission`, or
     the tip, an offer is late and is made again, and withdrawals,
     expiries, and drops and evictions of the cache wait for the next
     turn. A move costs in proportion to its block. A store whose move is
-    refused five turns in a row warns in its log.
+    refused five turns in a row warns in its log, with how long the last
+    took and which answer of Redis had changed.
+  - **The floor lasts as long as the move.** The store says every two
+    seconds that it is at its move, in a key of its own (`fx:beat`), and
+    has the floor for ten seconds from each time. The floor lasted ten
+    seconds from when it was taken, and the move over a block of Bitcoin
+    took longer than that to decide on a server: it was refused at every
+    turn, the tip staying where it was while the database went on. A
+    decision also judges time by one clock, read at its start, where it
+    read the clock again each time it asked Redis, and so found its own
+    lease of ten seconds run out. A store says in its log when a move
+    took five seconds or more: transactions wait meanwhile.
+  - **A decision of any size is carried out.** Its questions and writes
+    go to Redis a thousand to an argument, without the writes that a
+    later delete undoes and with one command for many members of a key.
+    They went as an argument for each word, 1,008,352 for the move of
+    the tip over one block of Bitcoin, and Redis closes the connection of
+    a command with more than 1,048,576.
   - **It costs Redis more:** an offer that is taken is two calls where it
     was one, and about 137 microseconds of Redis where the script took 74
     (Valkey's own count). That leaves room for some seven thousand offers

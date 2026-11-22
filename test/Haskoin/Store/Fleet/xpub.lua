@@ -1,3 +1,12 @@
+-- This is the script that wrote the cache before its decisions were made
+-- in Haskell (Haskoin.Store.Fleet.XPub.Decide), kept to hold them to it,
+-- with one thing changed since, as it was changed in the decisions: the
+-- move under way is its token in one key and the time at which its store
+-- last said that it is at it in another ('fx:beat'), and the store of a
+-- move, in 'piece' and 'abort', asks only whether the token is its own.
+-- It was one key with both, and a piece of a move that had gone quiet
+-- for ten seconds ended the move.
+--
 -- The cache of extended public keys of a fleet: xpubScript in
 -- Haskoin.Store.Fleet.XPub, which says what an entry is and why, after
 -- greedy.lua. The pool (Haskoin.Store.Fleet.Pool.Decide) keeps the part
@@ -108,6 +117,7 @@ local key = {
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:',
   moving = prefix .. 'fx:moving',
+  beat = prefix .. 'fx:beat',
   marked = prefix .. 'fx:marked',
   spender = prefix .. 'pool:spender',
   atx = prefix .. 'pool:atx:',
@@ -163,22 +173,26 @@ local function abort()
   for _, id in ipairs(redis.call('SMEMBERS', key.marked)) do
     drop(id)
   end
-  redis.call('DEL', key.marked, key.moving)
+  redis.call('DEL', key.marked, key.moving, key.beat)
 end
 
--- the token of the move of the tip under way, if there is one; a move that
--- wrote nothing for ten seconds is aborted
+-- the token of the move of the tip under way, if there is one; a move
+-- whose store said nothing for ten seconds is aborted
 local function moving()
-  local v = redis.call('GET', key.moving)
-  if not v then
+  local token = redis.call('GET', key.moving)
+  if not token then
     return nil
   end
-  local space = string.find(v, ' ', 1, true)
-  if now() - tonumber(string.sub(v, space + 1)) > 10000 then
+  if now() - tonumber(redis.call('GET', key.beat) or '0') > 10000 then
     abort()
     return nil
   end
-  return string.sub(v, 1, space - 1)
+  return token
+end
+
+-- whether the move under way is that of a token
+local function mine(token)
+  return redis.call('GET', key.moving) == token
 end
 
 local function numbers(e)
@@ -219,7 +233,7 @@ end
 local here = place(moves, fleet)
 
 if what == 'abort' then
-  if moving() == ARGV[4] then
+  if mine(ARGV[4]) then
     abort()
   end
   return {'ok'}
@@ -231,13 +245,14 @@ elseif what == 'begin' then
   if other and other ~= ARGV[4] then
     return {'busy'}
   end
-  redis.call('SET', key.moving, ARGV[4] .. ' ' .. now())
+  redis.call('SET', key.moving, ARGV[4])
+  redis.call('SET', key.beat, now())
   return {'ok'}
 elseif what == 'piece' then
-  if fleet ~= ARGV[5] or moving() ~= ARGV[4] then
+  if fleet ~= ARGV[5] or not mine(ARGV[4]) then
     return {'raced'}
   end
-  redis.call('SET', key.moving, ARGV[4] .. ' ' .. now())
+  redis.call('SET', key.beat, now())
   local ver = redis.call('INCR', prefix .. 'fleet:xver')
   -- take out what has a score of the chain, and leave the pool's layer
   local function chained(z, m)

@@ -32,8 +32,9 @@ pieces (`cacheBegin`, then `cachePieces`), each marking the entries that it
 touches. Then one step (`fleetCommit`, the decision `advance`) moves the
 pool, the fleet tip and the cache tip together, stamps the marked entries and clears
 the marks. A read of a marked entry waits up to two seconds, then has the
-request answered again: no request sees half a move. A move with no piece
-for ten seconds is aborted by whoever finds it.
+request answered again: no request sees half a move. The member says
+every two seconds that it is at its move (`cacheBeat`); a move whose store
+said nothing for ten seconds is aborted by whoever finds it.
 
 A reorganisation is undone address by address, read from the store's views
 of its database at recent blocks (`tipMoves`): what the abandoned blocks

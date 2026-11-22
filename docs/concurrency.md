@@ -145,6 +145,9 @@ What it rests on, and how each part is established:
 | The pure model of Redis says what Redis says | tested against a Valkey: any writes, then every question |
 | A decision whose answers changed writes nothing | tested against a Valkey, with a set and a hash of 200 members in whatever order Redis lists them |
 | No change is lost when many decide at once | tested: eight threads, four hundred additions to one number |
+| A decision has one clock, that of Redis when it was first asked, however long the decision takes | tested in the model: Redis is asked three times with a clock ten seconds later each time, and the decision reads the first. It fails with a clock for each time |
+| A decision of any size is carried out | tested against a Valkey: 280,000 writes, more words than Redis takes arguments in a command (1,048,576). Questions and writes go a thousand to an argument, packed, and the script unpacks one argument at a time |
+| The writes that are sent do what all the writes do | tested on 5,000 drawn cases in the model for those that a later delete undoes (`tidy`); tested against a Valkey for the commands with many members that the rest become, 300 drawn lists of writes and the two scripts side by side |
 | No write is refused for the kind of its key | by type: a key has its kind in its type (`Haskoin.Store.Fleet.Atomic.Keys`), given once where the key is named, and each write takes keys of one kind. A hash to a set, or an addition to what is no number, does not compile; three such writes were tried. The decisions of the pool and of the cache import that module and not the writes without kinds. A key that both write is named once: the cache takes it from the record of the pool |
 | The decisions of the pool do what its script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
 | The decisions of the cache of xpubs do what its script did | tested the same way: 300 drawn sequences of builds, moves begun, written in pieces, given up, gone quiet and committed, entries dropped and evicted, with the pool changing under them (`Haskoin.Store.Fleet.XPubDecideSpec`) |
@@ -161,6 +164,14 @@ and 300 rows is two calls where it was one, and about 1.5 milliseconds
 of Redis where the script took 1.0. A decision is gone through more than
 once to learn what it asks, so that Redis is asked in a few calls and not
 once for each question.
+
+A decision judges time by one clock, read at its start. It read the clock
+again each time Redis was asked, at first. A move of the tip that took ten
+seconds to decide then judged the lease of its own store, of ten seconds,
+ten seconds late: it found no store live and gave up, at every turn
+(item 21). What it may judge by an early clock is what stays true: a lease
+that had run out has run out, and one that had not is what a script that
+ran at the start would have found.
 
 One thing changed in what the cache does. A move of the tip that its
 store left for ten seconds was ended by whoever came across it, a read
@@ -189,8 +200,10 @@ tests moved the tip over a dozen transactions with nothing else writing.
 
 So the store that moves the tip **has the floor**, as it had before it
 for the cache of xpubs (`Haskoin.Store.Fleet.XPub.Decide.begin`): it
-writes a mark with its token, and writes again at each piece. Whatever
-else writes gives way while the mark is less than ten seconds old
+writes a mark with its token (`fx:moving`), and beside it the time
+(`fx:beat`), which it writes again every two seconds for as long as it
+works at the move (`beat`, from `moveTip`). Whatever else writes gives way
+while that time is less than ten seconds old
 (`Haskoin.Store.Fleet.Pool.Decide.floorHeld`):
 
 | Decision | While another store has the floor |
@@ -212,26 +225,53 @@ asks which leases still run and not when each runs out (`HAbove`), so a
 renewal is the same answer. And a read of the cache notes that a key was
 used, in a list that the move does not read.
 
-A mover that stops leaves a mark that is ten seconds old soon enough, and
-the others go on. A move that takes longer than that to decide can be
-raced again: the move is made to cost in proportion to its block, by
-going through the writes to one cell only for a question about that cell
+The floor lasts as long as the move, and not ten seconds from when it
+was taken. It did at first, the time being written at the beginning and
+at each piece, and that was the fault of item 21: on a server the move
+over a block took more than ten seconds to decide, the offers that it had
+held back were taken, and it was refused. Three things make the time a
+key of its own, said from a thread of its own:
+
+- The move reads the token and never the time. So saying the time changes
+  no answer of the move: the store cannot race itself.
+- The decisions of the mover (`piece`, `abort`, `advance`) ask only
+  whether the token is theirs. A move is its store's until another
+  decision ends it, which takes the token away.
+- Everyone else reads both, and ends a move whose store said nothing for
+  ten seconds. A store that stops loses the floor ten seconds later.
+
+A move that is not over in ten minutes has gone wrong, and its store
+stops saying that it is at it. A store whose move is refused five turns
+in a row says so in its log, at the level of a warning, with how long the
+last took and which answer had changed; one whose move took five seconds
+or more says how long, since transactions wait meanwhile.
+
+The move costs in proportion to its block, by going through the writes to
+one cell only for a question about that cell
 (`Haskoin.Store.Fleet.Atomic.Cells.skipOthers`, proved), where it grew
-with the square of the block. A store whose move is refused five turns
-in a row says so in its log, at the level of a warning.
+with the square of the block; and Redis is asked five times whatever the
+size, the first questions of every transaction being asked at once.
 
 How this is established:
 
 | Claim | How |
 | --- | --- |
-| Under the floor, no other decision changes an answer that a move depends on | checked in the model of Redis on 2,000 drawn cases: a pool, a move decided, then any mix of offers, withdrawals, expiries, trims, builds, drops, evictions, another move begun, written and given up, and a lease renewed; every answer of the move is the same after them. Without the floor the same property fails, which is checked too |
+| While its store says that it is at the move, no other decision changes an answer that the move depends on, however long that lasts, and neither does saying it | checked in the model of Redis on 2,000 drawn cases: a pool, a move decided, then any mix of offers, withdrawals, expiries, trims, builds, drops, evictions, another move begun, written and given up, and a lease renewed, each seven seconds after the one before, the store saying a second before each that it is at it; every answer of the move is the same after them. With the floor taken and nothing said after, the same property fails, and it fails without the floor: both are checked too |
+| A move that is carried out twelve seconds after it was decided is carried out, with leases of ten seconds | tested against a Valkey: 200 transactions out of the pool, offers that spend from them every 5 ms, the store saying every two seconds that it is at it. Saying nothing, the same move is refused, which is tested too |
+| Redis is asked as many times about a large block as about a small one | tested against a Valkey: five times for 40 transactions and for 400. It fails without the questions asked at once |
 | A move over a full block is carried out at its first try while others write | tested against a Valkey: 800 transactions out of the pool, with offers that spend from them, another store's reports and builds at their addresses every 5 ms. It fails if nobody gives way, and if the move depends on when a lease runs out |
 | A store answers from each new block while its node never stops taking transactions | tested against Bitcoin Core and Bitcoin Cash Node in Podman (`Haskoin.Store.MempoolSpec`): a block that confirms 2,400 transactions of the pool while about sixty a second keep coming. It fails without the floor |
 
 Not established: that a move always wins within a bound when stores of a
 fleet report different blocks at once, which changes what they agree on
-and so, rightly, has the move decided again; and how long a move takes on
-a slow machine against the ten seconds.
+and so, rightly, has the move decided again. That the member says that it
+is at its move while it works is tested only where a move takes about a
+second (`Haskoin.Store.MempoolSpec`): the long move of the tests says so
+from the test. And how long a move takes on a server is not measured
+here: the tests run without optimisation, where one over 5,400
+transactions of three inputs and three outputs takes about eight
+seconds and one over 9,000 about thirteen, both carried out at the first
+try under offers. Transactions wait for that long at each block.
 
 The invariants the fleet relies on:
 
@@ -362,6 +402,21 @@ finding was checked against the code before it was fixed.
     was well. The store that moves the tip has the floor now, and what
     else writes gives way ("The floor", above). A test moves the tip
     while others write, as no test did.
+21. **A move of the tip over a full block was still refused at every
+    turn**, on the same server, the day the floor went in. Three faults,
+    each of them about a move that takes ten seconds and none seen by a
+    test, which moved 800 small transactions in under a second with
+    leases of a minute. The clock of a decision was read again at each
+    question to Redis, so the move judged its store's lease, of ten
+    seconds, ten seconds late, and found no store live. The floor lasted
+    ten seconds from when it was taken, so a move that was decided in
+    time lost it before it was carried out. And the move went to Redis as
+    one command of 1,008,352 arguments, four in a hundred under the most
+    that Redis takes: a block a little larger would have closed the
+    connection. A decision has one clock now, the store keeps the floor
+    for as long as it works, questions and writes go a thousand to an
+    argument, and a store whose move is refused says which answer had
+    changed. Each has a test at the time or the size that it failed at.
 
 **Known limits, left as they are:**
 
@@ -372,9 +427,12 @@ finding was checked against the code before it was fixed.
   behind, or flush it, which the stores notice.
 - **The stream of events keeps 10,000 entries.** A listener further behind
   loses what was trimmed, without an error.
-- **A move of the tip that takes more than ten seconds** before its first
-  piece can be aborted by another store. That costs time, never the state:
-  the commit checks the token of the move.
+- **A store that stops for more than ten seconds in the middle of a move
+  of the tip**, as a machine that swaps can, loses the floor, and its move
+  can be ended by another store or refused. That costs time, never the
+  state: the commit checks the token of the move and every answer.
+- **Transactions wait while the tip moves**, for as long as the move takes
+  to decide: seconds for a full block.
 - **The fleet tip follows its slowest healthy store**, whose own node may be
   hours behind the network.
 - **`fleetMove`** sets the tip without the pool. It is for the tests; the

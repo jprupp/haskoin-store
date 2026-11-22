@@ -3,6 +3,7 @@ module Haskoin.Store.Fleet.AtomicSpec (spec) where
 import Control.Concurrent.Async (forConcurrently_)
 import Control.Exception (throwIO, try)
 import Control.Monad (forM_, replicateM_, void)
+import Control.Monad.State.Strict (runState, state)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
 import Data.IORef (atomicModifyIORef', newIORef)
@@ -30,6 +31,11 @@ spec = do
            in classify (either (const True) (const False) told') "cannot tell" $ case told' of
                 Left _ -> property True
                 Right (a, db') -> (a, db') === (answer later (questionUnder "" q), later)
+    modifyMaxSuccess (const 5000) $
+      prop "leaves Redis the same without the writes that a later one undoes" $
+        forAll ((,) <$> listOf anOp <*> listOf anOp) $ \(earlier, during) ->
+          let db = foldl (flip perform) emptyDb earlier
+           in foldl (flip perform) db (tidy during) === foldl (flip perform) db during
     it "tells what it cannot tell, and no more than that" $ do
       let z = "z1"
           full = perform (HSet "h1" "a" "1") emptyDb
@@ -53,10 +59,49 @@ spec = do
       case runPure 0 decision emptyDb of
         Right ((), db) -> db `shouldBe` emptyDb
         Left why -> expectationFailure (show why)
+    -- Redis is asked three times, and its clock is ten seconds later
+    -- each time that it is read
+    it "has one clock, however many times Redis is asked" $ do
+      let decision :: (Monad m) => Atomic m (Integer, Integer)
+          decision = do
+            first <- clock
+            a <- get "s1"
+            b <- get (maybe "s2" (const "s3") a)
+            _ <- get (maybe "n1" (const "n2") b)
+            second <- clock
+            return (first, second)
+          ticking =
+            Backend
+              { fetch = return . map (answer (perform (Set "s1" "x") (perform (Set "s3" "y") emptyDb))),
+                time = state (\t -> (t, t + 10000))
+              }
+      case runState (runAtomic ticking decision) 1000 of
+        (Decided times _ _ rounds, _) -> (times, rounds) `shouldBe` ((1000, 1000), 3)
+        (Stuck why, _) -> expectationFailure (show why)
   usable <- runIO podmanUsable
   describe "a decision, in Redis" $ case usable of
     Left why -> it "is carried out in one step" (pendingWith why)
     Right () -> aroundAll withRedis $ do
+      -- Redis closes the connection of a command of more than 1,048,576
+      -- arguments, which a decision reached as an argument for each word:
+      -- the move of the tip over one block had 1,008,352.
+      it "is carried out with more words than Redis takes arguments" $ \(conn, fresh) -> do
+        p <- fresh
+        let n = 280000 :: Int
+            field i = C.pack (show (i :: Int))
+            key i = p <> "h" <> field (i `mod` 7)
+            large :: (Monad m) => Atomic m ()
+            large = do
+              was <- mapM (\i -> hget (key i) (field i)) [1 .. 2000]
+              forM_ [1 .. n] $ \i -> write (HSet (key i) (field i) "v")
+              write (Set (p <> "s1") (C.pack (show (length (filter isJust was)))))
+        transact conn 1 large `shouldReturn` Just ()
+        Right sizes <- Redis.runRedis conn (mapM (\i -> Redis.hlen (key i)) [0 .. 6] >>= return . sequence)
+        sum sizes `shouldBe` toInteger n
+        -- and again, with what it wrote to ask about
+        transact conn 1 large `shouldReturn` Just ()
+        Right said <- Redis.runRedis conn (Redis.get (p <> "s1"))
+        said `shouldBe` Just "2000"
       modifyMaxSuccess (const 300) $
         it "finds Redis to say what the model says, after any writes" $ \(conn, fresh) ->
           property . forAll (listOf anOp) $ \during -> ioProperty $ do

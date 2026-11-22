@@ -67,6 +67,7 @@ local key = {
   of = prefix .. 'fx:of:',
   entry = prefix .. 'fx:e:',
   moving = prefix .. 'fx:moving',
+  beat = prefix .. 'fx:beat',
   marked = prefix .. 'fx:marked',
   spender = prefix .. 'pool:spender',
   atx = prefix .. 'pool:atx:',
@@ -98,18 +99,17 @@ local function now()
   return t[1] * 1000 + math.floor(t[2] / 1000)
 end
 
--- the token of the move of the tip under way, if there is one; a move that
--- wrote nothing for ten seconds is none
+-- the token of the move of the tip under way, if there is one; a move
+-- whose store said nothing for ten seconds is none
 local function moving()
-  local v = redis.call('GET', key.moving)
-  if not v then
+  local token = redis.call('GET', key.moving)
+  if not token then
     return nil
   end
-  local space = string.find(v, ' ', 1, true)
-  if now() - tonumber(string.sub(v, space + 1)) > 10000 then
+  if now() - tonumber(redis.call('GET', key.beat) or '0') > 10000 then
     return nil
   end
-  return string.sub(v, 1, space - 1)
+  return token
 end
 
 local function numbers(e)

@@ -600,7 +600,20 @@ report m = do
 -- undone address by address, is written in pieces ('tipMoves',
 -- 'cachePieces'); then 'fleetCommit' moves the pool, the tip and the cache
 -- together. A move that is refused is aborted, and the entries that it
--- wrote are dropped ('cacheAbort'). When this store cannot say what the
+-- wrote are dropped ('cacheAbort').
+--
+-- From the beginning of a move to its end the store says every two
+-- seconds that it is at it ('cacheBeat'), which keeps the floor: whatever
+-- else writes to the pool or to the cache gives way meanwhile
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'). The move of a full block
+-- takes seconds to decide, and more than ten on a slow machine. When the
+-- floor lasted ten seconds from the last piece, such a move lost it before
+-- it was carried out, and the tip of a server stayed where it was while
+-- its database went on. A move that is not over in ten minutes has gone
+-- wrong: the store stops saying so then, and the floor is free ten
+-- seconds later, as it is ten seconds after a store that stopped.
+--
+-- When this store cannot say what the
 -- blocks did, the pool is emptied, and the cache with it: Redis allows that
 -- to a store that is alone, and to any store when the way is too long for
 -- all of them (v'TooFar').
@@ -632,16 +645,24 @@ moveTip m = do
           m.config.note LevelDebug "Fleet tip not moved: another store is moving it"
           return False
         BeginRaced -> return False
-        Begun -> moveWith seen token target
+        Begun -> withAsync (beats token (300 :: Int)) (\_ -> moveWith seen token target)
     agreed -> do
       when (isNothing agreed) . m.config.note LevelDebug $
         "The live stores have no block in common: " <> shown (Map.size reports) <> " reports"
       return False
   where
+    -- the store says that it is at its move, so many times at most, and
+    -- stops when the move is no longer its own
+    beats token n = when (n > 0) $ do
+      threadDelay 2000000
+      still <- cacheBeat m.redis m.keys token
+      when still (beats token (n - 1))
     -- the move under a token of the cache: what the blocks did at the
     -- addresses of the entries is written in pieces, and the commit moves
     -- the pool, the tip and the cache together
     moveWith seen token target = do
+      began <- getMonotonicTimeNSec
+      changed <- newIORef Nothing
       way <- case (traverse decode seen, decode target) of
         (Right from, Right to) -> wayBetween m.views m.db from to
         _ -> return NoWay
@@ -674,7 +695,25 @@ moveTip m = do
                   <> blockName target
                   <> ": starting the shared mempool again there"
               fleetRestart m.redis m.keys 32 Nothing seen target
-            _ -> fleetCommit m.redis m.keys 32 Nothing m.config.name seen target ((.pool) <$> between) path token
+            _ ->
+              fleetCommitTelling
+                (writeIORef changed . Just)
+                m.redis
+                m.keys
+                32
+                Nothing
+                m.config.name
+                seen
+                target
+                ((.pool) <$> between)
+                path
+                token
+      ended <- getMonotonicTimeNSec
+      why <- readIORef changed
+      let took = shown ((ended - began) `div` 1000000) <> " ms"
+          -- what Redis answered otherwise when the move was to be carried
+          -- out, if it was decided and then refused
+          refusal = maybe "" (\q -> ", refused for the answer to " <> T.pack (show q)) why
       m.config.note LevelDebug . mconcat $
         [ "Fleet tip from ",
           maybe "none" blockName seen,
@@ -684,6 +723,9 @@ moveTip m = do
             MovedTo _ -> ": moved"
             Stays -> ": stays"
             Raced -> ": not moved, another store did it first or has to",
+          " in ",
+          took,
+          refusal,
           case way of
             Way _ -> ""
             NoWay -> " (this store does not know the way)"
@@ -697,6 +739,11 @@ moveTip m = do
                 Way _ -> False
                 _ -> True
           when restarted $ wasEmptied m target "the shared mempool started again"
+          -- transactions wait for as long as a move takes, so a slow
+          -- one is said: half of the ten seconds that the floor lasts
+          -- without a word is slow
+          when (ended - began >= 5000000000) . m.config.note LevelInfo $
+            "The fleet tip moved to " <> blockName target <> " in " <> took
           atomically (writeTVar m.refused 0)
           return True
         _ -> do
@@ -713,7 +760,9 @@ moveTip m = do
               maybe "none" blockName seen,
               " to ",
               blockName target,
-              ": the store answers from the block that it is at"
+              ": the store answers from the block that it is at. The last took ",
+              took,
+              refusal
             ]
           False <$ cacheAbort m.redis m.keys token
     redis' :: R.Redis (Either R.Reply a) -> IO a

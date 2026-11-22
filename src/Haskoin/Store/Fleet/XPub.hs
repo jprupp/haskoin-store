@@ -116,6 +116,7 @@ module Haskoin.Store.Fleet.XPub
     cacheTracked,
     Begun (..),
     cacheBegin,
+    cacheBeat,
     AddressMove (..),
     tipMoves,
     cachePieces,
@@ -631,8 +632,8 @@ data Begun
 -- that the store saw: from here until the commit ('fleetCommit' in
 -- "Haskoin.Store.Fleet.Redis") or 'cacheAbort', builds wait, so that every
 -- entry is either one that the move brings along or one built after it. A
--- move whose store wrote nothing for ten seconds is aborted by whoever
--- comes across it.
+-- move whose store said nothing for ten seconds ('cacheBeat') is aborted
+-- by whoever comes across it.
 cacheBegin :: Connection -> FleetKeys -> ByteString -> ByteString -> IO Begun
 cacheBegin conn keys token seen =
   transact conn 5 (X.begin (X.cacheKeys keys.prefix) token seen) <&> \case
@@ -641,6 +642,14 @@ cacheBegin conn keys token seen =
     -- another store moves the tip, or others kept changing what this
     -- asked about: the store tries at its next turn
     _ -> Moving
+
+-- | Say that the store is still at the move of a token: whether the move
+-- is still its own. A store says so every two seconds while it works at a
+-- move, and has the floor for ten seconds from each time
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'): for as long as the move
+-- takes, and no longer than ten seconds after the store stops.
+cacheBeat :: Connection -> FleetKeys -> ByteString -> IO Bool
+cacheBeat conn keys token = fromMaybe False <$> transact conn 3 (X.beat (X.cacheKeys keys.prefix) token)
 
 -- | End a move of the cache that will not be committed, dropping the
 -- entries that its pieces wrote, to be built again.

@@ -50,6 +50,7 @@ module Haskoin.Store.Fleet.XPub.Decide
     Step (..),
     build,
     begin,
+    beat,
     piece,
     abort,
     drop,
@@ -88,8 +89,10 @@ data Keys = Keys
     watchers :: !(Family 'Group),
     -- | the keys of the pool, for those of each entry (@entryOf@)
     pool :: !P.Keys,
-    -- | the move of the tip under way: its token and when it last wrote
+    -- | the move of the tip under way: its token
     moving :: !(K 'Text),
+    -- | when the store that makes that move last said that it is at it
+    beat :: !(K 'Number),
     -- | the entries that the move under way wrote
     marked :: !(K 'Group),
     -- | the transactions of the pool at each address, the outputs that it
@@ -116,6 +119,7 @@ cacheKeys p =
       watchers = pool.watchers,
       pool,
       moving = pool.moving,
+      beat = pool.beat,
       marked = pool.marked,
       atx = pool.atx,
       aout = pool.aout,
@@ -246,20 +250,44 @@ ended k = do
   forM_ (Set.toList ids) (dropped k)
   del k.marked
   del k.moving
+  del k.beat
 
 -- | The token of the move of the tip under way, if there is one. A move
--- that wrote nothing for ten seconds is ended here, and there is none
--- then.
+-- whose store said nothing for ten seconds is ended here, and there is
+-- none then: the store stopped, or lost its way to Redis.
 moving :: (Monad m) => Keys -> Atomic m (Maybe ByteString)
 moving k =
   get k.moving >>= \case
     Nothing -> return Nothing
-    Just v -> do
-      let (token, wrote) = B.breakSubstring " " v
+    Just token -> do
       now <- clock
-      if now - maybe 0 fst (C.readInteger (B.drop 1 wrote)) > 10000
+      said <- getNumber k.beat
+      if now - said > 10000
         then ended k >> return Nothing
         else return (Just token)
+
+-- | Whether the move under way is that of a token: what the store that
+-- makes the move asks. It does not ask when it last said that it is at
+-- it, as @moving@ does: its move is its own until another decision ends
+-- it, which takes the token away. So what it says (@beat@) changes no
+-- answer of its own decisions.
+mine :: (Monad m) => Keys -> ByteString -> Atomic m Bool
+mine k token = (== Just token) <$> get k.moving
+
+-- | Say that the store of a token is still at its move: whether the move
+-- is still its own. It keeps the floor for ten seconds from here
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld').
+--
+-- A store says it every two seconds for as long as it works at a move
+-- (@moveTip@ in "Haskoin.Store.Fleet.Member"). Without it the floor was
+-- the store's for ten seconds from its last piece, and a move that took
+-- longer to decide was first raced by the offers that it had held back,
+-- and then ended by the first request for a key.
+beat :: (Monad m) => Keys -> ByteString -> Atomic m Bool
+beat k token = do
+  ours <- mine k token
+  when ours (clock >>= setNumber k.beat)
+  return ours
 
 -- | A use of an entry: its priority is the level plus what it cost
 -- (GreedyDual).
@@ -291,8 +319,8 @@ evict k most = do
 -- whose commit was refused.
 abort :: (Monad m) => Keys -> ByteString -> Atomic m ()
 abort k token = do
-  under' <- moving k
-  when (under' == Just token) (ended k)
+  ours <- mine k token
+  when ours (ended k)
 
 -- | Begin a move of the tip under a token, from the tip that the store
 -- saw. Builds wait until it is done, so that every entry is one that the
@@ -307,8 +335,8 @@ begin k token saw = do
       if isJust under' && under' /= Just token
         then return OtherMoving
         else do
-          now <- clock
-          set k.moving (token <> " " <> num now)
+          set k.moving token
+          clock >>= setNumber k.beat
           return BeganMove
 
 -- | Write what a move of the tip does at addresses into every entry that
@@ -320,12 +348,11 @@ begin k token saw = do
 piece :: (Monad m) => Keys -> ByteString -> ByteString -> [Piece] -> Atomic m Bool
 piece k token saw pieces = do
   at <- fromMaybe "" <$> get k.fleet
-  under' <- if at /= saw then return Nothing else moving k
-  if at /= saw || under' /= Just token
+  own <- if at /= saw then return False else mine k token
+  if not own
     then return False
     else do
-      now <- clock
-      set k.moving (token <> " " <> num now)
+      clock >>= setNumber k.beat
       version <- (+ 1) <$> getNumber k.xver
       incrBy k.xver 1
       forM_ pieces $ \p -> do

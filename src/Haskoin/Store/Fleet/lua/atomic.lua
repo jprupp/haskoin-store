@@ -4,23 +4,27 @@
 -- carries out a list of writes if the answers to questions are what the
 -- caller was told before.
 --
--- ARGV[1] is what to do.
+-- ARGV[1] is what to do. Everything else comes as lists, a thousand
+-- items to an argument, each argument one string in MessagePack: Redis
+-- closes the connection of a command with more than 1,048,576 arguments,
+-- and the move of the tip over one block has that many words. An argument
+-- is unpacked when its turn comes and let go after it, so that the script
+-- never holds more than a thousand items unpacked.
 --
--- 'read': the number of questions, and the questions. Returns the clock of
--- Redis in milliseconds, as a string, and then the answer to each question.
+-- 'read': lists of questions. Returns the clock of Redis in milliseconds,
+-- as a string, and then the answer to each question.
 --
--- 'apply': the number of questions, each question followed by the answer
--- that the caller has for it, the number of writes, and the writes.
+-- 'apply': the number of lists of questions, those lists, and lists of
+-- writes. A question comes after the answer that the caller has for it.
 -- Returns {'raced', n} if the answer to question n, from 1, is another
 -- now, and has changed nothing then; {'done'} once it has carried out
 -- every write.
 --
--- A question is a letter for the shape of its answer, the number of words
--- of its command, and the words: 'p' for an answer to take as it is, 'u'
--- for a list in no order, as the members of a set, 'h' for the fields of
--- a hash with their values, and 'k' for the fields of a hash whose value
--- is a number above a bound, which is then the first of the words, before
--- the command.
+-- A question is a letter for the shape of its answer, and the words of its
+-- command: 'p' for an answer to take as it is, 'u' for a list in no order,
+-- as the members of a set, 'h' for the fields of a hash with their values,
+-- and 'k' for the fields of a hash whose value is a number above a bound,
+-- which is then the first of the words, before the command.
 --
 -- An answer is given as a string that says all of it, so that two answers
 -- are the same when their strings are: 'n' for none, 'i' a number and ';',
@@ -30,8 +34,8 @@
 -- that order is the same every time, which the order of the bytes is not
 -- where Redis compares strings as some language does.
 --
--- A write is the number of its words and the words of one command, or two
--- words, '!WIPE' and the start of the keys to delete.
+-- A write is the words of one command, or two words, '!WIPE' and the
+-- start of the keys to delete.
 --
 -- No write comes before the last answer is compared, and nothing is
 -- decided between two writes: each is a plain command to a key of the kind
@@ -73,13 +77,12 @@ local function ordered(keyed)
   return out
 end
 
--- the answer to the question at a place of the arguments, and the place
--- after it
-local function ask(at)
-  local shape, n = ARGV[at], tonumber(ARGV[at + 1])
+-- the answer to a question: its words, from a place in a list
+local function ask(q, from)
+  local shape = q[from]
   local words = {}
-  for i = 1, n do
-    words[i] = ARGV[at + 1 + i]
+  for i = from + 1, #q do
+    words[#words + 1] = q[i]
   end
   local above
   if shape == 'k' then
@@ -109,46 +112,40 @@ local function ask(at)
     end
     r = ordered(keyed)
   end
-  return enc(r), at + 2 + n
+  return enc(r)
 end
 
 if mode == 'read' then
   local time = redis.call('TIME')
   local answers = {string.format('%.0f', time[1] * 1000 + math.floor(time[2] / 1000))}
-  local at = 3
-  for _ = 1, tonumber(ARGV[2]) do
-    local a
-    a, at = ask(at)
-    answers[#answers + 1] = a
+  for a = 2, #ARGV do
+    for _, q in ipairs(cmsgpack.unpack(ARGV[a])) do
+      answers[#answers + 1] = ask(q, 1)
+    end
   end
   return answers
 end
 
 -- apply: compare every answer, and only then write
-local at = 3
-for i = 1, tonumber(ARGV[2]) do
-  local a
-  a, at = ask(at)
-  if a ~= ARGV[at] then
-    return {'raced', tostring(i)}
+local asked = tonumber(ARGV[2])
+local n = 0
+for a = 3, 2 + asked do
+  for _, q in ipairs(cmsgpack.unpack(ARGV[a])) do
+    n = n + 1
+    if ask(q, 2) ~= q[1] then
+      return {'raced', tostring(n)}
+    end
   end
-  at = at + 1
 end
-local writes = tonumber(ARGV[at])
-at = at + 1
-for _ = 1, writes do
-  local n = tonumber(ARGV[at])
-  if ARGV[at + 1] == '!WIPE' then
-    for _, k in ipairs(redis.call('KEYS', ARGV[at + 2] .. '*')) do
-      redis.call('DEL', k)
+for a = 3 + asked, #ARGV do
+  for _, words in ipairs(cmsgpack.unpack(ARGV[a])) do
+    if words[1] == '!WIPE' then
+      for _, k in ipairs(redis.call('KEYS', words[2] .. '*')) do
+        redis.call('DEL', k)
+      end
+    else
+      redis.call(unpack(words))
     end
-  else
-    local words = {}
-    for i = 1, n do
-      words[i] = ARGV[at + i]
-    end
-    redis.call(unpack(words))
   end
-  at = at + 1 + n
 end
 return {'done'}

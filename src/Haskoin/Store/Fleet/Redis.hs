@@ -91,6 +91,7 @@ module Haskoin.Store.Fleet.Redis
     poolExpire,
     fleetAdvance,
     fleetCommit,
+    fleetCommitTelling,
     fleetRestart,
     fleetRestarts,
     FleetEvent (..),
@@ -120,8 +121,8 @@ import Data.Maybe (fromMaybe, isJust)
 import Database.Redis (Connection, Redis, Reply (..))
 import Database.Redis qualified as R
 import Haskoin.Store.Fleet (Time)
-import Haskoin.Store.Fleet.Atomic (Atomic)
-import Haskoin.Store.Fleet.Atomic.Redis (insist, transact)
+import Haskoin.Store.Fleet.Atomic (Atomic, Query)
+import Haskoin.Store.Fleet.Atomic.Redis (insist, transact, transactTelling)
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Pool.Types
 import Haskoin.Store.Fleet.Script (Script, evalScript, script)
@@ -311,8 +312,26 @@ fleetCommit ::
   [ByteString] ->
   ByteString ->
   IO Moved
-fleetCommit conn keys tsize clock store seen target known path token =
-  advance conn keys tsize clock seen target (maybe (D.AloneNotKnowing store) D.Changing known) (path, token)
+fleetCommit = fleetCommitTelling (\_ -> return ())
+
+-- | 'fleetCommit', telling of each time that the move was decided and not
+-- carried out which question had another answer by then
+-- ('transactTelling'): what a store says of a tip that does not move.
+fleetCommitTelling ::
+  (Query -> IO ()) ->
+  Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe Time ->
+  ByteString ->
+  Maybe ByteString ->
+  ByteString ->
+  Maybe PoolChange ->
+  [ByteString] ->
+  ByteString ->
+  IO Moved
+fleetCommitTelling tell conn keys tsize clock store seen target known path token =
+  advance tell conn keys tsize clock seen target (maybe (D.AloneNotKnowing store) D.Changing known) (path, token)
 
 -- | Move the tip to a block and empty the pool, for a store that has both
 -- the tip and the block and finds the way between them longer than it
@@ -329,7 +348,7 @@ fleetCommit conn keys tsize clock store seen target known path token =
 -- peers for theirs.
 fleetRestart :: Connection -> FleetKeys -> Int -> Maybe Time -> Maybe ByteString -> ByteString -> IO Moved
 fleetRestart conn keys tsize clock seen target =
-  advance conn keys tsize clock seen target D.TooLong ([], "")
+  advance (\_ -> return ()) conn keys tsize clock seen target D.TooLong ([], "")
 
 -- | How many times the pool was emptied, by 'fleetRestart' or by a store
 -- alone that did not have the old tip. A store that sees another number
@@ -345,6 +364,7 @@ fleetRestarts conn keys =
 -- what the decision asked about makes it be decided again, three times at
 -- most: then the move is 'Raced', and the store tries at its next turn.
 advance ::
+  (Query -> IO ()) ->
   Connection ->
   FleetKeys ->
   Int ->
@@ -354,8 +374,8 @@ advance ::
   D.How ->
   ([ByteString], ByteString) ->
   IO Moved
-advance conn keys tsize clock seen target how (path, token) =
-  fromMaybe Raced <$> transact conn 3 decision
+advance tell conn keys tsize clock seen target how (path, token) =
+  fromMaybe Raced <$> transactTelling conn 3 tell decision
   where
     decision :: (Monad m) => Atomic m Moved
     decision = D.advance (D.poolKeys keys.prefix tsize) seen target (fromIntegral <$> clock) keys.size how path token

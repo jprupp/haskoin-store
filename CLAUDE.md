@@ -91,7 +91,10 @@ reads much needs a turn of its own. Test a decision at the size and under
 the traffic of a full block: `crowded` in `Haskoin.Store.Fleet.DecideSpec`
 and `unceasing` in `Haskoin.Store.MempoolSpec` are the examples. A test
 that lets the node go quiet before it looks does not see a store that
-cannot keep up. `Haskoin.Store.Fleet.DecideSpec`
+cannot keep up. Test it too at the time that it takes on a slow machine,
+with leases of ten seconds as stores have them: `longMove` carries a move
+out twelve seconds after it was decided. A test whose move takes under a
+second sees no limit of ten. `Haskoin.Store.Fleet.DecideSpec`
 and `Haskoin.Store.Fleet.XPubDecideSpec` hold the decisions to the
 scripts that they replaced (`pool.lua` and `xpub.lua` in
 `test/Haskoin/Store/Fleet`); a change to a decision makes one fail, and

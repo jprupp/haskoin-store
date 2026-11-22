@@ -137,8 +137,10 @@ data Keys = Keys
     lostat :: !(K 'Sorted),
     -- | the place of the tip that the cache of extended public keys is at
     xtip :: !(K 'Text),
-    -- | the move of the cache that is under way
+    -- | the move of the cache that is under way: its token
     moving :: !(K 'Text),
+    -- | when the store that makes that move last said that it is at it
+    beat :: !(K 'Number),
     -- | the entries of the cache that the move changed
     marked :: !(K 'Group),
     -- | the cached keys that have each address
@@ -190,6 +192,7 @@ poolKeys p tsize =
       lostat = named (p <> "pool:lostat"),
       xtip = named (p <> "fx:tip"),
       moving = named (p <> "fx:moving"),
+      beat = named (p <> "fx:beat"),
       marked = named (p <> "fx:marked"),
       watchers = family (p <> "fx:of:"),
       entry = p <> "fx:e:"
@@ -463,8 +466,8 @@ insert k tx = do
   sawIt k t
 
 -- | Whether a store has the floor: it began a move of the tip
--- ('Haskoin.Store.Fleet.XPub.Decide.begin'), and wrote in the last ten
--- seconds.
+-- ('Haskoin.Store.Fleet.XPub.Decide.begin'), and said in the last ten
+-- seconds that it is at it ('Haskoin.Store.Fleet.XPub.Decide.beat').
 --
 -- A move of the tip is one decision that reads what tens of thousands of
 -- questions say, over seconds, and is carried out only if every answer
@@ -475,18 +478,26 @@ insert k tx = do
 -- floor, as everything gave way to the script that moved the tip, which
 -- Redis ran alone. An offer is 'Late' then, and is made again.
 --
+-- The floor is the store's for as long as it says so, and not for ten
+-- seconds from when it took it: the move over a block of Bitcoin was
+-- decided in more than ten seconds on a server, lost the floor before it
+-- was carried out, and was refused at every turn. What the store says is
+-- written to a key of its own, which the move does not read, so that
+-- saying it changes no answer of the move.
+--
 -- Giving way for no reason costs a moment, and the clock can only do
 -- that: a move that looks under way and has just gone quiet. A move that
 -- has gone quiet at the clock of this decision has still gone quiet when
--- the decision is carried out, if it wrote nothing since, which the
+-- the decision is carried out, if its store said nothing since, which the
 -- script checks.
 floorHeld :: (Monad m) => Keys -> Atomic m Bool
 floorHeld k =
   get k.moving >>= \case
     Nothing -> return False
-    Just v -> do
+    Just _ -> do
       now <- clock
-      return (now - number (Just (B.drop 1 (snd (B.breakSubstring " " v)))) <= 10000)
+      said <- getNumber k.beat
+      return (now - said <= 10000)
 
 -- | Withdraw transactions and all that spends them: those that left. None
 -- while a store is moving the tip.
@@ -609,10 +620,6 @@ data How
     -- every store: the pool is emptied, or the tip would never move again
     TooLong
 
--- | A number that Redis keeps as text, or 0.
-number :: Maybe ByteString -> Integer
-number = maybe 0 (maybe 0 fst . C.readInteger)
-
 -- | Four bytes, big-endian, as a number: the height at the end of what is
 -- kept of a replaced transaction.
 heightOf :: Keys -> ByteString -> Score
@@ -708,8 +715,7 @@ advance k saw target given bsize how path token = do
                 TooLong -> emptied at after
                 Changing change -> do
                   current <- get k.moving
-                  let mine = token <> " "
-                      other = maybe False ((/= mine) . B.take (B.length mine)) current
+                  let other = maybe False (/= token) current
                   if other || (isNothing current && not (B.null token))
                     then return Raced
                     else changed change before after
@@ -731,6 +737,7 @@ advance k saw target given bsize how path token = do
               when there (hsetNumber (entryMeta k i) "ver" (version + 1))
           del k.marked
           del k.moving
+          del k.beat
       set k.xtip after
     -- the pool starts again. What it decided on is gone, so the fleet
     -- forgets what it saw, and a counter tells the stores to fill the
@@ -745,6 +752,17 @@ advance k saw target given bsize how path token = do
       emit k "b" target
       return (MovedTo target)
     changed change before after = do
+      -- What the rest asks first of each transaction that the blocks
+      -- confirm, asked here at once. A question is asked of Redis when
+      -- the decision comes to it, and the decision is then made again
+      -- from the start: asked one after the other, these cost a turn each
+      -- through thousands of transactions.
+      prefetch $
+        [asking k.xtip, askingMembers k.marked]
+          <> concat
+            [ [askingField k.spends t, askingField k.entries t, askingMember k.rbf t, askingMembers (under k.lostby t)]
+            | t <- change.confirmed
+            ]
       -- the abandoned blocks: what can come back does, and what spends the
       -- same in the pool gives way. What a transaction that comes back
       -- replaced is not replaced any more.

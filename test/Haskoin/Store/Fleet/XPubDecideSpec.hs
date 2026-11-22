@@ -156,12 +156,12 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (tip, under, n) step = do
       luaAbort conn lua (token b)
       transact conn 1 (X.abort k (token b)) `shouldReturn` Just ()
       return (tip, under, n)
-    -- the move under way last wrote at the start of time
+    -- the store of the move under way last said that it is at it at the
+    -- start of time
     Quiet -> do
       onBoth $ \keys -> do
         Right v <- Redis.runRedis conn (Redis.get (keys.prefix <> "fx:moving"))
-        forM_ v $ \moving ->
-          go keys (Redis.set (keys.prefix <> "fx:moving") (C.takeWhile (/= ' ') moving <> " 0"))
+        forM_ v $ \_ -> go keys (Redis.set (keys.prefix <> "fx:beat") "0")
       return (tip, under, n)
     -- Where the decisions differ from the script, on purpose: while a
     -- store is moving the tip, an entry is neither dropped nor evicted,
@@ -221,7 +221,7 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (tip, under, n) step = do
   where
     name i = C.pack ("key" <> show i)
 
--- | All that Redis has, with the move under way by its token and not by
--- the time at which it last wrote.
+-- | All that Redis has, but the time at which the store of the move under
+-- way last said that it is at it, which is that of each call.
 quietly :: Dump -> Dump
-quietly dump = [(key, if key == "fx:moving" then map (C.takeWhile (/= ' ')) v else v) | (key, v) <- dump]
+quietly = filter ((/= "fx:beat") . fst)

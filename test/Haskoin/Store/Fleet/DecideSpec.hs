@@ -11,6 +11,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Containers.ListUtils (nubOrd, nubOrdOn)
+import Data.Either (isLeft)
 import Data.Functor.Identity (runIdentity)
 import Data.List (sort)
 import Data.List.NonEmpty qualified as NonEmpty
@@ -30,12 +31,12 @@ import Haskoin.Store.Fleet.Atomic
     runAtomic,
     runPure,
   )
-import Haskoin.Store.Fleet.Atomic.Redis (transact)
+import Haskoin.Store.Fleet.Atomic.Redis (Planned (..), carry, plan, transact)
 import Haskoin.Store.Fleet.Oracle
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Redis
 import Haskoin.Store.Fleet.RedisSpec (PoolStep (..), address, block, number, out, timeOf, txOf, withRedis)
-import Haskoin.Store.Fleet.XPub (Begun (..), cacheBegin)
+import Haskoin.Store.Fleet.XPub (Begun (..), cacheBeat, cacheBegin)
 import Haskoin.Store.Fleet.XPub.Decide qualified as X
 import Test.Hspec
 import Test.Hspec.QuickCheck (modifyMaxSuccess, prop)
@@ -46,17 +47,53 @@ spec :: Spec
 spec = do
   describe "a move of the tip, in the model of Redis" $ do
     modifyMaxSuccess (const 2000) $
-      prop "has no answer changed by what others decide while its store has the floor" $
-        \earlier during confirmed -> undisturbed True earlier during confirmed
+      prop "has no answer changed by what others decide, for as long as its store says that it is at it" $
+        \earlier during confirmed -> undisturbed Kept earlier during confirmed
+    modifyMaxSuccess (const 2000) $
+      prop "has answers changed by them ten seconds after its store last said so" $
+        \earlier during confirmed -> expectFailure (undisturbed Silent earlier during confirmed)
     modifyMaxSuccess (const 2000) $
       prop "has answers changed by them when no store has the floor" $
-        \earlier during confirmed -> expectFailure (undisturbed False earlier during confirmed)
+        \earlier during confirmed -> expectFailure (undisturbed Free earlier during confirmed)
   usable <- runIO podmanUsable
+  -- a group of its own, and so a process of its own: it takes its time
+  describe "the floor, in Redis" $ case usable of
+    Left why -> it "is the store's for as long as it says that it is at its move" (pendingWith why)
+    Right () -> aroundAll withRedis $ do
+      it "is the store's for as long as it says that it is at its move: a move is carried out after twelve seconds" $
+        \(conn, fresh) -> longMove True conn =<< fresh
+      it "is the store's for ten seconds if it says nothing: a move is refused after twelve" $
+        \(conn, fresh) -> longMove False conn =<< fresh
   describe "the shared mempool in Redis" $ case usable of
     Left why -> it "is decided in Haskell as the script decides it" (pendingWith why)
     Right () -> aroundAll withRedis $ do
       it "moves the tip over a full block while transactions are offered, stores report and keys are built" $
         \(conn, fresh) -> crowded conn =<< fresh
+      it "asks Redis no more times about a large block than about a small one" $ \(conn, fresh) -> do
+        asked <- forM [40, 400] $ \n -> do
+          keys <- fresh
+          let txs = map blockTx [1 .. n]
+              change = PoolChange [] [] (map (.txid) txs) [] (Just 100) []
+              move :: (Monad m) => Atomic m Moved
+              move =
+                D.advance
+                  (D.poolKeys keys.prefix 4)
+                  Nothing
+                  (block 77)
+                  Nothing
+                  keys.size
+                  (D.Changing change)
+                  []
+                  "token"
+          forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
+          fleetReport conn keys Nothing 60000 "a" [block 77] [] `shouldReturn` True
+          cacheBegin conn keys "token" "" `shouldReturn` Begun
+          planned <- plan conn move
+          planned.result `shouldBe` MovedTo (block 77)
+          return planned.rounds
+        -- the tip, the live stores, their blocks, all that is asked first
+        -- of each transaction, and what is asked of each address
+        asked `shouldBe` [5, 5]
       modifyMaxSuccess (const 300) $
         it "is decided in Haskell as the script decides it, state by state" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do
@@ -65,18 +102,118 @@ spec = do
             forM_ [lua, ours] (watched conn)
             foldM_ (both conn lua ours) ([], [], Nothing, 0) (steps :: [PoolStep])
 
--- | A move of the tip is decided, and before it is carried out other
--- decisions are: transactions offered, withdrawn and expired, what the
--- fleet saw trimmed, entries of the cache built, dropped and evicted,
--- another store that tries to move the tip, and one that renews its
--- lease. Every answer that the move depends on must be the same after
--- them: then the script carries the move out, whatever the others did.
+-- | A move of the tip that is carried out twelve seconds after it was
+-- decided, as that of a full block is on a slow machine, while
+-- transactions that spend from those of the block are offered without a
+-- pause, and with leases of ten seconds, as stores have them.
 --
--- With the floor ('Haskoin.Store.Fleet.XPub.Decide.begin'), that holds:
--- all of them give way. Without it, it does not, which the second
--- property says, so that the first is known to see what it is for.
-undisturbed :: Bool -> [PoolStep] -> [PoolStep] -> [Word32] -> Property
-undisturbed held earlier during confirmed =
+-- The store says every two seconds that it is at its move, as a member
+-- does (@moveTip@), or says nothing. Saying it, it keeps the floor and
+-- the move is carried out. Saying nothing, it has the floor for ten
+-- seconds, the transactions are taken after that, and the move is
+-- refused: what happened on a server at every block, the floor lasting
+-- ten seconds from when it was taken.
+longMove :: Bool -> Redis.Connection -> FleetKeys -> IO ()
+longMove saying conn keys = do
+  forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
+  fleetReport conn keys Nothing 10000 "a" [target] [] `shouldReturn` True
+  cacheBegin conn keys "token" "" `shouldReturn` Begun
+  poolOffer conn keys 4 Nothing (childTx 1) [False] [] `shouldReturn` Late
+  planned <- plan conn move
+  planned.result `shouldBe` MovedTo target
+  carried <-
+    withAsync (forM_ (cycle [1 .. n]) (\c -> offered c >> threadDelay 5000)) $ \_ ->
+      withAsync (when saying (forever (threadDelay 2000000 >> cacheBeat conn keys "token"))) $ \_ -> do
+        threadDelay 12000000
+        carry conn planned
+  if saying
+    then do
+      carried `shouldBe` Right ()
+      fleetTip conn keys `shouldReturn` Just target
+      cacheBeat conn keys "token" `shouldReturn` False
+    else do
+      carried `shouldSatisfy` isLeft
+      fleetTip conn keys `shouldReturn` Nothing
+  where
+    n = 200 :: Word32
+    target = block 77
+    txs = map blockTx [1 .. n]
+    offered c = void (poolOffer conn keys 4 Nothing (childTx c) [False] [])
+    move :: (Monad m) => Atomic m Moved
+    move =
+      D.advance
+        (D.poolKeys keys.prefix 4)
+        Nothing
+        target
+        Nothing
+        keys.size
+        (D.Changing (PoolChange [] [] (map (.txid) txs) [] (Just 100) []))
+        []
+        "token"
+
+-- | A transaction that spends the output of one of a block, at its
+-- address.
+childTx :: Word32 -> PoolTx
+childTx c =
+  PoolTx
+    { txid = encode (5000000 + c),
+      time = 1700009000,
+      inputs = [encode c <> encode (0 :: Word32)],
+      body = B.replicate 250 7,
+      signals = False,
+      entries =
+        [ PoolTouches (C.pack ("addr" <> show c)),
+          PoolSpends (C.pack ("addr" <> show c)) (encode c <> encode (0 :: Word32)) 1000
+        ]
+    }
+
+-- | A transaction of a block, with an address of its own and one that it
+-- shares with the next.
+blockTx :: Word32 -> PoolTx
+blockTx c =
+  PoolTx
+    { txid = encode c,
+      time = 1700000000 + fromIntegral c,
+      inputs = [encode (1000000 + c) <> encode (0 :: Word32)],
+      body = B.replicate 250 7,
+      signals = False,
+      entries =
+        [ PoolTouches (addr c),
+          PoolPays (addr c) (encode c <> encode (0 :: Word32)) 1000 "script",
+          PoolTouches (addr (c + 1)),
+          PoolSpends (addr (c + 1)) (encode (1000000 + c) <> encode (0 :: Word32)) 1000
+        ]
+    }
+  where
+    addr a = C.pack ("addr" <> show a)
+
+-- | What the store that moves the tip does for the floor.
+data Floor
+  = -- | nothing: it moves the tip without a move of the cache
+    Free
+  | -- | it takes it, and says nothing after
+    Silent
+  | -- | it takes it, and says every seven seconds that it is at its move
+    Kept
+
+-- | A move of the tip is decided, and before it is carried out other
+-- decisions are, seven seconds after each other: transactions offered,
+-- withdrawn and expired, what the fleet saw trimmed, entries of the cache
+-- built, dropped and evicted, another store that tries to move the tip,
+-- and one that renews its lease. Every answer that the move depends on
+-- must be the same after them: then the script carries the move out,
+-- whatever the others did.
+--
+-- With the floor kept ('Haskoin.Store.Fleet.XPub.Decide.beat'), that
+-- holds, however long the others go on: all of them give way, and what
+-- the store says to keep the floor changes no answer of its own move.
+-- With the floor taken and nothing said after, it does not: the others
+-- stop giving way after ten seconds, which is how the tip of a server
+-- stayed where it was, its move taking longer than that to decide. Nor
+-- does it without the floor. The last two properties say so, so that the
+-- first is known to see what it is for.
+undisturbed :: Floor -> [PoolStep] -> [PoolStep] -> [Word32] -> Property
+undisturbed how earlier during confirmed =
   case runIdentity (runAtomic (inModel begun) move) of
     Stuck why -> counterexample (show why) False
     Decided _ depends _ _ ->
@@ -87,6 +224,9 @@ undisturbed held earlier during confirmed =
     kx = X.cacheKeys ""
     target = block 1000
     inModel db = Backend {fetch = return . map (answer db), time = return now}
+    held = case how of
+      Free -> False
+      _ -> True
     -- two live stores that agree on the block, cached keys at three of
     -- the four addresses, and a pool
     start =
@@ -97,8 +237,8 @@ undisturbed held earlier during confirmed =
             <> [HSet "fleet:recent" store target | store <- ["a", "b"]]
             <> [SAdd ("fx:of:" <> address a) i | (a, ids) <- [(0, ["x1"]), (1, ["x1", "x2"]), (2, ["x2"])], i <- ids]
         )
-    pool = foldl (flip others) start earlier
-    begun = if held then decided (X.begin kx "mover" "") pool else pool
+    pool = foldl (flip (others now)) start earlier
+    begun = if held then decided now (X.begin kx "mover" "") pool else pool
     move :: (Monad m) => Atomic m Moved
     move =
       D.advance
@@ -110,25 +250,32 @@ undisturbed held earlier during confirmed =
         (D.Changing (PoolChange [] [] (map block confirmed) [] (Just 100) []))
         []
         (if held then "mover" else "")
-    -- the other store renews its lease, and the rest decide
-    later = foldl (flip others) (perform (HSet "fleet:lease" "b" "950000") begun) during
-    decided :: (forall m. (Monad m) => Atomic m a) -> Db -> Db
-    decided decision db = either (error . show) snd (runPure now decision db)
-    others :: PoolStep -> Db -> Db
-    others step = case step of
+    -- the other store renews its lease, and the rest decide, each seven
+    -- seconds after the one before, the store of the move saying a second
+    -- before each that it is at it, if it does
+    later = foldl next (perform (HSet "fleet:lease" "b" "950000") begun) (zip [1 ..] during)
+    next db (i, step) =
+      let at = now + 7000 * i
+       in others at step $ case how of
+            Kept -> decided (at - 1000) (X.beat kx "mover") db
+            _ -> db
+    decided :: Integer -> (forall m. (Monad m) => Atomic m a) -> Db -> Db
+    decided at decision db = either (error . show) snd (runPure at decision db)
+    others :: Integer -> PoolStep -> Db -> Db
+    others at step = case step of
       Give t inputs replaced ->
         let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
-         in decided (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
-      Take ts -> decided (D.withdraw k (map block ts))
+         in decided at (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
+      Take ts -> decided at (D.withdraw k (map block ts))
       Go back dead done used ->
-        decided (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
-          . decided (D.trim k (length used))
-          . decided (X.evict kx (length done))
-          . decided (X.drop kx "x1")
-          . decided (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
-          . decided (X.begin kx "other" "")
-          . decided (X.piece kx "other" "" [X.Piece (address (fromIntegral (length back))) "" [] [] [] []])
-          . decided (X.abort kx "other")
+        decided at (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
+          . decided at (D.trim k (length used))
+          . decided at (X.evict kx (length done))
+          . decided at (X.drop kx "x1")
+          . decided at (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
+          . decided at (X.begin kx "other" "")
+          . decided at (X.piece kx "other" "" [X.Piece (address (fromIntegral (length back))) "" [] [] [] []])
+          . decided at (X.abort kx "other")
     added a = X.Addition {address = address a, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}
 
 -- | A move of the tip that takes eight hundred transactions out of the
@@ -266,7 +413,7 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
       -- entries of the cache that a move marked, one of them gone
       when (n `mod` 4 == 1) . onBoth $ \key -> go (Redis.sadd (key "fx:marked") (NonEmpty.fromList ["x1", "x3"]))
       -- a move of the cache under way: that of the store, or none
-      when (n `mod` 6 == 2) . onBoth $ \key -> go (Redis.set (key "fx:moving") "tok 1")
+      when (n `mod` 6 == 2) . onBoth $ \key -> go (Redis.set (key "fx:moving") "tok")
       forM_ [lua, ours] $ \keys ->
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
       (moved, decided) <-

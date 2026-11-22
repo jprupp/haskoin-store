@@ -700,7 +700,7 @@ local function settle(wipe)
         end
       end
     end
-    redis.call('DEL', key.marked, key.moving)
+    redis.call('DEL', key.marked, key.moving, prefix .. 'fx:beat')
   end
   redis.call('SET', key.xtip, after)
 end
@@ -744,7 +744,7 @@ for _ = 1, tonumber(ARGV[14]) do
 end
 local mine = token(at)
 local current = redis.call('GET', key.moving)
-if (current and string.sub(current, 1, #mine + 1) ~= mine .. ' ') or (not current and mine ~= '') then
+if (current and current ~= mine) or (not current and mine ~= '') then
   return {'raced'}
 end
 

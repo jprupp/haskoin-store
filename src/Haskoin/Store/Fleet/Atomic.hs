@@ -54,8 +54,9 @@
 -- loses every time: it is right whenever it is carried out, and it never
 -- is. Nothing here prevents that. A decision that reads much has to be
 -- given the floor by the others, as the move of the tip is
--- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'), and has to be tested
--- while others write.
+-- ('Haskoin.Store.Fleet.Pool.Decide.floorHeld'), for as long as it takes
+-- and not for a time that it is expected to take, and has to be tested
+-- while others write and at the time that it takes on a slow machine.
 --
 -- = A decision sees what it wrote
 --
@@ -100,6 +101,7 @@ module Haskoin.Store.Fleet.Atomic
     clock,
     Outcome (..),
     runAtomic,
+    tidy,
 
     -- * Reading
     get,
@@ -548,14 +550,22 @@ backend f = Atomic (ask >>= lift . lift . lift . f)
 newtype Stop = Cannot Unanswerable
 
 -- | The clock of Redis, in milliseconds: read once in a decision, and the
--- same every time after. The script does not compare it, as it compares
--- answers, and it is a moment earlier than the script.
+-- same every time after, however many times Redis is asked before the
+-- decision is made. The script does not compare it, as it compares
+-- answers, and it is earlier than the script: by a moment for most
+-- decisions, and by ten seconds and more for a move of the tip over a
+-- full block.
 --
 -- So a decision may use it for what it writes, and may judge by it only
--- what stays true as time goes on, or what a moment does not matter to:
--- that a lease has run out, or that a move went quiet for ten seconds, is
--- as true a moment later; that a lease has not run out yet is what a
--- script that ran a moment earlier would have found.
+-- what stays true as time goes on, or what the time since does not matter
+-- to: that a lease has run out, or that a move went quiet for ten
+-- seconds, is as true later; that a lease has not run out yet is what a
+-- script that ran when the decision began would have found.
+--
+-- It was read again each time Redis was asked, once. A move of the tip
+-- that Redis was asked about for ten seconds then judged the leases by a
+-- clock ten seconds after its store renewed its own, found no store
+-- live, and was refused, turn after turn.
 clock :: (Monad m) => Atomic m Integer
 clock =
   session (gets (.clockAt)) >>= \case
@@ -703,10 +713,12 @@ data Outcome a
 -- It ends because each time Redis is asked at least one question that it
 -- was not asked before, and a decision that ends asks finitely many.
 runAtomic :: (Monad m) => Backend m -> Atomic m a -> m (Outcome a)
-runAtomic with (Atomic f) = go Map.empty (0 :: Int)
+runAtomic with (Atomic f) = go Map.empty (0 :: Int) Nothing
   where
-    go known rounds = do
-      (r, s) <- runStateT (runExceptT (runReaderT f with)) (start known)
+    -- with the clock that an earlier pass read, if one did: the clock of
+    -- a decision is read once, and not once in each pass
+    go known rounds before = do
+      (r, s) <- runStateT (runExceptT (runReaderT f with)) (start known before)
       if Set.null s.missed
         then return $ case r of
           Left (Cannot why) -> Stuck why
@@ -714,8 +726,8 @@ runAtomic with (Atomic f) = go Map.empty (0 :: Int)
         else do
           let new = Set.toList s.missed
           answers <- with.fetch new
-          go (foldl' (\m (q, a) -> Map.insert q a m) known (zip new answers)) (rounds + 1)
-    start known =
+          go (foldl' (\m (q, a) -> Map.insert q a m) known (zip new answers)) (rounds + 1) s.clockAt
+    start known before =
       Session
         { said = known,
           used = Set.empty,
@@ -726,8 +738,32 @@ runAtomic with (Atomic f) = go Map.empty (0 :: Int)
           byWhole = Map.empty,
           wipes = Seq.empty,
           ops = Seq.empty,
-          clockAt = Nothing
+          clockAt = before
         }
+
+-- | The writes of a decision without those that a later one undoes: a
+-- write to a key that is deleted afterwards, or wiped, changes nothing in
+-- the end. Redis is the same after the writes that are left, in their
+-- order, as after all of them.
+--
+-- A decision writes as the script before it did, one thing at a time: a
+-- transaction that leaves the pool takes five counts off the summary of
+-- an address, and then the summary is deleted, since nothing is left of
+-- it. For a block that confirms thousands of transactions, most of what
+-- was written was undone a few writes later, and all of it was sent to
+-- Redis.
+tidy :: [Op] -> [Op]
+tidy written = snd (foldl' keep ((Set.empty, []), []) (reverse written))
+  where
+    -- from the last write to the first, with the keys that a later write
+    -- deletes and the starts of those that one wipes; what is kept is put
+    -- in front of what was kept after it, and so comes out in its order
+    keep ((gone, wiped), kept) op = case opKey op of
+      Left p -> ((gone, p : wiped), op : kept)
+      Right k
+        | Set.member k gone || any (`B.isPrefixOf` k) wiped -> ((gone, wiped), kept)
+        | Del _ <- op -> ((Set.insert k gone, wiped), op : kept)
+        | otherwise -> ((gone, wiped), op : kept)
 
 -------------------------------------------------------------------------------
 -- Reading
