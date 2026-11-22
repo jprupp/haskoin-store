@@ -1669,7 +1669,7 @@ compacted.
 
 ### Measurements for moving the fleet tip
 
-`haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS]]]]`
+`haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]`
 (`bench/Decide.hs`) times what the move of the fleet tip over a block
 costs to decide, without Redis: transactions that are offered wait for as
 long as a move takes (`docs/concurrency.md`, "The floor"). It fills the
@@ -1678,7 +1678,9 @@ move over a block of 4,000 of them, some in chains, as on Bitcoin. It
 prints the time of each pass over
 the decision, its answers and writes, the time for each of those in a
 pass, which is the number to compare between two builds, and what was
-allocated. Run it with `+RTS -T` for the last.
+allocated. Run it with `+RTS -T` for the last. With RIVALS, the block
+is also in conflict with so many transactions of the pool, which leave
+with what spends from them.
 
 On a desktop of 2026 the move over 4,000 transactions of three inputs and
 three outputs is decided in about 1.1 seconds: four passes, one of which

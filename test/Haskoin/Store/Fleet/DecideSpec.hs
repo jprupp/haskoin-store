@@ -81,12 +81,19 @@ spec = do
         let asked related n = do
               keys <- fresh
               let txs = map blockTx [1 .. n]
+                  -- transactions of the pool, each with a child, that
+                  -- spend what a transaction of the block spends, which
+                  -- the pool never had
+                  rivals = [blockTx c | related, c <- [9001 .. 9010]]
+                  winners = [(encode (8000000 + i :: Word32), o) | (i, r) <- zip [1 ..] rivals, o <- r.inputs]
                   change =
                     PoolChange
                       { returned = [],
                         gone = [],
-                        confirmed = map (.txid) txs,
-                        spent = [o <> tx.txid <> encode (100 :: Word32) | tx <- txs, o <- tx.inputs],
+                        confirmed = map (.txid) txs <> map fst winners,
+                        spent =
+                          [o <> tx.txid <> encode (100 :: Word32) | tx <- txs, o <- tx.inputs]
+                            <> [o <> t <> encode (100 :: Word32) | (t, o) <- winners],
                         height = Just 100,
                         lost = []
                       }
@@ -112,10 +119,14 @@ spec = do
                       [X.Addition {address = "addr3", path = "\0\0\0\0\0", balance = "", txs = [], outs = []}]
               forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
               when related $ do
-                -- one in four has a child that stays, and a cached key
-                -- has one of the addresses
+                -- one in four has a child that stays, a cached key has
+                -- one of the addresses, and ten transactions with their
+                -- children spend what the block spends
                 forM_ [c | c <- [1 .. n], c `mod` 4 == 0] $ \c ->
                   poolOffer conn keys 4 Nothing (childTx c) [False] [] `shouldReturn` Taken
+                forM_ rivals $ \r -> do
+                  poolOffer conn keys 4 Nothing r [True] [] `shouldReturn` Taken
+                  poolOffer conn keys 4 Nothing (childTx (number r.txid)) [False] [] `shouldReturn` Taken
                 void (transact conn 1 cached)
               fleetReport conn keys Nothing 60000 "a" [block 77] [] `shouldReturn` True
               cacheBegin conn keys "token" "" `shouldReturn` Begun
@@ -123,7 +134,7 @@ spec = do
               planned.result `shouldBe` MovedTo (block 77)
               return planned.rounds
         mapM (asked False) [40, 400] `shouldReturn` [3, 3]
-        mapM (asked True) [40, 400] `shouldReturn` [4, 4]
+        mapM (asked True) [40, 400] `shouldReturn` [5, 5]
       modifyMaxSuccess (const 300) $
         it "is decided in Haskell as the script decides it, state by state" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do

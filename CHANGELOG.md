@@ -189,7 +189,11 @@ whitelist it must now say what they grant (`--peer-permission`, or
     went and was gone through from its start for each step: five times
     through a block in the benchmark, and more on a server. Deciding the
     move over 4,000 transactions takes 1.3 seconds where it took 4.4,
-    on a desktop, and decides the same.
+    on a desktop, and decides the same. What it asks of the transactions
+    of the pool that a block is in conflict with is named ahead too: on
+    a server, blocks with such transactions took nine and fifteen
+    seconds where the others took under five, and sixty of them made the
+    benchmark go from 1.1 seconds to 5.4; it is 1.2 with them named.
   - **A store takes whatever its node has.** A transaction that a node
     names is fetched and offered unless the pool has it. It was also left
     alone if the fleet remembered having seen it, among the newest

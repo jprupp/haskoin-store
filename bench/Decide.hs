@@ -1,6 +1,6 @@
 -- | What the move of the tip over a block costs to decide, without Redis.
 --
--- > haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS]]]]
+-- > haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]
 --
 -- A move of the tip is one decision ("Haskoin.Store.Fleet.Pool.Decide",
 -- @advance@) that takes the transactions of a block out of the shared
@@ -25,6 +25,12 @@
 -- address of its own. One in five spends an output of the one before it,
 -- which the block confirms too, and one in ten has a child that stays in
 -- the pool, as blocks of Bitcoin have.
+--
+-- A block also confirms RIVALS transactions (0) that the pool does not
+-- have, each spending what a transaction of the pool spends: that one
+-- leaves with its child, and is kept as replaced. A node drops such a
+-- transaction when the block comes, and a store that had it takes it out
+-- in the move.
 --
 -- For each run it prints how long each pass over the decision took and
 -- how many questions it ended with, the answers that the decision depends
@@ -62,12 +68,14 @@ import Text.Printf (printf)
 
 decideBench :: [String] -> IO ()
 decideBench args = do
-  let numbers = map read args <> drop (length args) [4000, 20000, 3, 3] :: [Int]
-      (txs, pool, ins, outs) = case numbers of
-        a : b : c : d : _ -> (a, max a b, c, d)
-        _ -> error "usage: haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS]]]]"
-      shape = Shape {ins, outs}
+  let numbers = map read args <> drop (length args) [4000, 20000, 3, 3, 0] :: [Int]
+      (txs, pool, ins, outs, rivals) = case numbers of
+        a : b : c : d : e : _ -> (a, max a b, c, d, e)
+        _ -> error "usage: haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]"
+      shape = Shape {ins, outs, rivals}
   printf "A pool of %d transactions of %d inputs and %d outputs, and a block of %d of them\n" pool ins outs txs
+  when (rivals > 0) $
+    printf "The block also confirms %d transactions that each spend what one of the pool spends\n" rivals
   began <- getMonotonicTimeNSec
   db <- evaluate (filled shape pool)
   -- all of it, and not what the first questions happen to look at
@@ -76,11 +84,18 @@ decideBench args = do
   printf "The pool was filled in %d ms\n\n" (millis (ended - began))
   forM_ [txs `div` 4, txs `div` 2, txs] $ \n -> do
     printf "A block of %d transactions:\n" n
-    forM_ [1 .. 3 :: Int] $ \_ -> decided shape db n
+    forM_ [1 .. 3 :: Int] $ \_ -> decided shape pool db n
     putStrLn ""
 
--- | How many inputs and outputs a transaction has.
-data Shape = Shape {ins :: !Int, outs :: !Int}
+-- | How many inputs and outputs a transaction has, and how many
+-- transactions of the pool a block is in conflict with.
+data Shape = Shape {ins :: !Int, outs :: !Int, rivals :: !Int}
+
+-- | The number of a transaction of the pool that a block conflicts with:
+-- the last ones of the pool, which no block here confirms, those that
+-- have a child.
+rival :: Int -> Int -> Int
+rival pool i = 10 * ((pool `div` 10) - i)
 
 keys :: D.Keys
 keys = D.poolKeys "hs3:btc:" 32
@@ -181,8 +196,8 @@ filled shape pool = foldl' offered start [1 .. pool]
 
 -- | Decide the move over the first so many transactions of the pool, and
 -- say what it cost.
-decided :: Shape -> Db -> Int -> IO ()
-decided shape db n = do
+decided :: Shape -> Int -> Db -> Int -> IO ()
+decided shape pool db n = do
   marks <- newIORef []
   let fetch qs = do
         from <- getMonotonicTimeNSec
@@ -191,7 +206,16 @@ decided shape db n = do
         unless (and (zipWith (==) answers answers)) (error "An answer differs from itself")
         to <- getMonotonicTimeNSec
         answers <$ modifyIORef' marks ((from, to, length qs) :)
-      confirmed = map txid [1 .. n]
+      -- the transactions of the block that the pool never had, each
+      -- with the output that it spends and that one of the pool spends
+      strangers =
+        [ (txid (3000000000 + i), o)
+        | i <- [1 .. shape.rivals],
+          let r = rival pool i,
+          r > n,
+          o <- take 1 (poolTx shape r).inputs
+        ]
+      confirmed = map txid [1 .. n] <> map fst strangers
       change =
         PoolChange
           { returned = [],
@@ -202,7 +226,8 @@ decided shape db n = do
               | c <- [1 .. n],
                 let tx = poolTx shape c,
                 o <- tx.inputs
-              ],
+              ]
+                <> [o <> t <> encode (978000 :: Word32) | (t, o) <- strangers],
             height = Just 978000,
             lost = []
           }

@@ -426,9 +426,11 @@ departing k t es =
 -- are live; then, of each transaction, what taking it out asks about its
 -- addresses ('departing'), and of each cached key at one of them.
 --
--- These are the questions of a move with nothing to undo, which is
--- nearly all of them. One that brings transactions back, or finds a
--- transaction in the pool that spends what a block spent, asks more, and
+-- And of each transaction of the pool that spends what a block spends:
+-- what taking it out asks, and of all that spends from it.
+--
+-- These are the questions of a move with no block to undo, which is
+-- nearly all of them. One that brings transactions back asks more, and
 -- is gone through again for it. Nothing depends on this being right:
 -- @asks Redis no more times@ in "Haskoin.Store.Fleet.DecideSpec" fails
 -- when a question is missing here.
@@ -453,10 +455,26 @@ foreseen k saw target now change =
              h >= 2016,
              z <- [k.repat, k.lostat]
            ]
-        <> [ only (askingField k.spender (B.take (k.tsize + 4) item))
+        <> [ thenField k.spender (B.take (k.tsize + 4) item) (maybe [] rival)
            | item <- concatMap (pieces (2 * k.tsize + 8)) change.spent
            ]
         <> concatMap confirmed change.confirmed
+    confirming = Set.fromList change.confirmed
+    -- A transaction of the pool that spends what a block spends, and
+    -- that the blocks do not confirm, leaves with all that spends it,
+    -- and is kept as replaced. A block of Bitcoin has some of those, and
+    -- finding them as it went had the move gone through five more times
+    -- for sixty of them.
+    rival t
+      | Set.member t confirming = []
+      | otherwise = leaver t
+    leaver t =
+      [ only (askingWhetherField k.spends t),
+        only (askingField k.spends t),
+        only (askingField k.rep t),
+        thenField k.entries t (maybe [] (departing k t . snd . kept)),
+        thenMembers (under k.kids t) (concatMap leaver . Set.toList)
+      ]
     confirmed t =
       [ only (askingField k.spends t),
         only (askingMembers (under k.lostby t)),

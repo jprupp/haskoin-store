@@ -283,6 +283,15 @@ transactions on a desktop:
 | Finding the questions as it went | 8 | 5 | 4.4 s | 1.8 s |
 | Naming them ahead | 5 | 1 | 1.3 s | 0.4 s |
 | And not working out which can be replaced by fee | 4 | 1 | 1.1 s | 0.3 s |
+| The same block in conflict with 60 transactions of the pool, found as it went | 9 | 6 | 5.4 s | |
+| And named ahead | 6 | 1 | 1.2 s | |
+
+The last two rows are what a server showed once the rest was in place:
+of four blocks, two moved in under five seconds and two took nine and
+fifteen, asking Redis seven times. A block of Bitcoin confirms
+transactions that the pool never had and that spend what transactions of
+the pool spend; those leave, with all that spends from them, and each
+step of that was found by going through the block again.
 
 The answers and the writes are the same in the first two, 103,741 and
 212,540, and 94,409 and 205,207 in the third. A pass costs about a
@@ -298,7 +307,7 @@ How this is established:
 | --- | --- |
 | While its store says that it is at the move, no other decision changes an answer that the move depends on, however long that lasts, and neither does saying it | checked in the model of Redis on 2,000 drawn cases: a pool, a move decided, then any mix of offers, withdrawals, expiries, trims, builds, drops, evictions, another move begun, written and given up, and a lease renewed, each seven seconds after the one before, the store saying a second before each that it is at it; every answer of the move is the same after them. With the floor taken and nothing said after, the same property fails, and it fails without the floor: both are checked too |
 | A move that is carried out twelve seconds after it was decided is carried out, with leases of ten seconds | tested against a Valkey: 200 transactions out of the pool, offers that spend from them every 5 ms, the store saying every two seconds that it is at it. Saying nothing, the same move is refused, which is tested too |
-| The move is gone through once, whatever the size of its block | tested against a Valkey: Redis is asked three times for 40 unrelated transactions and for 400, and four times when a quarter have children in the pool and a cached key has one of their addresses. It fails when one question of the move is not named ahead. That naming changes nothing of what is decided is by construction, and the two scripts side by side hold it to that |
+| The move is gone through once, whatever the size of its block | tested against a Valkey: Redis is asked three times for 40 unrelated transactions and for 400, and five times when a quarter have children in the pool, a cached key has one of their addresses, and the block is in conflict with ten transactions of the pool that have children; nine times without the conflicts named ahead. It fails when one question of the move is not named ahead. That naming changes nothing of what is decided is by construction, and the two scripts side by side hold it to that |
 | A move over a full block is carried out at its first try while others write | tested against a Valkey: 800 transactions out of the pool, with offers that spend from them, another store's reports and builds at their addresses every 5 ms. It fails if nobody gives way, and if the move depends on when a lease runs out |
 | A store answers from each new block while its node never stops taking transactions | tested against Bitcoin Core and Bitcoin Cash Node in Podman (`Haskoin.Store.MempoolSpec`): a block that confirms 2,400 transactions of the pool while about sixty a second keep coming. It fails without the floor |
 
