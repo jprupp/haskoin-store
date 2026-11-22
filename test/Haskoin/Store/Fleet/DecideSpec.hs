@@ -69,31 +69,61 @@ spec = do
     Right () -> aroundAll withRedis $ do
       it "moves the tip over a full block while transactions are offered, stores report and keys are built" $
         \(conn, fresh) -> crowded conn =<< fresh
+      -- The move names what it will ask before it is gone through
+      -- ('Haskoin.Store.Fleet.Pool.Decide.foreseen'), in steps: the tip;
+      -- what is asked of each transaction; what is asked of its addresses
+      -- and which its children are; what is asked of the children and of
+      -- the cached keys at its addresses; and what the children spend
+      -- from. Then it is gone through once. A question of the move that
+      -- is not named there makes these numbers one more, and the move of
+      -- a full block a pass longer, which is seconds on a server.
       it "asks Redis no more times about a large block than about a small one" $ \(conn, fresh) -> do
-        asked <- forM [40, 400] $ \n -> do
-          keys <- fresh
-          let txs = map blockTx [1 .. n]
-              change = PoolChange [] [] (map (.txid) txs) [] (Just 100) []
-              move :: (Monad m) => Atomic m Moved
-              move =
-                D.advance
-                  (D.poolKeys keys.prefix 4)
-                  Nothing
-                  (block 77)
-                  Nothing
-                  keys.size
-                  (D.Changing change)
-                  []
-                  "token"
-          forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
-          fleetReport conn keys Nothing 60000 "a" [block 77] [] `shouldReturn` True
-          cacheBegin conn keys "token" "" `shouldReturn` Begun
-          planned <- plan conn move
-          planned.result `shouldBe` MovedTo (block 77)
-          return planned.rounds
-        -- the tip, the live stores, their blocks, all that is asked first
-        -- of each transaction, and what is asked of each address
-        asked `shouldBe` [5, 5]
+        let asked related n = do
+              keys <- fresh
+              let txs = [(blockTx c) {signals = related} | c <- [1 .. n]]
+                  change =
+                    PoolChange
+                      { returned = [],
+                        gone = [],
+                        confirmed = map (.txid) txs,
+                        spent = [o <> tx.txid <> encode (100 :: Word32) | tx <- txs, o <- tx.inputs],
+                        height = Just 100,
+                        lost = []
+                      }
+                  move :: (Monad m) => Atomic m Moved
+                  move =
+                    D.advance
+                      (D.poolKeys keys.prefix 4)
+                      Nothing
+                      (block 77)
+                      Nothing
+                      keys.size
+                      (D.Changing change)
+                      []
+                      "token"
+                  cached :: (Monad m) => Atomic m X.Step
+                  cached =
+                    X.build
+                      (X.cacheKeys keys.prefix)
+                      ""
+                      "key1"
+                      (0, 0)
+                      1
+                      [X.Addition {address = "addr3", path = "\0\0\0\0\0", balance = "", txs = [], outs = []}]
+              forM_ txs $ \tx -> poolOffer conn keys 4 Nothing tx [True] [] `shouldReturn` Taken
+              when related $ do
+                -- one in four has a child that stays, and a cached key
+                -- has one of the addresses
+                forM_ [c | c <- [1 .. n], c `mod` 4 == 0] $ \c ->
+                  poolOffer conn keys 4 Nothing (childTx c) [False] [] `shouldReturn` Taken
+                void (transact conn 1 cached)
+              fleetReport conn keys Nothing 60000 "a" [block 77] [] `shouldReturn` True
+              cacheBegin conn keys "token" "" `shouldReturn` Begun
+              planned <- plan conn move
+              planned.result `shouldBe` MovedTo (block 77)
+              return planned.rounds
+        mapM (asked False) [40, 400] `shouldReturn` [3, 3]
+        mapM (asked True) [40, 400] `shouldReturn` [4, 4]
       modifyMaxSuccess (const 300) $
         it "is decided in Haskell as the script decides it, state by state" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do

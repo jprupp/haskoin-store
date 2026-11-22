@@ -386,15 +386,109 @@ account k t at es sign = do
   where
     entering = sign > 0
     newest = negate (fromIntegral at) :: Score
-    touched = nub (concatMap addressOf es)
+    touched = touchedBy es
+    cats = categoriesOf es
+    held = heldBy es
+
+-- | The addresses that a transaction touches, each once.
+touchedBy :: [PoolEntry] -> [ByteString]
+touchedBy = nub . concatMap addressOf
+  where
     addressOf = \case
       PoolTouches a -> [a]
       PoolSpends a _ _ -> [a]
       PoolPays a _ _ _ -> [a]
       _ -> []
-    moved = concatMap (\case PoolMakes o -> [o]; PoolUses o -> [o]; _ -> []) es
-    cats = nub (map (.category) moved)
-    held = nub [(o.category, a) | o <- moved, Just a <- [o.address]]
+
+-- | The outputs with tokens that a transaction makes or uses up.
+tokenOuts :: [PoolEntry] -> [PoolTokenOut]
+tokenOuts = concatMap (\case PoolMakes o -> [o]; PoolUses o -> [o]; _ -> [])
+
+-- | The categories of the tokens that a transaction moves, each once.
+categoriesOf :: [PoolEntry] -> [ByteString]
+categoriesOf = nub . map (.category) . tokenOuts
+
+-- | The categories that a transaction moves at each address, each once.
+heldBy :: [PoolEntry] -> [(ByteString, ByteString)]
+heldBy es = nub [(o.category, a) | o <- tokenOuts es, Just a <- [o.address]]
+
+-- | What taking a transaction out asks about its addresses and tokens
+-- ('account', with sign -1), given what it does there: for 'foreseen'.
+-- What is asked of the cached keys at an address is named once Redis has
+-- said which they are.
+departing :: Keys -> ByteString -> [PoolEntry] -> [Ahead]
+departing k t es =
+  concatMap entry es
+    <> [only (askingCount (under k.asum a) "txs") | a <- touchedBy es]
+    <> [only (askingCount (under k.csum c) "txs") | c <- categoriesOf es]
+    <> [only (askingCount (under k.tsum (c <> a)) "txs") | (c, a) <- heldBy es]
+  where
+    entry = \case
+      PoolMakes o -> [only (askingWhetherField k.spender o.output)]
+      PoolUses o -> [only (askingWhetherField k.spends (maker k o.output))]
+      PoolTouches a -> [watching a (\i -> askingScore (entryTxs k i) t)]
+      PoolSpends a o _ -> [only (askingWhetherField (under k.aval a) o)]
+      PoolPays a o _ _ ->
+        [ watching a (\i -> askingScore (entryOuts k i) o),
+          only (askingWhetherField (under k.aspent a) o)
+        ]
+    watching a asks =
+      thenMembers (under k.watchers a) $ \ids ->
+        [only (askingNumber k.xver) | not (Set.null ids)] <> map (only . asks) (Set.toList ids)
+
+-- | What a move of the tip over blocks asks, in the steps in which it can
+-- be named: the tip; then what is asked of each transaction that the
+-- blocks confirm and of each output that they spend, and which stores
+-- are live; then, of each transaction, what taking it out asks about its
+-- addresses ('departing'), and its children if it could be replaced; then
+-- what is asked of each child, and of what each child spends from.
+--
+-- These are the questions of a move with nothing to undo, which is
+-- nearly all of them. One that brings transactions back, or finds a
+-- transaction in the pool that spends what a block spent, asks more, and
+-- is gone through again for it. Nothing depends on this being right:
+-- @asks Redis no more times@ in "Haskoin.Store.Fleet.DecideSpec" fails
+-- when a question is missing here.
+foreseen :: Keys -> Maybe ByteString -> ByteString -> Integer -> PoolChange -> [Ahead]
+foreseen k saw target now change =
+  [ thenText k.tip $ \tip ->
+      let at = fromMaybe "" tip
+       in if at /= fromMaybe "" saw || at == target then [] else rest
+  ]
+  where
+    rest =
+      [ thenAbove k.lease now (map (only . askingField k.recent) . Set.toList),
+        only (askingNumber k.moves),
+        only (asking k.moving),
+        only (asking k.xtip),
+        thenMembers k.marked $ \ids ->
+          [only (askingNumber k.xver) | not (Set.null ids)]
+            <> [only (askingWhether (entryMeta k i)) | i <- Set.toList ids]
+      ]
+        <> [ only (askingRange z MinusInf (At (fromIntegral (h - 2016))) Nothing)
+           | h <- maybe [] pure change.height,
+             h >= 2016,
+             z <- [k.repat, k.lostat]
+           ]
+        <> [ only (askingField k.spender (B.take (k.tsize + 4) item))
+           | item <- concatMap (pieces (2 * k.tsize + 8)) change.spent
+           ]
+        <> concatMap confirmed change.confirmed
+    confirmed t =
+      [ only (askingField k.spends t),
+        only (askingMembers (under k.lostby t)),
+        thenField k.entries t (maybe [] (departing k t . snd . kept)),
+        thenMember k.rbf t $ \could ->
+          [thenMembers (under k.kids t) (concatMap child . Set.toList) | could]
+      ]
+    -- whether a child can still be replaced is worked out again
+    -- ('replaceable')
+    child c =
+      [ thenField k.spends c (map (only . askingMember k.rbf . maker k) . outputs k . fromMaybe ""),
+        only (askingMember k.own c),
+        only (askingMember k.rbf c),
+        only (askingMembers (under k.kids c))
+      ]
 
 -- | Work out again whether a transaction of the pool can be replaced by
 -- fee, which it can if it says so itself or spends from one of the pool
@@ -687,39 +781,49 @@ advance ::
   ByteString ->
   Atomic m Moved
 advance k saw target given bsize how path token = do
-  at <- fromMaybe "" <$> get k.tip
-  if at /= fromMaybe "" saw
-    then return Raced
-    else
-      if target == at
-        then return Stays
-        else do
-          now <- maybe clock return given
-          -- which stores are live, and not until when: a store that
-          -- renews its lease while this is decided changes nothing for it
-          live <- Set.toAscList <$> hfieldsAbove k.lease now
-          reports <- forM live (fmap (pieces bsize . fromMaybe "") . hget k.recent)
-          let agreed = case reports of
-                first : others -> take 1 [b | b <- first, all (elem b) others]
-                [] -> []
-          if null live || agreed /= [target]
-            then return Raced
-            else do
-              count <- getNumber k.moves
-              let before = num count <> "@" <> at
-                  after = num (count + 1) <> "@" <> target
-              case how of
-                AloneNotKnowing caller
-                  | live /= [caller] -> return Raced
-                  | otherwise -> emptied at after
-                TooLong -> emptied at after
-                Changing change -> do
-                  current <- get k.moving
-                  let other = maybe False (/= token) current
-                  if other || (isNothing current && not (B.null token))
-                    then return Raced
-                    else changed change before after
+  -- What a move over blocks will ask, named before it is gone through
+  -- ('foreseen'). A pass in which Redis has not answered all of that
+  -- does not count, and is left at once, with a result that nobody sees.
+  ready <- case how of
+    Changing change -> do
+      now <- maybe clock return given
+      ahead (foreseen k saw target now change)
+    _ -> return True
+  if ready then moving else return Raced
   where
+    moving = do
+      at <- fromMaybe "" <$> get k.tip
+      if at /= fromMaybe "" saw
+        then return Raced
+        else
+          if target == at
+            then return Stays
+            else do
+              now <- maybe clock return given
+              -- which stores are live, and not until when: a store that
+              -- renews its lease while this is decided changes nothing for it
+              live <- Set.toAscList <$> hfieldsAbove k.lease now
+              reports <- forM live (fmap (pieces bsize . fromMaybe "") . hget k.recent)
+              let agreed = case reports of
+                    first : others -> take 1 [b | b <- first, all (elem b) others]
+                    [] -> []
+              if null live || agreed /= [target]
+                then return Raced
+                else do
+                  count <- getNumber k.moves
+                  let before = num count <> "@" <> at
+                      after = num (count + 1) <> "@" <> target
+                  case how of
+                    AloneNotKnowing caller
+                      | live /= [caller] -> return Raced
+                      | otherwise -> emptied at after
+                    TooLong -> emptied at after
+                    Changing change -> do
+                      current <- get k.moving
+                      let other = maybe False (/= token) current
+                      if other || (isNothing current && not (B.null token))
+                        then return Raced
+                        else changed change before after
     -- the cache of extended public keys at the new place of the tip: its
     -- entries gone if the pool is, or if it was not at the place before;
     -- and otherwise every entry that the move marked with a new version
@@ -752,17 +856,6 @@ advance k saw target given bsize how path token = do
       emit k "b" target
       return (MovedTo target)
     changed change before after = do
-      -- What the rest asks first of each transaction that the blocks
-      -- confirm, asked here at once. A question is asked of Redis when
-      -- the decision comes to it, and the decision is then made again
-      -- from the start: asked one after the other, these cost a turn each
-      -- through thousands of transactions.
-      prefetch $
-        [asking k.xtip, askingMembers k.marked]
-          <> concat
-            [ [askingField k.spends t, askingField k.entries t, askingMember k.rbf t, askingMembers (under k.lostby t)]
-            | t <- change.confirmed
-            ]
       -- the abandoned blocks: what can come back does, and what spends the
       -- same in the pool gives way. What a transaction that comes back
       -- replaced is not replaced any more.

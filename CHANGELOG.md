@@ -184,6 +184,12 @@ whitelist it must now say what they grant (`--peer-permission`, or
   - **`haskoin-store-bench decide`** times what the move of the tip over
     a block costs to decide, without Redis: each pass over the decision,
     its answers and writes, and what it allocates.
+  - **The move of the tip is gone through once.** It names what it will
+    ask before it starts, in steps, where it found its questions as it
+    went and was gone through from its start for each step: five times
+    through a block in the benchmark, and more on a server. Deciding the
+    move over 4,000 transactions takes 1.3 seconds where it took 4.4,
+    on a desktop, and decides the same.
   - **A decision of any size is carried out.** Its questions and writes
     go to Redis a thousand to an argument, without the writes that a
     later delete undoes and with one command for many members of a key.

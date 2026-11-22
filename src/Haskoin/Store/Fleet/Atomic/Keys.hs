@@ -53,6 +53,20 @@ module Haskoin.Store.Fleet.Atomic.Keys
     Atomic,
     clock,
     prefetch,
+
+    -- * Questions named ahead, in steps
+    Ahead,
+    ahead,
+    only,
+    thenText,
+    thenField,
+    thenMember,
+    thenMembers,
+    thenAbove,
+    askingCount,
+    askingScore,
+    askingRange,
+    askingWhether,
     Query,
     Score,
     Bound (..),
@@ -116,7 +130,18 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Map.Strict (Map)
 import Data.Set (Set)
-import Haskoin.Store.Fleet.Atomic (Atomic, Bound (..), Op (..), Query (..), Score, clock, prefetch, write)
+import Haskoin.Store.Fleet.Atomic
+  ( Ahead (..),
+    Atomic,
+    Bound (..),
+    Op (..),
+    Query (..),
+    Score,
+    ahead,
+    clock,
+    prefetch,
+    write,
+  )
 import Haskoin.Store.Fleet.Atomic qualified as A
 
 -- | What a key of Redis holds, as far as the fleet tells them apart.
@@ -169,6 +194,57 @@ whole :: ByteString -> Maybe Integer
 whole v = case C.readInteger v of
   Just (n, rest) | B.null rest -> Just n
   _ -> Nothing
+
+-- | A question to name ahead, and nothing after it ('ahead').
+only :: Query -> Ahead
+only q = Ahead q (const [])
+
+-- | The question that 'get' asks, and what to name from its answer.
+thenText :: K 'Text -> (Maybe ByteString -> [Ahead]) -> Ahead
+thenText (K k) next = Ahead (Get k) $ \case
+  A.Text v -> next v
+  _ -> []
+
+-- | The question that 'hget' asks, and what to name from its answer.
+thenField :: K 'Hash -> ByteString -> (Maybe ByteString -> [Ahead]) -> Ahead
+thenField (K k) f next = Ahead (HGet k f) $ \case
+  A.Text v -> next v
+  _ -> []
+
+-- | The question that 'sismember' asks, and what to name from its answer.
+thenMember :: K 'Group -> ByteString -> (Bool -> [Ahead]) -> Ahead
+thenMember (K k) x next = Ahead (SIsMember k x) $ \case
+  A.Flag v -> next v
+  _ -> []
+
+-- | The question that 'smembers' asks, and what to name from its answer.
+thenMembers :: K 'Group -> (Set ByteString -> [Ahead]) -> Ahead
+thenMembers (K k) next = Ahead (SMembers k) $ \case
+  A.Members v -> next v
+  _ -> []
+
+-- | The question that 'hfieldsAbove' asks, and what to name from its
+-- answer.
+thenAbove :: K 'Counts -> Integer -> (Set ByteString -> [Ahead]) -> Ahead
+thenAbove (K k) n next = Ahead (HAbove k n) $ \case
+  A.Members v -> next v
+  _ -> []
+
+-- | The question that 'hgetNumber' asks.
+askingCount :: K 'Counts -> ByteString -> Query
+askingCount (K k) = HGet k
+
+-- | The question that 'zscore' asks.
+askingScore :: K 'Sorted -> ByteString -> Query
+askingScore (K k) = ZScore k
+
+-- | The question that 'zrangeByScore' asks.
+askingRange :: K 'Sorted -> Bound -> Bound -> Maybe Int -> Query
+askingRange (K k) = ZRangeByScore k
+
+-- | The question that 'exists' asks.
+askingWhether :: K kind -> Query
+askingWhether (K k) = Exists k
 
 -- | @DEL@.
 del :: (Monad m) => K kind -> Atomic m ()

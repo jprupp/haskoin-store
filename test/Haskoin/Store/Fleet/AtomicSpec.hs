@@ -6,6 +6,7 @@ import Control.Monad (forM_, replicateM_, void)
 import Control.Monad.State.Strict (runState, state)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
+import Data.Functor.Identity (runIdentity)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.Maybe (isJust)
 import Database.Redis qualified as Redis
@@ -78,6 +79,23 @@ spec = do
       case runState (runAtomic ticking decision) 1000 of
         (Decided times _ _ rounds, _) -> (times, rounds) `shouldBe` ((1000, 1000), 3)
         (Stuck why, _) -> expectationFailure (show why)
+    -- three keys, each holding the name of the next
+    it "names questions ahead in steps, is gone through once, and depends on none of them" $ do
+      let db = foldr perform emptyDb [Set "s1" "s2", Set "s2" "s3", Set "s3" "x"]
+          naming next = \case
+            Text (Just k) -> next k
+            _ -> []
+          steps = [Ahead (Get "s1") (naming (\a -> [Ahead (Get a) (naming (\b -> [Ahead (Get b) (const [])]))]))]
+          decision :: (Monad m) => Atomic m (Maybe ByteString, Int)
+          decision = do
+            ready <- ahead steps
+            -- a pass that is left, and one that is gone through
+            if ready then (,1) <$> get "s3" else return (Nothing, 0)
+          model = Backend {fetch = return . map (answer db), time = return 0}
+      case runIdentity (runAtomic model decision) of
+        Decided result depends _ rounds ->
+          (result, map fst depends, rounds) `shouldBe` ((Just "x", 1), [Get "s3"], 3)
+        Stuck why -> expectationFailure (show why)
   usable <- runIO podmanUsable
   describe "a decision, in Redis" $ case usable of
     Left why -> it "is carried out in one step" (pendingWith why)

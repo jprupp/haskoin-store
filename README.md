@@ -1681,10 +1681,11 @@ pass, which is the number to compare between two builds, and what was
 allocated. Run it with `+RTS -T` for the last.
 
 On a desktop of 2026 the move over 4,000 transactions of three inputs and
-three outputs is decided in about 4.4 seconds: eight passes, five of
-which go through the whole block, about 1.7 microseconds and 1.7
-kilobytes allocated for each answer or write of a pass, and two fifths of
-the time in the garbage collector.
+three outputs is decided in about 1.3 seconds: five passes, one of which
+goes through the whole block, and about a microsecond and a kilobyte
+allocated for each answer or write of a pass. It took 4.4 seconds in
+eight passes, five of them through the block, before the move named its
+questions ahead (`docs/concurrency.md`, "The floor").
 
 ### Contributing
 

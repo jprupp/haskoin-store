@@ -41,7 +41,6 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (foldl')
 import Data.Serialize (encode)
 import Data.Word (Word32, Word64)
 import GHC.Clock (getMonotonicTimeNSec)

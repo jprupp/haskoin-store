@@ -254,23 +254,39 @@ measured on the server and not guessed.
 The move costs in proportion to its block, by going through the writes to
 one cell only for a question about that cell
 (`Haskoin.Store.Fleet.Atomic.Cells.skipOthers`, proved), where it grew
-with the square of the block; and how many times Redis is asked does not
-depend on the size, the first questions of every transaction being asked
-at once: five times for a block of unrelated transactions, and a few more
-for one with chains of transactions and transactions that can be
-replaced, since what is asked of a child is known only once its parent
-is. It was eight in the benchmark and nine on a server.
+with the square of the block.
+
+It is gone through once, whatever its size. A decision is gone through
+from its start each time Redis is asked, and what the move asks comes in
+steps that each need the answers of the one before: which transactions
+are in the pool, what each does at its addresses, which children each
+has, what the children spend from. Left to find those as it went, the
+move went through the whole block five times, and the store of a server
+nine, three of them to ask a few hundred questions about children. So the
+move names what it will ask before it starts
+(`Haskoin.Store.Fleet.Pool.Decide.foreseen`), in those steps, and leaves
+a pass in which Redis has not answered all of it
+(`Haskoin.Store.Fleet.Atomic.ahead`): a step costs a call to Redis and
+not a pass over the block. Naming a question changes nothing of what is
+decided, since a decision depends on a question only by asking it. A
+question of the move that is not named costs a pass again, which a test
+counts.
 
 Where the time of deciding goes is measured without Redis by
 `haskoin-store-bench decide` (`bench/Decide.hs`). For a block of 4,000
-transactions on a desktop: 4.4 seconds, in eight passes of which five go
-through the whole block, three of those to ask fewer than 1,500 questions
-each; 1.7 microseconds and 1.7 kilobytes allocated for each answer or
-write of a pass; two fifths of the time in the garbage collector. A
-server took four times as long for each. Compiling the decisions so that
-they are specialised to the monad that runs them changed nothing, which
-was tried: the cost is in what a pass does and in how many there are, and
-not in the decisions being written for any monad.
+transactions on a desktop:
+
+| | Passes | Through the block | Deciding | Collector |
+| --- | --- | --- | --- | --- |
+| Finding the questions as it went | 8 | 5 | 4.4 s | 1.8 s |
+| Naming them ahead | 5 | 1 | 1.3 s | 0.4 s |
+
+The answers and the writes are the same in both, 103,741 and 212,540. A
+pass costs about a microsecond and a kilobyte allocated for each of
+them. A server took four times as long for each. Compiling the decisions
+so that they are specialised to the monad that runs them changed
+nothing, which was tried: the cost was in how many passes there were, and
+is now in what one pass does.
 
 How this is established:
 
@@ -278,7 +294,7 @@ How this is established:
 | --- | --- |
 | While its store says that it is at the move, no other decision changes an answer that the move depends on, however long that lasts, and neither does saying it | checked in the model of Redis on 2,000 drawn cases: a pool, a move decided, then any mix of offers, withdrawals, expiries, trims, builds, drops, evictions, another move begun, written and given up, and a lease renewed, each seven seconds after the one before, the store saying a second before each that it is at it; every answer of the move is the same after them. With the floor taken and nothing said after, the same property fails, and it fails without the floor: both are checked too |
 | A move that is carried out twelve seconds after it was decided is carried out, with leases of ten seconds | tested against a Valkey: 200 transactions out of the pool, offers that spend from them every 5 ms, the store saying every two seconds that it is at it. Saying nothing, the same move is refused, which is tested too |
-| Redis is asked as many times about a large block as about a small one | tested against a Valkey: five times for 40 transactions and for 400. It fails without the questions asked at once |
+| The move is gone through once, whatever the size of its block | tested against a Valkey: Redis is asked three times for 40 unrelated transactions and for 400, and four times when they can be replaced, a quarter have children in the pool and a cached key has one of their addresses. It fails when one question of the move is not named ahead. That naming changes nothing of what is decided is by construction, and the two scripts side by side hold it to that |
 | A move over a full block is carried out at its first try while others write | tested against a Valkey: 800 transactions out of the pool, with offers that spend from them, another store's reports and builds at their addresses every 5 ms. It fails if nobody gives way, and if the move depends on when a lease runs out |
 | A store answers from each new block while its node never stops taking transactions | tested against Bitcoin Core and Bitcoin Cash Node in Podman (`Haskoin.Store.MempoolSpec`): a block that confirms 2,400 transactions of the pool while about sixty a second keep coming. It fails without the floor |
 
@@ -472,6 +488,10 @@ finding was checked against the code before it was fixed.
   fails, since the script that it compares with has not changed: say
   there what differs and why, or drop the comparison once the script is
   no longer what the stores should do.
+- A new question in the move of the tip is named in `foreseen`, or the
+  move of a full block is gone through once more for it: `asks Redis no
+  more times` in `DecideSpec` fails then, and `haskoin-store-bench decide`
+  says what it costs.
 - A new key of the pool or of the cache is named in its record of keys,
   with its kind. A decision imports `Haskoin.Store.Fleet.Atomic.Keys`,
   never the writes of `Haskoin.Store.Fleet.Atomic`.

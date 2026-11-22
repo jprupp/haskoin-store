@@ -97,6 +97,8 @@ module Haskoin.Store.Fleet.Atomic
     query,
     queries,
     prefetch,
+    Ahead (..),
+    ahead,
     write,
     clock,
     Outcome (..),
@@ -583,6 +585,50 @@ clock =
 prefetch :: (Monad m) => [Query] -> Atomic m ()
 prefetch qs = session . modify' $ \s ->
   s {missed = foldl' (\m q -> if Map.member q s.said then m else Set.insert q m) s.missed qs}
+
+-- | A question to name ahead, with those that its answer names: what a
+-- decision will ask of the children of a transaction is known only once
+-- Redis has said which they are.
+data Ahead = Ahead !Query (Answer -> [Ahead])
+
+-- | Name questions ahead in steps: these, and, of each that Redis has
+-- answered, those that its answer names, and so on. It says whether Redis
+-- has answered all of them.
+--
+-- = Why
+--
+-- A decision is gone through from its start each time Redis is asked
+-- ('runAtomic'). 'prefetch' is for what a decision can name before it
+-- asks anything. What it asks next, of what the first answers name, cost
+-- a whole pass for each step of such a chain: the move of the tip over a
+-- block of four thousand transactions was gone through five times, three
+-- of them to ask a few hundred questions each about the children of its
+-- transactions.
+--
+-- = What a decision may do with the answer
+--
+-- It may leave a pass in which this says no, with any result: Redis has
+-- not answered a question that was named here, so the pass does not
+-- count, and is gone through again once Redis has. So the steps of a
+-- chain cost a question each to Redis and not a pass each over the whole
+-- decision. In the pass that counts Redis has answered everything, and
+-- this says yes.
+--
+-- The answers that the steps are worked out from are what Redis said and
+-- go nowhere else: the decision depends on a question only by asking it
+-- ('query'), and the script compares only those. Naming too little costs
+-- a pass, and too much costs its answer.
+ahead :: (Monad m) => [Ahead] -> Atomic m Bool
+ahead hints = do
+  s <- session (gets id)
+  let go ready missing = \case
+        [] -> (ready, missing)
+        Ahead q next : rest -> case Map.lookup q s.said of
+          Just a -> go ready missing (next a <> rest)
+          Nothing -> go False (Set.insert q missing) rest
+      (answered, missed) = go True s.missed hints
+  session (modify' (\x -> x {missed}))
+  return answered
 
 -- | The answer of a Redis that has nothing: what a pass goes on with for a
 -- question that Redis was not asked yet.
