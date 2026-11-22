@@ -254,8 +254,23 @@ measured on the server and not guessed.
 The move costs in proportion to its block, by going through the writes to
 one cell only for a question about that cell
 (`Haskoin.Store.Fleet.Atomic.Cells.skipOthers`, proved), where it grew
-with the square of the block; and Redis is asked five times whatever the
-size, the first questions of every transaction being asked at once.
+with the square of the block; and how many times Redis is asked does not
+depend on the size, the first questions of every transaction being asked
+at once: five times for a block of unrelated transactions, and a few more
+for one with chains of transactions and transactions that can be
+replaced, since what is asked of a child is known only once its parent
+is. It was eight in the benchmark and nine on a server.
+
+Where the time of deciding goes is measured without Redis by
+`haskoin-store-bench decide` (`bench/Decide.hs`). For a block of 4,000
+transactions on a desktop: 4.4 seconds, in eight passes of which five go
+through the whole block, three of those to ask fewer than 1,500 questions
+each; 1.7 microseconds and 1.7 kilobytes allocated for each answer or
+write of a pass; two fifths of the time in the garbage collector. A
+server took four times as long for each. Compiling the decisions so that
+they are specialised to the monad that runs them changed nothing, which
+was tried: the cost is in what a pass does and in how many there are, and
+not in the decisions being written for any monad.
 
 How this is established:
 

@@ -6,13 +6,14 @@
 --
 -- > haskoin-store-bench PORT BLOCKS [REDIS_URL]
 --
--- Four other things are measured without a server: @haskoin-store-bench
+-- Five other things are measured without a server: @haskoin-store-bench
 -- micro@ times the pure functions that encode a response,
 -- @haskoin-store-bench import@ the import of full blocks ("Import"),
 -- @haskoin-store-bench merge@ what the merge records of those blocks cost
--- the readers of the database ("Merge"), and @haskoin-store-bench
+-- the readers of the database ("Merge"), @haskoin-store-bench
 -- admission@ how the limit on long requests behaves under load
--- ("Admission").
+-- ("Admission"), and @haskoin-store-bench decide@ what the move of the
+-- fleet tip over a block costs to decide ("Decide").
 --
 -- Set @BENCH_LOG=1@ to print the log of the store, such as to see why it
 -- does not sync.
@@ -63,6 +64,7 @@ import Data.Text.IO qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Vector qualified as V
 import Data.Word (Word32)
+import Decide (decideBench)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
 import Haskoin.Node
@@ -86,6 +88,7 @@ main = do
     "import" : more -> importBench more
     "merge" : more -> mergeBench more
     "admission" : more -> admissionBench more
+    "decide" : more -> decideBench more
     _ -> server args
 
 server :: [String] -> IO ()

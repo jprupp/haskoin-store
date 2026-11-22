@@ -1667,6 +1667,25 @@ the spenders of a transaction, for keys with no merge record, one, three
 and six, each in a table file of its own, and then the same keys once
 compacted.
 
+### Measurements for moving the fleet tip
+
+`haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS]]]]`
+(`bench/Decide.hs`) times what the move of the fleet tip over a block
+costs to decide, without Redis: transactions that are offered wait for as
+long as a move takes (`docs/concurrency.md`, "The floor"). It fills the
+pure model of Redis with a pool of 20,000 transactions and decides the
+move over a block of 4,000 of them, some in chains and two in three
+replaceable by fee, as on Bitcoin. It prints the time of each pass over
+the decision, its answers and writes, the time for each of those in a
+pass, which is the number to compare between two builds, and what was
+allocated. Run it with `+RTS -T` for the last.
+
+On a desktop of 2026 the move over 4,000 transactions of three inputs and
+three outputs is decided in about 4.4 seconds: eight passes, five of
+which go through the whole block, about 1.7 microseconds and 1.7
+kilobytes allocated for each answer or write of a pass, and two fifths of
+the time in the garbage collector.
+
 ### Contributing
 
 Pull requests are welcome.

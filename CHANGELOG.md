@@ -181,6 +181,9 @@ whitelist it must now say what they grant (`--peer-permission`, or
     where the time went: reading the blocks, reading and writing the
     cache, deciding, the calls to Redis, carrying it out, and the
     garbage collector.
+  - **`haskoin-store-bench decide`** times what the move of the tip over
+    a block costs to decide, without Redis: each pass over the decision,
+    its answers and writes, and what it allocates.
   - **A decision of any size is carried out.** Its questions and writes
     go to Redis a thousand to an argument, without the writes that a
     later delete undoes and with one command for many members of a key.

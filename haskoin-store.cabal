@@ -425,6 +425,7 @@ benchmark haskoin-store-bench
   main-is: Main.hs
   other-modules:
       Admission
+      Decide
       Import
       Merge
       Paths_haskoin_store
