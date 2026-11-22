@@ -5,11 +5,14 @@ synopsis:      Liquid Haskell proofs about the pure machines of haskoin-store
 description:
   Not part of the store's build. It compiles the pure machine modules of
   ../src again with the Liquid Haskell plugin, which checks the refinement
-  types written in their comments. See ../docs/mempool-ingestion.md.
+  types written in their comments. See ../docs/mempool-ingestion.md for the
+  path into the shared mempool, and ../docs/concurrency.md for what a
+  decision about the state in Redis sees of its own writes.
 
 library
   hs-source-dirs:     ../src
   exposed-modules:
+    Haskoin.Store.Fleet.Atomic.Cells
     Haskoin.Store.Ingest
     Haskoin.Store.Ingest.Ledger
 

@@ -62,6 +62,13 @@ document, and adds the property that the change keeps to the machine's
 spec. Change shared state only from its owner, or in one STM transaction
 that reads what the decision depends on.
 
+What a write to Redis does to one cell is said once, in
+`Haskoin.Store.Fleet.Atomic.Cells`, for the model of Redis and for what a
+decision sees of its own writes. Liquid Haskell checks that module with
+the others (`cabal build` in `proofs/`): a change to it, or a new kind of
+write, is not done until that passes. Its bytes are a type of any kind:
+Liquid Haskell does not load `ByteString` here.
+
 The shared mempool in Redis is changed only by the decisions of
 `Haskoin.Store.Fleet.Pool.Decide`, and the cache of extended public keys
 by those of `Haskoin.Store.Fleet.XPub.Decide`: Haskell that asks Redis
@@ -93,7 +100,8 @@ each claim is established. The path is one pure machine,
   of a record field: what it has to reason about is read by matching. It
   checks a module again only when GHC compiles it again. A function that
   reads the same thing many times through a function call can make the
-  check take hours: bind it once.
+  check take hours: bind it once. The same build checks
+  `Haskoin.Store.Fleet.Atomic.Cells` (`docs/concurrency.md`).
 - The document says what is now proved, checked, sampled or only tested.
   Never write "proved" for what is tested.
 

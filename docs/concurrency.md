@@ -141,7 +141,7 @@ What it rests on, and how each part is established:
 | --- | --- |
 | A decision does nothing but ask and write | by its type: it is run as `forall m. Monad m => Atomic m a` |
 | The script compares before it writes, and decides nothing | by reading it: a hundred lines, with no rule of the fleet in them |
-| A decision sees its own writes as Redis would say them (`replay`) | tested: 5,000 drawn cases against the pure model of Redis, and 300 against a Valkey; where it cannot tell, it stops with an error and guesses nothing |
+| A decision sees its own writes as the model of Redis says them (`replay`) | what a write does to one cell (a field of a hash, a member of a set, the score of a member, what a key holds) is written once, in `Haskoin.Store.Fleet.Atomic.Cells`, and used by both. **Proved** by Liquid Haskell (`proofs/`) for every cell function, key and list of writes: the cell of a key in the model after the writes is the answer that the decision works out from the cell before. It assumes four facts of `Data.Map`, and does not look into the arithmetic of `INCRBY`. Six bugs planted in it are each rejected. For all the fields of a hash and all the members of a set, the decision changes its answer by the function that changes the model. **Tested** only, on 5,000 drawn cases against the model and 300 against a Valkey: the names of the fields of a hash, a range and a count of a sorted set, whether a key is there, and that a write goes to the map of its own kind. Where a decision cannot tell, it stops with an error and guesses nothing |
 | The pure model of Redis says what Redis says | tested against a Valkey: any writes, then every question |
 | A decision whose answers changed writes nothing | tested against a Valkey, with a set and a hash of 200 members in whatever order Redis lists them |
 | No change is lost when many decide at once | tested: eight threads, four hundred additions to one number |
@@ -149,9 +149,10 @@ What it rests on, and how each part is established:
 | The decisions of the pool do what its script did | tested: the script and the decisions side by side under two prefixes of one Valkey, 300 drawn sequences of offers, withdrawals, expiries and moves of the tip of each kind, all that Redis has compared after every step (`Haskoin.Store.Fleet.DecideSpec`) |
 | The decisions of the cache of xpubs do what its script did | tested the same way: 300 drawn sequences of builds, moves begun, written in pieces, given up, gone quiet and committed, entries dropped and evicted, with the pool changing under them (`Haskoin.Store.Fleet.XPubDecideSpec`) |
 
-None of this is proved. What changed is where a fault can be: in a pure
-function, where it is an exception before any write, and no longer in
-the middle of a script.
+One row of this is proved, and the rest is by type, by reading or
+tested. What changed is where a fault can be: in a pure function, where
+it is an exception before any write, and no longer in the middle of a
+script.
 
 What it costs. An offer that is taken is two calls to Redis where it was
 one, and Redis spends about 137 microseconds on it where the script took

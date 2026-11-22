@@ -133,6 +133,16 @@ import Data.Sequence (Seq, (|>))
 import Data.Sequence qualified as Seq
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Haskoin.Store.Fleet.Atomic.Cells
+  ( CellOp (..),
+    MapOp (..),
+    RankOp (..),
+    at,
+    cellAfter,
+    mapAfter,
+    rankAfter,
+    thereAt,
+  )
 
 -- | The name of a key of Redis.
 type Key = ByteString
@@ -271,19 +281,27 @@ data Unanswerable = Unanswerable !Query !String
 -- The writes are those to the key of the question, in their order, with a
 -- 'Del' for each 'Wipe' that takes the key.
 --
--- For every question, answer and list of writes that it has an answer
--- for, the answer is what Redis says after the writes if it said the
--- first before them: 'answer' and 'perform' are the statement of that,
--- and the specs check one against the other, and both against a Redis.
+-- What a write does to one cell, a field of a hash, a member of a set or
+-- the score of one, is not said here: it is the function of
+-- "Haskoin.Store.Fleet.Atomic.Cells" that the model of Redis below uses
+-- too ('perform'). So for a question about one cell, the answer here is
+-- what the model says after the writes, which Liquid Haskell checks
+-- ('Haskoin.Store.Fleet.Atomic.Cells.cellAfterAll',
+-- 'Haskoin.Store.Fleet.Atomic.Cells.thereAtAllSame'). For all the fields
+-- of a hash and all the members of a set, the writes are done to the
+-- answer by the function that does them to the model. For the rest, the
+-- fields of a hash by name, a range or a count of a sorted set, whether a
+-- key is there, the specs check it against the model on drawn cases, and
+-- against a Redis.
 replay :: Query -> Answer -> [Op] -> Either Unanswerable Answer
 replay q before ops = case (q, before) of
   (Get _, Text v) -> Text <$> foldM' text v
   (HGet _ f, Text v) -> Text <$> foldM' (field f) v
-  (HExists _ f, Flag b) -> Flag <$> foldM' (has f) b
+  (HExists _ f, Flag b) -> Flag <$> foldM' (\x op -> (\o -> thereAt unmarked f o x) <$> kind hashOp op) b
   (HGetAll _, Fields m) -> Fields <$> foldM' fields m
-  (HKeys _, Members s) -> Members <$> foldM' names s
-  (SIsMember _ x, Flag b) -> Flag <$> foldM' (isIn x) b
-  (SMembers _, Members s) -> Members <$> foldM' members s
+  (HKeys _, Members s) -> Members . Map.keysSet <$> foldM' (those nameOp) (Map.fromSet (const ()) s)
+  (SIsMember _ x, Flag b) -> Flag <$> foldM' (\y op -> (\o -> thereAt unmarked x o y) <$> kind groupOp op) b
+  (SMembers _, Members s) -> Members . Map.keysSet <$> foldM' (those groupOp) (Map.fromSet (const ()) s)
   (ZScore _ x, Scored s) -> Scored <$> foldM' (score x) s
   (ZCard _, Count n) -> Count <$> foldM' count n
   (ZRangeByScore _ lo hi limit, Ranked ms)
@@ -302,61 +320,32 @@ replay q before ops = case (q, before) of
     wrong op = no ("a write of another kind than the key: " <> show op)
     foldM' :: (a -> Op -> Either Unanswerable a) -> a -> Either Unanswerable a
     foldM' f z = foldl' (\acc op -> acc >>= (`f` op)) (Right z) ops
-    number :: Maybe ByteString -> Either Unanswerable Integer
-    number Nothing = Right 0
-    number (Just v) = case C.readInteger v of
-      Just (n, rest) | B.null rest -> Right n
-      _ -> no "a number, of a value that is none"
-    text v = \case
-      Set _ x -> Right (Just x)
-      Del _ -> Right Nothing
-      IncrBy _ n -> Just . C.pack . show . (+ n) <$> number v
-      op -> wrong op
-    field f v = \case
-      HSet _ g x | g == f -> Right (Just x)
-      HDel _ g | g == f -> Right Nothing
-      HIncrBy _ g n | g == f -> Just . C.pack . show . (+ n) <$> number v
-      Del _ -> Right Nothing
-      op | hashOp op -> Right v
-      op -> wrong op
-    has f b = \case
-      HSet _ g _ | g == f -> Right True
-      HDel _ g | g == f -> Right False
-      HIncrBy _ g _ | g == f -> Right True
-      Del _ -> Right False
-      op | hashOp op -> Right b
-      op -> wrong op
-    fields m = \case
-      HSet _ g x -> Right (Map.insert g x m)
-      HDel _ g -> Right (Map.delete g m)
-      HIncrBy _ g n -> (\v -> Map.insert g (C.pack (show (v + n))) m) <$> number (Map.lookup g m)
-      Del _ -> Right Map.empty
-      op -> wrong op
-    names s = \case
-      HSet _ g _ -> Right (Set.insert g s)
-      HDel _ g -> Right (Set.delete g s)
-      HIncrBy _ g _ -> Right (Set.insert g s)
-      Del _ -> Right Set.empty
-      op -> wrong op
-    isIn x b = \case
-      SAdd _ y | y == x -> Right True
-      SRem _ y | y == x -> Right False
-      Del _ -> Right False
-      op | setOp op -> Right b
-      op -> wrong op
-    members s = \case
-      SAdd _ y -> Right (Set.insert y s)
-      SRem _ y -> Right (Set.delete y s)
-      Del _ -> Right Set.empty
-      op -> wrong op
+    -- a write as one to a key of some kind, or it is to a key of another
+    kind :: (Op -> Maybe o) -> Op -> Either Unanswerable o
+    kind as op = maybe (wrong op) Right (as op)
+    -- Redis adds to a number only: a decision that adds to anything else
+    -- would have its writes refused half way, so it is stopped here
+    adds :: Maybe ByteString -> Either Unanswerable ()
+    adds v = if maybe True numeric v then Right () else no "a number, of a value that is none"
+    text v op =
+      kind textOp op >>= \c -> case c of
+        Plus _ -> cellAfter addTo c v <$ adds v
+        _ -> Right (cellAfter addTo c v)
+    field f v op =
+      kind hashOp op >>= \o -> case o of
+        On g (Plus _) | g == f -> at unmarked (cellAfter addTo) f o v <$ adds v
+        _ -> Right (at unmarked (cellAfter addTo) f o v)
+    fields m op =
+      kind hashOp op >>= \o -> case o of
+        On g (Plus _) -> mapAfter unmarked (cellAfter addTo) o m <$ adds (Map.lookup g m)
+        _ -> Right (mapAfter unmarked (cellAfter addTo) o m)
+    -- the names of what a hash or a set holds, as a map of cells that
+    -- hold nothing
+    those :: (Op -> Maybe (Within (CellOp ()))) -> Map ByteString () -> Op -> Either Unanswerable (Map ByteString ())
+    those as m op = (\o -> mapAfter unmarked (cellAfter nothingTo) o m) <$> kind as op
     score x s = \case
-      ZAdd _ v y | y == x -> Right (Just v)
-      ZAddNX _ v y | y == x -> Right (Just (fromMaybe v s))
-      ZRem _ y | y == x -> Right Nothing
-      Del _ -> Right Nothing
       ZRemRangeByRank {} -> no "a score, of a sorted set that lost members by their rank"
-      op | sortedOp op -> Right s
-      op -> wrong op
+      op -> (\o -> at unmarked rankAfter x o s) <$> kind rankOp op
     count _ = \case
       Del _ -> Right 0
       op | sortedOp op -> no "how many members a sorted set has after it was written to"
@@ -375,6 +364,74 @@ replay q before ops = case (q, before) of
       op | makes op -> Right (Just True)
       _ -> Right (if known == Just False then Just False else Nothing)
 
+-- | A write to a map inside what a key holds: to a field of a hash, a
+-- member of a set or of a sorted set, or to all of them. Nothing marks
+-- those, as the start of a key marks the keys that a wipe takes.
+type Within c = MapOp () ByteString c
+
+-- | No field or member is marked.
+unmarked :: () -> ByteString -> Bool
+unmarked _ _ = False
+
+-- | Add to the number that bytes say, as @INCRBY@ does, or to 0 for none.
+addTo :: Integer -> Maybe ByteString -> ByteString
+addTo n v = C.pack (show (maybe 0 (maybe 0 fst . C.readInteger) v + n))
+
+-- | What adding gives a cell that holds nothing: nothing.
+nothingTo :: Integer -> Maybe () -> ()
+nothingTo _ _ = ()
+
+-- | Whether bytes are a whole number, all of them.
+numeric :: ByteString -> Bool
+numeric v = case C.readInteger v of
+  Just (_, rest) -> B.null rest
+  Nothing -> False
+
+-- | A write to a key that holds bytes, as a write to one cell.
+textOp :: Op -> Maybe (CellOp ByteString)
+textOp = \case
+  Set _ x -> Just (Put x)
+  Del _ -> Just Clear
+  IncrBy _ n -> Just (Plus n)
+  _ -> Nothing
+
+-- | A write to a hash, as a write to the map of its fields.
+hashOp :: Op -> Maybe (Within (CellOp ByteString))
+hashOp = \case
+  HSet _ f x -> Just (On f (Put x))
+  HDel _ f -> Just (On f Clear)
+  HIncrBy _ f n -> Just (On f (Plus n))
+  Del _ -> Just All
+  _ -> Nothing
+
+-- | A write to a hash, as a write to the names of its fields.
+nameOp :: Op -> Maybe (Within (CellOp ()))
+nameOp = \case
+  HSet _ f _ -> Just (On f (Put ()))
+  HDel _ f -> Just (On f Clear)
+  HIncrBy _ f _ -> Just (On f (Put ()))
+  Del _ -> Just All
+  _ -> Nothing
+
+-- | A write to a set, as a write to the map of its members.
+groupOp :: Op -> Maybe (Within (CellOp ()))
+groupOp = \case
+  SAdd _ x -> Just (On x (Put ()))
+  SRem _ x -> Just (On x Clear)
+  Del _ -> Just All
+  _ -> Nothing
+
+-- | A write to a sorted set that changes the score of one member or takes
+-- all of them, as a write to the map of its scores. One that takes
+-- members by their rank is not one of those.
+rankOp :: Op -> Maybe (Within (RankOp Score))
+rankOp = \case
+  ZAdd _ s x -> Just (On x (Rank s))
+  ZAddNX _ s x -> Just (On x (RankNew s))
+  ZRem _ x -> Just (On x Unrank)
+  Del _ -> Just All
+  _ -> Nothing
+
 -- | Whether a score is between two bounds, both included.
 within :: Bound -> Bound -> Score -> Bool
 within lo hi v = above && below
@@ -388,16 +445,7 @@ within lo hi v = above && below
       MinusInf -> False
       At x -> v <= x
 
-hashOp, setOp, sortedOp, makes :: Op -> Bool
-hashOp = \case
-  HSet {} -> True
-  HDel {} -> True
-  HIncrBy {} -> True
-  _ -> False
-setOp = \case
-  SAdd {} -> True
-  SRem {} -> True
-  _ -> False
+sortedOp, makes :: Op -> Bool
 sortedOp = \case
   ZAdd {} -> True
   ZAddNX {} -> True
@@ -702,7 +750,8 @@ exists k =
 data Value
   = Bytes !ByteString
   | Hash !(Map ByteString ByteString)
-  | Group !(Set ByteString)
+  | -- | a set: its members
+    Group !(Map ByteString ())
   | Sorted !(Map ByteString Score)
   | -- | a stream: the fields of its entries, oldest first
     Stream !(Seq [(ByteString, ByteString)])
@@ -722,57 +771,74 @@ emptyDb = Map.empty
 answer :: Db -> Query -> Answer
 answer db = \case
   Get k -> Text (case Map.lookup k db of Just (Bytes v) -> Just v; _ -> Nothing)
-  HGet k f -> Text (Map.lookup f (hash k))
-  HExists k f -> Flag (Map.member f (hash k))
-  HGetAll k -> Fields (hash k)
-  HKeys k -> Members (Map.keysSet (hash k))
-  SIsMember k x -> Flag (Set.member x (group k))
-  SMembers k -> Members (group k)
-  ZScore k x -> Scored (Map.lookup x (sorted k))
-  ZCard k -> Count (fromIntegral (Map.size (sorted k)))
+  HGet k f -> Text (Map.lookup f (hash (Map.lookup k db)))
+  HExists k f -> Flag (Map.member f (hash (Map.lookup k db)))
+  HGetAll k -> Fields (hash (Map.lookup k db))
+  HKeys k -> Members (Map.keysSet (hash (Map.lookup k db)))
+  SIsMember k x -> Flag (Map.member x (group (Map.lookup k db)))
+  SMembers k -> Members (Map.keysSet (group (Map.lookup k db)))
+  ZScore k x -> Scored (Map.lookup x (sorted (Map.lookup k db)))
+  ZCard k -> Count (fromIntegral (Map.size (sorted (Map.lookup k db))))
   ZRangeByScore k lo hi limit ->
     Ranked . maybe id take limit . sortOn (\(x, s) -> (s, x)) $
-      [(x, s) | (x, s) <- Map.toList (sorted k), within lo hi s]
+      [(x, s) | (x, s) <- Map.toList (sorted (Map.lookup k db)), within lo hi s]
   Exists k -> Flag (Map.member k db)
-  where
-    hash k = case Map.lookup k db of Just (Hash m) -> m; _ -> Map.empty
-    group k = case Map.lookup k db of Just (Group s) -> s; _ -> Set.empty
-    sorted k = case Map.lookup k db of Just (Sorted m) -> m; _ -> Map.empty
 
--- | A Redis after a write. A write to a key of another kind changes
--- nothing here, where Redis would refuse it; the fleet makes none.
+-- | The fields of what a key holds, if it is a hash, the members if it is
+-- a set, and the scores if it is a sorted set: none for a key that is not
+-- there or holds something else.
+hash :: Maybe Value -> Map ByteString ByteString
+hash = \case
+  Just (Hash m) -> m
+  _ -> Map.empty
+
+group :: Maybe Value -> Map ByteString ()
+group = \case
+  Just (Group m) -> m
+  _ -> Map.empty
+
+sorted :: Maybe Value -> Map ByteString Score
+sorted = \case
+  Just (Sorted m) -> m
+  _ -> Map.empty
+
+-- | A Redis after a write: the map of its keys after a write to the cell
+-- of one key, or to the cells of the keys that start with some bytes
+-- ('Haskoin.Store.Fleet.Atomic.Cells.mapAfter').
 perform :: Op -> Db -> Db
-perform = \case
-  Set k v -> Map.insert k (Bytes v)
-  Del k -> Map.delete k
-  IncrBy k n -> Map.alter (Just . Bytes . C.pack . show . (+ n) . maybe 0 numberOf) k
-  HSet k f v -> onHash k (Map.insert f v)
-  HDel k f -> onHash k (Map.delete f)
-  HIncrBy k f n -> onHash k (\m -> Map.insert f (C.pack (show (maybe 0 integer (Map.lookup f m) + n))) m)
-  SAdd k x -> onGroup k (Set.insert x)
-  SRem k x -> onGroup k (Set.delete x)
-  ZAdd k s x -> onSorted k (Map.insert x s)
-  ZAddNX k s x -> onSorted k (Map.insertWith (\_ old -> old) x s)
-  ZRem k x -> onSorted k (Map.delete x)
-  ZRemRangeByRank k from to -> onSorted k (dropRanks from to)
-  XAdd k keep fields -> Map.alter (Just . Stream . trim keep . (|> fields) . entries) k
-  Wipe p -> Map.filterWithKey (\k _ -> not (p `B.isPrefixOf` k))
+perform op = mapAfter B.isPrefixOf holds route
   where
-    numberOf = \case
-      Bytes v -> integer v
-      _ -> 0
-    integer v = maybe 0 fst (C.readInteger v)
-    entries = \case
-      Just (Stream es) -> es
-      _ -> Seq.empty
+    route = case opKey op of
+      Right k -> On k op
+      Left p -> Under p
+
+-- | What a key holds after a write to it, from what it held: the cell of
+-- the key. A hash, a set and a sorted set are maps of cells in turn, and
+-- change by the same function, each with the function of its cells; one
+-- that is left with nothing is no key any more, as in Redis.
+--
+-- A write to a key that holds something of another kind changes nothing
+-- here, where Redis would refuse it; the fleet makes none.
+holds :: Op -> Maybe Value -> Maybe Value
+holds op v = case (op, v) of
+  (Del _, _) -> Nothing
+  (Wipe _, _) -> Nothing
+  (_, Just (Bytes x)) | Just c <- textOp op -> Bytes <$> cellAfter addTo c (Just x)
+  (_, Nothing) | Just c <- textOp op -> Bytes <$> cellAfter addTo c Nothing
+  (_, Just (Hash m)) | Just o <- hashOp op -> kept Hash (mapAfter unmarked (cellAfter addTo) o m)
+  (_, Nothing) | Just o <- hashOp op -> kept Hash (mapAfter unmarked (cellAfter addTo) o Map.empty)
+  (_, Just (Group m)) | Just o <- groupOp op -> kept Group (mapAfter unmarked (cellAfter nothingTo) o m)
+  (_, Nothing) | Just o <- groupOp op -> kept Group (mapAfter unmarked (cellAfter nothingTo) o Map.empty)
+  (_, Just (Sorted m)) | Just o <- rankOp op -> kept Sorted (mapAfter unmarked rankAfter o m)
+  (_, Nothing) | Just o <- rankOp op -> kept Sorted (mapAfter unmarked rankAfter o Map.empty)
+  (ZRemRangeByRank _ from to, Just (Sorted m)) -> kept Sorted (dropRanks from to m)
+  (XAdd _ keep fields, Just (Stream es)) -> Just (Stream (trim keep (es |> fields)))
+  (XAdd _ keep fields, Nothing) -> Just (Stream (trim keep (Seq.singleton fields)))
+  _ -> v
+  where
+    kept con m = if Map.null m then Nothing else Just (con m)
     -- a stream keeps about so many: here, no more than that
     trim keep es = Seq.drop (Seq.length es - keep) es
-    onHash k f = Map.alter (\v -> keepHash (f (case v of Just (Hash m) -> m; _ -> Map.empty))) k
-    keepHash m = if Map.null m then Nothing else Just (Hash m)
-    onGroup k f = Map.alter (\v -> keepGroup (f (case v of Just (Group s) -> s; _ -> Set.empty))) k
-    keepGroup s = if Set.null s then Nothing else Just (Group s)
-    onSorted k f = Map.alter (\v -> keepSorted (f (case v of Just (Sorted m) -> m; _ -> Map.empty))) k
-    keepSorted m = if Map.null m then Nothing else Just (Sorted m)
     -- the members from one rank to another, both included, counted from 0
     -- and, below zero, from the end
     dropRanks from to m =

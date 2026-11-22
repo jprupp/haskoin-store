@@ -176,6 +176,14 @@ whitelist it must now say what they grant (`--peer-permission`, or
     write nothing but the note that a key was used: a move of the tip
     that its store left for ten seconds is no longer ended by a read, but
     by the build that follows the miss.
+  - **That a decision sees its own writes rightly is proved** for what it
+    asks about one cell: a field of a hash, a member of a set, the score
+    of a member, what a key holds. What a write does to a cell is written
+    once (`Haskoin.Store.Fleet.Atomic.Cells`), for the model of Redis and
+    for the decision, and Liquid Haskell checks, for every list of
+    writes, that the cell in the model after them is what the decision
+    works out (`proofs/`). It assumes four facts of `Data.Map`. The rest
+    of what a decision can ask is tested, as before.
   The scripts of the reports and of the move of the tip without the pool
   are as they were.
 - **The testnet3 of Bitcoin Cash is `--net bchtest3`**, no longer
