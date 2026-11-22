@@ -234,10 +234,15 @@ feed sc input w = do
             all (\h -> Set.member h (ids after) || h `elem` concat [cs | Check _ cs <- outs]) hs
     _ -> return ()
   -- T6: what the pool lacks of what a held transaction spends from has a
-  -- place, to be asked for, if there is a peer to ask and room
+  -- place, to be asked for, if there is a peer to ask and room. It is
+  -- so for a verdict that the machine was waiting for: one that comes
+  -- after the transaction was given up, and came again and waits, is not
+  -- of this offer, and the machine does nothing with it. Left out, that
+  -- made this check fail once in two thousand runs of the larger world.
   case input of
     Offered h (Orphan ps)
-      | Just (Held _ _ (Waiting _ _)) <- placeOf h after,
+      | Just (Held _ _ Offering) <- placeOf h before,
+        Just (Held _ _ (Waiting _ _)) <- placeOf h after,
         any (\(p, _) -> windowOf p after /= Nothing) sc.peers,
         Set.size (ids after) < sc.config.room ->
           check "the pool lacks what a held transaction spends from, and it is not asked for" $
