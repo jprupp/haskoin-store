@@ -54,15 +54,15 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    commit: 0d87e1f3eee34aaa03f19bc39d479240ca124bac
+    commit: 254b4a9636ab475eeb22c60b7a75067a4615b32f
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: 69a56373d8e9c1704f49463d9f290faa275ec4478f06f89612b667e069a75bb1
-      size: 11102
+      sha256: fe0f1bed08778caaa95a43d271cb5f5c28ea49d7744f7781c772b9ed9204df64
+      size: 11246
     version: 3.0.0
   original:
-    commit: 0d87e1f3eee34aaa03f19bc39d479240ca124bac
+    commit: 254b4a9636ab475eeb22c60b7a75067a4615b32f
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
@@ -76,26 +76,26 @@ packages:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
     git: https://github.com/jprupp/podman-test.git
 - completed:
-    commit: 4e8fd893dba4e474d59de8d1078dafbdccb1e00e
+    commit: 798edcd4dfcabedb8642364fb6eccdad406e904d
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: 7ad43978fb85677847d6b8eb52b347ef96746b58db83732e91fcf76aebb06a7c
+      sha256: 91a223478a9497a97228a1cf722456ae512ae59c377f01d45c3b24b5ef779c21
       size: 3515
     version: 2.7.0
   original:
-    commit: 4e8fd893dba4e474d59de8d1078dafbdccb1e00e
+    commit: 798edcd4dfcabedb8642364fb6eccdad406e904d
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: 38977200483d01efc78c1bbef45e8b2d64310261
+    commit: 463732224a36bd7aec75d2a76a39a173ee6b2e97
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: c26285e0e9ebcbfbf41282dd9bbb06dc4decb5f9b67292bbcb21690c68d38ce7
+      sha256: d76566f05dffbb205e9615874b5e8dc18d7b392f1bb154efc58691780ffe5380
       size: 1263
     version: 4.0.0
   original:
-    commit: 38977200483d01efc78c1bbef45e8b2d64310261
+    commit: 463732224a36bd7aec75d2a76a39a173ee6b2e97
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550
