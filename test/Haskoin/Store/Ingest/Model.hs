@@ -576,7 +576,8 @@ large =
             orphanLife = 6,
             retry = 1,
             sweepGap = 2,
-            sweepEvery = 0
+            sweepEvery = 0,
+            sweepFast = 0
           },
       txs = Map.fromList [(1, []), (2, [1]), (3, [2]), (4, []), (5, [4]), (6, [5, 3])],
       peers = [(1, True), (2, True), (3, False)],
@@ -614,7 +615,8 @@ withoutOrder =
             orphanLife = 2,
             retry = 1,
             sweepGap = 1,
-            sweepEvery = 0
+            sweepEvery = 0,
+            sweepFast = 0
           },
       txs = Map.fromList [(1, []), (2, [1])],
       peers = [(1, True)],
@@ -694,5 +696,6 @@ scenarios =
           orphanLife = 2,
           retry = 1,
           sweepGap = 1,
-          sweepEvery = 0
+          sweepEvery = 0,
+          sweepFast = 0
         }

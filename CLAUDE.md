@@ -103,7 +103,7 @@ has to say there what differs and why.
 ## The path into the shared mempool
 
 `docs/mempool-ingestion.md` says what the path from a node's mempool to
-the pool must guarantee (T1 to T5), what it assumes (A1 to A6), and how
+the pool must guarantee (T1 to T7), what it assumes (A1 to A8), and how
 each claim is established. The path is one pure machine,
 `Haskoin.Store.Ingest`. A change to it is not done until:
 
@@ -112,7 +112,15 @@ each claim is established. The path is one pure machine,
   the store. A new rule of the machine gets a check in
   `Haskoin.Store.Ingest.Model`, and a planted bug that the check finds.
 - Liquid Haskell passes: `cabal build` in `proofs/`, with GHCup's GHC
-  9.12.4 and `z3` on the `PATH`, in about two minutes. It checks the
+  9.12.4 and `z3` on the `PATH`, in about two minutes and 7 GiB of
+  memory when it passes. When it does not it takes all the memory there
+  is: it reached 19 GiB once and had the kernel kill another program.
+  Run it under a limit, always, such as
+  `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=512M`,
+  and take a run that the limit stops for a change that has to be
+  written another way. A small function of its own that takes numbers
+  and compares them in guards did that, three times: the same
+  arithmetic written where it is used, with `max` and `min`, passes. It checks the
   refinement types of `Haskoin.Store.Ingest.Ledger`, the only module that
   can change where a transaction id is, and that every function of the
   machine is total and ends. Liquid Haskell does not see through the dot

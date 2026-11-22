@@ -75,6 +75,29 @@ spec = do
       -- not sooner than the gap, and then it does
       snd (run' [Tick 1000] s) `shouldBe` []
       snd (run' [Tick 10000] s) `shouldBe` [Sweep 1]
+    it "reads its source after thirty seconds while transactions come, and ever less often when none do" $ do
+      -- a transaction that the pool lacks is named, comes and is taken
+      let came h = [Named 1 [h], Checked 1 [] [h], Body (Just 1) h [], Offered h Settled]
+          readings t s = [() | Sweep _ <- snd (run' [Tick t] s)]
+          at t s = fst (run' [Tick t] s)
+          (s1, _) = run (came 1)
+      -- not before thirty seconds, and then
+      readings 29999 s1 `shouldBe` []
+      readings 30000 s1 `shouldBe` [()]
+      -- one more comes: thirty seconds again
+      let (s2, _) = run' (came 2) (at 30000 s1)
+      readings 59999 s2 `shouldBe` []
+      readings 60000 s2 `shouldBe` [()]
+      -- none comes: thirty, then a minute, two, four, eight, and ten for good
+      let times = [90000, 150000, 270000, 510000, 990000, 1590000, 2190000]
+          quiet = scanl (flip at) (at 60000 s2) times
+      forM_ (zip quiet times) $ \(s, t) -> do
+        readings (t - 1) s `shouldBe` []
+        readings t s `shouldBe` [()]
+      -- and thirty seconds after one comes again
+      let (s4, _) = run' (came 3) (last quiet)
+      readings (2190000 + 29999) s4 `shouldBe` []
+      readings (2190000 + 30000) s4 `shouldBe` [()]
     it "asks a peer for no more than its window, which grows as the peer answers" $ do
       let (s, outs) = run [Named 1 [1 .. 100], Checked 1 [] [1 .. 100]]
       [length hs | Get _ hs <- outs] `shouldBe` [16]

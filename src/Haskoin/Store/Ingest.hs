@@ -149,7 +149,10 @@ data Config = Config
     sweepGap :: !Tick,
     -- | a reading of the sources this often even when nothing was given
     -- up, or 0 for none
-    sweepEvery :: !Tick
+    sweepEvery :: !Tick,
+    -- | and this often while peers name transactions that the pool
+    -- lacks: not more than 'sweepEvery', and never sooner than 'sweepGap'
+    sweepFast :: !Tick
   }
   deriving (Eq, Ord, Show)
 
@@ -157,7 +160,8 @@ data Config = Config
 -- Bitcoin Core, a hundred thousand bodies, windows from 16 to 4,096, a
 -- request given twenty seconds and an orphan twenty minutes, offered again
 -- after two seconds and then twice as long each time, and a reading of the
--- sources at most every ten seconds and at least every ten minutes.
+-- sources at most every ten seconds, every thirty while transactions
+-- come, and at least every ten minutes.
 defaultConfig :: Config
 defaultConfig =
   Config
@@ -169,7 +173,8 @@ defaultConfig =
       orphanLife = 1200000,
       retry = 2000,
       sweepGap = 10000,
-      sweepEvery = 600000
+      sweepEvery = 600000,
+      sweepFast = 30000
     }
 
 -- | What the machine knows of a peer.
@@ -189,7 +194,13 @@ data Link h = Link
     -- | when its mempool was last asked for
     swept :: !(Maybe Tick),
     -- | whether something was given up since, that it may still have
-    owed :: !Bool
+    owed :: !Bool,
+    -- | how long after its mempool was asked for it is asked for again,
+    -- when nothing else has it asked for
+    every :: !Tick,
+    -- | whether a peer named a transaction that the pool lacked, since
+    -- its mempool was asked for
+    lively :: !Bool
   }
   deriving (Eq, Ord, Show)
 
@@ -343,7 +354,9 @@ react parents input s = case input of
                   queue = Set.empty,
                   asks = Set.empty,
                   swept = Nothing,
-                  owed = False
+                  owed = False,
+                  every = max s.config.sweepGap s.config.sweepFast,
+                  lively = False
                 }
             -- A node names to a peer nothing that it took before the peer
             -- connected (A1). A peer that is a source is asked for its
@@ -483,8 +496,33 @@ unsettled' p acc@(s, said) h
   | Map.notMember p s.links = if Map.member h (places s) then acc else forget PeerGone h acc
   | Map.member h (places s) = (also p h s, said)
   | otherwise = case L.put h (Wanted (Map.singleton p s.now)) s.ledger of
-      Just ledger -> (queued p h s {ledger}, said)
+      Just ledger -> (told (queued p h s {ledger}), said)
       Nothing -> forget NoRoom h acc
+
+-- | A peer named a transaction that the pool lacks: transactions are
+-- coming, and the sources are read again after the shortest wait.
+--
+-- A node names transactions to a peer no faster than it chooses to.
+-- Bitcoin Core names about five hundred at once and then seventy every
+-- five seconds, to a peer that it whitelists too, and a node that takes
+-- more than fourteen a second for a few minutes has thousands that it
+-- has not named to anyone yet. Its mempool, when asked for, has them
+-- all. So a store that reads it only every ten minutes is minutes behind
+-- its node whenever transactions come fast, and one that reads it while
+-- they come is half a minute behind at most.
+--
+-- Whether they come fast, the machine cannot tell: it sees what the node
+-- names, at the node's pace. So it reads while they come at all, and
+-- waits twice as long each time that a reading comes after none came
+-- ('sweep').
+told :: Ingest p h b -> Ingest p h b
+told s
+  | s.config.sweepEvery > 0 = s {links = Map.map soon s.links}
+  | otherwise = s
+  where
+    soon l
+      | l.source = l {lively = True, every = max s.config.sweepGap s.config.sweepFast}
+      | otherwise = l
 
 -- | A request of a peer got no answer, or the answer that the peer does
 -- not have it: the id is wanted of the others that named it, or given up.
@@ -692,14 +730,28 @@ requests p s = case Map.lookup p s.links of
 -- and none sooner than the gap after its last time. What was given up is
 -- owed by every source, since any of their nodes may have it, and a
 -- source owes it until it is asked: reading one does not clear another.
+--
+-- When it is time depends on whether transactions come ('told'): after
+-- the shortest wait if a peer named one that the pool lacked since the
+-- last reading, and after twice the last wait if none did, up to the
+-- longest. A store of a network where nothing happens reads a mempool
+-- that does not change every ten minutes, and one of a network that
+-- never rests every thirty seconds.
 sweep :: (Ord p) => Ingest p h b -> (Ingest p h b, [Output p h b])
 sweep s0
   | null due = (s, [])
   | otherwise =
-      ( s {links = foldl' (\ls p -> Map.adjust (\l -> l {swept = Just s.now, owed = False}) p ls) s.links due},
+      ( s {links = foldl' (\ls p -> Map.adjust asked p ls) s.links due},
         map Sweep due
       )
   where
+    asked l = l {swept = Just s.now, owed = False, lively = False, every = after l}
+    -- the wait until the next reading that nothing else asks for
+    after l
+      | l.lively = max s.config.sweepGap s.config.sweepFast
+      | otherwise =
+          let was = max (max s.config.sweepGap s.config.sweepFast) l.every
+           in min (max was s.config.sweepEvery) (was + was)
     -- with a source to read, what was given up becomes what each owes
     s
       | s0.dirty && any (.source) (Map.elems s0.links) =
@@ -711,7 +763,7 @@ sweep s0
       Nothing -> True
       Just at ->
         (l.owed && s.now - at >= s.config.sweepGap)
-          || (s.config.sweepEvery > 0 && s.now - at >= s.config.sweepEvery)
+          || (s.config.sweepEvery > 0 && s.now - at >= l.every)
 
 -- | Offer what is ready.
 offer :: (Ord h) => Ingest p h b -> (Ingest p h b, [Output p h b])
@@ -735,6 +787,11 @@ wellFormed s =
         l.window < s.config.minWindow || l.window > s.config.maxWindow
       ],
       ["more requests out than the most a window allows" | l <- Map.elems s.links, l.out > s.config.maxWindow],
+      [ "a wait between two readings of a source longer than the longest"
+      | s.config.sweepEvery > 0,
+        l <- Map.elems s.links,
+        l.every > max (max s.config.sweepGap s.config.sweepFast) s.config.sweepEvery
+      ],
       ["a peer that is gone is still named" | ps <- namers, not (ps `Set.isSubsetOf` Map.keysSet s.links)],
       ["an id that nobody named is waiting to be asked for" | Wanted ms <- map snd placed, Map.null ms],
       ["every body held waits for another" | s.config.heldRoom > 0, Set.size s.tries >= s.config.heldRoom],

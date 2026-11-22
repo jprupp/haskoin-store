@@ -120,6 +120,11 @@ spec = do
           it "has every transaction that no block confirmed" (withBed kind busy)
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
+      -- Bitcoin Cash Node names what it takes to a peer that it
+      -- whitelists as fast as it takes it
+      describe "A store whose node takes transactions faster than it names them, on Bitcoin Core" $
+        it "has them within the time of a reading of the node's mempool, and not at the node's pace" $
+          withBed BitcoinCore burst
       -- Bitcoin Cash Node replaces nothing by fee
       describe "A store whose node replaces transactions by ones that pay more, on Bitcoin Core" $
         it "has the replacements, and nothing of what they replaced" (withBed BitcoinCore outbid)
@@ -204,6 +209,27 @@ away block bed = withRamDir $ \dir -> do
   when block . void $ generateTo bed.node 1 bed.miner
   submit bed (map (drop 12) chains)
   withMemberIn bed dir $ \_ server -> converges bed server 60
+
+-- | A node that takes 2,500 transactions in a few seconds. Bitcoin Core
+-- names about five hundred of them to a peer at once, and then seventy
+-- every five seconds, to a peer that it whitelists too
+-- (@namesAtItsPace@ in "Haskoin.Store.NodeAxiomsSpec"): at that pace the
+-- store would have them all after two minutes and a half. It reads the
+-- mempool of its node every thirty seconds while transactions come
+-- (@told@ in "Haskoin.Store.Ingest"), so it has them all within the
+-- time of a reading and of taking them in: here 31 seconds after the
+-- first came, where it has 1,800 of them after a minute without.
+--
+-- A server was a minute and more behind its node, by thousands of
+-- transactions, whenever the node took more than fourteen a second, and
+-- read the node's mempool every ten minutes.
+burst :: Bed -> IO ()
+burst bed = do
+  roots <- fund bed 2500
+  withMember bed $ \_ server -> do
+    converges bed server 60
+    submit bed (map (chainOf 1) roots)
+    converges bed server 60
 
 -- | A node that takes chains of transactions, and then, for the first of
 -- each chain, another that spends the same output and pays more: it

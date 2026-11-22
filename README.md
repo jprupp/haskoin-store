@@ -871,7 +871,10 @@ never confirm. It is handed over, and comes in when a node announces it.
   Bitcoin Cash Node), and tell the store what they grant
   (`--peer-permission`). A node announces to a whitelisted peer without
   delay, so the transaction shows in the store at once; otherwise Bitcoin
-  Core takes five seconds on average. And a node never closes the
+  Core takes five seconds on average. When a node takes transactions
+  faster than it names them, which for Bitcoin Core is more than
+  fourteen a second for a while, the store has them at its next reading
+  of the node's mempool, every thirty seconds while transactions come. And a node never closes the
   connections of a whitelisted peer.
 
 `docs/publishing.md` has the design, what was measured on Bitcoin Core and

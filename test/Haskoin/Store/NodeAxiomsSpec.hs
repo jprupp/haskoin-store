@@ -21,6 +21,7 @@
 -- checked is what the node does and not what the store makes of it.
 module Haskoin.Store.NodeAxiomsSpec (spec) where
 
+import Control.Concurrent.Async (async, wait)
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -75,6 +76,9 @@ spec = do
         it "once, and never one that it took before the peer connected (A1)" (withBed kind namesOnce)
       on "asked for what a transaction that it named spends from" $
         it "sends it though it never named it, or says that it has it not (A7)" (withBed kind (sendsParents kind))
+      on "that takes many transactions at once" $
+        it "names them to a peer that it whitelists no faster than it chooses to (A8)" $
+          withBed kind (namesAtItsPace kind)
       on "asked for its mempool by a peer that it allows" $
         it "names all of it, each after those it spends from, and sends or says it has not (A2, A3, A5)" $
           withBed kind namesAll
@@ -134,6 +138,32 @@ sendsParents kind bed = do
           BitcoinCore -> ([txHash parent], [])
           BitcoinCashNode -> ([], [txHash parent])
     _ -> expectationFailure "Not two transactions"
+
+-- | A8. The node takes 800 transactions in a second or so, with a peer
+-- that it whitelists connected. Bitcoin Core names about five hundred of
+-- them at once and then seventy every five seconds: ten seconds on, the
+-- peer has not been told of them all, and it has within forty-five.
+-- Bitcoin Cash Node names them all in the first seconds.
+--
+-- So a store of Bitcoin is behind its node whenever the node takes more
+-- than fourteen transactions a second for a while, however fast the
+-- store is, unless it asks the node for its mempool, which has them all
+-- (A2). The path into the pool reads its sources every thirty seconds
+-- while transactions come, for that (@told@ in "Haskoin.Store.Ingest").
+namesAtItsPace :: NodeKind -> Bed -> IO ()
+namesAtItsPace kind bed = do
+  roots <- fund bed 800
+  let txs = concatMap (chainOf 1) roots
+  withProbe bed $ \p -> do
+    sender <- async (submit bed (map pure txs))
+    early <- length . namedIn <$> collect p 10
+    late <- length . namedIn <$> collect p 35
+    wait sender
+    case kind of
+      BitcoinCore -> do
+        early `shouldSatisfy` (< 800)
+        early + late `shouldBe` 800
+      BitcoinCashNode -> (early, late) `shouldBe` (800, 0)
 
 -- | A2, A3 and A5. A peer that the node allows asks for its mempool: the
 -- node names every transaction of it, those of a chain in their order;

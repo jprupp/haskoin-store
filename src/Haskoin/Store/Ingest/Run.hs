@@ -442,6 +442,24 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
               <> [Tick now | tick]
       machine <- drive run'.peers failing lostNow run'.machine all'
       publish machine
+      -- A source is read every thirty seconds while transactions come
+      -- (@told@ in "Haskoin.Store.Ingest"), and a reading goes through
+      -- every transaction of a mempool. What that costs is said when it
+      -- is a second or more, so that a store for which it is too much
+      -- shows it.
+      done <- milliseconds
+      case event of
+        Just (Names _ hs)
+          | done - now >= 1000,
+            length hs >= 1000 ->
+              say LevelInfo . T.unwords $
+                [ "Went through",
+                  shown (length hs),
+                  "transactions that a node named at once in",
+                  shown (done - now),
+                  "ms"
+                ]
+        _ -> return ()
       -- what was given up and that a node may still have is said, once a
       -- pass: it makes the store read its sources again, and without the
       -- reason nobody can tell why it did

@@ -40,7 +40,7 @@ what had to hold from end to end, so nothing could be proved.
 These are the axioms: what the proofs take from the world. Each is a rule
 of the nodes that haskoin-core's protocol notes translate from their
 source (`doc/protocol/bitcoin-core.md`, `bitcoin-cash-node.md`). A1, A2,
-A3, A5, A7 and F1 have a test against both nodes in Podman
+A3, A5, A7, A8 and F1 have a test against both nodes in Podman
 (`Haskoin.Store.NodeAxiomsSpec`), so that a release of a node that
 changes one of them is noticed.
 
@@ -52,6 +52,7 @@ changes one of them is noticed.
 | A4 | A node sends in order, and stops sending to a peer that stops reading. It never asks again by itself. |
 | A5 | A node names a transaction after the transactions that it spends from, within one answer. Across answers and across peers there is no order. |
 | A6 | A node drops transactions from its mempool without saying so: confirmed, replaced, evicted, expired. |
+| A8 | A node names transactions to a peer no faster than it chooses to. Bitcoin Core 32 names about five hundred at once and then seventy every five seconds, fourteen a second, to a peer that it whitelists too; Bitcoin Cash Node 29 names 800 at once to a peer that it whitelists. Asked for its mempool, a node names all of it at once (A2). |
 | A7 | A node that has a transaction has those that it spends from, unless a block has confirmed them. Asked for one of them that it never named to the peer, Bitcoin Core sends it, and Bitcoin Cash Node says `notfound`, though it has it. Neither drops the peer for asking. |
 | F1 | The RPC of a node is a source as a peer is one: `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from, and `getrawtransaction` gives a transaction or the error -5 for one that the node has not. Any other answer, or none, says nothing of what the node has. |
 | R1 | A Redis script runs alone, start to end. |
@@ -142,7 +143,11 @@ checker has a world that shows this, and that must fail.
   it is back at the next reading of the source, every ten minutes, and
   not before: nothing spends from it, so nothing asks for it (T6).
 - **Time.** T3 bounds steps, not seconds: a node or a Redis that answers
-  slowly makes it slow, never wrong.
+  slowly makes it slow, never wrong. One bound in seconds is kept, by a
+  test and not by a proof: while transactions come, a source is read
+  every thirty seconds, so a store is half a minute behind its node at
+  most, plus the time of a reading, however fast the node takes
+  transactions and however slowly it names them (A8).
 
 ## The design that makes this provable
 
@@ -156,9 +161,18 @@ checker has a world that shows this, and that must fail.
   is not settled. What is settled never takes room.
 - **The last room for a body is for one that can be offered.** A
   transaction that has to wait for another never takes it.
-- **Reading the source again**, at the start, when dirty, and at a period
-  that follows what a reading costs and what it finds. This is what makes
-  every loss temporary, and T3 true from any state.
+- **Reading the source again**, at the start, when dirty, and at a
+  period: thirty seconds after a reading if a peer named a transaction
+  that the pool lacked since, and twice the last wait if none did, up to
+  ten minutes. This is what makes every loss temporary, and T3 true from
+  any state. The period was ten minutes whatever happened, once, and a
+  server was thousands of transactions behind its node for minutes
+  whenever the node took more than fourteen a second, which is all that
+  Bitcoin Core names to a peer (A8). Whether transactions come fast, the
+  store cannot tell, since it sees what the node names at the node's
+  pace; so it reads while they come at all. What a reading costs is not
+  measured by the machine: the runner says in the log when going through
+  what a node named at once took a second or more.
 - **A source that is no peer is a peer to the machine.** The RPC of the
   node (`Haskoin.Store.NodeRpc`) comes as a peer that is a source, is
   asked for its mempool and for transactions by the same outputs, within
@@ -206,7 +220,7 @@ never called proved, and what is not done yet is said.
   gives the machine five functions and nothing else to change it with.
 
 **Proved for every state and every input**, by Liquid Haskell
-(`proofs/`, `cabal build` there, two minutes):
+(`proofs/`, `cabal build` there, two minutes and 7 GiB of memory):
 
 - **Nothing leaves in silence (T1).** Of the five functions of the
   ledger, four keep every id in its place, and the fifth, `leave`, takes
@@ -282,9 +296,13 @@ in Podman:
   again under it (R2); its node takes chains while it finds blocks; its
   pool lost transactions that its node then takes children of (T6); its
   pool let go of transactions that its node still has (T7). The last two
-  fail without their rule. On Bitcoin Core, a ninth: the node replaces
+  fail without their rule. On Bitcoin Core, two more: the node replaces
   transactions by ones that pay more, and the store has the
-  replacements and nothing of what they replaced. Three of them fail on the
+  replacements and nothing of what they replaced; and the node takes
+  2,500 transactions in a few seconds, which the store has within a
+  minute, 31 seconds after the first where it was measured, and not
+  after the two minutes and a half that the node takes to name them.
+  That one fails without the reading every thirty seconds. Three of them fail on the
   version that fell behind on the server, so they can see that failure,
   and one failed one run in three on the path before this one, a race.
   They do not decide the order of events, and so cannot find a race by
@@ -312,6 +330,9 @@ in Podman:
   after those it spends from, the transactions asked for, and its word
   for one that it never had; a node that nobody listens for, or that does
   not know the account, is an exception and never an empty mempool (F1).
+  Given 800 transactions at once, Bitcoin Core has not named them all to
+  a peer that it whitelists ten seconds on, and has within forty-five;
+  Bitcoin Cash Node has at once (A8).
 - **Not tested:** that a node stops sending to a peer that stops reading
   (A4), and that it says nothing of what it drops (A6), which is an
   absence. The limit of 50,000 names to a message is not reached by a

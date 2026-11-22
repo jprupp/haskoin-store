@@ -225,6 +225,15 @@ whitelist it must now say what they grant (`--peer-permission`, or
     run of a test in about forty. A peer that connects and is no source
     now makes the sources owe a reading. The model of the path has a
     node with its RPC and a peer, and fails without the rule.
+  - **A store reads the mempool of its node every thirty seconds while
+    transactions come**, and twice as long after each reading that
+    follows none, up to the ten minutes that it was. Bitcoin Core names
+    transactions to a peer at fourteen a second after a first batch, to
+    a peer that it whitelists too, so a store was minutes and thousands
+    of transactions behind its node whenever the node took more: nothing
+    was lost, and all of it was late. Asked for its mempool, the node
+    names everything at once. A store says in its log when going through
+    what a node named at once took a second or more.
   - **`rbf` is true for every unconfirmed transaction on Bitcoin, and
     false elsewhere.** The nodes of Bitcoin take a replacement of any
     unconfirmed transaction, whatever it signals, since Bitcoin Core 28,
