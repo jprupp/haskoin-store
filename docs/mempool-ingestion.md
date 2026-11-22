@@ -111,6 +111,13 @@ checker has a world that shows this, and that must fail.
 
 ## What is not promised
 
+- **With the RPC of a node as the only source, and no peer connected
+  to that node**, a transaction that the node takes is in the pool at
+  the next reading of the RPC, every ten minutes, and not before: the
+  RPC announces nothing, and no peer is there to be told. With a peer
+  connected, T3 holds: the peer is told of what the node takes, and what
+  the node took before the peer connected is read from the RPC when the
+  peer connects.
 - **Without a source**, T3 does not hold, and cannot: by A1 a transaction
   that the store missed is not announced again. A store whose peers are
   all strangers on Bitcoin, and that was not given the RPC of a node, has
@@ -156,10 +163,17 @@ checker has a world that shows this, and that must fail.
   node (`Haskoin.Store.NodeRpc`) comes as a peer that is a source, is
   asked for its mempool and for transactions by the same outputs, within
   the same window, and answers with the same inputs. When a call fails it
-  is a peer that went, and when it is tried again a new peer (U1). So the
-  machine, its proofs and its model have nothing that is particular to
-  the RPC, and what the store asks a node at once over RPC follows what
-  the node delivers, with no number written down for it.
+  is a peer that went, and when it is tried again a new peer (U1). What
+  the store asks a node at once over RPC follows what the node
+  delivers, with no number written down for it. One thing is particular
+  to it, and the model has it since a test lost transactions to it: the
+  RPC announces nothing. What its node takes is announced to a peer, on
+  another connection, which begins at another time.
+- **A peer that connects owes what its node took before.** A node names
+  to a peer nothing that it took before the peer connected (A1). A peer
+  that is a source is asked for its mempool when it connects. When one
+  that is no source connects, the sources are read again, since one of
+  them may be the RPC of that node, read a moment before.
 - **No room is a reason, not a wait.** Announcements are ids of 32 bytes
   and cheap to drop when the source is read again; blocking a peer's
   reader would stop its blocks too.
@@ -223,7 +237,7 @@ which is a property of the machine in a world and not of a function.
 **Checked for every order of events, in small worlds**: a model checker
 in the test suite (`Haskoin.Store.Ingest.Model`) runs `step` itself in
 worlds of one to three transactions and one or two peers, with nodes that
-follow A1 to A6, through every order of events: 17 worlds, about 790,000
+follow A1 to A7, through every order of events: 19 worlds, about 990,000
 states.
 
 - In every state: nothing leaves in silence and what a peer names has a
@@ -243,6 +257,12 @@ states.
   (A7 as Bitcoin Core does it). That a Bitcoin Cash Node says `notfound`
   for what it did not name is not in them: the store then waits for the
   next reading, as it did, which the worlds without the new rule passed.
+- Two worlds have one node with its RPC and a peer that is no source,
+  one mempool between them, the RPC announcing nothing. In them a
+  machine that does not read its sources when a peer connects comes to
+  rest without what the node took between the reading of the RPC and the
+  connection of the peer, in seven steps: the sixth planted bug, and the
+  one that was in the store.
 - One world breaks an assumption and must fail: a source that names a
   child first, with room for one id (A5). The search finds the store going
   round for ever there, and the program of `scripts/check-ingest.sh` ends
@@ -273,7 +293,11 @@ in Podman:
   Core that whitelists nobody, and a store that was away while
   transactions came, with and without a block. It has them when it is
   back. Without the RPC the same test fails, on what the node took before
-  the store connected.
+  the store connected. And one whose node closes its connections, takes
+  transactions, and takes connections again: the store has them once it
+  is connected, by reading the RPC again. That one fails without the
+  rule, ending as the server's stores did: at rest, without what its
+  node has, and not knowing it.
 - **The assumptions** (`Haskoin.Store.NodeAxiomsSpec`), with a peer of the
   tests' own that keeps what a node sends: a node names a transaction to
   a peer once, and never one that it took before the peer connected (A1);
@@ -333,9 +357,21 @@ with that of the store, id by id, and neither by a check here:
    the store asked something else. It asks the pool alone now (T7).
 8. **Transactions waited twenty minutes for a parent that nobody was
    fetching.** A test ended with 84 held behind four that the store had
-   lost. The parent is asked for now (T6). How those four were lost is
-   not known: the test passed 17 times after, and once again where it
-   had failed.
+   lost. The parent is asked for now (T6).
+9. **What a node took between the reading of its RPC and the connection
+   of the store as its peer was in neither.** That is how the four of
+   finding 8 were lost. The store read the RPC as it started, and its
+   handshake with the node ended a moment later; the test sends four
+   transactions at once, so four were taken in between, one of each of
+   four chains, and the node names to a peer nothing that it took before
+   the peer connected. It happened in one run of about forty, where the
+   handshake was the slower of the two, and on a developer's machine
+   never: there a store that starts on a new database starts its pool
+   again and reads the RPC a second time for that, ten seconds later,
+   which hid it. The model had the RPC as a peer like any other, which
+   announces what its node takes, so it could not show it; with a source
+   that does not announce it does, in seven steps. A peer that connects
+   now makes the sources owe a reading.
 
 The same search showed where the first model of the world was wrong: it
 used the name of a peer again for a later connection, which haskoin-node

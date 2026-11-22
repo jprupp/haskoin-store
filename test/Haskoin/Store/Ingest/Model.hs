@@ -93,6 +93,13 @@ data Scenario = Scenario
     txs :: Map H [H],
     -- | the peers, and whether each is a source
     peers :: [(P, Bool)],
+    -- | whether the peers are all connections to one node, with one
+    -- mempool, and which of them are no peers at all but the RPC of that
+    -- node: sources that answer and never announce. A store that is given
+    -- the RPC of a node that whitelists nobody has both, a peer that
+    -- announces and is no source, and a source that does not announce.
+    oneNode :: Bool,
+    feeds :: [P],
     -- | whether a source names a transaction __before__ those that it
     -- spends from, against A5: for the world that shows what A5 is needed
     -- for ('withoutOrder'), and for no world that has to pass
@@ -347,20 +354,33 @@ disturbed sc w
         + Seq.length w.asked
     everywhere = Set.unions (map (.has) (Map.elems w.nodes))
     of' = \case
-      Mempools ->
-        [ ("the node of peer " <> show p <> " takes " <> show h, Right (arrive p h node))
-        | (p, node) <- Map.toList w.nodes,
-          (h, ps) <- Map.toList sc.txs,
-          Set.notMember h node.has,
-          Set.notMember h w.confirmed,
-          all (\x -> Set.member x node.has || Set.member x w.confirmed) ps
-        ]
-          <> [ ( "the node of peer " <> show p <> " drops " <> show h,
-                 Right w {nodes = Map.insert p node {has = Set.difference node.has (family h)} w.nodes}
-               )
-             | (p, node) <- Map.toList w.nodes,
-               h <- Set.toList node.has
-             ]
+      Mempools
+        | sc.oneNode ->
+            [ ("the node takes " <> show h, Right (foldl' (\x p -> arriveIn x p h) w (Map.keys w.nodes)))
+            | (h, ps) <- Map.toList sc.txs,
+              Set.notMember h everywhere,
+              Set.notMember h w.confirmed,
+              all (\x -> Set.member x everywhere || Set.member x w.confirmed) ps
+            ]
+              <> [ ( "the node drops " <> show h,
+                     Right w {nodes = Map.map (\n -> n {has = Set.difference n.has (family h)}) w.nodes}
+                   )
+                 | h <- Set.toList everywhere
+                 ]
+        | otherwise ->
+            [ ("the node of peer " <> show p <> " takes " <> show h, Right (arriveIn w p h))
+            | (p, node) <- Map.toList w.nodes,
+              (h, ps) <- Map.toList sc.txs,
+              Set.notMember h node.has,
+              Set.notMember h w.confirmed,
+              all (\x -> Set.member x node.has || Set.member x w.confirmed) ps
+            ]
+              <> [ ( "the node of peer " <> show p <> " drops " <> show h,
+                     Right w {nodes = Map.insert p node {has = Set.difference node.has (family h)} w.nodes}
+                   )
+                 | (p, node) <- Map.toList w.nodes,
+                   h <- Set.toList node.has
+                 ]
       Blocks ->
         [ ( "a block confirms " <> show h,
             Right
@@ -415,14 +435,17 @@ disturbed sc w
         close s =
           let s' = Set.union s (Set.fromList [c | (c, ps) <- Map.toList sc.txs, any (`Set.member` s) ps])
            in if s' == s then s else close s'
-    -- A1: a node names a transaction once, to a peer that is there
-    arrive p h node
-      | node.online =
-          w
-            { nodes = Map.insert p node {has = Set.insert h node.has, told = Set.insert h node.told} w.nodes,
-              toStore = Map.adjust (|> MInv [h]) p w.toStore
-            }
-      | otherwise = w {nodes = Map.insert p node {has = Set.insert h node.has} w.nodes}
+    -- A1: a node names a transaction once, to a peer that is there. Its
+    -- RPC names nothing by itself.
+    arriveIn x p h = case Map.lookup p x.nodes of
+      Just node
+        | node.online && p `notElem` sc.feeds ->
+            x
+              { nodes = Map.insert p node {has = Set.insert h node.has, told = Set.insert h node.told} x.nodes,
+                toStore = Map.adjust (|> MInv [h]) p x.toStore
+              }
+        | otherwise -> x {nodes = Map.insert p node {has = Set.insert h node.has} x.nodes}
+      Nothing -> x
 
 -- | A peer comes: not a disturbance, and not something that has to
 -- happen. A peer that stays away is no source.
@@ -444,8 +467,16 @@ comes sc w =
 
 -- | T3 at rest: the pool has every transaction of the mempool of every
 -- source that is connected.
-converged :: World -> Bool
-converged w = and [node.has `Set.isSubsetOf` settled w | node <- Map.elems w.nodes, node.online, node.source]
+--
+-- Of a node that the store has the RPC of and a peer to, that is so while
+-- the peer is connected: the RPC announces nothing, so what the node
+-- takes while no peer is there to be told is in the pool at the next
+-- reading of the RPC, which is by the clock and not by anything that
+-- happens.
+converged :: Scenario -> World -> Bool
+converged sc w
+  | sc.oneNode && not (or [node.online | (p, node) <- Map.toList w.nodes, p `notElem` sc.feeds]) = True
+  | otherwise = and [node.has `Set.isSubsetOf` settled w | node <- Map.elems w.nodes, node.online, node.source]
 
 -- | Go through every state of a scenario. In each: the rules of every
 -- step. From each, with only things going well: no way to go on for ever,
@@ -494,7 +525,7 @@ explore sc = search (Map.singleton w0 Nothing) [w0] [] 0
         let next = [(label, x) | (label, Right x) <- calm sc w, x /= w]
          in if null next
               then
-                if converged w
+                if converged sc w
                   then Right (Map.insert w True done)
                   else Left (short, w, reverse path)
               else do
@@ -517,7 +548,7 @@ wander sc = go (initial sc) []
             (label, Left why) -> Left (why, reverse (label : path))
             (label, Right w') -> go w' (label : path) ns
     settleDown w path fuel = case [(label, x) | (label, x) <- calm sc w, x /= Right w] of
-      [] | converged w -> Right ()
+      [] | converged sc w -> Right ()
       [] -> Left ("the store is at rest and the pool lacks transactions of the mempool of a source", reverse path)
       (label, Left why) : _ -> Left (why, reverse (label : path))
       (label, Right w') : _
@@ -544,6 +575,8 @@ large =
           },
       txs = Map.fromList [(1, []), (2, [1]), (3, [2]), (4, []), (5, [4]), (6, [5, 3])],
       peers = [(1, True), (2, True), (3, False)],
+      oneNode = False,
+      feeds = [],
       backwards = False,
       disturbances = [minBound .. maxBound],
       busy = 6,
@@ -580,6 +613,8 @@ withoutOrder =
           },
       txs = Map.fromList [(1, []), (2, [1])],
       peers = [(1, True)],
+      oneNode = False,
+      feeds = [],
       backwards = True,
       disturbances = [Mempools],
       busy = 2,
@@ -609,11 +644,33 @@ scenarios =
     world "a chain of two, the pool failing and emptied" chain [(1, True)] [Mempools, PoolFails, PoolEmptied] small,
     world "a chain of two, blocks and a store out of sync" chain [(1, True)] [Mempools, Blocks, Desyncs] small,
     world "one transaction, a source and a peer that is none" one mixed [Mempools, PeerDrops, Timeouts] small,
-    world "one transaction, two sources" one [(1, True), (2, True)] [Mempools, PeerDrops] small
+    world "one transaction, two sources" one [(1, True), (2, True)] [Mempools, PeerDrops] small,
+    -- a node that whitelists nobody, and a store that has its RPC: a
+    -- source that does not announce, and a peer that announces and is no
+    -- source, with one mempool between them
+    (world "one transaction, one node: its RPC and a peer that is no source" one mixed [Mempools, PeerDrops] small)
+      { oneNode = True,
+        feeds = [1]
+      },
+    (world "a chain of two, one node: its RPC and a peer that is no source" chain mixed [Mempools, PeerDrops] small)
+      { oneNode = True,
+        feeds = [1]
+      }
   ]
   where
     world name txs peers disturbances config =
-      Scenario {name, config, txs, peers, backwards = False, disturbances, busy = 2, limit = 1500000}
+      Scenario
+        { name,
+          config,
+          txs,
+          peers,
+          oneNode = False,
+          feeds = [],
+          backwards = False,
+          disturbances,
+          busy = 2,
+          limit = 1500000
+        }
     mixed = [(1, True), (2, False)]
     tight = small {room = 1, heldRoom = 1}
     two = small {heldRoom = 2, maxWindow = 3}

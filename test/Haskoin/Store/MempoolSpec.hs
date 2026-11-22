@@ -129,6 +129,9 @@ spec = do
         describe ("A store that no peer gives a mempool to, with the RPC of its node" <> withBlock block) $
           it "has what came while it was away" $
             withBedOf (bare BitcoinCore) BitcoinCore (away block . rpcOnly)
+      describe "A store with the RPC of its node, whose node takes transactions while the two are not connected" $
+        it "has them once it is connected again" $
+          withBedOf (bare BitcoinCore) BitcoinCore (cutOff . rpcOnly)
   where
     name BitcoinCore = "Bitcoin Core"
     name BitcoinCashNode = "Bitcoin Cash Node"
@@ -217,6 +220,41 @@ outbid bed = do
     submit bed (map (chainOf 3) roots)
     converges bed server 60
     forM_ roots $ \(op, value) -> send bed (spend op [TxOut 0 note, TxOut (value - 30 * fee) lock])
+    converges bed server 60
+
+-- | A store that has the RPC of a node that whitelists nobody, and is its
+-- peer: the node closes its connections, takes transactions, and takes
+-- connections again. It names to a peer nothing that it took before the
+-- peer connected (A1), and its RPC names nothing by itself, so the store
+-- has them only by reading the RPC again once it is connected: a peer
+-- that connects owes what its node took before.
+--
+-- A store read the RPC of its node when it started and connected to the
+-- node a moment later. What the node took in between was in neither: one
+-- run in many of another test here lost four transactions so, one for
+-- each of the four that are sent at once, and ended with the 84 that
+-- spent from them waiting.
+cutOff :: Bed -> IO ()
+cutOff bed = do
+  roots <- fund bed 6
+  withMember bed $ \_ server -> do
+    converges bed server 60
+    -- A store that starts on a new database starts its pool again once it
+    -- has its blocks, and reads the RPC again for that, ten seconds after
+    -- the first time. The node is cut off after that reading, so that
+    -- nothing but the peer that connects again makes the store read.
+    threadDelay 15000000
+    void (rpc bed.node "setnetworkactive" [Bool False])
+    -- the node closes its connections a moment after it is told to
+    let alone = null . arr <$> rpc bed.node "getpeerinfo" []
+        awaitAlone n = do
+          gone <- alone
+          unless gone $
+            if n > (0 :: Int) then threadDelay 100000 >> awaitAlone (n - 1) else fail "The node kept its peer"
+    awaitAlone 100
+    -- transactions that nothing spends from: nothing asks for them
+    submit bed (map (chainOf 1) roots)
+    void (rpc bed.node "setnetworkactive" [Bool True])
     converges bed server 60
 
 -- | A store that runs while its pool loses transactions, without the

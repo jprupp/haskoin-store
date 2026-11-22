@@ -39,6 +39,11 @@
 --   larger than its room: each reading named the settled ones first, and
 --   they took the room of those that it lacked.
 --
+-- * __A peer that connects owes what its node took before__, which the
+--   node will not announce. A source is asked for its mempool when it
+--   connects; when a peer that is none connects, the sources are read
+--   again.
+--
 -- * __Giving up is allowed, and remembered.__ When there is no room, when
 --   a peer goes, when a request gets no answer, the id is given up with a
 --   reason and the machine is /dirty/. A dirty machine reads the whole
@@ -340,7 +345,21 @@ react parents input s = case input of
                   swept = Nothing,
                   owed = False
                 }
-         in (s {links = Map.insert p link s.links}, [])
+            -- A node names to a peer nothing that it took before the peer
+            -- connected (A1). A peer that is a source is asked for its
+            -- mempool, which has it. One that is none is not, so what its
+            -- node took until now is owed by the sources: one of them may
+            -- be that node, as its RPC is, and was read before.
+            --
+            -- Without this, a store that had the RPC of a node and was
+            -- its peer read the RPC, connected a moment later, and never
+            -- had what the node took in between: one test in many ended
+            -- with four transactions lost, one for each of four that were
+            -- sent at once, and all that spent from them waiting.
+            others
+              | src = s.links
+              | otherwise = Map.map (\l -> if l.source then l {owed = True} else l) s.links
+         in (s {links = Map.insert p link others}, [])
   PeerDown p -> done (peerDown p (s, []))
   Synced b -> (s {synced = b}, [])
   Named p hs

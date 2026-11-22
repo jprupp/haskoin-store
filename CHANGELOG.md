@@ -212,6 +212,15 @@ whitelist it must now say what they grant (`--peer-permission`, or
     Cash Node says that it has it not, and there the store waits as it
     did. The rule is in the model of the path, with a check that a
     machine without it fails, and Liquid Haskell passes.
+  - **A store that has the RPC of its node reads it again when it
+    connects to the node as a peer.** A node names to a peer nothing
+    that it took before the peer connected, and its RPC announces
+    nothing: what the node took between the reading of the RPC and the
+    connection was in neither, and stayed out of the store until the
+    next reading, ten minutes later. It lost four transactions in one
+    run of a test in about forty. A peer that connects and is no source
+    now makes the sources owe a reading. The model of the path has a
+    node with its RPC and a peer, and fails without the rule.
   - **`rbf` is true for every unconfirmed transaction on Bitcoin, and
     false elsewhere.** The nodes of Bitcoin take a replacement of any
     unconfirmed transaction, whatever it signals, since Bitcoin Core 28,
