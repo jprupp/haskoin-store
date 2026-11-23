@@ -1,0 +1,4008 @@
+{
+  "title": "Haskoin Store",
+  "uid": "haskoin-store",
+  "tags": [
+    "haskoin",
+    "haskoin-store"
+  ],
+  "description": "haskoin-store's metrics, read from InfluxDB as Telegraf's statsd input writes them, for a store that sends its own statistics (--statsd-aggregates --statsd-no-events). See docs/grafana.md of haskoin-store.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "timezone": "",
+  "links": [
+    {
+      "title": "Metrics reference (haskoin-store README)",
+      "type": "link",
+      "icon": "doc",
+      "url": "https://github.com/jprupp/haskoin-store#statsd",
+      "targetBlank": true
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "influxdb",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "regex": ""
+      },
+      {
+        "name": "prefix",
+        "label": "Metric prefix",
+        "type": "textbox",
+        "query": "haskoin_store_btc",
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "haskoin_store_btc",
+          "value": "haskoin_store_btc"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "haskoin_store_btc",
+            "value": "haskoin_store_btc"
+          }
+        ]
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "${datasource}"
+        },
+        "query": "SHOW TAG VALUES FROM \"${prefix}_stats_gauges_store_blocks\" WITH KEY = \"host\"",
+        "definition": "SHOW TAG VALUES FROM \"${prefix}_stats_gauges_store_blocks\" WITH KEY = \"host\"",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "hide": 0
+      },
+      {
+        "name": "route",
+        "label": "Kind of request",
+        "type": "query",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "${datasource}"
+        },
+        "query": "SHOW MEASUREMENTS WITH MEASUREMENT =~ /^${prefix}_stats_timers_web_([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*_count$/",
+        "definition": "SHOW MEASUREMENTS WITH MEASUREMENT =~ /^${prefix}_stats_timers_web_([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*_count$/",
+        "regex": "/^.*_stats_timers_web_(.*)_count$/",
+        "includeAll": false,
+        "multi": false,
+        "refresh": 2,
+        "sort": 1,
+        "current": {},
+        "options": [],
+        "hide": 0
+      },
+      {
+        "name": "pct",
+        "label": "Percentile",
+        "type": "custom",
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "query": "90 : 90,95 : 95",
+        "current": {
+          "selected": true,
+          "text": "95",
+          "value": "95"
+        },
+        "options": [
+          {
+            "selected": false,
+            "text": "90",
+            "value": "90"
+          },
+          {
+            "selected": true,
+            "text": "95",
+            "value": "95"
+          }
+        ]
+      },
+      {
+        "name": "how",
+        "label": "Percentile of",
+        "type": "custom",
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "query": "a typical second : mean(\"mean\"),the worst second : max(\"upper\")",
+        "current": {
+          "selected": true,
+          "text": "a typical second",
+          "value": "mean(\"mean\")"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "a typical second",
+            "value": "mean(\"mean\")"
+          },
+          {
+            "selected": false,
+            "text": "the worst second",
+            "value": "max(\"upper\")"
+          }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 1,
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Block height",
+      "description": "Height of the best block that the store has imported (store.blocks).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_blocks\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Blocks behind",
+      "description": "Best header minus best block (store.headers - store.blocks). More than a few for long means that the store is not keeping up with the chain.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_headers\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_blocks\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "type": "math",
+          "expression": "$A - $B",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Peers",
+      "description": "Peers online (store.peers). At zero the store hears of no new blocks or transactions.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_peers\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Requests",
+      "description": "Requests answered a second, every kind together: the counts of the web.* timings, added up. Exact: Telegraf adds the store's counts up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [
+        {
+          "id": "calculateField",
+          "options": {
+            "mode": "reduceRow",
+            "reduce": {
+              "reducer": "sum"
+            },
+            "replaceFields": true,
+            "alias": "Requests"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM /^${prefix}_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_count$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Server errors",
+      "description": "Requests that failed with a server error, a second (web.server_errors).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_server_errors_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Server errors",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "type": "stat",
+      "title": "Requests refused",
+      "description": "Requests refused with server-busy, a second, for any reason (web.requests_refused). See the Overload row for why.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_requests_refused_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Refused",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 8,
+      "title": "Requests",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "type": "timeseries",
+      "title": "Requests by kind",
+      "description": "Requests answered a second, by kind of request (the count of each web.* timing). Exact: Telegraf adds the store's counts up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_count$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM /^${prefix}_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_count$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "type": "timeseries",
+      "title": "Time spent answering, by kind",
+      "description": "Seconds spent answering each kind of request, for each second that passes: 1 is one core busy with it all the time. It says where the time of the store goes, which neither the rate nor the response time does alone. Exact: Telegraf adds the store's sums up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_sum$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"sum\")), 1s) / 1000 FROM /^${prefix}_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_sum$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "type": "timeseries",
+      "title": "Response time by kind, percentile $pct",
+      "description": "The time within which $pct in a hundred requests of each kind were answered (web.* timings). The store works a percentile out for each second, and no percentile of a longer time can be made of those. Shown is the one chosen at the top: of a typical second (the mean of the seconds) or of the worst second. A second with fewer than ten requests of a kind has no 90th percentile to speak of: look at the longest then.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_upper_[0-9]+$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT ${how:raw} FROM /^${prefix}_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_upper_$pct$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "type": "timeseries",
+      "title": "Longest response by kind",
+      "description": "The longest that a request of each kind took. Exact: the longest of the longest of each second.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_upper$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT max(\"upper\") FROM /^${prefix}_stats_timers_web_(([^c]|c[^a]|ca[^p]|cap[^_])[a-z0-9_]*)_upper$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "type": "timeseries",
+      "title": "Errors and reruns",
+      "description": "Requests that failed, a second: server errors (web.server_errors) and client errors (web.client_errors). Reruns (web.reruns) are requests answered again because a cached xpub that they read changed meanwhile.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_server_errors_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Server errors",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_client_errors_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Client errors",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_reruns_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Reruns",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "type": "timeseries",
+      "title": "Event stream clients",
+      "description": "Clients connected to the stream of events (web.events_connected).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_events_connected\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 15,
+      "title": "One kind of request: $route",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "type": "timeseries",
+      "title": "Requests",
+      "description": "Requests of the kind chosen at the top, a second. Exact: Telegraf adds the store's counts up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_timers_web_${route}_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Requests",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "type": "timeseries",
+      "title": "Response time",
+      "description": "Of the kind chosen at the top. The mean is exact: the sum of the times over the count of the requests, and not the mean that Telegraf makes of the means of the seconds, which counts a second with one request as much as one with a thousand. The percentiles are those of a typical second. The longest is exact.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Mean"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT sum(\"sum\") FROM \"${prefix}_stats_timers_web_${route}_sum\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "part",
+          "resultFormat": "time_series",
+          "hide": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT sum(\"value\") FROM \"${prefix}_stats_timers_web_${route}_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "part",
+          "resultFormat": "time_series",
+          "hide": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "type": "math",
+          "expression": "$A / $B",
+          "hide": false
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT mean(\"mean\") FROM \"${prefix}_stats_timers_web_${route}_upper_90\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "90%, typical second",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT mean(\"mean\") FROM \"${prefix}_stats_timers_web_${route}_upper_95\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "95%, typical second",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT max(\"upper\") FROM \"${prefix}_stats_timers_web_${route}_upper\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Longest",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "type": "timeseries",
+      "title": "Seconds with requests",
+      "description": "Of each ten seconds, in how many the store answered a request of this kind. Below ten, the kind is quiet, and its percentiles are of few requests.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT mean(\"count\") FROM \"${prefix}_stats_timers_web_${route}_upper\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Seconds",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 19,
+      "title": "Overload: admission control of long requests",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "type": "timeseries",
+      "title": "Long requests: limit, running and waiting",
+      "description": "The limit on long requests that the controller set (web.cap.limit), those being answered (web.requests_running) and those waiting for a slot (web.requests_waiting). A limit stuck at its ceiling with long waits points at the disk; one stuck at its floor with a high delay points at work that is not limited.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_cap_limit\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Limit $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_requests_running\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Running $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_requests_waiting\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Waiting $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "type": "timeseries",
+      "title": "Requests refused, by reason",
+      "description": "Requests refused a second: because the line was full (web.cap.refused_full), after waiting too long (web.cap.refused_waited), or by CoDel (web.cap.refused_codel).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_cap_refused_full_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Line full",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_cap_refused_waited_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Waited too long",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_web_cap_refused_codel_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "CoDel",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 50
+      },
+      "type": "timeseries",
+      "title": "Scheduler delay",
+      "description": "90th percentile of the scheduler's delay in the last half second, without the garbage collector's pauses (web.cap.delay_us) and with them (web.cap.lateness_us). These are gauges: the last value of each ten seconds.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_cap_delay_us\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Delay $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_cap_lateness_us\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "With GC pauses $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 50
+      },
+      "type": "timeseries",
+      "title": "Cores in use",
+      "description": "Use of the cores that the controller sees, smoothed over two seconds (web.cap.used, here in cores).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") / 100 FROM \"${prefix}_stats_gauges_web_cap_used\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 50
+      },
+      "type": "timeseries",
+      "title": "Wait for a slot, and time holding it",
+      "description": "How long an admitted long request waited for its slot (web.cap.sojourn: the 90th percentile of a typical second, and the longest), and the smoothed time that a long request holds its slot (web.cap.round_trip_us).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT mean(\"mean\") FROM \"${prefix}_stats_timers_web_cap_sojourn_upper_90\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Wait, 90%, typical second",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT max(\"upper\") FROM \"${prefix}_stats_timers_web_cap_sojourn_upper\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "Wait, longest",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") / 1000 FROM \"${prefix}_stats_gauges_web_cap_round_trip_us\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Slot held $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 50
+      },
+      "type": "state-timeline",
+      "title": "Overloaded",
+      "description": "Whether CoDel finds the line of long requests overloaded (web.cap.overloaded).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "No",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Overloaded",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_web_cap_overloaded\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 57
+      },
+      "type": "timeseries",
+      "title": "Slots held, by long route",
+      "description": "Slots that each long route holds (web.cap.<route>.running).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_gauges_web_cap_(.+)_running$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM /^${prefix}_stats_gauges_web_cap_(.+)_running$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 57
+      },
+      "type": "timeseries",
+      "title": "Wait for a slot by long route, percentile $pct",
+      "description": "The time that a request of each long route waited for its slot (web.cap.<route>.waited). The store works a percentile out for each second, and no percentile of a longer time can be made of those. Shown is the one chosen at the top: of a typical second (the mean of the seconds) or of the worst second. A second with fewer than ten requests of a kind has no 90th percentile to speak of: look at the longest then.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_cap_(.+)_waited_upper_[0-9]+$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT ${how:raw} FROM /^${prefix}_stats_timers_web_cap_(.+)_waited_upper_$pct$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 57
+      },
+      "type": "timeseries",
+      "title": "Slot held by long route, percentile $pct",
+      "description": "The time that a request of each long route held its slot, to the last byte (web.cap.<route>.held). The store works a percentile out for each second, and no percentile of a longer time can be made of those. Shown is the one chosen at the top: of a typical second (the mean of the seconds) or of the worst second. A second with fewer than ten requests of a kind has no 90th percentile to speak of: look at the longest then.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_timers_web_cap_(.+)_held_upper_[0-9]+$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT ${how:raw} FROM /^${prefix}_stats_timers_web_cap_(.+)_held_upper_$pct$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 57
+      },
+      "type": "timeseries",
+      "title": "Requests refused, by long route",
+      "description": "Requests of each long route refused a second (web.cap.<route>.refused).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^.*_stats_counters_web_cap_(.+)_refused_count$",
+            "renamePattern": "$1"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM /^${prefix}_stats_counters_web_cap_(.+)_refused_count$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+          "alias": "$measurement",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 30,
+      "title": "Blocks and peers",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
+      "panels": []
+    },
+    {
+      "id": 31,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 66
+      },
+      "type": "timeseries",
+      "title": "Heights",
+      "description": "Height of the best block (store.blocks) and of the best header (store.headers).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_blocks\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Blocks $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_headers\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Headers $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 66
+      },
+      "type": "timeseries",
+      "title": "Import of the latest block, by stage",
+      "description": "Milliseconds that the latest block took to import, by stage: working out what the import needs (prepare), reading ahead what the rules will read (prefetch), the rules in memory (apply) and writing the batch to RocksDB (write). A slow prefetch is the disk or RocksDB's cache; the other stages are mostly CPU. (store.last_block_*_ms)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_last_block_prepare_ms\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Prepare $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_last_block_prefetch_ms\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Prefetch $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_last_block_apply_ms\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Apply $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_last_block_write_ms\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "Write $tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 66
+      },
+      "type": "timeseries",
+      "title": "Peers",
+      "description": "Peers online (store.peers).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "rawQuery": true,
+          "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_store_peers\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+          "alias": "$tag_host",
+          "resultFormat": "time_series",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 34,
+      "title": "Database",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 74
+      },
+      "panels": [
+        {
+          "id": 35,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 75
+          },
+          "type": "timeseries",
+          "title": "Database reads by kind",
+          "description": "Reads of the database a second, by what was read (db.*).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 25,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_best_block_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Best block",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_blocks_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Blocks",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_txs_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Transactions",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "D",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_balances_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Balances",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "E",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_unspents_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Unspent outputs",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "F",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_address_txs_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Address transactions",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "G",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_xpub_balances_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Xpub balances",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "H",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_xpub_unspents_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Xpub unspent outputs",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "I",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_xpub_txs_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Xpub transactions",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "J",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_db_xpub_tx_count_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Xpub transaction counts",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 36,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 12,
+            "y": 75
+          },
+          "type": "timeseries",
+          "title": "Open iterators",
+          "description": "Iterators open on RocksDB (db.iterators).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_db_iterators\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "$tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 37,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 16,
+            "y": 75
+          },
+          "type": "timeseries",
+          "title": "Pending compaction",
+          "description": "Bytes that RocksDB has to compact, over every column family (db.pending_compaction_bytes).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_db_pending_compaction_bytes\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "$tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 38,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 20,
+            "y": 75
+          },
+          "type": "state-timeline",
+          "title": "Writes",
+          "description": "Writes to RocksDB: flowing, delayed or stopped (db.write_delayed). Delayed or stopped writes mean that compaction is not keeping up.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "text"
+              },
+              "custom": {
+                "fillOpacity": 80,
+                "lineWidth": 0
+              },
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "Flowing",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "1": {
+                      "text": "Delayed",
+                      "color": "yellow",
+                      "index": 1
+                    },
+                    "2": {
+                      "text": "Stopped",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          },
+          "options": {
+            "mergeValues": true,
+            "showValue": "auto",
+            "alignValue": "left",
+            "rowHeight": 0.9,
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_db_write_delayed\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "$tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 39,
+      "title": "Mempool ingestion",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 83
+      },
+      "panels": [
+        {
+          "id": 40,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 84
+          },
+          "type": "timeseries",
+          "title": "Transactions settled and messages dropped",
+          "description": "Transactions that peers named and that the pool decided on, or already had (ingest.settled), and messages of peers dropped because the path into the pool was behind (ingest.dropped), a second.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_ingest_settled_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Settled",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_ingest_dropped_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Dropped",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 41,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 84
+          },
+          "type": "timeseries",
+          "title": "Transactions given up, by reason",
+          "description": "Transactions given up on their way to the pool, a second, by reason (ingest.given_up.*). Every reason but node_has_not makes the store read its sources again.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 25,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [
+            {
+              "id": "renameByRegex",
+              "options": {
+                "regex": "^.*_stats_counters_ingest_given_up_(.+)_count$",
+                "renamePattern": "$1"
+              }
+            }
+          ],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM /^${prefix}_stats_counters_ingest_given_up_(.+)_count$/ WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "$measurement",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 42,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 84
+          },
+          "type": "timeseries",
+          "title": "Transactions on their way",
+          "description": "Transaction ids on their way to the pool (ingest.ids), those asked of peers and not received, which /health counts (ingest.pending), and those held (ingest.held).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_ingest_ids\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "On their way $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_ingest_pending\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Asked, not received $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_ingest_held\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Held $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 43,
+      "title": "Fleet cache of xpubs",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 92
+      },
+      "panels": [
+        {
+          "id": 44,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 93
+          },
+          "type": "timeseries",
+          "title": "Hits and misses",
+          "description": "Requests about an xpub whose balances the cache gave (fleet.cache.hits) and that the cache did not have (fleet.cache.misses), a second. Misses include xpubs being built.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 25,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_hits_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Hits",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_misses_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Misses",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 45,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 93
+          },
+          "type": "timeseries",
+          "title": "Share of hits",
+          "description": "Hits over hits and misses: how much of the load the cache takes. Exact: a ratio of two counts.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "C"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Hits"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT sum(\"value\") FROM \"${prefix}_stats_counters_fleet_cache_hits_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "part",
+              "resultFormat": "time_series",
+              "hide": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT sum(\"value\") FROM \"${prefix}_stats_counters_fleet_cache_misses_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "part",
+              "resultFormat": "time_series",
+              "hide": true
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "__expr__",
+                "uid": "__expr__"
+              },
+              "type": "math",
+              "expression": "$A / ($A + $B)",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 46,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 93
+          },
+          "type": "timeseries",
+          "title": "Cache size",
+          "description": "Xpubs in the cache, whichever store cached them (fleet.cache.xpubs), and the addresses that they have between them (fleet.cache.addresses).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_fleet_cache_xpubs\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Xpubs $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_fleet_cache_addresses\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Addresses $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 47,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 101
+          },
+          "type": "timeseries",
+          "title": "Cache builds and evictions",
+          "description": "A second: entries that this store built or added addresses to (fleet.cache.builds), builds given up (fleet.cache.abandoned), entries evicted (fleet.cache.evictions) and times that this store emptied the cache (fleet.cache.emptied).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_builds_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Builds",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_abandoned_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Abandoned",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_evictions_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Evictions",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "D",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_fleet_cache_emptied_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Emptied",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 48,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 101
+          },
+          "type": "timeseries",
+          "title": "Time to build an entry",
+          "description": "The time to build an entry (fleet.cache.build). The mean is exact: the sum of the times over the count of the builds. The longest is exact. Builds are few, so no percentile is shown.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "C"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Mean"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT sum(\"sum\") FROM \"${prefix}_stats_timers_fleet_cache_build_sum\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "part",
+              "resultFormat": "time_series",
+              "hide": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT sum(\"value\") FROM \"${prefix}_stats_timers_fleet_cache_build_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "part",
+              "resultFormat": "time_series",
+              "hide": true
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "__expr__",
+                "uid": "__expr__"
+              },
+              "type": "math",
+              "expression": "$A / $B",
+              "hide": false
+            },
+            {
+              "refId": "D",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT max(\"upper\") FROM \"${prefix}_stats_timers_fleet_cache_build_upper\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Longest",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 49,
+      "title": "Runtime: GHC's garbage collector",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 109
+      },
+      "panels": [
+        {
+          "id": 50,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 0,
+            "y": 110
+          },
+          "type": "timeseries",
+          "title": "Time stopped for the collector",
+          "description": "Share of each second that every thread was stopped (rts.gc_pause_percent). While stopped the store answers nothing, so a high share shows up as slow answers everywhere. A gauge: the last second of each ten.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_rts_gc_pause_percent\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "$tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 51,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 6,
+            "y": 110
+          },
+          "type": "timeseries",
+          "title": "Mean pause",
+          "description": "Mean pause of a collection in the last second (rts.gc_pause_mean_us).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "µs",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_rts_gc_pause_mean_us\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "$tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 52,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 12,
+            "y": 110
+          },
+          "type": "timeseries",
+          "title": "Collections",
+          "description": "Collections a second (rts.gcs), and those of the whole heap (rts.major_gcs).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_rts_gcs_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "All",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_rts_major_gcs_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Whole heap",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 53,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 110
+          },
+          "type": "timeseries",
+          "title": "CPU of the collector",
+          "description": "Cores that the collector uses (the rate of rts.gc_cpu_us).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "decimals": 2
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) / 1000000 FROM \"${prefix}_stats_counters_rts_gc_cpu_us_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Cores",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 54,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 118
+          },
+          "type": "timeseries",
+          "title": "Allocation",
+          "description": "Bytes allocated a second (rts.allocated_bytes).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "binBps",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT derivative(cumulative_sum(sum(\"value\")), 1s) FROM \"${prefix}_stats_counters_rts_allocated_bytes_count\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval) fill(none)",
+              "alias": "Allocated",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        },
+        {
+          "id": 55,
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 118
+          },
+          "type": "timeseries",
+          "title": "Heap",
+          "description": "Bytes live after the last collection (rts.live_bytes) and bytes that the heap holds from the system (rts.heap_bytes).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "calcs": [],
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "transformations": [],
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_rts_live_bytes\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Live $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "influxdb",
+                "uid": "${datasource}"
+              },
+              "rawQuery": true,
+              "query": "SELECT last(\"value\") FROM \"${prefix}_stats_gauges_rts_heap_bytes\" WHERE \"host\" =~ /^$host$/ AND $timeFilter GROUP BY time($__interval), \"host\" fill(none)",
+              "alias": "Heap $tag_host",
+              "resultFormat": "time_series",
+              "hide": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

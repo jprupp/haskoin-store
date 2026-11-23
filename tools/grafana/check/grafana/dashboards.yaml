@@ -1,0 +1,7 @@
+# The dashboard, from a folder that run.sh fills.
+apiVersion: 1
+providers:
+  - name: check
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,12 @@
+# The InfluxDB of the pod, asked in InfluxQL.
+apiVersion: 1
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: influx-check
+    access: proxy
+    url: http://127.0.0.1:8086
+    database: telegraf
+    isDefault: true
+    jsonData:
+      httpMode: GET

@@ -32,6 +32,7 @@ Read these three, in this order. Together they are the whole design.
 | [congestion-control.md](congestion-control.md) | How many heavy requests does a store answer at once? |
 | [cashtokens.md](cashtokens.md) | How does the store read, index and serve the tokens of Bitcoin Cash? |
 | [hsq.md](hsq.md) | How do I ask a store something from the command line? |
+| [grafana.md](grafana.md) | How do I see a store's metrics on a dashboard? |
 
 ## Words used on every page
 

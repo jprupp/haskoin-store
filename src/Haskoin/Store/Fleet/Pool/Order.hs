@@ -104,6 +104,7 @@ mFull = Map.filter (/= Set.empty)
 
 -- | What a key has once a member is taken out of every set: the set that
 -- it had without that member, and no set if it had none.
+
 {-@ reflect minus @-}
 minus :: (Ord t) => t -> Maybe (Set t) -> Maybe (Set t)
 minus _ Nothing = Nothing
@@ -111,6 +112,7 @@ minus x (Just s) = Just (Set.difference s (Set.singleton x))
 
 -- | What a key has once the empty sets are dropped: the set that it had
 -- if that was not empty, and nothing otherwise.
+
 {-@ reflect kept @-}
 kept :: (Ord t) => Maybe (Set t) -> Maybe (Set t)
 kept Nothing = Nothing
@@ -118,12 +120,14 @@ kept (Just s) = if s == Set.empty then Nothing else Just s
 
 -- | The outputs that a transaction spends, as a set: none for a
 -- transaction that the pool does not have.
+
 {-@ assume spentBy :: (Ord o) => r:Maybe [o] -> {s:Set o | s == ins r} @-}
 spentBy :: (Ord o) => Maybe [o] -> Set o
 spentBy = maybe Set.empty Set.fromList
 
 -- | Assumed: a map without a key has nothing at that key, and at any
 -- other what it had.
+
 {-@ assume lookGone :: m:Map k v -> x:k -> y:k
       -> {look (gone m x) y == (if y == x then Nothing else look m y)} @-}
 lookGone :: Map k v -> k -> k -> ()
@@ -131,6 +135,7 @@ lookGone _ _ _ = ()
 
 -- | Assumed: a map without a set of keys has nothing at a key of the set,
 -- and at any other what it had.
+
 {-@ assume lookLess :: m:Map k v -> s:Set k -> y:k
       -> {look (less m s) y == (if Set_mem y s then Nothing else look m y)} @-}
 lookLess :: Map k v -> Set k -> k -> ()
@@ -138,17 +143,20 @@ lookLess _ _ _ = ()
 
 -- | Assumed: with a member taken out of every set, a key has the set that
 -- it had without that member, and no set if it had none.
+
 {-@ assume lookWout :: m:Map k (Set t) -> x:t -> y:k -> {look (wout m x) y == minus x (look m y)} @-}
 lookWout :: Map k (Set t) -> t -> k -> ()
 lookWout _ _ _ = ()
 
 -- | Assumed: without its empty sets, a map has at a key the set that it
 -- had if that was not empty, and nothing otherwise.
+
 {-@ assume lookFull :: m:Map k (Set t) -> y:k -> {look (full m) y == kept (look m y)} @-}
 lookFull :: Map k (Set t) -> k -> ()
 lookFull _ _ = ()
 
 -- | Assumed: two maps that give the same at every key are the same map.
+
 {-@ assume same :: m:Map k v -> n:Map k v -> (y:k -> {look m y == look n y}) -> {m == n} @-}
 same :: Map k v -> Map k v -> (k -> ()) -> ()
 same _ _ _ = ()
@@ -161,6 +169,7 @@ same _ _ _ = ()
 -- it spends nothing any more, nothing is spent by it, and it spends from
 -- no transaction. A transaction from which nothing spends any more has no
 -- set left.
+
 {-@ removeCore :: (Ord t, Ord o) => x:t -> c:Core t o
       -> {d:Core t o | cSpends d == gone (cSpends c) x
                     && cSpender d == less (cSpender c) (ins (look (cSpends c) x))
@@ -179,6 +188,7 @@ both _ _ = ()
 
 -- | Proved: at any key, deleting two keys in one order gives what
 -- deleting them in the other gives.
+
 {-@ goneAt :: (Ord k) => m:Map k v -> a:k -> b:k -> y:k
       -> {look (gone (gone m b) a) y == look (gone (gone m a) b) y} @-}
 goneAt :: (Ord k) => Map k v -> k -> k -> k -> ()
@@ -189,6 +199,7 @@ goneAt m a b y =
 
 -- | Proved: at any key, taking two sets of keys out in one order gives
 -- what taking them out in the other gives.
+
 {-@ lessAt :: (Ord k) => m:Map k v -> s:Set k -> u:Set k -> y:k
       -> {look (less (less m u) s) y == look (less (less m s) u) y} @-}
 lessAt :: (Ord k) => Map k v -> Set k -> Set k -> k -> ()
@@ -202,6 +213,7 @@ lessAt m s u y =
 -- that the first leaves empty is dropped at once, and the second then
 -- finds none; taken the other way round, the second leaves a set that the
 -- first empties, and it is dropped then.
+
 {-@ swap :: (Ord t) => a:t -> b:t -> v:Maybe (Set t)
       -> {kept (minus a (kept (minus b v))) == kept (minus b (kept (minus a v)))} @-}
 swap :: (Ord t) => t -> t -> Maybe (Set t) -> ()
@@ -218,20 +230,21 @@ swap a b (Just s)
 -- | Proved: at any key, taking two transactions out of the sets of those
 -- that spend from each transaction, and dropping the empty sets each
 -- time, gives the same in either order.
+
 {-@ kidsAt :: (Ord k, Ord t) => m:Map k (Set t) -> a:t -> b:t -> y:k
       -> {look (full (wout (full (wout m b)) a)) y == look (full (wout (full (wout m a)) b)) y} @-}
 kidsAt :: (Ord k, Ord t) => Map k (Set t) -> t -> t -> k -> ()
 kidsAt m a b y =
   both (swap a b (mLookup y m)) $
     both
-    ( both
-        (both (lookFull (mWithout a (mFull (mWithout b m))) y) (lookWout (mFull (mWithout b m)) a y))
-        (both (lookFull (mWithout b m) y) (lookWout m b y))
-    )
-    ( both
-        (both (lookFull (mWithout b (mFull (mWithout a m))) y) (lookWout (mFull (mWithout a m)) b y))
-        (both (lookFull (mWithout a m) y) (lookWout m a y))
-    )
+      ( both
+          (both (lookFull (mWithout a (mFull (mWithout b m))) y) (lookWout (mFull (mWithout b m)) a y))
+          (both (lookFull (mWithout b m) y) (lookWout m b y))
+      )
+      ( both
+          (both (lookFull (mWithout b (mFull (mWithout a m))) y) (lookWout (mFull (mWithout a m)) b y))
+          (both (lookFull (mWithout a m) y) (lookWout m a y))
+      )
 
 -- | Proved: taking one transaction out and then another leaves the same
 -- three maps as taking them out the other way round.
@@ -240,6 +253,7 @@ kidsAt m a b y =
 -- since the first is gone by then: it does not, because a transaction
 -- that is not the first one spends what it spent before
 -- (@lookGone@).
+
 {-@ anyOrder :: (Ord t, Ord o) => a:t -> b:t -> c:Core t o
       -> {r:(Core t o, Core t o) | cSpends (fst r) == cSpends (snd r)
                                 && cSpender (fst r) == cSpender (snd r)

@@ -230,6 +230,22 @@ whitelist it must now say what they grant (`--peer-permission`, or
     run of a test in about forty. A peer that connects and is no source
     now makes the sources owe a reading. The model of the path has a
     node with its RPC and a peer, and fails without the rule.
+  - **A Grafana dashboard for the store's metrics**, read from InfluxDB
+    as Telegraf's statsd input writes them, for a store that sends its
+    own statistics (`--statsd-aggregates --statsd-no-events`):
+    `tools/grafana/haskoin-store.json`, with the script that generates
+    it. Nine rows and 46 panels: requests, one kind of request,
+    overload, blocks and peers, the database, the path into the
+    mempool, the cache of xpubs and the runtime. Telegraf sums the
+    store's statistics up a second time, which leaves counts, sums and
+    the longest right, and means, rates and percentiles wrong: the
+    dashboard reads the first and works the rest out, and
+    `docs/grafana.md` says how. Checked on a real Telegraf and InfluxDB
+    with a known load, which `tools/grafana/check/run.sh` does again,
+    and not yet against a store in production. The README now lists the
+    metrics of the web server and of the reads of the database, which
+    the store sent and the README did not name, and what the statistics
+    of `--statsd-aggregates` are called.
   - **The tip moves at once, and the pool lets go of the block's
     transactions after it.** A move of the tip over a full block took
     what the block confirmed out of the pool in the same step: more than

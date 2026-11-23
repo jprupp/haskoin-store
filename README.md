@@ -1248,6 +1248,46 @@ With `--statsd`, the store reports:
 | `fleet.cache.*` | What a server of a fleet does with the fleet's cache of xpubs |
 | `rts.*` | GHC's garbage collector |
 
+Every name starts with the prefix and the network: `web.reruns` of a
+store of Bitcoin is `haskoin_store.btc.web.reruns`.
+
+With `--statsd-aggregates` the store also works out statistics of each
+metric, every second, and sends those: a counter's count as
+`stats.counters.<metric>.count`, a gauge as `stats.gauges.<metric>`,
+and of a timing its count, sum, mean, longest, shortest and
+percentiles, as `stats.timers.<metric>.count`, `.sum`, `.mean`,
+`.upper`, `.lower`, `.upper_90` and so on
+([statsd-rupp](https://github.com/jprupp/statsd-rupp) has all of
+them). `--statsd-no-events` leaves the single samples out, so that only
+the statistics are sent: that is for a collector that keeps every line
+it is given.
+
+The metrics of the web server:
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `web.<kind>` | timing | Milliseconds to answer a request of one kind, one metric for each: `web.address_balance`, `web.xpub_balances`, `web.transaction`, `web.blockchain_multiaddr` and so on |
+| `web.server_errors` | counter | Requests that failed with a server error |
+| `web.client_errors` | counter | Requests that failed with a client error |
+| `web.reruns` | counter | Requests answered again because a cached xpub that they read changed meanwhile |
+| `web.events_connected` | gauge | Clients connected to the stream of events |
+
+The reads of the database, each a count of the items read:
+
+| Metric | Kind | Meaning |
+| --- | --- | --- |
+| `db.best_block` | counter | Reads of the best block |
+| `db.blocks` | counter | Blocks |
+| `db.txs` | counter | Transactions |
+| `db.balances` | counter | Balances |
+| `db.unspents` | counter | Unspent outputs |
+| `db.address_txs` | counter | Address transactions |
+| `db.xpub_balances` | counter | Xpub balances |
+| `db.xpub_unspents` | counter | Xpub unspent outputs |
+| `db.xpub_txs` | counter | Xpub transactions |
+| `db.xpub_tx_count` | counter | Xpub transaction counts |
+| `db.iterators` | gauge | Iterators open on RocksDB |
+
 The metrics of the block store:
 
 | Metric | Kind | Meaning |
@@ -1360,6 +1400,13 @@ And for each long route, named by the fixed segments of its path, such as
 | `web.cap.<route>.waited` | timing | Milliseconds that a request waited for its slot |
 | `web.cap.<route>.held` | timing | Milliseconds that a request held its slot, to the last byte |
 | `web.cap.<route>.refused` | counter | Requests refused |
+
+`tools/grafana/haskoin-store.json` is a Grafana dashboard for these,
+read from InfluxDB, for a store that sends its own statistics
+(`--statsd-aggregates --statsd-no-events`) to
+[Telegraf](https://github.com/influxdata/telegraf). `docs/grafana.md`
+says what it needs, how to install it, and what becomes of the store's
+statistics when Telegraf sums them up a second time.
 
 ### Database statistics
 
