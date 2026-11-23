@@ -416,7 +416,12 @@ uses, and cannot be better without knowing what miners will do.
   queries on Bitcoin Cash, with tokens moved twice in the pool and then
   confirmed; and a store that stops right after moving the tip, whose
   cached key is then read without what the block confirmed, the read
-  taking it out.
+  taking it out. The same with a transaction that the block made
+  invalid, by confirming another that spends the same coin and that the
+  pool never had: the chain says nothing of that one, only the mark
+  does, and the key is read without what it paid. Both fail when the
+  cache is made not to look for marks, and the second when the move is
+  made not to mark what a block is in conflict with.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 

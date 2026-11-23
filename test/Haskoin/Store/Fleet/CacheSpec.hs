@@ -116,6 +116,8 @@ spec = do
       it "never answers an entry that a move of the tip is writing" (`withBed` markedTest)
       it "answers a key without what a block took out of the pool, before the pool has let go of it" $
         (`withBed` leavingTest)
+      it "answers a key without what a block made invalid, before the pool has let go of it" $
+        (`withBed` conflictTest)
       it "keeps the cache across a reorganisation, as the chain and the pool give it" (`withBed` reorgTest)
       it "fills the pool again after Redis lost its data" (`withBed` refillTest)
       it "fills the pool again after it started again, once after Redis lost its data" (`withBed` restartTest)
@@ -622,6 +624,55 @@ leavingTest bed = do
     _ -> expectationFailure "The entry of the key was not answered"
   poolLeaving bed.conn bed.a.keys `shouldReturn` []
   sameAsChain bed bed.a x
+  settle bed
+  sameAsChain bed bed.b x
+
+-- | A block confirms a transaction that the pool never had, and that
+-- spends what a transaction of the pool spends: the one of the pool pays
+-- an address of a cached key, and is no longer valid. The store that
+-- moves the tip stops right after, so it is marked as leaving and still
+-- in the pool, with what it pays the key.
+--
+-- The chain does not have it and never will, so nothing of the chain's
+-- side of the entry says that it is gone: only the mark does. A read of
+-- the key takes it out, and answers what the chain and the pool give,
+-- without the payment.
+conflictTest :: Bed -> IO ()
+conflictTest bed = do
+  let x = xpub 11
+  payKey bed x [0] True
+  xpubAsk bed.a.door x `shouldReturn` Indexed
+  dest <- addressScript bed x 0
+  away <- addressScript bed (xpub 12) 0
+  c : other : _ <- filter ((> 101000) . (.value)) <$> coins bed
+  let loser = spend [c] [(dest, 100000)]
+      winner = spend [c] [(away, 90000)]
+      staying = spend [other] [(dest, 100000)]
+  offer bed loser
+  offer bed staying
+  settle bed
+  inPool bed loser `shouldReturn` True
+  sameAsChain bed bed.a x
+  before <- expected bed x
+  -- the block with the other spend of the same coin, and a move of the
+  -- tip with nothing after it
+  mineBlock bed [winner]
+  noted bed
+  forM_ [bed.a, bed.b] (\m -> report m `shouldReturn` True)
+  moveTip bed.a `shouldReturn` True
+  poolLeaving bed.conn bed.a.keys `shouldReturn` [encode (txHash loser)]
+  -- the entry is read, which takes the transaction out
+  tip <- fleetTipOf bed
+  cachedEntry bed.conn bed.a.keys tip bed.db.initGap bed.db.maxGap True x >>= \case
+    Hit _ -> return ()
+    _ -> expectationFailure "The entry of the key was not answered"
+  poolLeaving bed.conn bed.a.keys `shouldReturn` []
+  sameAsChain bed bed.a x
+  inPool bed loser `shouldReturn` False
+  inPool bed staying `shouldReturn` True
+  -- and the key no longer has what the transaction paid it
+  after <- expected bed x
+  after `shouldNotBe` before
   settle bed
   sameAsChain bed bed.b x
 
