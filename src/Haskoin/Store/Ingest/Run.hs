@@ -24,7 +24,7 @@
 --   connection, never for a later one to the same node (U1).
 --
 -- * __It carries out each output__: a request or a question to a peer, a
---   question to the pool ('memberSettled'), an offer ('memberOffer'), a
+--   question to the pool ('memberSettled'), an offer ('memberOfferTimed'), a
 --   count of what left and why. An answer of the pool is an input, given
 --   to the machine before the next thing that happened.
 --
@@ -422,7 +422,7 @@ data Costs = Costs
     inChecks :: !Word64,
     -- | sending requests to peers
     inSends :: !Word64,
-    -- | saying the state of the machine, for @/health@ and the metrics
+    -- | saying the state of the machine, for @\/health@ and the metrics
     inPublish :: !Word64,
     offerParts :: !OfferCost
   }
