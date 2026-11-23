@@ -1,6 +1,6 @@
 -- | What the move of the tip over a block costs to decide, without Redis.
 --
--- > haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]
+-- > haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS [WATCHED]]]]]]
 --
 -- A move of the tip is one decision ("Haskoin.Store.Fleet.Pool.Decide",
 -- @advance@) that takes the transactions of a block out of the shared
@@ -32,6 +32,13 @@
 -- transaction when the block comes, and a store that had it takes it out
 -- in the move.
 --
+-- WATCHED transactions in a hundred (0) have every address of theirs
+-- watched by a cached extended public key, one of a thousand: taking
+-- such a transaction out of the pool takes it out of the lists of the
+-- key too, and gives the key a new version. A server with many keys
+-- pays that for each block, and a benchmark without them does not show
+-- it.
+--
 -- For each run it prints how long each pass over the decision took and
 -- how many questions it ended with, the answers that the decision depends
 -- on and its writes, and, with @+RTS -T@, how much it allocated and how
@@ -46,7 +53,7 @@
 module Decide (decideBench) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -74,14 +81,16 @@ import Text.Printf (printf)
 
 decideBench :: [String] -> IO ()
 decideBench args = do
-  let numbers = map read args <> drop (length args) [4000, 20000, 3, 3, 0] :: [Int]
-      (txs, pool, ins, outs, rivals) = case numbers of
-        a : b : c : d : e : _ -> (a, max a b, c, d, e)
-        _ -> error "usage: haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]"
-      shape = Shape {ins, outs, rivals}
+  let numbers = map read args <> drop (length args) [4000, 20000, 3, 3, 0, 0] :: [Int]
+      (txs, pool, ins, outs, rivals, watched) = case numbers of
+        a : b : c : d : e : f : _ -> (a, max a b, c, d, e, f)
+        _ -> error "usage: haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS [WATCHED]]]]]]"
+      shape = Shape {ins, outs, rivals, watched}
   printf "A pool of %d transactions of %d inputs and %d outputs, and a block of %d of them\n" pool ins outs txs
   when (rivals > 0) $
     printf "The block also confirms %d transactions that each spend what one of the pool spends\n" rivals
+  when (watched > 0) $
+    printf "A cached key watches every address of %d transactions in a hundred\n" watched
   began <- getMonotonicTimeNSec
   db <- evaluate (filled shape pool)
   -- all of it, and not what the first questions happen to look at
@@ -93,9 +102,22 @@ decideBench args = do
     forM_ [1 .. 3 :: Int] $ \_ -> decided shape pool db n
     putStrLn ""
 
--- | How many inputs and outputs a transaction has, and how many
--- transactions of the pool a block is in conflict with.
-data Shape = Shape {ins :: !Int, outs :: !Int, rivals :: !Int}
+-- | How many inputs and outputs a transaction has, how many
+-- transactions of the pool a block is in conflict with, and how many
+-- transactions in a hundred have their addresses watched by a cached
+-- key.
+data Shape = Shape {ins :: !Int, outs :: !Int, rivals :: !Int, watched :: !Int}
+
+-- | The cached keys that watch an address of a transaction, as writes to
+-- the model: one key of a thousand for all the addresses of a
+-- transaction that is watched.
+watching :: Shape -> Int -> [Op]
+watching shape c
+  | c `mod` 100 < shape.watched =
+      [ SAdd ("hs3:btc:fx:of:" <> a) (C.pack ("key" <> show (c `mod` 1000)))
+      | a <- [address 0 c i | i <- [0 .. shape.ins - 1]] <> [address 1 c i | i <- [0 .. shape.outs - 1]]
+      ]
+  | otherwise = []
 
 -- | The number of a transaction of the pool that a block conflicts with:
 -- the last ones of the pool, which no block here confirms, those that
@@ -191,8 +213,9 @@ filled shape pool = foldl' offered start [1 .. pool]
         [ HSet "hs3:btc:fleet:lease" "a" (C.pack (show (now + 10000))),
           HSet "hs3:btc:fleet:recent" "a" target
         ]
-    offered db c =
-      let with = offer (unspent shape c) (poolTx shape c) db
+    offered db0 c =
+      let db = foldl' (flip perform) db0 (watching shape c)
+          with = offer (unspent shape c) (poolTx shape c) db
        in if shape.outs > 1 && c `mod` 10 == 0 then offer [False] (child c) with else with
     offer :: [Bool] -> PoolTx -> Db -> Db
     offer oks tx db = case runPure now (D.offer keys Nothing oks [] tx) db of
@@ -238,7 +261,9 @@ decided shape pool db n = do
             lost = []
           }
       move :: (Monad m) => Atomic m Moved
-      move = D.advance keys Nothing target (Just now) 32 (D.Changing change) [] ""
+      move = D.advance keys Nothing target (Just now) 32 (D.AtOnce change) [] ""
+      mark :: (Monad m) => Atomic m Moved
+      mark = D.advance keys Nothing target (Just now) 32 (D.Changing change) [] ""
   before <- stats
   began <- getMonotonicTimeNSec
   outcome <- runAtomic Backend {fetch, time = return now} move
@@ -283,7 +308,40 @@ decided shape pool db n = do
       ((a.gc_elapsed_ns - b.gc_elapsed_ns) `div` 1000000)
       (a.gcs - b.gcs)
   when (answers == 0) (error "A move that asked nothing")
+  -- the same move with what leaves only marked, and then taken out a
+  -- few transactions at a time
+  (ms, asked, wrote, calls, after1) <- step db mark
+  printf "  marked: %d ms, %d answers, %d writes, in %d calls\n" ms asked wrote calls
+  let chunks = pieces 200 confirmed
+      go (total, longest, most, d) chunk = do
+        (t, _, w, _, d') <- step d (D.takeOut keys chunk)
+        return (total + t, max longest t, max most w, d')
+  (total, longest, most, _) <- foldM go (0, 0, 0 :: Int, after1) chunks
+  printf
+    "  taken out: %d ms in %d steps of 200 transactions, the longest %d ms and %d writes\n"
+    total
+    (length chunks)
+    longest
+    most
   where
+    pieces n xs = case splitAt n xs of
+      (a, []) -> [a]
+      (a, rest) -> a : pieces n rest
+    -- decide against a model, and carry out: how long the deciding took,
+    -- its answers, its writes, how many times the model was asked, and
+    -- the model after it
+    step :: Db -> (forall m. (Monad m) => Atomic m a) -> IO (Word64, Int, Int, Int, Db)
+    step d decision = do
+      from <- getMonotonicTimeNSec
+      outcome <- runAtomic Backend {fetch = return . map (answer d), time = return now} decision
+      case outcome of
+        Decided _ depends writes calls -> do
+          a <- evaluate (length depends)
+          let kept' = tidy writes
+          w <- evaluate (length kept')
+          to <- getMonotonicTimeNSec
+          return (millis (to - from), a, w, calls, foldl' (flip perform) d kept')
+        Stuck why -> error (show why)
     stats =
       getRTSStatsEnabled >>= \case
         True -> Just <$> getRTSStats

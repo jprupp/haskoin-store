@@ -160,6 +160,34 @@ if redis.call('SISMEMBER', key.marked, id) == 1 then
   end
   return {'miss'}
 end
+-- A move of the tip marks what its blocks took out of the pool, and the
+-- transactions leave after it (pool:leaving, and takeOut in
+-- Haskoin.Store.Fleet.Pool.Decide). The entry has the chain at the tip
+-- already, and what the pool keeps for its addresses still counts them.
+-- So a read of an entry that has one of them answers {'leaving', ...}
+-- with those, and reads nothing: the store takes them out and reads
+-- again. Every transaction at an address of the entry is in its list,
+-- whichever of the chain or the pool it is from.
+local leaving = prefix .. 'pool:leaving'
+if redis.call('EXISTS', leaving) == 1 then
+  local found = {'leaving'}
+  if redis.call('ZCARD', e .. 'txs') <= redis.call('HLEN', leaving) then
+    for _, t in ipairs(redis.call('ZRANGE', e .. 'txs', 0, -1)) do
+      if redis.call('HEXISTS', leaving, t) == 1 then
+        found[#found + 1] = t
+      end
+    end
+  else
+    for _, t in ipairs(redis.call('HKEYS', leaving)) do
+      if redis.call('ZSCORE', e .. 'txs', t) then
+        found[#found + 1] = t
+      end
+    end
+  end
+  if #found > 1 then
+    return found
+  end
+end
 -- every read gives the version of the entry, which each change stamps
 local answer = {'ok', redis.call('HGET', e .. 'meta', 'ver') or '0'}
 

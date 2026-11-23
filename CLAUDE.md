@@ -86,7 +86,11 @@ A decision is carried out only if nothing that it read has changed, which
 makes it right and does not make it happen: one that reads much loses
 every race to those that read little. The move of the tip has the floor
 for that (`docs/concurrency.md`, "The floor"). A new decision that writes
-to the pool or to the cache gives way to it (`floorHeld`), and one that
+to the pool or to the cache gives way to it (`floorHeld`), and to what a
+move marked as leaving and has not taken out yet (`leavingHeld`,
+"After the move"); a new read of the pool or of the cache has to name
+the marked transactions in its way, in `read.lua` or `xpub.lua`, and the
+test of that in `DecideSpec` (`reading`) has to read it. A decision that
 reads much needs a turn of its own. Test a decision at the size and under
 the traffic of a full block: `crowded` in `Haskoin.Store.Fleet.DecideSpec`
 and `unceasing` in `Haskoin.Store.MempoolSpec` are the examples. A test

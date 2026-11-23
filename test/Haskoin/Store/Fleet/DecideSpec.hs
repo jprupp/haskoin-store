@@ -6,7 +6,7 @@ module Haskoin.Store.Fleet.DecideSpec (spec, Dump, everything) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (withAsync)
-import Control.Monad (foldM_, forM, forM_, forever, void, when)
+import Control.Monad (foldM_, forM, forM_, forever, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -134,7 +134,21 @@ spec = do
               planned.result `shouldBe` MovedTo (block 77)
               return planned.rounds
         mapM (asked False) [40, 400] `shouldReturn` [3, 3]
-        mapM (asked True) [40, 400] `shouldReturn` [5, 5]
+        -- one less than when the move took them out itself: it asks
+        -- nothing of the addresses of what leaves
+        mapM (asked True) [40, 400] `shouldReturn` [4, 4]
+      -- A move marks what leaves the pool, and a read that would go by
+      -- a marked transaction takes it out first. So whatever is read
+      -- between the move and the end of the taking out is what is read
+      -- once all of it is out: here every kind of read, of every address,
+      -- transaction and output of these histories, from a pool that has
+      -- only been marked, against the same pool with everything out.
+      modifyMaxSuccess (const 300) $
+        it "is read while a block's transactions leave as it is read once they are out" $ \(conn, fresh) ->
+          property $ \steps -> ioProperty $ do
+            marked <- fresh
+            out' <- fresh
+            foldM_ (reading conn marked out') (Nothing, 0) (steps :: [PoolStep])
       modifyMaxSuccess (const 300) $
         it "is decided in Haskell as the script decides it, state by state" $ \(conn, fresh) ->
           property $ \steps -> ioProperty $ do
@@ -188,7 +202,11 @@ longMove saying conn keys = do
         target
         Nothing
         keys.size
-        (D.Changing (PoolChange [] [] (map (.txid) txs) [] (Just 100) []))
+        -- the move that takes everything out in one step, as a move
+        -- that undoes a block still does: the long decision is what
+        -- the floor is for. One that only marks what leaves depends on
+        -- nothing that these offers change, and is not refused.
+        (D.AtOnce (PoolChange [] [] (map (.txid) txs) [] (Just 100) []))
         []
         "token"
 
@@ -337,6 +355,19 @@ crowded conn keys = do
         threadDelay 300000
         cacheBegin conn keys "token" "" `shouldReturn` Begun
         fleetCommit conn keys 4 Nothing "a" Nothing target (Just change) [] "token" `shouldReturn` MovedTo target
+        -- the tip is at the block, and what the block confirmed is
+        -- marked and still in the pool: nothing is offered into it, and
+        -- it is taken out two hundred at a time, under the same traffic
+        fleetTip conn keys `shouldReturn` Just target
+        marked <- poolLeaving conn keys
+        length marked `shouldBe` fromIntegral n
+        poolOffer conn keys 4 (Just target) (child (1 :: Word32)) [False] [] `shouldReturn` Late
+        let pieces xs = case splitAt 200 xs of
+              (a, []) -> [a]
+              (a, rest) -> a : pieces rest
+        taken <- mapM (poolTakeOut conn keys 4) (pieces marked)
+        sum taken `shouldBe` fromIntegral n
+        poolLeaving conn keys `shouldReturn` []
   fleetTip conn keys `shouldReturn` Just target
   left <- map fst <$> poolSpends conn keys
   filter (`elem` map (.txid) txs) left `shouldBe` []
@@ -469,6 +500,24 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
                   <$> luaCommit conn lua 4 (Just 0) "a" tip target (Just sent) [block n, target] token
                   <*> transact conn 1 (D.advance k tip target (Just 0) 4 (D.Changing sent) [block n, target] token)
       decided `shouldBe` Just moved
+      -- The move in Haskell only marks what leaves the pool when no
+      -- block is undone, where the script took it out: it is taken out
+      -- here, in an order and in pieces that change from one step to
+      -- the next, and the two are the same again after it. Until then
+      -- nothing else is put in or taken out.
+      marked <- either (error . show) id <$> Redis.runRedis conn (Redis.hkeys (ours.prefix <> "pool:leaving"))
+      unless (null marked) $ do
+        transact conn 1 (D.offer k (Just target) [] [] (txOf 4000 [])) `shouldReturn` Just Late
+        transact conn 1 (D.withdraw k marked) `shouldReturn` Just []
+        let order = if even n then marked else reverse marked
+            size = 1 + fromIntegral (n `mod` 3)
+            pieces xs = case splitAt size xs of
+              (a, []) -> [a]
+              (a, rest) -> a : pieces rest
+        counts <- forM (pieces order) (\piece -> transact conn 1 (D.takeOut k piece))
+        fmap sum (sequence counts) `shouldBe` Just (length marked)
+        -- and taking them out again takes nothing
+        transact conn 1 (D.takeOut k marked) `shouldReturn` Just 0
       let cutoff = toInteger (timeOf (sum dead))
           most = length done + 1
       expected <- luaExpire conn lua 4 cutoff most
@@ -479,6 +528,73 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
   here <- everything conn ours.prefix
   versions here0 here `shouldBe` versions there0 there
   return (there, here, tip', n')
+
+-- carry a step out under two prefixes, by the decisions. After a move,
+-- under the first what leaves the pool is only marked, and under the
+-- second it is all taken out: every read of the first is then the read
+-- of the second, and takes out what it has to. Then the rest is taken
+-- out, and Redis has the same under both.
+reading :: Redis.Connection -> FleetKeys -> FleetKeys -> (Maybe ByteString, Word32) -> PoolStep -> IO (Maybe ByteString, Word32)
+reading conn (marked :: FleetKeys) (settled :: FleetKeys) (tip, n) step = do
+  let each f = forM_ [marked, settled] (\(keys :: FleetKeys) -> f keys (D.poolKeys keys.prefix 4))
+      everyone = [0 .. 12] :: [Word32]
+      outs = [out t i | t <- everyone, i <- [0, 1]]
+      reads at =
+        [("sums", map address everyone), ("bodies", [B.concat (map block everyone)])]
+          <> [("spenders", [B.concat outs]), ("replaced", map block everyone)]
+          <> [("page", ["0", "0"]), ("page", ["1", "3"]), ("ids", [""]), ("ids", ["\0\0\0"])]
+          <> concat
+            [ [ ("txs", [address a, "", "", "100"]),
+                ("outs", [address a, "", "", "100"]),
+                ("spent", [address a, B.concat outs]),
+                ("tokens", [address a])
+              ]
+            | a <- at
+            ]
+  case step of
+    Give t inputs replaced -> do
+      let spent = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
+          tx = txOf t (map fst spent)
+      each $ \_ k -> void (transact conn 1 (D.offer k tip (map snd spent) (map block replaced) tx))
+      return (tip, n)
+    Take ts -> do
+      each $ \_ k -> void (transact conn 1 (D.withdraw k (map block ts)))
+      return (tip, n)
+    Go back dead done used -> do
+      let target = block (1000 + n)
+          height = 700 * (n + 1)
+          -- two moves in three undo no block, and so only mark
+          undo = n `mod` 3 == 2
+          labelled = [(out a i, block ((a * 7 + i * 3 + n) `mod` 12) <> encode height) | (a, i) <- used]
+          sent =
+            PoolChange
+              [txOf (number (block t)) [out a i | (a, i) <- nubOrd ins, a < t] | undo, (t, ins) <- back]
+              [block t | undo, t <- dead]
+              (map block done)
+              [o <> w | (o, w) <- labelled]
+              (Just height)
+              []
+      results <- forM [marked, settled] $ \(keys :: FleetKeys) -> do
+        fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
+        transact conn 1 (D.advance (D.poolKeys keys.prefix 4) tip target (Just 0) 4 (D.Changing sent) [] "")
+      let tip' = if all (== Just (MovedTo target)) results then Just target else tip
+      take 1 results `shouldBe` drop 1 results
+      -- everything out under the second prefix
+      left <- poolLeaving conn settled
+      unless (null left) (void (poolTakeOut conn settled 4 left))
+      -- every read under the first is the read under the second; the
+      -- addresses in an order of their own each time
+      let at = drop (fromIntegral n `mod` 5) everyone <> take (fromIntegral n `mod` 5) everyone
+      forM_ (reads at) $ \(what, args) -> do
+        got <- poolRead conn marked 4 tip' what args
+        expected <- poolRead conn settled 4 tip' what args
+        (what, args, got) `shouldBe` (what, args, expected)
+      rest <- poolLeaving conn marked
+      unless (null rest) (void (poolTakeOut conn marked 4 rest))
+      there <- everything conn marked.prefix
+      here <- everything conn settled.prefix
+      versions [] there `shouldBe` versions [] here
+      return (tip', n + 1)
 
 -- the version of an entry of the cache as whether it is new since the
 -- step before. Every change to an address gives the entries that have

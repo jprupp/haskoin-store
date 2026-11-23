@@ -13,7 +13,7 @@ module Haskoin.Store.Fleet.RedisSpec
   )
 where
 
-import Control.Monad (foldM_, forM_)
+import Control.Monad (foldM_, forM_, unless, void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -93,10 +93,10 @@ spec = do
         poolOffer conn keys 4 (Just (block 1)) seven [True] [] `shouldReturn` Taken
         poolBody conn keys (block 7) `shouldReturn` Just "seven"
         -- the tip does not move to a block that the stores do not agree on
-        fleetAdvance conn keys 4 Nothing "a" (Just (block 1)) (block 2) (Just nothing) [] `shouldReturn` Raced
+        advancing conn keys 4 Nothing "a" (Just (block 1)) (block 2) (Just nothing) [] `shouldReturn` Raced
         fleetReport conn keys Nothing 60000 "a" [block 2, block 1] [block 1] `shouldReturn` True
         let confirms = nothing {confirmed = [block 7], spent = [out 0 0 <> block 7 <> encode (2 :: Word32)]}
-        fleetAdvance conn keys 4 Nothing "a" (Just (block 1)) (block 2) (Just confirms) []
+        advancing conn keys 4 Nothing "a" (Just (block 1)) (block 2) (Just confirms) []
           `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         poolBody conn keys (block 7) `shouldReturn` Nothing
@@ -146,7 +146,7 @@ spec = do
       it "tells what happens to the pool and to the tip, in the order in which it happens" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys Nothing 60000 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 Nothing "a" Nothing (block 1) (Just nothing) [] `shouldReturn` MovedTo (block 1)
+        advancing conn keys 4 Nothing "a" Nothing (block 1) (Just nothing) [] `shouldReturn` MovedTo (block 1)
         -- a store that starts to listen hears what comes after
         start <- fleetEventsEnd conn keys
         let seven = txOf 7 [out 0 0]
@@ -160,7 +160,7 @@ spec = do
         -- and the tip moves through two blocks
         fleetReport conn keys Nothing 60000 "a" [block 3, block 2, block 1] [block 1] `shouldReturn` True
         let confirms = nothing {confirmed = [block 9], spent = [out 0 1 <> block 9 <> encode (3 :: Word32)]}
-        fleetAdvance conn keys 4 Nothing "a" (Just (block 1)) (block 3) (Just confirms) [block 2, block 3]
+        advancing conn keys 4 Nothing "a" (Just (block 1)) (block 3) (Just confirms) [block 2, block 3]
           `shouldReturn` MovedTo (block 3)
         heard <- map snd <$> fleetEventsAfter conn keys start 10
         take 3 heard `shouldBe` map FleetEntered [block 7, block 8, block 9]
@@ -172,29 +172,29 @@ spec = do
       it "empties the pool for a store that is alone and does not know the way" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        advancing conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
         -- with another store live, the tip waits for one that knows
         fleetReport conn keys (Just 0) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
         fleetReport conn keys (Just 0) 10 "b" [block 2, block 1] [block 1] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
+        advancing conn keys 4 (Just 0) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
         map fst <$> poolSpends conn keys `shouldReturn` [block 7]
         -- a store that is not live, whose report was refused, does not
         -- empty the pool however many stores are live
-        fleetAdvance conn keys 4 (Just 0) "x" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
+        advancing conn keys 4 (Just 0) "x" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
         -- the other store's lease runs out
         fleetReport conn keys (Just 20) 10 "a" [block 2, block 1] [block 1] `shouldReturn` True
         -- and with "a" the one store live, a store that is not live still
         -- may not empty it: "a" may know the way
-        fleetAdvance conn keys 4 (Just 20) "x" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
-        fleetAdvance conn keys 4 (Just 20) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` MovedTo (block 2)
+        advancing conn keys 4 (Just 20) "x" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
+        advancing conn keys 4 (Just 20) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` MovedTo (block 2)
         poolSpends conn keys `shouldReturn` []
         (Redis.runRedis conn (Redis.keys (keys.prefix <> "pool:*")) >>= either (fail . show) return)
           `shouldReturn` []
       it "empties the pool for any store when the way is too long" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        advancing conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         poolOffer conn keys 4 (Just (block 1)) (txOf 7 [out 0 0]) [True] [] `shouldReturn` Taken
         fleetSettled conn keys [block 7] `shouldReturn` [True]
         fleetRestarts conn keys `shouldReturn` 0
@@ -203,7 +203,7 @@ spec = do
         fleetReport conn keys (Just 0) 10 "a" [block 2] [block 2, block 1] `shouldReturn` True
         fleetReport conn keys (Just 0) 10 "b" [block 2] [block 2, block 1] `shouldReturn` True
         -- a store that does not know the way waits for one that does
-        fleetAdvance conn keys 4 (Just 0) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
+        advancing conn keys 4 (Just 0) "a" (Just (block 1)) (block 2) Nothing [] `shouldReturn` Raced
         fleetTip conn keys `shouldReturn` Just (block 1)
         -- one that knows it and finds it too long does not, or the tip
         -- would never move again
@@ -222,7 +222,7 @@ spec = do
       it "reads what the pool does to tokens, by address and by category" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        advancing conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         -- ten transactions: the fifth spends the first output of the first
         -- two, and the tenth an output of the chain that holds tokens
         let tip = Just (block 1)
@@ -257,7 +257,7 @@ spec = do
       it "reads the pool by the page, as it is at the tip that is asked for" $ \(conn, fresh) -> do
         keys <- fresh
         fleetReport conn keys (Just 0) 10 "a" [block 1] [] `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
+        advancing conn keys 4 (Just 0) "a" Nothing (block 1) Nothing [] `shouldReturn` MovedTo (block 1)
         let tip = Just (block 1)
             a = address 1
         -- nine transactions, of which the fifth spends the first output of
@@ -383,7 +383,7 @@ spec = do
                 (Just height)
                 [t <> w | (t, _, w) <- lost]
         fleetReport conn keys (Just 0) 10 "a" [target] (maybe [] pure tip) `shouldReturn` True
-        fleetAdvance conn keys 4 (Just 0) "a" tip target (Just sent) [] `shouldReturn` MovedTo target
+        advancing conn keys 4 (Just 0) "a" tip target (Just sent) [] `shouldReturn` MovedTo target
         let (records, waiting) = kept
             (model', replaced, waiting') = P.advanceReplacing maker change (`lookup` labelled) lost waiting model
             -- what a transaction that comes back had replaced is forgotten
@@ -686,6 +686,27 @@ instance Arbitrary PoolStep where
 
 -- | A Redis in a container, reached through a socket of its pod, and a way
 -- to get the keys of a fleet that no test has used.
+-- | Move the tip, and then take out of the pool what the move marked as
+-- leaving, as the store that moves the tip does
+-- (@Haskoin.Store.Fleet.Member.clearLeaving@): the pool is then as the
+-- rules say it is after the move.
+advancing ::
+  Redis.Connection ->
+  FleetKeys ->
+  Int ->
+  Maybe Time ->
+  ByteString ->
+  Maybe ByteString ->
+  ByteString ->
+  Maybe PoolChange ->
+  [ByteString] ->
+  IO Moved
+advancing conn keys tsize clock store seen target known path = do
+  moved <- fleetAdvance conn keys tsize clock store seen target known path
+  marked <- poolLeaving conn keys
+  unless (null marked) (void (poolTakeOut conn keys tsize marked))
+  return moved
+
 withRedis :: ((Redis.Connection, IO FleetKeys) -> IO ()) -> IO ()
 withRedis go =
   withContainer redisContainer $ \p -> do

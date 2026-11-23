@@ -348,6 +348,48 @@ and timers through it, and checks that a well store leaves nothing
 waiting. A turn offers no transaction: the path into the pool does, each
 as it comes (`memberOffer`).
 
+### After the move: the pool lets go
+
+A move of the tip over new blocks alone marks what leaves the pool, and
+does not take it out (`docs/fleet-mempool.md`, "The tip first"). So the
+long decision that the floor is for is now the move that undoes a block,
+and the common move reads a fifth of what it read and writes a
+twentieth.
+
+Who owns what, between the move and the last transaction out:
+
+- **The marks** (`pool:leaving`) are written by the move, in the step
+  that moves the tip, and only when there are none: a move finds the
+  marks of the one before it and waits (`Leaving`).
+- **A mark is removed only by the decision that takes its transaction
+  out** (`takeOut`), in the same step. Anyone may make that decision,
+  for any marked transactions: the store that moved the tip, another
+  store at its turn, a request that has to read one. It does nothing for
+  a transaction that is not marked, so making it twice, or by two at
+  once, is making it once.
+- **Everything else that writes the pool or the cache reads whether
+  there is a mark, and does nothing if there is** (`leavingHeld`): the
+  offer, the withdrawal, the expiry, the build, the drop and the
+  eviction of an entry, and the next move. Each is carried out only if
+  that answer still holds, as with any answer of a decision.
+- **A read** goes by no marked transaction (`read.lua`, `xpub.lua`): it
+  names those in its way, they are taken out, and it reads again.
+
+Why no interleaving breaks it. Between the move and the last
+transaction out, the only writes to the pool and to the cache are
+takings out. Each takes whole transactions out, exactly as the move took
+them out when it did so itself, and the order does not matter: this is
+what `Haskoin.Store.Fleet.DecideSpec` holds to the old script, state by
+state, with the order and the pieces changing. A read sees either the
+pool before a taking out or after it, never half of one, and what it
+reads is written only by transactions that it has had taken out. A store
+that stops leaves marks, and the next turn of any store takes them out:
+nothing waits for a store that is gone.
+
+This is tested, not proved: by random histories against Redis for the
+decisions and for the reads of the pool, and by one case for the reads
+of the cache.
+
 ## The web server
 
 | Protocol | Machine | Rule |

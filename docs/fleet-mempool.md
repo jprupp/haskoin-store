@@ -138,6 +138,47 @@ the new block is still the one the live servers agree on. Then it changes
 the pool, moves the tip, counts the move, and tells the blocks as events.
 Two servers that try at once do it once: the second finds the tip changed.
 
+### The tip first, and the pool lets go after it
+
+A move over new blocks alone, which nearly every move is, does not take
+out of the pool what the blocks confirmed or replaced. It **marks** each
+of those transactions (`pool:leaving`, one field for each: nothing for
+one that a block confirmed, and for one that a block is in conflict
+with, the transaction that replaced it and the height). That is one write
+for each, and the tip is at the new block. The transactions then leave a
+few at a time (`takeOut`, two hundred to a decision), each as it left
+before: the store that moved the tip does it, and so does any store at
+its next turn, for one that stops in between.
+
+Why. Taking a transaction out is taking it out of all that mentions it:
+the lists and the sums of each of its addresses, and the entry of every
+cached key that has one of them. For a full block that was tens of
+thousands of questions and more than a hundred thousand writes in one
+decision, for which the tip waited: seconds of it in Haskell, and nearly
+a second in Redis on a server, where Redis answers nobody else while it
+carries a decision out. It grew with the number of cached keys. The tip
+of a server was five to fifteen seconds behind its node at every full
+block, and once, on a machine short of memory, Redis answered nobody for
+twenty-three seconds. Marking is decided in a tenth of the time whatever
+the number of cached keys, and no step of the taking out is long.
+
+What makes it right is that nobody sees a marked transaction:
+
+- **Nothing else changes the pool or the cache meanwhile.** While a
+  transaction is marked, an offer is late, a withdrawal takes nothing,
+  no entry of the cache is built, dropped or evicted, and the next move
+  waits (`leavingHeld`), as all of them do while a store has the floor.
+- **A read that would go by a marked transaction takes it out first**
+  (below). So every answer is the answer of a pool that has let go of
+  everything.
+- **Taking out is the same in any order and by anyone.** One that is no
+  longer marked is left alone, so two stores, or a store and a request,
+  take nothing out twice.
+
+A move that undoes a block takes everything out in its own step, as all
+moves did: a transaction that comes back to the pool has to find what
+the new blocks did already done.
+
 ### What the blocks replaced
 
 The pool also keeps what the blocks replaced, so that every server answers
@@ -240,6 +281,18 @@ enter between two reads of the same request. A balance and a list can
 differ by it. Reads of an xpub are exact: they see one version of its
 entry, and the request is answered again if it changes.
 
+After a move, the chain at the tip has the transactions that the blocks
+confirmed, and the pool still has those that are marked as leaving. A
+read that would go by one of them says so, with which, and reads
+nothing: the store takes those out and reads again (`poolRead`, and the
+reads of the cache). Which those are is known without reading them all.
+What the pool keeps for an address is written by the transactions at
+that address and by no other, and the same for a category of tokens; an
+entry of the cache lists every transaction at its addresses; a
+transaction and an output are read with what spends them. A read that
+goes by none of them reads the pool as it will be once they are all out.
+The list of the whole pool is read without them.
+
 ## What a fleet reads of a server's database
 
 RocksDB holds the chain alone. A fleet reads:
@@ -272,6 +325,12 @@ These hold after every script call:
 - **Tip and pool together.** Only a decision of the pool changes either,
   in one step, after checking the tip it was given. Reads check the tip
   too.
+- **What a block took out is out, or marked.** After a move, each
+  transaction that the blocks confirmed or replaced is out of the pool
+  or marked as leaving, in the same step as the tip. Nothing but the
+  taking out changes the pool while one is marked, and no read goes by
+  one. So the three rules above hold of the pool without the marked
+  transactions, which is the pool that every request sees.
 
 The check of the chain (the flags) happens in the server, outside Redis.
 That is safe because the flags are about the chain at one block, which
@@ -332,6 +391,15 @@ uses, and cannot be better without knowing what miners will do.
 - `Haskoin.Store.Fleet.RedisSpec`: the scripts against a real Redis, step
   by step against the model, the tokens included, plus the emptying
   rules, the events, and what counts as settled.
+- `Haskoin.Store.Fleet.DecideSpec`: the decisions held to the scripts
+  that they replaced, over random histories against a real Redis. A move
+  that marks, with the marked taken out afterwards in an order and in
+  pieces that change from step to step, leaves Redis as the script that
+  took everything out in one step did, and nothing is offered or
+  withdrawn meanwhile. And every kind of read, of every address,
+  transaction and output of a history, from a pool that has only been
+  marked, is the read of the same pool with everything out: it fails
+  with the guard of one kind of read taken away.
 - `Haskoin.Store.Fleet.CacheSpec`: two members on one chain and a real
   Redis: random histories of payments, blocks, reorganisations and builds,
   each cached entry held to the queries at the tip and the pool; a
@@ -339,7 +407,9 @@ uses, and cannot be better without knowing what miners will do.
   lost its data; a transaction that one member received fetched by the
   other until it is offered, and not after; and the token endpoints'
   queries on Bitcoin Cash, with tokens moved twice in the pool and then
-  confirmed.
+  confirmed; and a store that stops right after moving the tip, whose
+  cached key is then read without what the block confirmed, the read
+  taking it out.
 - `IntegrationSpec`, the fleet test: two servers against a real node and
   Redis, answering alike with a payment in the pool and after its block.
 

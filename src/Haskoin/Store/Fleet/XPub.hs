@@ -185,6 +185,7 @@ import Haskoin.Store.Database.Reader (DatabaseReader (..), Derived (..), derived
 import Haskoin.Store.Database.Types (MemSummary (..))
 import Haskoin.Store.Fleet.Atomic (Atomic)
 import Haskoin.Store.Fleet.Atomic.Redis (insist, transact)
+import Haskoin.Store.Fleet.Pool.Decide qualified as P
 import Haskoin.Store.Fleet.Redis (FleetKeys (..), Script, evalScript, script)
 import Haskoin.Store.Fleet.XPub.Decide qualified as X
 import Haskoin.Store.XPub (greedyLua, indexCost)
@@ -434,6 +435,11 @@ ask conn keys what args = go (400 :: Int)
         ["raced"] -> return Moved
         ["marked"]
           | tries > 0 -> threadDelay 5000 >> go (tries - 1)
+          | otherwise -> return Moved
+        -- the entry has transactions that a move of the tip marked as
+        -- leaving the pool: they are taken out, and it is read again
+        "leaving" : ts
+          | tries > 0 -> insist conn (P.takeOut (P.poolKeys keys.prefix 32) ts) >> go (tries - 1)
           | otherwise -> return Moved
         other -> fail ("Unexpected answer of the xpub script: " <> show (take 1 other))
 

@@ -34,6 +34,9 @@ data Moved
     Stays
   | -- | another store moved the tip first
     Raced
+  | -- | the pool still has transactions that the last move marked as
+    -- leaving: they are taken out first
+    Leaving
   deriving (Eq, Show)
 
 -- | What became of an offer; see t'Haskoin.Store.Fleet.Pool.Offer'.

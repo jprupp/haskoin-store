@@ -43,6 +43,8 @@ module Haskoin.Store.Fleet.Pool.Decide
     entryOval,
     entryMeta,
     floorHeld,
+    leavingHeld,
+    takeOut,
     offer,
     withdraw,
     expire,
@@ -51,7 +53,7 @@ module Haskoin.Store.Fleet.Pool.Decide
   )
 where
 
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (foldM_, forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
@@ -129,6 +131,11 @@ data Keys = Keys
     lost :: !(K 'Hash),
     lostby :: !(Family 'Group),
     lostat :: !(K 'Sorted),
+    -- | the transactions that a move of the tip marked as leaving, and
+    -- that are still in the pool ('takeOut'): nothing for one that a
+    -- block confirmed, and for one that a block is in conflict with the
+    -- transaction that replaced it and the height of the block
+    leaving :: !(K 'Hash),
     -- | the place of the tip that the cache of extended public keys is at
     xtip :: !(K 'Text),
     -- | the move of the cache that is under way: its token
@@ -181,6 +188,7 @@ poolKeys p tsize =
       lost = named (p <> "pool:lost"),
       lostby = family (p <> "pool:lostby:"),
       lostat = named (p <> "pool:lostat"),
+      leaving = named (p <> "pool:leaving"),
       xtip = named (p <> "fx:tip"),
       moving = named (p <> "fx:moving"),
       beat = named (p <> "fx:beat"),
@@ -222,13 +230,19 @@ member k = hexists k.spends
 -- | The transactions of the pool among these, and all that spend them,
 -- each once and none before one that it spends from among them.
 descendants :: (Monad m) => Keys -> [ByteString] -> Atomic m [ByteString]
-descendants k from = do
+descendants k = descendantsBut k Set.empty
+
+-- | 'descendants' without some transactions, nor what spends from the
+-- rest only through them: a transaction that a block confirms leaves
+-- what spends from it in the pool.
+descendantsBut :: (Monad m) => Keys -> Set.Set ByteString -> [ByteString] -> Atomic m [ByteString]
+descendantsBut k but from = do
   roots <- filterM' (member k) from
   go Set.empty [] (reverse roots)
   where
     go _ order [] = return (reverse order)
     go done order (t : todo)
-      | Set.member t done = go done order todo
+      | Set.member t done || Set.member t but = go done order todo
       | otherwise = do
           children <- smembers (under k.kids t)
           go (Set.insert t done) (t : order) (Set.toDescList children <> todo)
@@ -434,8 +448,8 @@ departing k t es =
 -- is gone through again for it. Nothing depends on this being right:
 -- @asks Redis no more times@ in "Haskoin.Store.Fleet.DecideSpec" fails
 -- when a question is missing here.
-foreseen :: Keys -> Maybe ByteString -> ByteString -> Integer -> PoolChange -> [Ahead]
-foreseen k saw target now change =
+foreseen :: Keys -> Maybe ByteString -> ByteString -> Integer -> Bool -> PoolChange -> [Ahead]
+foreseen k saw target now light change =
   [ thenText k.tip $ \tip ->
       let at = fromMaybe "" tip
        in if at /= fromMaybe "" saw || at == target then [] else rest
@@ -445,6 +459,7 @@ foreseen k saw target now change =
       [ thenAbove k.lease now (map (only . askingField k.recent) . Set.toList),
         only (askingNumber k.moves),
         only (asking k.moving),
+        only (askingWhether k.leaving),
         only (asking k.xtip),
         thenMembers k.marked $ \ids ->
           [only (askingNumber k.xver) | not (Set.null ids)]
@@ -467,7 +482,13 @@ foreseen k saw target now change =
     -- for sixty of them.
     rival t
       | Set.member t confirming = []
+      | light = only (askingWhetherField k.spends t) : kin t
       | otherwise = leaver t
+    -- all that spends from a transaction, to mark it: not what the
+    -- blocks confirm, which leaves what spends from it
+    kin t
+      | Set.member t confirming = []
+      | otherwise = [thenMembers (under k.kids t) (concatMap kin . Set.toList)]
     leaver t =
       [ only (askingWhetherField k.spends t),
         only (askingField k.spends t),
@@ -475,11 +496,16 @@ foreseen k saw target now change =
         thenField k.entries t (maybe [] (departing k t . snd . kept)),
         thenMembers (under k.kids t) (concatMap leaver . Set.toList)
       ]
-    confirmed t =
-      [ only (askingField k.spends t),
-        only (askingMembers (under k.lostby t)),
-        thenField k.entries t (maybe [] (departing k t . snd . kept))
-      ]
+    confirmed t
+      | light =
+          [ only (askingWhetherField k.spends t),
+            only (askingMembers (under k.lostby t))
+          ]
+      | otherwise =
+          [ only (askingField k.spends t),
+            only (askingMembers (under k.lostby t)),
+            thenField k.entries t (maybe [] (departing k t . snd . kept))
+          ]
 
 -- | The outputs that are written one after the other.
 outputs :: Keys -> ByteString -> [ByteString]
@@ -555,12 +581,54 @@ floorHeld k =
       said <- getNumber k.beat
       return (now - said <= 10000)
 
+-- | Whether the pool still has transactions that a move of the tip marked
+-- as leaving. Nothing else is put in or taken out of the pool until they
+-- are out ('takeOut'): an offer is 'Late', a withdrawal takes nothing,
+-- and the next move waits, as all of them do while a store has the floor.
+leavingHeld :: (Monad m) => Keys -> Atomic m Bool
+leavingHeld k = exists k.leaving
+
+-- | Take out of the pool some of the transactions that a move of the tip
+-- marked as leaving, and say how many of these were: one that a block
+-- confirmed leaves quietly, and one that a block is in conflict with
+-- leaves as withdrawn, and is kept as replaced. One that is not marked,
+-- or no longer, is left alone, so that two stores may take the same ones
+-- out.
+--
+-- A move of the tip over a full block took what the block confirmed out
+-- of the pool in the same step: tens of thousands of questions and a
+-- hundred thousand writes, for which the tip waited, seconds of them in
+-- Redis, which answers nobody else meanwhile. The move now marks them,
+-- which is one write for each, and the tip is at the new block. They
+-- leave here, a few at a time, in the same way and to the same end, and
+-- a request that would read one of them takes it out first.
+takeOut :: (Monad m) => Keys -> [ByteString] -> Atomic m Int
+takeOut k ts = do
+  ready <- ahead [thenField k.leaving t (maybe [] (going t)) | t <- ts]
+  if ready then length . filter id <$> mapM one ts else return 0
+  where
+    going t by =
+      [ only (askingField k.spends t),
+        thenField k.entries t (maybe [] (departing k t . snd . kept))
+      ]
+        <> [only (askingField k.rep t) | not (B.null by)]
+    one t =
+      hget k.leaving t >>= \case
+        Nothing -> return False
+        Just by -> do
+          if B.null by
+            then remove k True t
+            else remove k False t >> replaced k t by
+          hdel k.leaving t
+          return True
+
 -- | Withdraw transactions and all that spends them: those that left. None
 -- while a store is moving the tip.
 withdraw :: (Monad m) => Keys -> [ByteString] -> Atomic m [ByteString]
 withdraw k from = do
   held <- floorHeld k
-  if held then return [] else withdrawn k from
+  busy <- leavingHeld k
+  if held || busy then return [] else withdrawn k from
 
 -- | 'withdraw' whoever has the floor: for the move of the tip itself.
 withdrawn :: (Monad m) => Keys -> [ByteString] -> Atomic m [ByteString]
@@ -596,7 +664,8 @@ offer k saw unspent replaces tx = do
   prefetch (likely k tx <> map (askingWhetherField k.spends) replaces)
   at <- get k.tip
   held <- floorHeld k
-  if held || fromMaybe "" at /= fromMaybe "" saw
+  busy <- leavingHeld k
+  if held || busy || fromMaybe "" at /= fromMaybe "" saw
     then return Late
     else do
       known <- member k tx.txid
@@ -628,6 +697,7 @@ likely :: Keys -> PoolTx -> [Query]
 likely k tx =
   [ asking k.tip,
     asking k.moving,
+    askingWhether k.leaving,
     askingWhetherField k.spends t,
     askingField k.spends t
   ]
@@ -652,8 +722,13 @@ likely k tx =
 
 -- | What a store that moves the tip knows of the way.
 data How
-  = -- | what the blocks between the two tips did to the pool
+  = -- | what the blocks between the two tips did to the pool. With no
+    -- block to undo, what leaves the pool is marked and taken out
+    -- afterwards ('takeOut'); otherwise as 'AtOnce'.
     Changing !PoolChange
+  | -- | the same, with everything that leaves the pool taken out in the
+    -- move itself
+    AtOnce !PoolChange
   | -- | nothing, for it does not have the old tip: the pool is emptied,
     -- and only if this store, by its name, is the one that is live, since
     -- another may know the way
@@ -735,7 +810,10 @@ advance k saw target given bsize how path token = do
   ready <- case how of
     Changing change -> do
       now <- maybe clock return given
-      ahead (foreseen k saw target now change)
+      ahead (foreseen k saw target now (plain change) change)
+    AtOnce change -> do
+      now <- maybe clock return given
+      ahead (foreseen k saw target now False change)
     _ -> return True
   if ready then moving else return Raced
   where
@@ -766,12 +844,25 @@ advance k saw target given bsize how path token = do
                       | live /= [caller] -> return Raced
                       | otherwise -> emptied at after
                     TooLong -> emptied at after
-                    Changing change -> do
-                      current <- get k.moving
-                      let other = maybe False (/= token) current
-                      if other || (isNothing current && not (B.null token))
-                        then return Raced
-                        else changed change before after
+                    Changing change
+                      | plain change -> floored (marked change before after)
+                      | otherwise -> floored (changed change before after)
+                    AtOnce change -> floored (changed change before after)
+    -- A move over blocks is for the store that began the move of the
+    -- cache, and waits for what the move before it left in the pool.
+    floored go = do
+      busy <- leavingHeld k
+      current <- get k.moving
+      let other = maybe False (/= token) current
+      if busy
+        then return Leaving
+        else
+          if other || (isNothing current && not (B.null token))
+            then return Raced
+            else go
+    -- no block is undone: nothing comes back, and nothing that was
+    -- replaced is to be kept
+    plain change = null change.returned && null change.gone && null change.lost
     -- the cache of extended public keys at the new place of the tip: its
     -- entries gone if the pool is, or if it was not at the place before;
     -- and otherwise every entry that the move marked with a new version
@@ -800,6 +891,54 @@ advance k saw target given bsize how path token = do
       set k.tip target
       incrBy k.moves 1
       emit k "b" target
+      return (MovedTo target)
+    -- The move over new blocks alone, with what leaves the pool only
+    -- marked: 'takeOut' takes it out, a few transactions at a time.
+    marked change before after = do
+      let confirming = Set.fromList change.confirmed
+      forM_ change.confirmed $ \t -> do
+        ours <- member k t
+        when ours (hset k.leaving t "")
+      -- what waited for a transaction that they confirm was replaced
+      forM_ change.confirmed $ \t -> do
+        waiting <- smembers (under k.lostby t)
+        unless (Set.null waiting) $ do
+          forM_ (Set.toList waiting) $ \w -> do
+            value <- hget k.lost w
+            forM_ value (replaced k w)
+            hdel k.lost w
+            zrem k.lostat w
+          del (under k.lostby t)
+      -- what spends what they spend leaves with all that spends it: each
+      -- is marked with the first transaction that replaces it
+      foldM_
+        ( \seen item -> do
+            let (o, by) = B.splitAt (k.tsize + 4) item
+            s <- hget k.spender o
+            case s of
+              Just rival | Set.notMember rival confirming -> do
+                order <- descendantsBut k confirming [rival]
+                let new = filter (`Set.notMember` seen) order
+                forM_ new (\t -> hset k.leaving t by)
+                return (foldr Set.insert seen new)
+              _ -> return seen
+        )
+        Set.empty
+        (concatMap (pieces (2 * k.tsize + 8)) change.spent)
+      forM_ change.height $ \h -> when (h >= 2016) $ do
+        let limit = At (fromIntegral (h - 2016 :: Word32))
+        old <- zrangeByScore k.repat MinusInf limit Nothing
+        unreplaced k (map fst old)
+        stale <- zrangeByScore k.lostat MinusInf limit Nothing
+        forM_ stale $ \(t, _) -> do
+          value <- hget k.lost t
+          forM_ value $ \v -> srem (under k.lostby (B.take k.tsize v)) t
+          hdel k.lost t
+          zrem k.lostat t
+      settle False before after
+      set k.tip target
+      incrBy k.moves 1
+      forM_ (if null path then [target] else path) (emit k "b")
       return (MovedTo target)
     changed change before after = do
       -- the abandoned blocks: what can come back does, and what spends the

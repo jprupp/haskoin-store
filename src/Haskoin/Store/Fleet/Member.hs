@@ -89,6 +89,7 @@ module Haskoin.Store.Fleet.Member
     -- * The parts of a tick
     report,
     moveTip,
+    clearLeaving,
     Between (..),
     blocksBetween,
     wayBetween,
@@ -455,7 +456,13 @@ memberTick m = do
   -- whose report was refused has no view of the tip, and moving from a tip
   -- that it does not know would empty the pool that another store knows
   taken <- report m
+  -- what a move left in the pool for after it, if its store stopped
+  -- before taking it out: nothing enters the pool until it is out
+  when taken (clearLeaving m)
   moved <- if taken then moveTip m else return False
+  -- the tip is at the block: what the block took out of the pool was
+  -- only marked, and leaves now
+  when moved (clearLeaving m)
   -- the tip is read after the report, as the rule of 'F.keep' asks
   tip <- fmap decoded <$> fleetTip m.redis m.keys
   atomically (writeTVar m.tip (fromMaybe Nothing tip))
@@ -776,7 +783,8 @@ moveTip m = do
           case moved of
             MovedTo _ -> ": moved"
             Stays -> ": stays"
-            Raced -> ": not moved, another store did it first or has to",
+            Raced -> ": not moved, another store did it first or has to"
+            Leaving -> ": not moved, the pool has not let go of the last blocks yet",
           " in ",
           took,
           " (",
@@ -838,6 +846,40 @@ moveTip m = do
     chunks bytes
       | B.null bytes = []
       | otherwise = B.take 32 bytes : chunks (B.drop 32 bytes)
+
+-- | Take out of the shared mempool what the moves of the tip marked as
+-- leaving, two hundred transactions to a decision, until none is left.
+--
+-- A move over a block marks what the block confirmed or replaced, and the
+-- tip is at the block at once ('Haskoin.Store.Fleet.Pool.Decide.takeOut').
+-- The store that moved it takes them out, and so does any store at its
+-- next turn, for a store that stops in between: no transaction enters
+-- the pool while one is marked. Two stores at it take nothing out twice.
+-- It says how long it took when that is a second or more, since
+-- transactions wait meanwhile.
+clearLeaving :: Member -> IO ()
+clearLeaving m = do
+  began <- getMonotonicTimeNSec
+  taken <- go (0 :: Int)
+  ended <- getMonotonicTimeNSec
+  when (ended - began >= 1000000000) . m.config.note LevelInfo . mconcat $
+    [ "Took ",
+      shown taken,
+      " transactions that the blocks confirmed or replaced out of the shared mempool in ",
+      shown ((ended - began) `div` 1000000),
+      " ms"
+    ]
+  where
+    go n = do
+      marked <- poolLeaving m.redis m.keys
+      if null marked
+        then return n
+        else do
+          counts <- mapM (poolTakeOut m.redis m.keys 32) (pieces marked)
+          go (n + sum counts)
+    pieces xs = case splitAt 200 xs of
+      (a, []) -> [a]
+      (a, rest) -> a : pieces rest
 
 -- | The most blocks that 'changeBetween' goes through on either side of a
 -- fork. Beyond that, a store that is alone starts the pool again, which

@@ -8,6 +8,19 @@
 -- the pool goes with the tip, and laid over the chain of another block it
 -- would give a transaction twice or not at all. Otherwise it is {'ok', ...}.
 --
+-- A move of the tip marks what its blocks took out of the pool, and the
+-- transactions leave after it, a few at a time (pool:leaving, and takeOut
+-- in Haskoin.Store.Fleet.Pool.Decide). The chain has them already, at the
+-- tip that the store answers from, and the pool still does. So a read that
+-- would go by one of them answers {'leaving', ...} with those
+-- transactions, and reads nothing: the store takes them out and reads
+-- again. Which those are, for each read: what the pool keeps for an
+-- address is written by the transactions at that address and by no
+-- other, and the same for a category of tokens; a transaction and an
+-- output are read with what spends them. A read that goes by none of
+-- them reads the pool as it will be when they are all out. The list of
+-- the pool alone is read without them.
+--
 -- 'sums': addresses. For each, its seven sums separated by spaces, in the
 -- order of the summary, or '' if the pool has nothing for it.
 --
@@ -68,6 +81,69 @@ local function split(s, n)
     items[#items + 1] = string.sub(s, i, i + n - 1)
   end
   return items
+end
+
+local leaving = prefix .. 'pool:leaving'
+local some = redis.call('EXISTS', leaving) == 1
+if some then
+  local found, seen = {'leaving'}, {}
+  local function note(t)
+    if not seen[t] and redis.call('HEXISTS', leaving, t) == 1 then
+      seen[t] = true
+      found[#found + 1] = t
+    end
+  end
+  -- the marked among the members of a sorted set, going through the
+  -- smaller of the two
+  local function among(zkey)
+    if redis.call('ZCARD', zkey) <= redis.call('HLEN', leaving) then
+      for _, t in ipairs(redis.call('ZRANGE', zkey, 0, -1)) do
+        note(t)
+      end
+    else
+      for _, t in ipairs(redis.call('HKEYS', leaving)) do
+        if not seen[t] and redis.call('ZSCORE', zkey, t) then
+          seen[t] = true
+          found[#found + 1] = t
+        end
+      end
+    end
+  end
+  if what == 'sums' then
+    for i = 5, #ARGV do
+      among(prefix .. 'pool:atx:' .. ARGV[i])
+    end
+  elseif what == 'txs' or what == 'outs' or what == 'spent' or what == 'tokens' then
+    among(prefix .. 'pool:atx:' .. ARGV[5])
+  elseif what == 'holders' or what == 'csum' or what == 'ctxs' or what == 'couts' then
+    among(prefix .. 'pool:ctx:' .. ARGV[5])
+  elseif what == 'bodies' then
+    for _, t in ipairs(split(ARGV[5], tsize)) do
+      note(t)
+      for _, kid in ipairs(redis.call('SMEMBERS', prefix .. 'pool:kids:' .. t)) do
+        note(kid)
+      end
+    end
+  elseif what == 'spenders' then
+    for _, o in ipairs(split(ARGV[5], osize)) do
+      local s = redis.call('HGET', prefix .. 'pool:spender', o)
+      if s then
+        note(s)
+      end
+    end
+  elseif what == 'ids' then
+    for _, t in ipairs(redis.call('ZRANGEBYLEX', prefix .. 'pool:ids',
+      '[' .. ARGV[5], '(' .. ARGV[5] .. string.rep(string.char(255), tsize))) do
+      note(t)
+    end
+  elseif what == 'replaced' then
+    for i = 5, #ARGV do
+      note(ARGV[i])
+    end
+  end
+  if #found > 1 then
+    return found
+  end
 end
 
 -- whether one string of bytes sorts before another, as Redis sorts the
@@ -176,6 +252,21 @@ elseif what == 'page' then
   local last = -1
   if many > 0 then
     last = offset + many - 1
+  end
+  if some then
+    -- without what is leaving: the place of a transaction in the list
+    -- is its place among those that stay
+    local rows, at = redis.call('ZREVRANGE', prefix .. 'pool:time', 0, -1, 'WITHSCORES'), 0
+    for i = 1, #rows, 2 do
+      if redis.call('HEXISTS', leaving, rows[i]) == 0 then
+        if at >= offset and (many == 0 or at < offset + many) then
+          answer[#answer + 1] = rows[i]
+          answer[#answer + 1] = string.format('%.0f', tonumber(rows[i + 1]))
+        end
+        at = at + 1
+      end
+    end
+    return answer
   end
   local rows = redis.call('ZREVRANGE', prefix .. 'pool:time', offset, last, 'WITHSCORES')
   for i = 1, #rows, 2 do

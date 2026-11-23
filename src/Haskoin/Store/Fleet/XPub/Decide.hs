@@ -226,7 +226,8 @@ keptFor a amount script = amount <> " " <> num (B.length a) <> " " <> a <> scrip
 drop :: (Monad m) => Keys -> ByteString -> Atomic m ()
 drop k i = do
   held <- P.floorHeld k.pool
-  unless held (dropped k i)
+  busy <- P.leavingHeld k.pool
+  unless (held || busy) (dropped k i)
 
 -- | Delete the entry of a key, whoever has the floor.
 dropped :: (Monad m) => Keys -> ByteString -> Atomic m ()
@@ -302,8 +303,9 @@ used k i cost = do
 evict :: (Monad m) => Keys -> Int -> Atomic m Integer
 evict k most = do
   held <- P.floorHeld k.pool
+  busy <- P.leavingHeld k.pool
   n <- zcard k.prio
-  if held || n <= toInteger most
+  if held || busy || n <= toInteger most
     then return 0
     else do
       lowest <- zrangeByScore k.prio MinusInf PlusInf (Just (fromInteger n - most))
@@ -395,7 +397,11 @@ build k tip i expected cost additions = do
     then return StepRaced
     else do
       under' <- moving k
-      if isJust under'
+      -- nor while the pool has what the last move marked as leaving:
+      -- nothing but the taking out writes to the pool or to the cache
+      -- until it is out ('P.leavingHeld')
+      busy <- P.leavingHeld k.pool
+      if isJust under' || busy
         then return StepBusy
         else do
           count <- getNumber k.moves

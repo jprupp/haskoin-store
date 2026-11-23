@@ -1672,7 +1672,7 @@ compacted.
 
 ### Measurements for moving the fleet tip
 
-`haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS]]]]]`
+`haskoin-store-bench decide [TXS [POOL [INPUTS [OUTPUTS [RIVALS [WATCHED]]]]]]`
 (`bench/Decide.hs`) times what the move of the fleet tip over a block
 costs to decide, without Redis: transactions that are offered wait for as
 long as a move takes (`docs/concurrency.md`, "The floor"). It fills the
@@ -1688,7 +1688,13 @@ which a store does not have in its memory: the move then takes nearly
 three times as long, and most of what is timed is the collector. With
 RIVALS, the block
 is also in conflict with so many transactions of the pool, which leave
-with what spends from them.
+with what spends from them. With WATCHED, so many transactions in a
+hundred have their addresses watched by a cached extended public key.
+
+It times the move twice: taking everything out of the pool in one step,
+as a move that undoes a block does, and marking what leaves, as every
+other move does, with the taking out that follows, two hundred
+transactions at a time (`docs/fleet-mempool.md`, "The tip first").
 
 On a desktop of 2026 the move over 4,000 transactions of three inputs and
 three outputs is decided in about 0.8 seconds: four passes, one of which
@@ -1698,6 +1704,14 @@ that pass. It took four times as long in
 eight passes, five of them through the block, before the move named its
 questions ahead and while the pool worked out which transactions could
 be replaced by fee (`docs/concurrency.md`, "The floor").
+
+Marking the same 4,000 transactions is decided in 0.12 seconds, with
+20,000 answers and 8,000 writes, and the taking out that follows takes
+0.8 seconds in twenty steps of 45 milliseconds at most. With a cached
+key at every address, the move in one step takes 2.7 seconds, the
+marking the same 0.12, and the taking out 1.3 seconds in steps of 65
+milliseconds, one of 0.2 seconds in three runs: what a block costs the
+tip no longer grows with the keys that a server has cached.
 
 ### Contributing
 

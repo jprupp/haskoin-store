@@ -230,6 +230,19 @@ whitelist it must now say what they grant (`--peer-permission`, or
     run of a test in about forty. A peer that connects and is no source
     now makes the sources owe a reading. The model of the path has a
     node with its RPC and a peer, and fails without the rule.
+  - **The tip moves at once, and the pool lets go of the block's
+    transactions after it.** A move of the tip over a full block took
+    what the block confirmed out of the pool in the same step: more than
+    a hundred thousand writes, for which the tip waited five to fifteen
+    seconds on a server, nearly one of them inside Redis, which answers
+    nobody else meanwhile, and more with every cached extended key. The
+    move now marks those transactions, one write for each, and they
+    leave afterwards, two hundred at a time. A request that would read
+    one of them takes it out first, so every answer is that of a pool
+    that has let go of everything; nothing enters the pool until it has.
+    In the benchmark the move over 4,000 transactions is decided in 0.12
+    seconds where it took 0.8, and 2.7 with a cached key at every
+    address. A move that undoes a block is as it was.
   - **A store reads the mempool of its node every thirty seconds while
     transactions come**, and twice as long after each reading that
     follows none, up to the ten minutes that it was. Bitcoin Core names

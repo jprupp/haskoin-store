@@ -89,6 +89,8 @@ module Haskoin.Store.Fleet.Redis
     poolOffer,
     poolWithdraw,
     poolExpire,
+    poolLeaving,
+    poolTakeOut,
     fleetAdvance,
     fleetCommit,
     fleetCommitTelling,
@@ -211,6 +213,16 @@ poolWithdraw conn keys tsize ts = insist conn (D.withdraw (D.poolKeys keys.prefi
 -- them, choosing and withdrawing them in one call. Gives those that left.
 poolExpire :: Connection -> FleetKeys -> Int -> Integer -> Int -> IO [ByteString]
 poolExpire conn keys tsize before most = insist conn (D.expire (D.poolKeys keys.prefix tsize) before most)
+
+-- | The transactions that a move of the tip marked as leaving and that
+-- the pool still has ('Haskoin.Store.Fleet.Pool.Decide.takeOut').
+poolLeaving :: Connection -> FleetKeys -> IO [ByteString]
+poolLeaving conn keys = run conn (R.hkeys (keys.prefix <> "pool:leaving"))
+
+-- | Take some of them out of the pool: how many of these were marked.
+-- One that another store took out first counts for nothing.
+poolTakeOut :: Connection -> FleetKeys -> Int -> [ByteString] -> IO Int
+poolTakeOut conn keys tsize ts = insist conn (D.takeOut (D.poolKeys keys.prefix tsize) ts)
 
 -- | Of these transactions, which are settled: those that the pool has.
 --
@@ -358,11 +370,20 @@ advance tell conn keys tsize clock seen target how (path, token) =
 -- id, the tip that the caller answers from, what to read and its arguments,
 -- as @read.lua@ takes them. 'Nothing' if the tip is another one by now.
 poolRead :: Connection -> FleetKeys -> Int -> Maybe ByteString -> ByteString -> [ByteString] -> IO (Maybe [ByteString])
-poolRead conn keys tsize tip what args =
-  run conn (evalScript readScript [] (what : keys.prefix : num tsize : maybe "" id tip : args)) >>= \case
-    "ok" : rows -> return (Just rows)
-    ["raced"] -> return Nothing
-    other -> fail ("Unexpected answer of the read script: " <> show (take 1 other))
+--
+-- A read that would go by transactions that a move of the tip marked as
+-- leaving takes those out first ('poolTakeOut'), and reads again: the
+-- chain has them at that tip, and the pool is read as it is without them.
+poolRead conn keys tsize tip what args = go (1000 :: Int)
+  where
+    go tries =
+      run conn (evalScript readScript [] (what : keys.prefix : num tsize : maybe "" id tip : args)) >>= \case
+        "ok" : rows -> return (Just rows)
+        ["raced"] -> return Nothing
+        "leaving" : ts
+          | tries > 0 -> poolTakeOut conn keys tsize ts >> go (tries - 1)
+          | otherwise -> fail "The shared mempool does not let go of what a block took out of it"
+        other -> fail ("Unexpected answer of the read script: " <> show (take 1 other))
 
 -- | Something that happened to the fleet, as every store of it tells its
 -- clients.

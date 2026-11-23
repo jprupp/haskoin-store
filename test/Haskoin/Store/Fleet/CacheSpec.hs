@@ -75,7 +75,7 @@ import Haskoin.Store.Database.Query.Pooled (pooledRead)
 import Haskoin.Store.Database.Reader (DatabaseReader (..), Derived (..), derivedAddrs)
 import Haskoin.Store.Database.Views (withViewAt)
 import Haskoin.Store.Fleet.Member
-import Haskoin.Store.Fleet.Redis (FleetKeys (..))
+import Haskoin.Store.Fleet.Redis (FleetKeys (..), poolLeaving)
 import Haskoin.Store.Fleet.RedisSpec (withRedis)
 import Haskoin.Store.Fleet.XPub
   ( Begun (..),
@@ -114,6 +114,8 @@ spec = do
       it "has a request answered again when the pool changes the entry it read" (`withBed` poolChangeTest)
       it "has a request answered again when the tip moves" (`withBed` tipMoveTest)
       it "never answers an entry that a move of the tip is writing" (`withBed` markedTest)
+      it "answers a key without what a block took out of the pool, before the pool has let go of it" $
+        (`withBed` leavingTest)
       it "keeps the cache across a reorganisation, as the chain and the pool give it" (`withBed` reorgTest)
       it "fills the pool again after Redis lost its data" (`withBed` refillTest)
       it "fills the pool again after it started again, once after Redis lost its data" (`withBed` restartTest)
@@ -579,6 +581,50 @@ fleetTipOf bed = memberTip bed.a >>= maybe (fail "No fleet tip") return
 
 -- | Both members take a view of the best block, as the block store has
 -- them do after each block.
+-- | A block confirms a transaction of the pool at an address of a cached
+-- key, and the store that moves the tip stops right after: the
+-- transaction is marked as leaving, and still in the pool. The chain at
+-- the tip has it, and so has the entry; what the pool keeps for the
+-- address still counts it. A read of the key takes it out, and answers
+-- what the chain and the pool give.
+--
+-- The address is one that the key has used already, so that the entry
+-- has the addresses that a scan of the key finds, and is the one read:
+-- with a new address the entry is a miss, the key is read address by
+-- address, and this would pass without the cache taking anything out.
+leavingTest :: Bed -> IO ()
+leavingTest bed = do
+  let x = xpub 9
+  payKey bed x [0] True
+  xpubAsk bed.a.door x `shouldReturn` Indexed
+  dest <- addressScript bed x 0
+  c : other : _ <- filter ((> 101000) . (.value)) <$> coins bed
+  -- one that the block confirms, and one that stays in the pool: while
+  -- the pool has a transaction at the key, what it keeps for each
+  -- address is read
+  let tx = spend [c] [(dest, 100000)]
+      staying = spend [other] [(dest, 100000)]
+  offer bed tx
+  offer bed staying
+  settle bed
+  inPool bed tx `shouldReturn` True
+  sameAsChain bed bed.a x
+  -- the block, and a move of the tip with nothing after it
+  mineBlock bed [tx]
+  noted bed
+  forM_ [bed.a, bed.b] (\m -> report m `shouldReturn` True)
+  moveTip bed.a `shouldReturn` True
+  poolLeaving bed.conn bed.a.keys `shouldReturn` [encode (txHash tx)]
+  -- the entry is read, which takes the transaction out
+  tip <- fleetTipOf bed
+  cachedEntry bed.conn bed.a.keys tip bed.db.initGap bed.db.maxGap True x >>= \case
+    Hit _ -> return ()
+    _ -> expectationFailure "The entry of the key was not answered"
+  poolLeaving bed.conn bed.a.keys `shouldReturn` []
+  sameAsChain bed bed.a x
+  settle bed
+  sameAsChain bed bed.b x
+
 noted :: Bed -> IO ()
 noted bed = best bed >>= \h -> mapM_ (`noteBest` h) [bed.a, bed.b]
 
