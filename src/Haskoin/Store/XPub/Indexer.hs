@@ -343,8 +343,7 @@ data Decision
     RefuseNothing !Refusal !Int
   deriving (Eq, Show)
 
--- | The decision of @docs\/xpub-indexing.md@ (What a request for an xpub
--- does):
+-- | The decision of @docs\/xpub-indexing.md@ (The door):
 --
 -- +------------------------+---------------------------+------------------------------------+
 -- | Holder                 | Estimate                  | Decision                           |

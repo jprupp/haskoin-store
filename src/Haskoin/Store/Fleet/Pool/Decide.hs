@@ -14,8 +14,9 @@
 -- "Haskoin.Store.Fleet.Pool" says what the pool is, as a pure value. This
 -- module says how that value lies in Redis, with all that the stores read
 -- beside it: what the pool does at each address and to each category of
--- tokens, which transactions can be replaced, the events, what the fleet
--- has seen, and the pool's layer of the cache of extended public keys.
+-- tokens, what the blocks replaced, what a move of the tip marked as
+-- leaving, the events, and the pool's layer of the cache of extended
+-- public keys.
 --
 -- = Why it is here and not in a script
 --

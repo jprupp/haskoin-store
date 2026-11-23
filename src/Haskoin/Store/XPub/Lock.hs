@@ -11,7 +11,7 @@
 -- One store of a fleet indexes an xpub at a time: a lock per xpub in the
 -- Redis that the stores share, taken by the indexer
 -- ("Haskoin.Store.XPub.Indexer") when it queues the xpub and let go when
--- the job has written the entry (@docs\/xpub-indexing.md@, In a fleet).
+-- the job has written the entry (@docs\/xpub-indexing.md@, The indexer).
 --
 -- = Why
 --

@@ -507,9 +507,9 @@ noteEpoch m = do
 
 -- | Find out whether the pool was emptied since this store's last turn
 -- ('fleetRestarts'), and if so count a refill, as 'noteEpoch' does for a
--- loss of Redis. The pool forgot with it what the fleet had seen, so what
--- the peers announce from then on is fetched again; the refill brings
--- back what they announced before. The first turn only notes the count.
+-- loss of Redis. The pool is empty then, so what the peers announce from
+-- then on is fetched again; the refill brings back what they announced
+-- before. The first turn only notes the count.
 noteRestarts :: Member -> IO ()
 noteRestarts m = do
   now <- fleetRestarts m.redis m.keys

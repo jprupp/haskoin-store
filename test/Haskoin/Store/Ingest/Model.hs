@@ -11,10 +11,10 @@
 -- A model checker for "Haskoin.Store.Ingest": the machine itself, the
 -- 'step' that a store runs, put in a small world of nodes, channels and a
 -- pool, and taken through __every__ order in which things can happen
--- there. @docs\/mempool-ingestion.md@ has what is checked, T1 to T5.
+-- there. @docs\/mempool-ingestion.md@ has what is checked, T1 to T7.
 --
 -- The module is compiled with optimisation whatever the build: going
--- through 790,000 states without it takes minutes.
+-- through about a million states without it takes minutes.
 --
 -- = Why not random tests
 --
@@ -29,7 +29,7 @@
 -- = The world
 --
 -- Nodes hold mempools and follow the rules that the document assumes of
--- a node (A1 to A6): a node names a transaction to a peer once, names its
+-- a node (A1 to A8): a node names a transaction to a peer once, names its
 -- whole mempool when a source is asked, sends what it named and still
 -- has, and says so when it has it no longer. Between a node and the
 -- machine there is a channel each way, in order. The pool settles a

@@ -183,6 +183,23 @@ and the alternatives it rejects. A reader should come away knowing when to use
 it and when not to. Keep to the structure the README already has, and put new
 material in the section where a reader would look for it.
 
+Write it so that it can be read at speaking speed by someone who has not
+read the code. The documents of `docs/` were once accurate and hard to
+follow, for their author too. `docs/tip-first.md` is the model:
+
+- Start with the problem, in everyday words, before any name of the code.
+  A page of `docs/` opens with "In short" and "Words used here".
+- Define every word of the project where it is first used, and use it for
+  one thing only: "the tip", "a decision", "the floor". The words that
+  the pages share are in `docs/README.md`.
+- Short sentences, one idea each, the subject first. What happens in
+  order is a numbered list, and a comparison a small table.
+- Say what is and why. How it was found belongs in the commit, unless it
+  is the reason.
+- Say how a claim is known with the four words of `docs/README.md`:
+  proved, checked, sampled, tested.
+- A new page is added to the table of `docs/README.md`.
+
 ## Line length
 
 Every line of code must be shorter than 120 columns. This covers Haskell

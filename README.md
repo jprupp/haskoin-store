@@ -825,8 +825,7 @@ third set of runs, the read ahead went from 56 to 21 ms and the block from
 189 to 148 ms, and from 433 to 398 ms at the tip. Without the reads that
 checked a mined block, in a later set, a block of chains of transactions
 went from 161 to 138 ms. These were measured while the database still had
-a mempool of its own, which it no longer has. `docs/block-import.md` has
-the sets of numbers.
+a mempool of its own, which it no longer has.
 
 A store of mainnet gains more than the benchmark shows. In the benchmark
 a read is 30 microseconds of CPU, as the files are in memory. On the
@@ -835,9 +834,8 @@ gave five times more reads a second when asked for 32 at a time than one
 at a time: its reads are slower than the benchmark's, and gain more from
 being made together.
 
-`docs/block-import.md` has the design, what was measured, and what is left.
-`docs/block-import.md` says what could bring a block well below a
-second, and what each step would do to reads.
+`docs/block-import.md` has the design, what was measured, and what was
+not done, with the reason for each.
 The stages are timed for StatsD: see [StatsD](#statsd).
 
 ### Publishing
@@ -877,8 +875,8 @@ never confirm. It is handed over, and comes in when a node announces it.
   of the node's mempool, every thirty seconds while transactions come. And a node never closes the
   connections of a whitelisted peer.
 
-`docs/publishing.md` has the design, what was measured on Bitcoin Core and
-Bitcoin Cash Node, and how it differs from earlier versions.
+`docs/publishing.md` has the design, and what was measured on Bitcoin
+Core and Bitcoin Cash Node.
 
 ### The database
 
@@ -899,11 +897,14 @@ RocksDB holds the chain alone. The mempool is the fleet's pool in Redis.
 - **Each request reads one snapshot** of the database, at the fleet tip, so
   everything in an answer is of the same moment.
 
-`docs/one-fleet.md` has the reasons, and `docs/fleet-mempool.md` the pool
-in detail and its tests. `docs/concurrency.md` says, for every protocol
-that runs at once, in a store and across a fleet, which pure machine,
-decision or Lua script decides it, who owns what, and why no interleaving
-breaks it.
+`docs/README.md` lists every page about how the store works inside, the
+question that each answers, and the words they use. Start with
+`docs/one-fleet.md`, which has the reasons, then `docs/tip-first.md`,
+which says what happens when a block arrives, and
+`docs/fleet-mempool.md`, the pool in detail and its tests.
+`docs/concurrency.md` says, for everything that runs at the same time,
+in a store and across a fleet, who may change what, and why nothing
+breaks.
 The layout of the keys is described in `Haskoin.Store.Database.Types`.
 
 ### Upgrading an existing database
@@ -1002,8 +1003,8 @@ script stay under one address with or without tokens. Importing a block
 writes what its transactions do to tokens next to what they do to coins:
 the token balance of each address and category, and for each category its
 transactions and its unspent outputs, in column families of their own. The
-holders of a category are a second key of the same balances, so that
-listing them reads no other address. The shared mempool in Redis keeps the
+holders of a category are the same balances under a second key, in a
+column family of their own, so that listing them reads no other address. The shared mempool in Redis keeps the
 same token entries for the transactions of the pool, which the endpoints
 lay over those of the blocks. `docs/cashtokens.md` has the details, and why
 each part is built as it is.

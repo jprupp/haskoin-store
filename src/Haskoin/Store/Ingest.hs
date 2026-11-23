@@ -9,8 +9,8 @@
 -- How transactions get from the nodes that a store is a peer of to the
 -- mempool that its fleet shares: one pure machine, 'step', that decides
 -- everything between an announcement and the pool's verdict.
--- @docs\/mempool-ingestion.md@ has what it must guarantee (T1 to T5) and
--- what it may assume of a node (A1 to A6); this module is written to be
+-- @docs\/mempool-ingestion.md@ has what it must guarantee (T1 to T7) and
+-- what it may assume of a node (A1 to A8); this module is written to be
 -- checked against that, and @Haskoin.Store.IngestSpec@ does the checking.
 --
 -- = Why one machine

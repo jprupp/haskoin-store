@@ -6,7 +6,7 @@
 -- Stability   : experimental
 -- Portability : POSIX
 --
--- What @docs\/mempool-ingestion.md@ assumes of a node, A1 to A5, checked
+-- What @docs\/mempool-ingestion.md@ assumes of a node, A1 to A8, checked
 -- against Bitcoin Core and Bitcoin Cash Node in Podman.
 --
 -- The proofs and the model checker of the path into the pool
