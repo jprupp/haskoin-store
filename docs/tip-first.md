@@ -161,9 +161,39 @@ transactions are taken out. Before, they waited for the whole move.
 
 ## How it is known to be right
 
-It is **sampled and tested, not proved**: thousands of random cases and
-some particular ones were tried ([README.md](README.md), "How sure we
-are").
+It is **checked in small worlds, sampled and tested. It is not proved**
+([README.md](README.md), "How sure we are").
+
+**Checked.** A program goes through small worlds with the store's own
+code (`scripts/check-pool.sh`, half a minute). A world is five or six
+transactions that could be in a pool: some spend from others, two spend
+the same coin, some move tokens, and cached keys may have their
+addresses. In each world it tries:
+
+- every pool: each set of those transactions, offered;
+- every block: each set of them, confirmed;
+- every order of taking out, one transaction at a time, and all at once.
+
+That is 7,168 pools and blocks and 22,866 states in between. In every
+one of them:
+
+1. the move marks exactly what the old single step took out;
+2. no writer changes anything while a transaction is marked: an offer, a
+   withdrawal, an expiry, a build, a drop and an eviction of a cached
+   key, the start of the next move's work on the cache, and the next
+   move itself;
+3. for each address, category, transaction, output and cached key: if
+   no marked transaction is among those that its read goes by, what the
+   read reads is already final; and taking out those that are makes it
+   so;
+4. with nothing marked, everything is as after the old single step, and
+   the pool takes a new transaction again.
+
+One limit: the checker says in Haskell what the two reading scripts read
+and which transactions they name. That the scripts do the same is
+sampled against a real Redis, below, not checked.
+
+**Sampled and tested.**
 
 | Check | Size |
 | --- | --- |
@@ -174,7 +204,12 @@ are").
 | Planted faults: a read that does not look for marks, a cache that does not, a move that does not mark conflicts, and three writers that do not wait | all caught |
 
 Every new rule comes with a broken version that its test must catch. A
-check that has never failed is not known to work.
+check that has never failed is not known to work. The checker was run
+with ten faults put in, one at a time: each of seven writers made not to
+wait, and a read by address, by category and of a cached key made not
+to look for marks. It failed on each. It also runs, every time, one
+world in which what a block made invalid is left unmarked, and that
+world must fail.
 
 ## What the tests found
 
@@ -187,7 +222,9 @@ so.
 
 ## What it does not prove
 
-- Nothing about every possible history: thousands were tried, not all.
+- Nothing about a pool of thousands. The worlds are small, on the bet
+  that a wrong rule already shows with five transactions. Thousands of
+  random histories are a second line behind that bet, not a proof.
 - Nothing about speed on a machine whose drive stalls. Small steps help
   there, since no single call holds Redis for long, but a frozen process
   is frozen.

@@ -19,7 +19,7 @@
   again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 190 seconds in eight processes (65 before the
+- The tests take about 200 seconds in eight processes (65 before the
   tests of the mempool against real nodes, 160 before those of the
   pool letting go after a move), against 140 to 210
   with every spec module in a process of its own. Most of it is
@@ -91,7 +91,13 @@ to the pool or to the cache gives way to it (`floorHeld`), and to what a
 move marked as leaving and has not taken out yet (`leavingHeld`,
 "After the move"); a new read of the pool or of the cache has to name
 the marked transactions in its way, in `read.lua` or `xpub.lua`, and the
-test of that in `DecideSpec` (`reading`) has to read it. A decision that
+test of that in `DecideSpec` (`reading`) has to read it. A change to
+any of this is not done until `scripts/check-pool.sh` passes: it goes
+through every pool, block and order of taking out of its small worlds,
+in half a minute, without building the store. A new writer is added to
+those that it tries (`others` in `Haskoin.Store.Fleet.LeavingModel`), a
+new read to what it reads (`aims`), and each with a fault put in that
+the checker finds. A decision that
 reads much needs a turn of its own. Test a decision at the size and under
 the traffic of a full block: `crowded` in `Haskoin.Store.Fleet.DecideSpec`
 and `unceasing` in `Haskoin.Store.MempoolSpec` are the examples. A test

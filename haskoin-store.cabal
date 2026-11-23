@@ -325,6 +325,8 @@ test-suite spec
       Haskoin.Store.Fleet.AtomicSpec
       Haskoin.Store.Fleet.CacheSpec
       Haskoin.Store.Fleet.DecideSpec
+      Haskoin.Store.Fleet.LeavingModel
+      Haskoin.Store.Fleet.LeavingSpec
       Haskoin.Store.Fleet.Oracle
       Haskoin.Store.Fleet.PoolSpec
       Haskoin.Store.Fleet.RedisSpec

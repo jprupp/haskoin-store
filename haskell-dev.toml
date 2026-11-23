@@ -20,4 +20,6 @@ slow-specs = [
   # the decisions of the pool: two groups in the model of Redis and two
   # against a Redis of their own, each a minute or more
   "Haskoin.Store.Fleet.Decide",
+  # each world of the checker of the pool after a move is a group
+  "Haskoin.Store.Fleet.Leaving",
 ]

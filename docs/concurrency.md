@@ -488,9 +488,14 @@ undoes a block, which still removes everything in its own step.
 4. A store that stops leaves marks, and the next turn of any store takes
    them out. Nothing waits for a store that is gone.
 
-**How it is known.** Sampled and tested, not proved (tip-first.md, "How
-it is known to be right", has the sizes). The decisions: random
-histories, sampled in the model of Redis and tested against a Redis. In
+**How it is known.** Checked in small worlds, sampled and tested; not
+proved (tip-first.md, "How it is known to be right", has the sizes).
+The checker (`scripts/check-pool.sh`) goes through every pool, every
+block and every order of taking out of its worlds, with the decisions
+themselves. In every state it checks that writers wait, that every read
+is exact, and that any order ends as the move in one step. The
+decisions also: random histories, sampled in the model of Redis and
+tested against a Redis. In
 the model, each of the other writers is tried between two takings out,
 and the property fails when one of them is made not to wait. The reads
 of the pool: random histories against a Redis, tested. The reads of the

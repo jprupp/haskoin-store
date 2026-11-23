@@ -243,6 +243,9 @@ whitelist it must now say what they grant (`--peer-permission`, or
     In the benchmark the move over 4,000 transactions is decided in 0.12
     seconds where it took 0.8, and 2.7 with a cached key at every
     address. A move that undoes a block is as it was.
+    `scripts/check-pool.sh` checks the three rules in small worlds, with
+    the decisions themselves: every pool, every block and every order of
+    taking out (`docs/tip-first.md`).
   - **A store reads the mempool of its node every thirty seconds while
     transactions come**, and twice as long after each reading that
     follows none, up to the ten minutes that it was. Bitcoin Core names
