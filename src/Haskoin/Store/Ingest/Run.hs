@@ -98,16 +98,17 @@ import Control.Concurrent.STM
     writeTQueue,
     writeTVar,
   )
+import Control.Exception (evaluate)
 import Control.Monad (forM_, unless, when)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find, nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Haskoin
   ( GetData (..),
@@ -124,7 +125,7 @@ import Haskoin
   )
 import Haskoin.Node (LogLevel (..), Logger, Peer, logAt, sendMessage)
 import Haskoin.Store.Exception (catchAny, onException, tryAny)
-import Haskoin.Store.Fleet.Member (Member, memberOffer, memberSettled)
+import Haskoin.Store.Fleet.Member (Member, OfferCost (..), memberOfferTimed, memberSettled)
 import Haskoin.Store.Ingest
 import System.Metrics.StatsD (StatCounter, StatGauge, Stats, incrementCounter, newStatCounter, newStatGauge, setGauge)
 
@@ -405,16 +406,95 @@ milliseconds = fromIntegral . (`div` 1000000) <$> getMonotonicTimeNSec
 parentsOf :: Tx -> [TxHash]
 parentsOf tx = nub [i.outpoint.hash | i <- tx.inputs, i.outpoint /= nullOutPoint]
 
+-- | Where the time of the runner went since it last said, in nanoseconds,
+-- and what it did meanwhile.
+data Costs = Costs
+  { -- | events taken in
+    passes :: !Int,
+    offersMade :: !Int,
+    checksMade :: !Int,
+    -- | waiting for an event
+    idle :: !Word64,
+    -- | in the steps of the machine
+    inMachine :: !Word64,
+    inOffers :: !Word64,
+    -- | asking the pool which of the ids that a peer named it has
+    inChecks :: !Word64,
+    -- | sending requests to peers
+    inSends :: !Word64,
+    -- | saying the state of the machine, for @/health@ and the metrics
+    inPublish :: !Word64,
+    offerParts :: !OfferCost
+  }
+
+noCosts :: Costs
+noCosts = Costs 0 0 0 0 0 0 0 0 0 mempty
+
 loop :: IngestConfig -> Ingester -> Maybe Metrics -> Run -> IO a
-loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
+loop cfg ing metrics run0 = do
+  t <- milliseconds
+  costs <- newIORef noCosts
+  saidAt <- newIORef t
+  loopWith costs saidAt cfg ing metrics run0 t
+
+loopWith :: IORef Costs -> IORef Tick -> IngestConfig -> Ingester -> Maybe Metrics -> Run -> Tick -> IO a
+loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
   where
+    -- the time that an action takes, added to what the runner spent
+    timed :: (Costs -> Word64 -> Costs) -> IO x -> IO x
+    timed add act = do
+      a <- getMonotonicTimeNSec
+      r <- act
+      b <- getMonotonicTimeNSec
+      modifyIORef' costs (`add` (b - a))
+      return r
+    -- Say where the time went, every ten seconds in which the runner was
+    -- busy for five or more: a store that is slow to fill its pool then
+    -- says why, which nothing outside it can tell.
+    account now m = do
+      since <- readIORef saidAt
+      when (now - since >= 10000) $ do
+        c <- readIORef costs
+        writeIORef costs noCosts
+        writeIORef saidAt now
+        let ms :: Word64 -> Text
+            ms ns = shown (ns `div` 1000000)
+            busy = c.inMachine + c.inOffers + c.inChecks + c.inSends + c.inPublish
+            o = c.offerParts
+        when (busy >= 5000000000) . say LevelInfo . T.unwords $
+          [ "The path into the pool was busy for",
+            ms busy,
+            "of the last",
+            shown (now - since) <> " ms:",
+            shown c.passes,
+            "events,",
+            shown c.offersMade,
+            "offers,",
+            shown c.checksMade,
+            "questions to the pool. In milliseconds: machine",
+            ms c.inMachine <> ", offers",
+            ms c.inOffers,
+            "(whether a block has it",
+            ms o.askedBlock <> ", outputs from the database",
+            ms o.readDb <> ", outputs from the pool",
+            ms o.readPool <> ", which are unspent",
+            ms o.readUnspent <> ", the pool's decision",
+            ms o.decided <> "), questions",
+            ms c.inChecks <> ", sending",
+            ms c.inSends <> ", saying its state",
+            ms c.inPublish <> ", waiting",
+            ms c.idle <> ". It knows",
+            shown (idCount m),
+            "ids and holds",
+            shown (holding m) <> "."
+          ]
     -- with whether the machine was last told that the store is in sync,
     -- and when it was last told the time
     go wasSynced lastTick run = do
       before <- milliseconds
       timer <- registerDelay (1000 * max 0 (lastTick + 1000 - before))
       event <-
-        atomically $
+        timed (\c d -> c {idle = c.idle + d, passes = c.passes + 1}) . atomically $
           (Just <$> readTQueue ing.events) `orElse` (readTVar timer >>= check >> return Nothing)
       lost <- atomically (swapTVar ing.dropped 0)
       when (lost > 0) $ do
@@ -441,7 +521,7 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
               <> inputs
               <> [Tick now | tick]
       machine <- drive run'.peers failing lostNow run'.machine all'
-      publish machine
+      timed (\c d -> c {inPublish = c.inPublish + d}) (publish machine)
       -- A source is read every thirty seconds while transactions come
       -- (@told@ in "Haskoin.Store.Ingest"), and a reading goes through
       -- every transaction of a mempool. What that costs is said when it
@@ -467,6 +547,7 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
       unless (null gaveUp) . say LevelInfo $
         "Gave up transactions on their way to the pool, and will read the sources again: "
           <> T.intercalate ", " [shown n <> " " <> cs (reasonName why) | (why, n) <- gaveUp]
+      account done machine
       go synced (if tick then now else lastTick) run' {machine}
     -- what an event is to the machine, with the peers named
     inputsOf run = \case
@@ -504,11 +585,17 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
     -- answers goes in after the inputs that are there already
     drive _ _ _ m [] = return m
     drive peers failing lostNow m (i : is) = do
-      let (m', outs) = step parentsOf i m
+      -- the step is made here, and what it says counted, so that its
+      -- time is not taken for that of what is done with it
+      (m', outs) <- timed (\c d -> c {inMachine = c.inMachine + d}) $ do
+        let (next, said) = step parentsOf i m
+        _ <- evaluate (length said)
+        next' <- evaluate next
+        return (next', said)
       answers <- concat <$> mapM (perform peers failing lostNow) outs
       drive peers failing lostNow m' (is <> answers)
     perform peers failing lostNow = \case
-      Get k hs -> do
+      Get k hs -> timed (\c d -> c {inSends = c.inSends + d}) $ do
         forM_ (Map.lookup k peers) $ \case
           Wire p -> MGetData (GetData [InvVector kind h.get | h <- hs]) `sendMessage` p
           Fed _ _ jobs -> atomically (writeTQueue jobs (Fetch hs))
@@ -525,7 +612,7 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
       Check k hs -> case cfg.member of
         Nothing -> return [Unchecked k hs]
         Just member ->
-          memberSettled member hs >>= \case
+          timed asked (memberSettled member hs) >>= \case
             Nothing -> return [Unchecked k hs]
             Just flags ->
               return [Checked k [h | (h, True) <- zip hs flags] [h | (h, False) <- zip hs flags]]
@@ -534,11 +621,13 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
         case cfg.member of
           Just member | not down -> do
             time <- round <$> getPOSIXTime
-            verdict <-
-              memberOffer member time tx `catchAny` \e -> do
-                writeIORef failing True
-                say LevelDebug ("Could not offer " <> shown h <> " to the pool: " <> shown e)
-                return Again
+            (verdict, parts) <-
+              timed (\c d -> c {inOffers = c.inOffers + d, offersMade = c.offersMade + 1}) $
+                memberOfferTimed member time tx `catchAny` \e -> do
+                  writeIORef failing True
+                  say LevelDebug ("Could not offer " <> shown h <> " to the pool: " <> shown e)
+                  return (Again, mempty)
+            modifyIORef' costs (\c -> c {offerParts = c.offerParts <> parts})
             return [Offered h verdict]
           _ -> return [Offered h Again]
       Gone h end -> do
@@ -549,11 +638,12 @@ loop cfg ing metrics run0 = milliseconds >>= \t -> go False t run0
             forM_ metrics $ \m -> forM_ (Map.lookup why m.gaveUp) (`incrementCounter` 1)
             say LevelDebug ("Gave up " <> shown h <> ": " <> cs (reasonName why))
         return []
+    asked c d = c {inChecks = c.inChecks + d, checksMade = c.checksMade + 1}
     kind = if cfg.net.segWit then InvWitnessTx else InvTx
     publish m = do
       let st =
             IngestState
-              { known = Set.size (ids m),
+              { known = idCount m,
                 pending = Haskoin.Store.Ingest.pending m,
                 held = holding m,
                 dirty = isDirty m,

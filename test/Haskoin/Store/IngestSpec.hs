@@ -62,7 +62,7 @@ spec = do
       -- every one is in the pool, in the time of that many offers and of
       -- the seconds in which the machine waits for nothing
       taken `shouldBe` count
-      time `shouldSatisfy` (< fromIntegral count + 5000)
+      time `shouldSatisfy` (< count + 5000)
       -- and the pool was asked for nothing that it could only refuse
       refused `shouldBe` 0
   describe "for example" $ do

@@ -98,6 +98,8 @@ module Haskoin.Store.Fleet.Member
     changeBetween,
     memberSettled,
     memberOffer,
+    memberOfferTimed,
+    OfferCost (..),
     memberPoolBody,
     memberNewest,
     expirePool,
@@ -1152,19 +1154,68 @@ memberSettled m hs =
 -- took in one second was offered child first and took as many rounds as
 -- it had transactions.
 memberOffer :: Member -> UnixTime -> Tx -> IO (I.Verdict TxHash)
-memberOffer m time tx =
+memberOffer m time tx = fst <$> memberOfferTimed m time tx
+
+-- | Where the time of offers went, in nanoseconds: what the path into the
+-- pool says in its log when it is busy
+-- ("Haskoin.Store.Ingest.Run"). An offer reads the database and the pool
+-- before the pool decides, and which of them a slow offer waits for
+-- cannot be told from outside.
+data OfferCost = OfferCost
+  { -- | asking the database whether a block has the transaction
+    askedBlock :: !Word64,
+    -- | reading from the database the outputs that it spends
+    readDb :: !Word64,
+    -- | reading from the pool those that the database has not
+    readPool :: !Word64,
+    -- | asking the database which of them are unspent
+    readUnspent :: !Word64,
+    -- | the decision of the pool
+    decided :: !Word64
+  }
+  deriving (Eq, Show)
+
+instance Semigroup OfferCost where
+  OfferCost a b c d e <> OfferCost a' b' c' d' e' = OfferCost (a + a') (b + b') (c + c') (d + d') (e + e')
+
+instance Monoid OfferCost where
+  mempty = OfferCost 0 0 0 0 0
+
+-- | 'memberOffer', with where its time went.
+memberOfferTimed :: Member -> UnixTime -> Tx -> IO (I.Verdict TxHash, OfferCost)
+memberOfferTimed m time tx = do
+  cost <- newIORef mempty
+  let timed :: (Word64 -> OfferCost) -> IO a -> IO a
+      timed part act = do
+        t0 <- getMonotonicTimeNSec
+        r <- act
+        t1 <- getMonotonicTimeNSec
+        modifyIORef' cost (<> part (t1 - t0))
+        return r
+  verdict <- memberOffer' timed m time tx
+  (,) verdict <$> readIORef cost
+
+-- | The offer itself, given what times each of its parts.
+memberOffer' ::
+  (forall a. (Word64 -> OfferCost) -> IO a -> IO a) ->
+  Member ->
+  UnixTime ->
+  Tx ->
+  IO (I.Verdict TxHash)
+memberOffer' timed m time tx =
   readTVarIO m.tip >>= \case
     Nothing -> return I.Again
     Just tip -> fmap (fromMaybe I.Again) . withViewAt m.views tip $ \at ->
-      Q.getTxData at h >>= \case
+      timed (\d -> mempty {askedBlock = d}) (Q.getTxData at h) >>= \case
         Just td | not td.deleted -> return I.Settled
         _ -> do
           let pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
           found <- forM (zip [0 :: Int ..] tx.inputs) (spent at pool)
           case lefts found of
             [] -> do
-              unspent <- forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
-                isJust <$> Q.getUnspent at p
+              unspent <- timed (\d -> mempty {readUnspent = d}) $
+                forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
+                  isJust <$> Q.getUnspent at p
               let td =
                     TxData
                       { block = MemRef time,
@@ -1184,7 +1235,7 @@ memberOffer m time tx =
                     Conflict rivals
                       | not second -> offer rivals >>= answered True
                       | otherwise -> return I.Again
-              offer [] >>= answered False
+              timed (\d -> mempty {decided = d}) (offer [] >>= answered False)
             missing -> return (I.Orphan (nub missing))
   where
     h = txHash tx
@@ -1193,10 +1244,10 @@ memberOffer m time tx =
     spent at pool (n, i)
       | i.outpoint == nullOutPoint = return (Right Nothing)
       | otherwise =
-          Q.getUnspent at i.outpoint >>= \case
+          timed (\d -> mempty {readDb = d}) (Q.getUnspent at i.outpoint) >>= \case
             Just u -> return (Right (Just (n, Prev u.script u.value)))
             Nothing ->
-              pool.bodies [i.outpoint.hash] >>= \case
+              timed (\d -> mempty {readPool = d}) (pool.bodies [i.outpoint.hash]) >>= \case
                 [(Just parent, _)]
                   | fromIntegral i.outpoint.index < length parent.tx.outputs ->
                       let o = parent.tx.outputs !! fromIntegral i.outpoint.index

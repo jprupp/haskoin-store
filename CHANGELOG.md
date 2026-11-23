@@ -284,6 +284,20 @@ whitelist it must now say what they grant (`--peer-permission`, or
     offers and had them all in 18 seconds; none and 13 seconds now. The
     model checks the rule both ways, with a planted bug for each, and
     Liquid Haskell passes.
+  - **A store that is slow to fill its pool says where its time goes.**
+    Every ten seconds in which the path into the pool was busy for five
+    or more, it says in its log how many events, offers and questions to
+    the pool it went through, and how many milliseconds went to the
+    machine, to the offers, to the questions, to sending requests and to
+    saying its state, with the offers split into what each reads: whether
+    a block has the transaction, the outputs that it spends from the
+    database and from the pool, which of them are unspent, and the
+    pool's decision. Nothing outside the store could tell: a store of
+    Bitcoin took its first minute over a twentieth of a mempool with one
+    core busy and Redis idle, and the futile offers that the change
+    above removes turned out not to be why. The number of ids that the
+    store knows, said after every event, is no longer counted by making
+    a set of them all: 0.8 milliseconds for 65,000.
   - **The tip moves at once, and the pool lets go of the block's
     transactions after it.** A move of the tip over a full block took
     what the block confirmed out of the pool in the same step: more than
