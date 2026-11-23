@@ -220,7 +220,7 @@ never called proved, and what is not done yet is said.
   gives the machine five functions and nothing else to change it with.
 
 **Proved for every state and every input**, by Liquid Haskell
-(`proofs/`, `cabal build` there, two minutes and 7 GiB of memory):
+(`proofs/`, `cabal build` there, eighty seconds and 1.3 GiB of memory at most):
 
 - **Nothing leaves in silence (T1).** Of the five functions of the
   ledger, four keep every id in its place, and the fifth, `leave`, takes

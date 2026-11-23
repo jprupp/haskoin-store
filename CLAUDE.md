@@ -112,15 +112,18 @@ each claim is established. The path is one pure machine,
   the store. A new rule of the machine gets a check in
   `Haskoin.Store.Ingest.Model`, and a planted bug that the check finds.
 - Liquid Haskell passes: `cabal build` in `proofs/`, with GHCup's GHC
-  9.12.4 and `z3` on the `PATH`, in about two minutes and 7 GiB of
-  memory when it passes. When it does not it takes all the memory there
-  is: it reached 19 GiB once and had the kernel kill another program.
-  Run it under a limit, always, such as
-  `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=512M`,
-  and take a run that the limit stops for a change that has to be
-  written another way. A small function of its own that takes numbers
-  and compares them in guards did that, three times: the same
-  arithmetic written where it is used, with `max` and `min`, passes. It checks the
+  9.12.4 and `z3` on the `PATH`, in about eighty seconds and 1 to 1.3 GiB of
+  memory. `Haskoin.Store.Ingest` has the option `--eliminate=none`
+  for that, and no other module has it. A comment there says why:
+  without it the module took 6.5 GiB, and for some changes, a
+  function that never ends among them, all the memory there is with
+  no verdict. It reached 19 GiB
+  once and had the kernel kill another program. Run it under a limit
+  all the same, such as
+  `systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=512M`:
+  a run that the limit stops is a failure to look into, and not a
+  limit to raise. A function that is not exported and that nothing
+  calls is not checked. It checks the
   refinement types of `Haskoin.Store.Ingest.Ledger`, the only module that
   can change where a transaction id is, and that every function of the
   machine is total and ends. Liquid Haskell does not see through the dot

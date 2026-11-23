@@ -107,6 +107,21 @@ module Haskoin.Store.Ingest
   )
 where
 
+-- Liquid Haskell is given no type to check the functions of this module
+-- against: it finds one for each, and checks that each handles every case,
+-- ends, and calls the ledger as the ledger asks. To find them it puts an
+-- unknown for what is true of each function, and by default writes each
+-- unknown out wherever it is used before it solves for them. In a module
+-- of small functions that call each other the formulas grow with that: it
+-- took 6.5 GiB for this module, more than 12 once three functions on plain
+-- numbers were added, and all that a machine had for a function that
+-- never ends, where it gave no verdict at all. Without that step it has
+-- three times as many things to check, each small, and takes 1 GiB and
+-- less time, with the same verdicts. The option is for this module only:
+-- the ledger and the cells have their types written, and are checked as
+-- Liquid Haskell checks by default.
+{-@ LIQUID "--eliminate=none" @-}
+
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
