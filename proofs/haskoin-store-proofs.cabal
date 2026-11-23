@@ -13,6 +13,7 @@ library
   hs-source-dirs:     ../src
   exposed-modules:
     Haskoin.Store.Fleet.Atomic.Cells
+    Haskoin.Store.Fleet.Pool.Order
     Haskoin.Store.Ingest
     Haskoin.Store.Ingest.Ledger
 

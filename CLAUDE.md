@@ -151,7 +151,12 @@ each claim is established. The path is one pure machine,
   checks a module again only when GHC compiles it again. A function that
   reads the same thing many times through a function call can make the
   check take hours: bind it once. The same build checks
-  `Haskoin.Store.Fleet.Atomic.Cells` (`docs/concurrency.md`).
+  `Haskoin.Store.Fleet.Atomic.Cells` (`docs/concurrency.md`) and
+  `Haskoin.Store.Fleet.Pool.Order`: that taking transactions out of the
+  pool, as a pure value, leaves the same in any order
+  (`docs/tip-first.md`). What such a module assumes of `Data.Map` is
+  written as laws in it, each in one line. A new law is added with a
+  claim of something false that the laws must not prove, tried once.
 - The document says what is now proved, checked, sampled or only tested.
   Never write "proved" for what is tested.
 

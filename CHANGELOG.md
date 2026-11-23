@@ -248,7 +248,9 @@ whitelist it must now say what they grant (`--peer-permission`, or
     taking out (`docs/tip-first.md`). And no decision can write to the
     pool or to the cache while a transaction is marked: every write to
     one of their keys asks first, whatever the decision does for
-    itself.
+    itself. That taking transactions out leaves the same pool in any
+    order is proved by Liquid Haskell for the pool as a pure value
+    (`Haskoin.Store.Fleet.Pool.Order`).
   - **A store reads the mempool of its node every thirty seconds while
     transactions come**, and twice as long after each reading that
     follows none, up to the ten minutes that it was. Bitcoin Core names

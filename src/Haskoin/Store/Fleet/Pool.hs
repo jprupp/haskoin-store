@@ -100,6 +100,7 @@ import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Word (Word64)
+import Haskoin.Store.Fleet.Pool.Order (Core (..), removeCore)
 
 -- | The shared mempool, for transactions of type @t@ and outputs of type
 -- @o@. The second and third fields follow from the first, and are kept so
@@ -186,15 +187,16 @@ withdraw :: (Ord t, Ord o) => [t] -> Pool t o -> Pool t o
 withdraw ts pool = foldl' (flip remove) pool (Set.toList (descendants ts pool))
 
 -- | Take one transaction out, leaving what spends it.
+--
+-- Taking several out leaves the same pool in whatever order they are
+-- taken: that is proved, for every pool and every two transactions, of
+-- the function that does it ('removeCore' and @anyOrder@ in
+-- "Haskoin.Store.Fleet.Pool.Order", which Liquid Haskell checks). A move
+-- of the tip relies on it: what it marks is taken out afterwards, by
+-- whoever gets to it (@docs\/tip-first.md@).
 remove :: (Ord t, Ord o) => t -> Pool t o -> Pool t o
-remove t pool =
-  Pool
-    { spends = Map.delete t pool.spends,
-      spender = foldl' (flip Map.delete) pool.spender inputs,
-      children = Map.filter (not . Set.null) (Map.map (Set.delete t) pool.children)
-    }
-  where
-    inputs = Map.findWithDefault [] t pool.spends
+remove t pool = case removeCore t (Core pool.spends pool.spender pool.children) of
+  Core spends spender children -> Pool {spends, spender, children}
 
 -- | What the blocks between two tips did, as far as the pool is concerned.
 data Change t o = Change

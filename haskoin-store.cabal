@@ -74,6 +74,7 @@ library
       Haskoin.Store.Fleet.Member
       Haskoin.Store.Fleet.Pool
       Haskoin.Store.Fleet.Pool.Decide
+      Haskoin.Store.Fleet.Pool.Order
       Haskoin.Store.Fleet.Pool.Types
       Haskoin.Store.Fleet.Redis
       Haskoin.Store.Fleet.Script

@@ -496,8 +496,12 @@ undoes a block, which still removes everything in its own step.
 4. A store that stops leaves marks, and the next turn of any store takes
    them out. Nothing waits for a store that is gone.
 
-**How it is known.** Checked in small worlds, sampled and tested; not
-proved (tip-first.md, "How it is known to be right", has the sizes).
+**How it is known.** That no write gets by a mark: by construction.
+That any order of taking out leaves the same pool: proved, for the pool
+as a pure value (`anyOrder` in `Haskoin.Store.Fleet.Pool.Order`). For
+the pool in Redis: checked in small worlds, sampled and tested
+(tip-first.md, "How it is known to be right", has the sizes and the
+limits of each).
 The checker (`scripts/check-pool.sh`) goes through every pool, every
 block and every order of taking out of its worlds, with the decisions
 themselves. In every state it checks that writers wait, that every read

@@ -174,9 +174,10 @@ transactions are taken out. Before, they waited for the whole move.
 
 ## How it is known to be right
 
-Rule 1 holds **by construction**. Rules 2 and 3 are **checked in small
-worlds, sampled and tested. They are not proved** ([README.md](README.md),
-"How sure we are").
+Rule 1 holds **by construction**. Rule 3 is **proved** for the pool as a
+pure value, which is what the pool in Redis is held to. For the pool in
+Redis itself, rules 2 and 3 are **checked in small worlds, sampled and
+tested** ([README.md](README.md), "How sure we are").
 
 **By construction.** A write to a key of the pool or of the cache asks
 first whether anything is marked (`guarded` in
@@ -194,6 +195,29 @@ first whether anything is marked (`guarded` in
 The checker below was run for each of seven writers with its own asking
 taken away: everything still holds, because the write underneath asks.
 With that taken away too, the checker fails for every one of them.
+
+**Proved.** The pool has a pure description
+(`Haskoin.Store.Fleet.Pool`): three maps, with no Redis. Taking one
+transaction out of them is one small function, `removeCore`. Liquid
+Haskell proves, for every pool and every two transactions, that taking
+one out and then the other leaves the same three maps as the other way
+round (`anyOrder`, in `Haskoin.Store.Fleet.Pool.Order`). Any order of any
+number of transactions is a series of such swaps, so every order leaves
+the same pool. Two things to know about it:
+
+- It assumes five plain facts about the library's maps, each written
+  out in one line: what a lookup gives after a key is deleted, after a
+  set of keys is taken out, after a member is taken out of every set,
+  and after empty sets are dropped; and that two maps with the same
+  lookups are the same map. Everything else is derived, and the tool
+  checks the derivation. It refuses a false claim built on those facts,
+  two wrong versions of the function, and the proof with one needed
+  step left out.
+- It is about the pure description. That the pool in Redis does what
+  the description does is what the checker and the random histories
+  below are for. In the pure description, what the pool keeps for
+  addresses and tokens is worked out from the transactions it has, so
+  it follows the three maps.
 
 **Checked.** A program goes through small worlds with the store's own
 code (`scripts/check-pool.sh`, half a minute). A world is five or six

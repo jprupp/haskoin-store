@@ -436,12 +436,13 @@ and cannot be better without knowing what miners will do.
 
 ## How it is tested
 
-Random histories are **sampled**, particular cases are **tested**, and
-one row is **checked**: every case of its small worlds
-([README.md](README.md), "How sure we are"). Nothing here is proved.
+Random histories are **sampled**, particular cases are **tested**, one
+row is **checked**: every case of its small worlds, and one is
+**proved** ([README.md](README.md), "How sure we are").
 
 | Where | What is held to what | How sure |
 | --- | --- | --- |
+| `Haskoin.Store.Fleet.Pool.Order`, in `proofs/` | The pool as a pure value: taking one transaction out and then another leaves the same pool as the other way round, so any order does. From five stated facts about the library's maps. | proved, for every pool and every two transactions |
 | `Haskoin.Store.Fleet.LeavingSpec`, and `scripts/check-pool.sh` | The pool after a move of the tip: every pool, block and order of taking out of four small worlds, with the decisions themselves. Writers wait, every read is exact, and any order ends as the move in one step ([tip-first.md](tip-first.md)). | checked: 7,168 pools and blocks, 22,866 states |
 | `Haskoin.Store.Fleet.PoolSpec` | The rules as a pure model. The pool stays valid on top of the chain, whatever is offered, mined and unwound. | sampled: 3,000 histories |
 | `Haskoin.Store.Fleet.RedisSpec` | The pool in a real Redis, step by step against the model, the tokens included. | sampled: 300 histories |
