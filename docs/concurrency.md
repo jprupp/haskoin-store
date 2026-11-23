@@ -386,9 +386,12 @@ reads is written only by transactions that it has had taken out. A store
 that stops leaves marks, and the next turn of any store takes them out:
 nothing waits for a store that is gone.
 
-This is tested, not proved: by random histories against Redis for the
-decisions and for the reads of the pool, and by one case for the reads
-of the cache.
+This is tested, not proved: by random histories for the decisions, in
+the model of Redis and against Redis, by random histories against Redis
+for the reads of the pool, and by one case for the reads of the cache.
+The order does matter to one thing that nobody reads: a count can end
+as a zero in one order and as nothing in another
+(`docs/fleet-mempool.md`, "How it is tested").
 
 ## The web server
 

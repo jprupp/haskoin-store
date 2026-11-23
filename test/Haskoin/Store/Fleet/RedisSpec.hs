@@ -684,8 +684,6 @@ instance Arbitrary PoolStep where
       few :: Gen a -> Gen [a]
       few one = choose (0, 3) >>= (`vectorOf` one)
 
--- | A Redis in a container, reached through a socket of its pod, and a way
--- to get the keys of a fleet that no test has used.
 -- | Move the tip, and then take out of the pool what the move marked as
 -- leaving, as the store that moves the tip does
 -- (@Haskoin.Store.Fleet.Member.clearLeaving@): the pool is then as the
@@ -707,6 +705,8 @@ advancing conn keys tsize clock store seen target known path = do
   unless (null marked) (void (poolTakeOut conn keys tsize marked))
   return moved
 
+-- | A Redis in a container, reached through a socket of its pod, and a way
+-- to get the keys of a fleet that no test has used.
 withRedis :: ((Redis.Connection, IO FleetKeys) -> IO ()) -> IO ()
 withRedis go =
   withContainer redisContainer $ \p -> do

@@ -12,9 +12,12 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as C
 import Data.Containers.ListUtils (nubOrd, nubOrdOn)
 import Data.Either (isLeft)
+import Data.Foldable (toList)
 import Data.Functor.Identity (runIdentity)
 import Data.List (sort)
 import Data.List.NonEmpty qualified as NonEmpty
+import Data.Map.Strict qualified as Map
+import Data.Sequence qualified as Seq
 import Data.Serialize (encode)
 import Data.Set qualified as Set
 import Data.Word (Word32)
@@ -25,6 +28,7 @@ import Haskoin.Store.Fleet.Atomic
     Db,
     Op (..),
     Outcome (..),
+    Value (..),
     answer,
     emptyDb,
     perform,
@@ -55,6 +59,17 @@ spec = do
     modifyMaxSuccess (const 2000) $
       prop "has answers changed by them when no store has the floor" $
         \earlier during confirmed -> expectFailure (undisturbed Free earlier during confirmed)
+  -- The move that only marks what leaves the pool, against the one that
+  -- takes it out in its own step: in the model, where thousands of
+  -- histories take a minute, and with the others trying to write between
+  -- two takings out. A group of its own, and so a process of its own. It
+  -- passed ten thousand histories when it was written, and found in the
+  -- first thousand what three hundred against Redis had not: that a
+  -- count can end as a zero or as nothing ('marking').
+  describe "the pool after a move of the tip, in the model of Redis" $
+    modifyMaxSuccess (const 3000) $
+      prop "lets go of what was marked, and ends as after the move that took it out, whatever others try" $
+        \earlier during confirmed used order -> marking earlier during confirmed used order
   usable <- runIO podmanUsable
   -- a group of its own, and so a process of its own: it takes its time
   describe "the floor, in Redis" $ case usable of
@@ -334,6 +349,104 @@ undisturbed how earlier during confirmed =
           . decided at (X.abort kx "other")
     added a = X.Addition {address = address a, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}
 
+-- | A pool, and a move of the tip over a block that confirms some
+-- transactions and spends some outputs, made twice: taking everything out
+-- in its own step, and marking what leaves, which is then taken out in an
+-- order and in pieces that the test chooses.
+--
+-- While a transaction is marked, the others change nothing: an offer, a
+-- withdrawal, an expiry, and the building, dropping and evicting of an
+-- entry of the cache each leave Redis as it was. And once the last is
+-- out, Redis has what the move in one step left, the events in another
+-- order: a block is told before what it replaced is told as gone.
+marking :: [PoolStep] -> [PoolStep] -> [Word32] -> [(Word32, Word32)] -> [Int] -> Property
+marking earlier during confirmed used order =
+  conjoin
+    [ counterexample "the others changed Redis while a transaction was marked" quiet,
+      counterexample "marks are left" (Map.notMember "pool:leaving" after),
+      counterexample (show differing) (null differing)
+    ]
+  where
+    -- the keys that the two do not end with the same in: marked and
+    -- taken out first, in one step second
+    differing =
+      [ (key, Map.lookup key (told after), Map.lookup key (told once))
+      | key <- Map.keys (Map.union after once),
+        Map.lookup key (told after) /= Map.lookup key (told once)
+      ]
+    now = 5000
+    k = D.poolKeys "" 4
+    kx = X.cacheKeys ""
+    target = block 1000
+    start =
+      foldl
+        (flip perform)
+        emptyDb
+        ( [HSet "fleet:lease" "a" "900000", HSet "fleet:recent" "a" target]
+            <> [SAdd ("fx:of:" <> address a) i | (a, ids) <- [(0, ["x1"]), (1, ["x1", "x2"]), (2, ["x2"])], i <- ids]
+        )
+    pool = foldl (flip others) start earlier
+    change =
+      PoolChange
+        []
+        []
+        (map block confirmed)
+        [out a i <> block ((a * 7 + i * 3) `mod` 12) <> encode (100 :: Word32) | (a, i) <- used]
+        (Just 100)
+        []
+    move :: D.How -> (forall m. (Monad m) => Atomic m Moved)
+    move how = D.advance k Nothing target (Just now) 4 how [] ""
+    once = decided (move (D.AtOnce change)) pool
+    begun = decided (move (D.Changing change)) pool
+    leaving db = case Map.lookup "pool:leaving" db of
+      Just (Hash fields) -> Map.keys fields
+      _ -> []
+    -- the marked, in the order that the test gives, and in pieces of one
+    -- to three
+    shuffled = map snd (sort (zip (order <> [0 ..]) (leaving begun)))
+    pieces n xs = case splitAt (1 + n `mod` 3) xs of
+      (a, []) -> [a]
+      (a, rest) -> a : pieces (n + 1) rest
+    (after, quiet) = foldl step (begun, True) (zip (pieces (length order) shuffled) trying)
+    trying = cycle (Nothing : map Just during)
+    -- the others try first, and change nothing; then some are taken out
+    step (db, ok) (piece, other) =
+      let tried = maybe db (`others` db) other
+       in (decided (D.takeOut k piece) tried, ok && (null (leaving db) || tried == db))
+    decided :: (forall m. (Monad m) => Atomic m a) -> Db -> Db
+    decided decision db = either (error . show) snd (runPure now decision db)
+    others :: PoolStep -> Db -> Db
+    others = \case
+      Give t inputs replaced ->
+        let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
+         in decided (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
+      Take ts -> decided (D.withdraw k (map block ts))
+      Go _ dead done _ ->
+        decided (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
+          . decided (X.evict kx (length done))
+          . decided (X.drop kx "x1")
+          . decided (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
+    added a = X.Addition {address = address a, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}
+    -- Redis with the events in no order, and with the version of an
+    -- entry of the cache as whether it has one: which entry ends with the
+    -- highest number depends on the order in which transactions left.
+    --
+    -- And with a count of zero as no count. A count is added to and
+    -- taken from, one transaction at a time, and where two transactions
+    -- that leave together count the same output, one as made and the
+    -- other as used up, the order in which they leave decides whether
+    -- the count went through one on its way to nothing: Redis keeps a
+    -- zero for a count that did, and nothing for one that did not. Every
+    -- read takes a count that is not there for zero (@read.lua@,
+    -- @xpub.lua@), and no decision asks for one of these but the count of
+    -- transactions, which each transaction adds one to.
+    told = Map.mapWithKey $ \key -> \case
+      Stream events -> Stream (Seq.fromList (sort (toList events)))
+      Hash fields
+        | "fx:e:" `B.isPrefixOf` key && ":meta" `B.isSuffixOf` key -> Hash (Map.adjust (const "some") "ver" fields)
+        | any (`B.isPrefixOf` key) ["pool:asum:", "pool:csum:", "pool:tsum:"] -> Hash (Map.filter (/= "0") fields)
+      other -> other
+
 -- | A move of the tip that takes eight hundred transactions out of the
 -- pool, while three others write without a pause: transactions that spend
 -- from those are offered, another store renews its lease, and entries of
@@ -534,7 +647,13 @@ both conn (lua :: FleetKeys) (ours :: FleetKeys) (there0, here0, tip, n) step = 
 -- second it is all taken out: every read of the first is then the read
 -- of the second, and takes out what it has to. Then the rest is taken
 -- out, and Redis has the same under both.
-reading :: Redis.Connection -> FleetKeys -> FleetKeys -> (Maybe ByteString, Word32) -> PoolStep -> IO (Maybe ByteString, Word32)
+reading ::
+  Redis.Connection ->
+  FleetKeys ->
+  FleetKeys ->
+  (Maybe ByteString, Word32) ->
+  PoolStep ->
+  IO (Maybe ByteString, Word32)
 reading conn (marked :: FleetKeys) (settled :: FleetKeys) (tip, n) step = do
   let each f = forM_ [marked, settled] (\(keys :: FleetKeys) -> f keys (D.poolKeys keys.prefix 4))
       everyone = [0 .. 12] :: [Word32]
@@ -628,6 +747,9 @@ everything conn p = do
         Redis.String -> maybe [] pure <$> list (Redis.get key)
         Redis.Hash
           | name key == "pool:entries" -> sort . map fst <$> list (Redis.hgetall key)
+          -- a count of zero is no count, as in the model ('marking')
+          | any (`B.isPrefixOf` name key) ["pool:asum:", "pool:csum:", "pool:tsum:"] ->
+              sort . map (\(f, v) -> f <> " = " <> v) . filter ((/= "0") . snd) <$> list (Redis.hgetall key)
           | otherwise -> sort . map (\(f, v) -> f <> " = " <> v) <$> list (Redis.hgetall key)
         Redis.Set -> sort <$> list (Redis.smembers key)
         Redis.ZSet ->

@@ -17,4 +17,7 @@ slow-specs = [
   "Haskoin.Store.Ingest",
   # each test of what a node does has a pod of its own
   "Haskoin.Store.NodeAxioms",
+  # the decisions of the pool: two groups in the model of Redis and two
+  # against a Redis of their own, each a minute or more
+  "Haskoin.Store.Fleet.Decide",
 ]

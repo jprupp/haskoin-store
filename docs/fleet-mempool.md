@@ -396,7 +396,14 @@ uses, and cannot be better without knowing what miners will do.
   that marks, with the marked taken out afterwards in an order and in
   pieces that change from step to step, leaves Redis as the script that
   took everything out in one step did, and nothing is offered or
-  withdrawn meanwhile. And every kind of read, of every address,
+  withdrawn meanwhile. The same in the model of Redis, over three
+  thousand histories at each run and ten thousand when it was written,
+  with offers, withdrawals, expiries and changes to the cache tried
+  between two takings out, which change nothing. The two ends are the
+  same but for this: a count that two transactions leaving together
+  both change can end as a zero where it would have ended as nothing,
+  which every read takes for the same. The model found that; three
+  hundred histories against Redis had not. And every kind of read, of every address,
   transaction and output of a history, from a pool that has only been
   marked, is the read of the same pool with everything out: it fails
   with the guard of one kind of read taken away.
