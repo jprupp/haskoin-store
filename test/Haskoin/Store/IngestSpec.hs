@@ -21,7 +21,10 @@
 module Haskoin.Store.IngestSpec (spec) where
 
 import Control.Monad (forM_)
-import Data.List (foldl')
+import Data.IntMap.Strict qualified as IntMap
+import Data.IntSet qualified as IntSet
+import Data.List (foldl', partition)
+import Data.Sequence qualified as Seq
 import Haskoin.Store.Ingest
 import Haskoin.Store.Ingest.Model
 import Test.Hspec hiding (pending)
@@ -51,6 +54,17 @@ spec = do
           case wander large choices of
             Right () -> property True
             Left (what, path) -> counterexample (unlines (what : map ("  " <>) path)) False
+  describe "A whole mempool that comes at once, most of it spending from the rest" $
+    it "is offered to the pool once each, and no transaction twice" $ do
+      -- as many as a full mempool of Bitcoin, in chains of 24
+      let count = 65000
+          (taken, refused, time) = refill count
+      -- every one is in the pool, in the time of that many offers and of
+      -- the seconds in which the machine waits for nothing
+      taken `shouldBe` count
+      time `shouldSatisfy` (< fromIntegral count + 5000)
+      -- and the pool was asked for nothing that it could only refuse
+      refused `shouldBe` 0
   describe "for example" $ do
     it "offers a chain root first, whatever the order its transactions come in" $ do
       -- 3 spends from 2, which spends from 1, and they come child first
@@ -105,8 +119,80 @@ spec = do
       let (s', more) = run' [Body (Just 1) 1 []] s
       [length hs | Get _ hs <- more] `shouldBe` [2]
       windowOf 1 s' `shouldBe` Just 17
+    it "does not offer at its time what waits for a transaction that has a place, and does once it has none" $ do
+      -- 2 spends from 1, and comes first: it waits for 1, which is asked for
+      let (s, outs) = run [Named 1 [1, 2], Checked 1 [] [1, 2], Body (Just 1) 2 [1]]
+      [h | Offer h _ <- outs] `shouldBe` []
+      -- its time comes, after two seconds, four and eight, and 1 is still
+      -- on its way: nothing to offer
+      let (s', more) = run' [Tick 2000, Tick 4000, Tick 8000] s
+      [h | Offer h _ <- more] `shouldBe` []
+      -- the node says that it has not 1, which is given up: at its next
+      -- time 2 is offered, since nothing else would wake it
+      let (_, last') = run' [Missing 1 [1], Tick 16000] s'
+      [h | Gone h (GaveUp NodeHasNot) <- last'] `shouldBe` [1]
+      [h | Offer h _ <- last'] `shouldBe` [2 :: Int]
   where
     ready :: Ingest Int Int [Int]
     ready = fst (run' [PeerUp 1 True, Synced True] (start defaultConfig 0))
     run = flip run' ready
     run' inputs s0 = foldl' (\(s, outs) i -> let (s', o) = step id i s in (s', outs <> o)) (s0, []) inputs
+
+-- | A store with an empty pool and one source whose mempool has so many
+-- transactions, in chains of 24: what a store goes through when its Redis
+-- lost its data, or when it starts with a new pool. Gives how many
+-- transactions the pool took, how many offers it refused for lack of what
+-- the transaction spends from, and the time that it all took.
+--
+-- It is the runner in small: it carries out what the machine says, one
+-- output at a time, and tells the machine the time once a second. The
+-- node names its whole mempool when asked and gives every transaction
+-- that it is asked for. The pool takes a transaction when it has all
+-- that it spends from. Only an offer takes time, a millisecond: about
+-- what one took on a server, and what made the futile ones matter.
+--
+-- The ids are scattered, as hashes are, so that the order in which the
+-- machine asks for transactions says nothing of which spends from which:
+-- most come before what they spend from, and wait for it.
+refill :: Int -> (Int, Int, Tick)
+refill count = go (start defaultConfig 0) IntSet.empty 0 0 0 0 (Seq.fromList [PeerUp 1 True, Synced True])
+  where
+    -- a prime above the count: multiplying by a number below it scatters
+    -- the ids and gives no two the same
+    prime = 65537
+    idOf k = ((k + 1) * 48271) `mod` prime
+    bodies = IntMap.fromList [(idOf k, [idOf (k - 1) | k `mod` 24 /= 0]) | k <- [0 .. count - 1]]
+    names = IntMap.keys bodies
+    cost = 1
+    go ::
+      Ingest Int Int [Int] ->
+      IntSet.IntSet ->
+      Tick ->
+      Tick ->
+      Int ->
+      Int ->
+      Seq.Seq (Input Int Int [Int]) ->
+      (Int, Int, Tick)
+    go s pool now told taken refused queue
+      -- all in, or an hour gone: the test says which
+      | IntSet.size pool == count || now > 3600000 = (taken, refused, now)
+      | otherwise = case Seq.viewl queue of
+          -- nothing to do until the next second
+          Seq.EmptyL -> let t = told + 1000 in feed (Tick t) s pool t t taken refused Seq.empty
+          i Seq.:< rest
+            | now - told >= 1000 -> feed (Tick now) s pool now now taken refused queue
+            | otherwise -> feed i s pool now told taken refused rest
+    feed i s pool now told taken refused queue =
+      let (s', outs) = step id i s
+          (pool', now', taken', refused', answers) = foldl' perform (pool, now, taken, refused, []) outs
+       in go s' pool' now' told taken' refused' (queue <> Seq.fromList (reverse answers))
+    perform (pool, now, taken, refused, answers) = \case
+      Sweep p -> (pool, now, taken, refused, Named p names : answers)
+      Check p hs ->
+        let (yes, no) = partition (`IntSet.member` pool) hs
+         in (pool, now, taken, refused, Checked p yes no : answers)
+      Get p hs -> (pool, now, taken, refused, reverse [Body (Just p) h (bodies IntMap.! h) | h <- hs] <> answers)
+      Offer h b -> case filter (`IntSet.notMember` pool) b of
+        [] -> (IntSet.insert h pool, now + cost, taken + 1, refused, Offered h Settled : answers)
+        lacks -> (pool, now + cost, taken, refused + 1, Offered h (Orphan lacks) : answers)
+      Gone _ _ -> (pool, now, taken, refused, answers)

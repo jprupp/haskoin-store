@@ -248,6 +248,37 @@ feed sc input w = do
           check "the pool lacks what a held transaction spends from, and it is not asked for" $
             all (`Set.member` ids after) (filter (/= h) ps)
     _ -> return ()
+  -- What waits for transactions that all have a place is not offered when
+  -- its time comes: the pool would only say that it lacks them, and the
+  -- held one is made ready when the last of them settles. A machine that
+  -- offered it all the same spent most of its offers on that when a whole
+  -- mempool came at once. One of them that was given up, in this step
+  -- too, has no place after it.
+  case input of
+    Tick _ ->
+      check "a held transaction is offered at its time while all that it waits for have a place" $
+        and
+          [ any (`Set.notMember` ids after) (Set.toList ps)
+          | Offer h _ <- outs,
+            Just (Held _ _ (Waiting ps _)) <- [placeOf h before]
+          ]
+    _ -> return ()
+  -- And the other way: one of those that it waits for has no place, so
+  -- nothing will wake it, and its time has come. It waits no longer: it
+  -- is ready, offered, or given up for having waited too long.
+  case input of
+    Tick t ->
+      check "a held transaction still waits after its time for a transaction that has no place" $
+        and
+          [ case placeOf h after of
+              Just (Held _ _ (Waiting _ _)) -> False
+              _ -> True
+          | h <- Set.toList (ids before),
+            Just (Held _ _ (Waiting ps at)) <- [placeOf h before],
+            at <= t,
+            any (`Set.notMember` ids before) (Set.toList ps)
+          ]
+    _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
     [] -> return ()

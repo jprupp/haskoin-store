@@ -255,6 +255,26 @@ when it does not, in place of a fixed number.
 when the parent settles, in place of every held transaction at every
 turn.
 
+**A held transaction is not offered while its parents are on their
+way.** A held transaction also has a time at which it is offered whether
+its parents came or not: two seconds after it was held, then four,
+eight, and so on. That time is for a parent that was given up, since
+nothing else would wake the child. While every parent that it waits for
+still has a place, the offer cannot succeed: the pool lacks the parent
+and says so. So at its time such a transaction is put off, and not
+offered.
+
+It used to be offered all the same. That cost nothing while a few
+transactions came at a time. When a whole mempool comes at once, after
+Redis lost its data or when a store starts on a new pool, most
+transactions wait for another one, and the path offers one transaction
+at a time. A store of Bitcoin whose Redis had been emptied took 233
+seconds to have the 65,962 transactions of its node again: 31 to 61 a
+second for the first minute, and 1,284 a second at the end, when the
+times had grown far apart. The machine, given 65,000 transactions in
+chains of 24 at once, made 103,862 offers that the pool could only
+refuse, beside the 65,000 that it took.
+
 **A parent that the pool lacks is asked for** (`seek`), of every peer,
 when the pool says so. The pool has just said that it lacks the parent,
 so the parent gets a place without the pool being asked. The store used
@@ -330,7 +350,10 @@ says in plain terms what a world is and how it is gone through.
     spends from, and a source only for its mempool (T4);
   - the count of requests out (T5);
   - a parent that the pool lacks has a place, to be asked for, when
-    there is a peer and room (T6).
+    there is a peer and room (T6);
+  - at its time, a held transaction is not offered while every parent
+    that it waits for has a place, and waits no longer when one of them
+    has none.
 - **From every state, with nothing more going wrong:** every run ends,
   and ends with the mempool of every connected source in the pool (T3).
 - **Five planted bugs** in `step`, one for each kind of check, are each
@@ -348,6 +371,11 @@ says in plain terms what a world is and how it is gone through.
   comes to rest without what the node took between the reading of the
   RPC and the connection of the peer, in seven steps. That is the sixth
   planted bug, and the one that was in the store.
+- **The time of a held transaction.** Two more planted bugs, one each
+  way. A machine that offers a held transaction at every time of its
+  own, as the store did, fails in 2 worlds. One that never offers it at
+  its time, and so leaves it waiting for a parent that was given up,
+  fails in 13.
 - **A world that must fail.** It breaks an assumption: a source that
   names a child first, with room for one id (A5). The search finds the
   store going round for ever there. The program of
@@ -358,6 +386,18 @@ says in plain terms what a world is and how it is gone through.
 
 2,000 runs of a larger world (two chains of three, three peers, every
 disturbance) keep the same rules and converge.
+
+### Tested at the size of a full mempool
+
+The worlds above are small, and a cost that grows with a mempool does
+not show in them. So one test gives the machine 65,000 transactions at
+once, in chains of 24, from one source, with an empty pool
+(`refill` in `Haskoin.Store.IngestSpec`). It stands in for the runner,
+the node and the pool, and counts a millisecond for each offer. The
+pool must take every transaction, and refuse no offer for lack of a
+parent. It runs in three seconds, and fails for the machine that
+offered a held transaction at every time of its own: 103,862 refused
+offers, and 169 seconds where 65 are enough.
 
 ### Tested against the real programs
 

@@ -702,10 +702,37 @@ onTick t acc0 = retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).lin
     -- whose time it is now, each once
     retried acc@(s0, _) = foldl' retry1 acc (takeWhile ((<= t) . fst) (Set.toAscList s0.tries))
     retry1 acc@(s, said) (at, h) = case Map.lookup h (places s) of
-      Just (Held _ since hold@(Waiting _ _))
+      Just (Held _ since hold@(Waiting ps _))
         | t - since > s.config.orphanLife -> forget WaitedTooLong h acc
+        | onTheirWay ps s -> (putOff h at since ps s, said)
         | otherwise -> (makeReady h (unhold h hold s), said)
       _ -> (s {tries = Set.delete (at, h) s.tries}, said)
+
+-- | Whether every transaction that a held one waits for has a place: each
+-- is wanted, asked for or held, and the held one is made ready when the
+-- last of them settles ('wake').
+--
+-- Such a transaction is not offered when its time comes. The pool lacks
+-- what it spends from, and would only say so. A machine that offered it
+-- all the same, after two seconds, then four, then eight, spent most of
+-- its offers on that when a whole mempool came at once: a store whose
+-- Redis had lost its data had 39,000 transactions waiting for others of
+-- the 65,000 of its node, offered each of them five or six times in two
+-- minutes, one offer at a time, and took 233 seconds to have them all,
+-- 31 to 61 a second for the first minute and 1,284 a second at the end.
+--
+-- One that it waits for and that has no place was given up, and nothing
+-- will wake the held one: that is what its time is for.
+onTheirWay :: (Ord h) => Set h -> Ingest p h b -> Bool
+onTheirWay ps s = all (\p -> Map.member p (places s)) (Set.toList ps)
+
+-- | A held transaction whose time came keeps waiting for the same
+-- transactions, until a later time: as much later as 'waiting' says of
+-- one held since then.
+putOff :: (Ord h) => h -> Tick -> Tick -> Set h -> Ingest p h b -> Ingest p h b
+putOff h at since ps s =
+  let (t, s') = waiting h since ps s {tries = Set.delete (at, h) s.tries}
+   in edit (rehold h (Waiting ps t)) s'
 
 -- | What the machine can do as it is: read its sources if something is
 -- owed or it is time, request what is wanted within the windows, and
