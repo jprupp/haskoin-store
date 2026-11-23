@@ -100,6 +100,9 @@ module Haskoin.Store.Fleet.Atomic
     Ahead (..),
     ahead,
     write,
+    guarding,
+    unguarded,
+    heldByMark,
     clock,
     Outcome (..),
     runAtomic,
@@ -522,7 +525,13 @@ data Session = Session
     -- | every write, in order
     ops :: !(Seq Op),
     -- | the clock, once it was read
-    clockAt :: !(Maybe Integer)
+    clockAt :: !(Maybe Integer),
+    -- | the marks that Redis was found without, so that a key that they
+    -- guard may be written to ('guarding')
+    clear :: !(Set Key),
+    -- | whether the decision writes to guarded keys whatever is marked
+    -- ('unguarded')
+    free :: !Bool
   }
 
 -- | A decision about the state in Redis: a computation that asks ('query'),
@@ -548,8 +557,59 @@ stop = Atomic . lift . throwE
 backend :: (Monad m) => (Backend m -> m a) -> Atomic m a
 backend f = Atomic (ask >>= lift . lift . lift . f)
 
--- | Why a decision stopped before its end.
-newtype Stop = Cannot Unanswerable
+-- | Why a decision stopped before its end: it asked what cannot be
+-- answered, or it was to write to a key that a mark guards while Redis
+-- had the mark.
+data Stop
+  = Cannot !Unanswerable
+  | Held !Key
+
+-- | Before a write to a key that a mark guards: stop the decision if
+-- Redis has the mark, and make the decision depend on Redis not having
+-- it otherwise, so that it is carried out only if that is still so.
+--
+-- = Why
+--
+-- A move of the tip marks the transactions that leave the pool, and they
+-- are taken out after it (@docs\/tip-first.md@). Until they are out,
+-- nothing else may change the pool or the cache: what a request reads
+-- there is right only because of that. Each decision that writes there
+-- asks whether anything is marked, and does nothing if so. That was a
+-- line of code in each of them, and a decision written without it would
+-- have compiled, passed its own tests, and written among the marked
+-- transactions.
+--
+-- So the asking is here, under every write
+-- ("Haskoin.Store.Fleet.Atomic.Keys" calls this before each write to a
+-- key that was named with its mark). A decision cannot write to such a
+-- key without it. One that still asks for itself, to answer something
+-- better than a failure, asks the same question and is never stopped
+-- here.
+--
+-- = What counts
+--
+-- What Redis said, and not what the decision wrote since: the move of the
+-- tip writes the marks itself, and goes on writing. A decision that has
+-- to write among marked transactions says so ('unguarded'): the taking
+-- out, and the emptying of the pool.
+guarding :: (Monad m) => Key -> Atomic m ()
+guarding mark = do
+  s <- session (gets id)
+  let q = Exists mark
+  if s.free || Set.member mark s.clear
+    then return ()
+    else case Map.lookup q s.said of
+      Just (Flag True) -> stop (Held mark)
+      Just _ -> session (modify' (\x -> x {used = Set.insert q x.used, clear = Set.insert mark x.clear}))
+      -- Redis was not asked: this pass does not count, and goes on as if
+      -- it had no mark
+      Nothing -> session (modify' (\x -> x {missed = Set.insert q x.missed}))
+
+-- | From here on the decision writes to guarded keys whatever is marked.
+-- For the decisions that are made among marked transactions: the taking
+-- out of those, and the emptying of the pool with its marks.
+unguarded :: (Monad m) => Atomic m ()
+unguarded = session (modify' (\s -> s {free = True}))
 
 -- | The clock of Redis, in milliseconds: read once in a decision, and the
 -- same every time after, however many times Redis is asked before the
@@ -768,6 +828,7 @@ runAtomic with (Atomic f) = go Map.empty (0 :: Int) Nothing
       if Set.null s.missed
         then return $ case r of
           Left (Cannot why) -> Stuck why
+          Left (Held mark) -> Stuck (Unanswerable (Exists mark) held)
           Right a -> Decided a [(q, x) | q <- Set.toList s.used, Just x <- [Map.lookup q known]] (toList s.ops) rounds
         else do
           let new = Set.toList s.missed
@@ -784,8 +845,21 @@ runAtomic with (Atomic f) = go Map.empty (0 :: Int) Nothing
           byWhole = Map.empty,
           wipes = Seq.empty,
           ops = Seq.empty,
-          clockAt = before
+          clockAt = before,
+          clear = Set.empty,
+          free = False
         }
+
+-- | What a decision that was stopped at a mark says ('guarding'). It is a
+-- fault of the decision, as a question that cannot be answered is: one
+-- that writes to the pool or to the cache asks first whether anything is
+-- marked, and does nothing then.
+held :: String
+held = "a write to a key that this mark guards, while Redis has the mark: nothing is written"
+
+-- | Whether a decision was stopped at a mark.
+heldByMark :: Unanswerable -> Bool
+heldByMark (Unanswerable _ why) = why == held
 
 -- | The writes of a decision without those that a later one undoes: a
 -- write to a key that is deleted afterwards, or wiped, changes nothing in

@@ -20,4 +20,4 @@ spec = do
         (explore w).failure `shouldBe` Nothing
   describe "The pool after a move of the tip, with what a block is in conflict with left unmarked" $
     it "fails, so that the checker is known to see a fault" $
-      (unmarked (head worlds)).failure `shouldSatisfy` isJust
+      spoilt.failure `shouldSatisfy` isJust

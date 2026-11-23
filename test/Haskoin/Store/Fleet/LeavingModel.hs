@@ -31,7 +31,11 @@
 --
 -- * __Writers wait.__ An offer, a withdrawal, an expiry, a build, a drop
 --   and an eviction of an entry of the cache, the beginning of a move of
---   the cache and another move of the tip each leave Redis as it is.
+--   the cache and another move of the tip each leave Redis as it is. Each
+--   asks for itself whether anything is marked, and a write to a key of
+--   the pool or of the cache asks whatever the decision does
+--   ('Haskoin.Store.Fleet.Atomic.guarding'): this holds with either of
+--   the two taken away, and fails with both.
 -- * __A read is exact.__ For each address, category of tokens,
 --   transaction, output and cached key: if none of the transactions that
 --   its read would go by is marked, then all that the read reads is
@@ -55,13 +59,12 @@ module Haskoin.Store.Fleet.LeavingModel
   ( World (..),
     Report (..),
     worlds,
-    unmarked,
+    spoilt,
     explore,
     describeReport,
   )
 where
 
-import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Foldable (toList)
@@ -72,7 +75,7 @@ import Data.Sequence qualified as Seq
 import Data.Serialize (encode)
 import Data.Set qualified as Set
 import Data.Word (Word32, Word64)
-import Haskoin.Store.Fleet.Atomic (Atomic, Db, Op (..), Value (..), emptyDb, perform, runPure)
+import Haskoin.Store.Fleet.Atomic (Atomic, Db, Op (..), Value (..), emptyDb, heldByMark, perform, runPure)
 import Haskoin.Store.Fleet.Pool.Decide qualified as D
 import Haskoin.Store.Fleet.Pool.Types
 import Haskoin.Store.Fleet.XPub.Decide qualified as X
@@ -214,6 +217,18 @@ target = idOf 1000
 run :: (forall m. (Monad m) => Atomic m a) -> Db -> (a, Db)
 run decision db = either (error . show) id (runPure now decision db)
 
+-- | What a decision leaves of Redis. One that is stopped at a mark
+-- leaves Redis as it is: a write to a key of the pool or of the cache
+-- asks first whether anything is marked
+-- ('Haskoin.Store.Fleet.Atomic.guarding'), whatever the decision does
+-- for itself.
+attempt :: (forall m. (Monad m) => Atomic m a) -> Db -> Db
+attempt decision db = case runPure now decision db of
+  Right (_, after) -> after
+  Left why
+    | heldByMark why -> db
+    | otherwise -> error (show why)
+
 hashOf :: ByteString -> Db -> Map ByteString ByteString
 hashOf key db = case Map.lookup key db of
   Just (Hash fields) -> fields
@@ -251,7 +266,10 @@ start w =
 -- | Offer a candidate, with the tip that the store saw and whether each
 -- coin that it spends is unspent in the chain at that tip.
 offering :: Maybe ByteString -> (Coin -> Bool) -> Cand -> Db -> (Offered, Db)
-offering tip unspent c = run (D.offer k tip (map unspent c.uses) [] (poolTxOf c))
+offering tip unspent c = run (offer tip unspent c)
+
+offer :: Maybe ByteString -> (Coin -> Bool) -> Cand -> (forall m. (Monad m) => Atomic m Offered)
+offer tip unspent c = D.offer k tip (map unspent c.uses) [] (poolTxOf c)
 
 -- | Whether a coin is one of the chain.
 ofChain :: Coin -> Bool
@@ -345,10 +363,13 @@ readOf w aim db0 = case aim of
 -- Going through a world
 -------------------------------------------------------------------------------
 
--- | A world gone through with a fault put in: what a block is in conflict
--- with is not marked. It has to fail, or the checker sees nothing.
-unmarked :: World -> Report
-unmarked = exploring (Map.adjust dropRivals "pool:leaving")
+-- | The first world gone through with a fault put in: what a block is in
+-- conflict with is not marked. It has to fail, or the checker sees
+-- nothing.
+spoilt :: Report
+spoilt = case worlds of
+  w : _ -> exploring (Map.adjust dropRivals "pool:leaving") w
+  [] -> Report 0 0 Nothing
   where
     dropRivals = \case
       Hash fields -> Hash (Map.filter B.null fields)
@@ -442,19 +463,19 @@ pair fault w offered confirmed = do
     -- Redis
     others :: Db -> [(String, Db -> Db)]
     others db =
-      [ ("an offer of " <> show c.number, snd . offering (Just target) unspentAfter c)
+      [ ("an offer of " <> show c.number, attempt (offer (Just target) unspentAfter c))
       | c <- w.cands
       ]
-        <> [ ("an offer of a child of " <> show c.number, snd . offering (Just target) unspentAfter (child c))
+        <> [ ("an offer of a child of " <> show c.number, attempt (offer (Just target) unspentAfter (child c)))
            | c <- w.cands,
              idOf c.number `elem` pooled db
            ]
-        <> [ ("a withdrawal", snd . run (D.withdraw k (pooled db))),
-             ("an expiry", snd . run (D.expire k 1000000000 100)),
-             ("a build of an entry", snd . run (X.build kx target "x9" (0, 0) 1 [added])),
-             ("a drop of an entry", snd . run (X.drop kx "x1")),
-             ("an eviction", snd . run (X.evict kx 0)),
-             ("the beginning of a move of the cache", snd . run (void (X.begin kx "other" target))),
+        <> [ ("a withdrawal", attempt (D.withdraw k (pooled db))),
+             ("an expiry", attempt (D.expire k 1000000000 100)),
+             ("a build of an entry", attempt (X.build kx target "x9" (0, 0) 1 [added])),
+             ("a drop of an entry", attempt (X.drop kx "x1")),
+             ("an eviction", attempt (X.evict kx 0)),
+             ("the beginning of a move of the cache", attempt (X.begin kx "other" target)),
              ("another move of the tip", moving)
            ]
     -- the store reports a newer block, which the tip would move to: only
@@ -463,7 +484,7 @@ pair fault w offered confirmed = do
       let reported = perform (HSet "fleet:recent" "a" (idOf 1001 <> target)) db
           next :: (forall m. (Monad m) => Atomic m Moved)
           next = D.advance k (Just target) (idOf 1001) (Just now) 4 (D.Changing none) [] ""
-          moved = snd (run (void next) reported)
+          moved = attempt next reported
        in if moved == reported then db else moved
     child c = cand (90 + c.number) (take 1 c.makes) [(a1, 1, Nothing)]
     added = X.Addition {address = a1, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}

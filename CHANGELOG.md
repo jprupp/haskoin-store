@@ -245,7 +245,10 @@ whitelist it must now say what they grant (`--peer-permission`, or
     address. A move that undoes a block is as it was.
     `scripts/check-pool.sh` checks the three rules in small worlds, with
     the decisions themselves: every pool, every block and every order of
-    taking out (`docs/tip-first.md`).
+    taking out (`docs/tip-first.md`). And no decision can write to the
+    pool or to the cache while a transaction is marked: every write to
+    one of their keys asks first, whatever the decision does for
+    itself.
   - **A store reads the mempool of its node every thirty seconds while
     transactions come**, and twice as long after each reading that
     follows none, up to the ten minutes that it was. Bitcoin Core names

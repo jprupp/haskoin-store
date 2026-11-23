@@ -147,7 +147,7 @@ data Entry = Entry
 entryOf :: Keys -> ByteString -> Entry
 entryOf k i =
   Entry
-    { addrs = named (k.pool.entry <> i <> ":addrs"),
+    { addrs = P.entryKey k.pool (i <> ":addrs"),
       meta = P.entryMeta k.pool i,
       txs = P.entryTxs k.pool i,
       outs = P.entryOuts k.pool i,

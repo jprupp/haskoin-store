@@ -45,7 +45,9 @@ module Haskoin.Store.Fleet.Atomic.Keys
     K,
     Family,
     named,
+    guarded,
     family,
+    guardedFamily,
     under,
     keyName,
 
@@ -53,6 +55,7 @@ module Haskoin.Store.Fleet.Atomic.Keys
     Atomic,
     clock,
     prefetch,
+    unguarded,
 
     -- * Questions named ahead, in steps
     Ahead,
@@ -140,6 +143,7 @@ import Haskoin.Store.Fleet.Atomic
     ahead,
     clock,
     prefetch,
+    unguarded,
     write,
   )
 import Haskoin.Store.Fleet.Atomic qualified as A
@@ -161,30 +165,50 @@ data Kind
   | -- | entries, oldest first
     Stream
 
--- | A key that holds something of one kind.
-newtype K (kind :: Kind) = K ByteString
+-- | A key that holds something of one kind, and the mark that guards it,
+-- if one does ('guarded').
+data K (kind :: Kind) = K !ByteString !(Maybe ByteString)
   deriving (Eq, Show)
 
 -- | The start of the keys of one kind that there are for each of
--- something: for each address, each transaction, each entry.
-newtype Family (kind :: Kind) = Family ByteString
+-- something: for each address, each transaction, each entry. With the
+-- mark that guards them all, if one does.
+data Family (kind :: Kind) = Family !ByteString !(Maybe ByteString)
 
 -- | A key by its name. Its kind is that of the place that it is put in:
 -- the field of a record of keys.
 named :: ByteString -> K kind
-named = K
+named k = K k Nothing
+
+-- | A key that a mark guards: given the name of the mark, a key of its
+-- own, and the name of the key. No decision can write to the key while
+-- Redis has the mark, and a decision that writes to it is carried out
+-- only if Redis still has no mark then
+-- ('Haskoin.Store.Fleet.Atomic.guarding'). Every write of this module to
+-- such a key asks first, so a decision has no way to write without it,
+-- short of saying so ('unguarded').
+--
+-- The keys of the pool and of the cache of extended public keys are
+-- guarded by the mark of the transactions that a move of the tip left to
+-- be taken out (@docs\/tip-first.md@).
+guarded :: ByteString -> ByteString -> K kind
+guarded mark k = K k (Just mark)
 
 -- | A family of keys by what they all start with.
 family :: ByteString -> Family kind
-family = Family
+family p = Family p Nothing
+
+-- | A family of keys that a mark guards ('guarded').
+guardedFamily :: ByteString -> ByteString -> Family kind
+guardedFamily mark p = Family p (Just mark)
 
 -- | The key of a family for one thing.
 under :: Family kind -> ByteString -> K kind
-under (Family p) x = K (p <> x)
+under (Family p mark) x = K (p <> x) mark
 
 -- | The name of a key.
 keyName :: K kind -> ByteString
-keyName (K k) = k
+keyName (K k _) = k
 
 num :: Integer -> ByteString
 num = C.pack . show
@@ -201,58 +225,58 @@ only q = Ahead q (const [])
 
 -- | The question that 'get' asks, and what to name from its answer.
 thenText :: K 'Text -> (Maybe ByteString -> [Ahead]) -> Ahead
-thenText (K k) next = Ahead (Get k) $ \case
+thenText (K k _) next = Ahead (Get k) $ \case
   A.Text v -> next v
   _ -> []
 
 -- | The question that 'hget' asks, and what to name from its answer.
 thenField :: K 'Hash -> ByteString -> (Maybe ByteString -> [Ahead]) -> Ahead
-thenField (K k) f next = Ahead (HGet k f) $ \case
+thenField (K k _) f next = Ahead (HGet k f) $ \case
   A.Text v -> next v
   _ -> []
 
 -- | The question that 'sismember' asks, and what to name from its answer.
 thenMember :: K 'Group -> ByteString -> (Bool -> [Ahead]) -> Ahead
-thenMember (K k) x next = Ahead (SIsMember k x) $ \case
+thenMember (K k _) x next = Ahead (SIsMember k x) $ \case
   A.Flag v -> next v
   _ -> []
 
 -- | The question that 'smembers' asks, and what to name from its answer.
 thenMembers :: K 'Group -> (Set ByteString -> [Ahead]) -> Ahead
-thenMembers (K k) next = Ahead (SMembers k) $ \case
+thenMembers (K k _) next = Ahead (SMembers k) $ \case
   A.Members v -> next v
   _ -> []
 
 -- | The question that 'hfieldsAbove' asks, and what to name from its
 -- answer.
 thenAbove :: K 'Counts -> Integer -> (Set ByteString -> [Ahead]) -> Ahead
-thenAbove (K k) n next = Ahead (HAbove k n) $ \case
+thenAbove (K k _) n next = Ahead (HAbove k n) $ \case
   A.Members v -> next v
   _ -> []
 
 -- | The question that 'hgetNumber' asks.
 askingCount :: K 'Counts -> ByteString -> Query
-askingCount (K k) = HGet k
+askingCount (K k _) = HGet k
 
 -- | The question that 'zscore' asks.
 askingScore :: K 'Sorted -> ByteString -> Query
-askingScore (K k) = ZScore k
+askingScore (K k _) = ZScore k
 
 -- | The question that 'zrangeByScore' asks.
 askingRange :: K 'Sorted -> Bound -> Bound -> Maybe Int -> Query
-askingRange (K k) = ZRangeByScore k
+askingRange (K k _) = ZRangeByScore k
 
 -- | The question that 'exists' asks.
 askingWhether :: K kind -> Query
-askingWhether (K k) = Exists k
+askingWhether (K k _) = Exists k
 
 -- | @DEL@.
 del :: (Monad m) => K kind -> Atomic m ()
-del (K k) = write (Del k)
+del (K k mark) = mapM_ A.guarding mark >> write (Del k)
 
 -- | @EXISTS@.
 exists :: (Monad m) => K kind -> Atomic m Bool
-exists (K k) = A.exists k
+exists (K k _) = A.exists k
 
 -- | Delete every key that starts with some bytes, of whatever kind.
 wipe :: (Monad m) => ByteString -> Atomic m ()
@@ -260,135 +284,135 @@ wipe = write . Wipe
 
 -- | @GET@.
 get :: (Monad m) => K 'Text -> Atomic m (Maybe ByteString)
-get (K k) = A.get k
+get (K k _) = A.get k
 
 -- | @SET@.
 set :: (Monad m) => K 'Text -> ByteString -> Atomic m ()
-set (K k) v = write (Set k v)
+set (K k mark) v = mapM_ A.guarding mark >> write (Set k v)
 
 -- | The question that 'get' asks, to name it before it is asked
 -- ('prefetch').
 asking :: K 'Text -> Query
-asking (K k) = Get k
+asking (K k _) = Get k
 
 -- | The number that a key holds, or 0 for a key that is not there.
 getNumber :: (Monad m) => K 'Number -> Atomic m Integer
-getNumber (K k) = maybe 0 (maybe 0 id . whole) <$> A.get k
+getNumber (K k _) = maybe 0 (maybe 0 id . whole) <$> A.get k
 
 -- | Give a key a number.
 setNumber :: (Monad m) => K 'Number -> Integer -> Atomic m ()
-setNumber (K k) n = write (Set k (num n))
+setNumber (K k mark) n = mapM_ A.guarding mark >> write (Set k (num n))
 
 -- | @INCRBY@.
 incrBy :: (Monad m) => K 'Number -> Integer -> Atomic m ()
-incrBy (K k) n = write (IncrBy k n)
+incrBy (K k mark) n = mapM_ A.guarding mark >> write (IncrBy k n)
 
 -- | The question that 'getNumber' asks.
 askingNumber :: K 'Number -> Query
-askingNumber (K k) = Get k
+askingNumber (K k _) = Get k
 
 -- | @HGET@.
 hget :: (Monad m) => K 'Hash -> ByteString -> Atomic m (Maybe ByteString)
-hget (K k) = A.hget k
+hget (K k _) = A.hget k
 
 -- | @HEXISTS@.
 hexists :: (Monad m) => K 'Hash -> ByteString -> Atomic m Bool
-hexists (K k) = A.hexists k
+hexists (K k _) = A.hexists k
 
 -- | @HGETALL@.
 hgetall :: (Monad m) => K 'Hash -> Atomic m (Map ByteString ByteString)
-hgetall (K k) = A.hgetall k
+hgetall (K k _) = A.hgetall k
 
 -- | @HKEYS@.
 hkeys :: (Monad m) => K 'Hash -> Atomic m (Set ByteString)
-hkeys (K k) = A.hkeys k
+hkeys (K k _) = A.hkeys k
 
 -- | @HSET@.
 hset :: (Monad m) => K 'Hash -> ByteString -> ByteString -> Atomic m ()
-hset (K k) f v = write (HSet k f v)
+hset (K k mark) f v = mapM_ A.guarding mark >> write (HSet k f v)
 
 -- | @HDEL@.
 hdel :: (Monad m) => K 'Hash -> ByteString -> Atomic m ()
-hdel (K k) f = write (HDel k f)
+hdel (K k mark) f = mapM_ A.guarding mark >> write (HDel k f)
 
 -- | The question that 'hget' asks.
 askingField :: K 'Hash -> ByteString -> Query
-askingField (K k) = HGet k
+askingField (K k _) = HGet k
 
 -- | The question that 'hexists' asks.
 askingWhetherField :: K 'Hash -> ByteString -> Query
-askingWhetherField (K k) = HExists k
+askingWhetherField (K k _) = HExists k
 
 -- | The number of a field, or nothing for a field that is not there.
 hgetNumber :: (Monad m) => K 'Counts -> ByteString -> Atomic m (Maybe Integer)
-hgetNumber (K k) f = (>>= whole) <$> A.hget k f
+hgetNumber (K k _) f = (>>= whole) <$> A.hget k f
 
 -- | Give a field a number.
 hsetNumber :: (Monad m) => K 'Counts -> ByteString -> Integer -> Atomic m ()
-hsetNumber (K k) f n = write (HSet k f (num n))
+hsetNumber (K k mark) f n = mapM_ A.guarding mark >> write (HSet k f (num n))
 
 -- | @HINCRBY@.
 hincrBy :: (Monad m) => K 'Counts -> ByteString -> Integer -> Atomic m ()
-hincrBy (K k) f n = write (HIncrBy k f n)
+hincrBy (K k mark) f n = mapM_ A.guarding mark >> write (HIncrBy k f n)
 
 -- | The fields whose number is above a bound: for a decision that needs
 -- to know which leases still run and not when each runs out, so that a
 -- lease that is renewed meanwhile changes nothing for it.
 hfieldsAbove :: (Monad m) => K 'Counts -> Integer -> Atomic m (Set ByteString)
-hfieldsAbove (K k) = A.habove k
+hfieldsAbove (K k _) = A.habove k
 
 -- | @SISMEMBER@.
 sismember :: (Monad m) => K 'Group -> ByteString -> Atomic m Bool
-sismember (K k) = A.sismember k
+sismember (K k _) = A.sismember k
 
 -- | @SMEMBERS@.
 smembers :: (Monad m) => K 'Group -> Atomic m (Set ByteString)
-smembers (K k) = A.smembers k
+smembers (K k _) = A.smembers k
 
 -- | @SADD@.
 sadd :: (Monad m) => K 'Group -> ByteString -> Atomic m ()
-sadd (K k) x = write (SAdd k x)
+sadd (K k mark) x = mapM_ A.guarding mark >> write (SAdd k x)
 
 -- | @SREM@.
 srem :: (Monad m) => K 'Group -> ByteString -> Atomic m ()
-srem (K k) x = write (SRem k x)
+srem (K k mark) x = mapM_ A.guarding mark >> write (SRem k x)
 
 -- | The question that 'sismember' asks.
 askingMember :: K 'Group -> ByteString -> Query
-askingMember (K k) = SIsMember k
+askingMember (K k _) = SIsMember k
 
 -- | The question that 'smembers' asks.
 askingMembers :: K 'Group -> Query
-askingMembers (K k) = SMembers k
+askingMembers (K k _) = SMembers k
 
 -- | @ZSCORE@.
 zscore :: (Monad m) => K 'Sorted -> ByteString -> Atomic m (Maybe Score)
-zscore (K k) = A.zscore k
+zscore (K k _) = A.zscore k
 
 -- | @ZCARD@.
 zcard :: (Monad m) => K 'Sorted -> Atomic m Integer
-zcard (K k) = A.zcard k
+zcard (K k _) = A.zcard k
 
 -- | @ZRANGEBYSCORE@, with the scores.
 zrangeByScore :: (Monad m) => K 'Sorted -> Bound -> Bound -> Maybe Int -> Atomic m [(ByteString, Score)]
-zrangeByScore (K k) = A.zrangeByScore k
+zrangeByScore (K k _) = A.zrangeByScore k
 
 -- | @ZADD@.
 zadd :: (Monad m) => K 'Sorted -> Score -> ByteString -> Atomic m ()
-zadd (K k) s x = write (ZAdd k s x)
+zadd (K k mark) s x = mapM_ A.guarding mark >> write (ZAdd k s x)
 
 -- | @ZADD NX@: only if the member is not there.
 zaddNew :: (Monad m) => K 'Sorted -> Score -> ByteString -> Atomic m ()
-zaddNew (K k) s x = write (ZAddNX k s x)
+zaddNew (K k mark) s x = mapM_ A.guarding mark >> write (ZAddNX k s x)
 
 -- | @ZREM@.
 zrem :: (Monad m) => K 'Sorted -> ByteString -> Atomic m ()
-zrem (K k) x = write (ZRem k x)
+zrem (K k mark) x = mapM_ A.guarding mark >> write (ZRem k x)
 
 -- | @ZREMRANGEBYRANK@.
 zremRangeByRank :: (Monad m) => K 'Sorted -> Integer -> Integer -> Atomic m ()
-zremRangeByRank (K k) from to = write (ZRemRangeByRank k from to)
+zremRangeByRank (K k mark) from to = mapM_ A.guarding mark >> write (ZRemRangeByRank k from to)
 
 -- | @XADD@ to a stream that keeps about so many entries.
 xadd :: (Monad m) => K 'Stream -> Int -> [(ByteString, ByteString)] -> Atomic m ()
-xadd (K k) keep fields = write (XAdd k keep fields)
+xadd (K k mark) keep fields = mapM_ A.guarding mark >> write (XAdd k keep fields)

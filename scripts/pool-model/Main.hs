@@ -32,7 +32,7 @@ main = do
   unseen <-
     if null args
       then do
-        let report = unmarked (head worlds)
+        let report = spoilt
         putStrLn "with a fault. what a block is in conflict with is not marked"
         case report.failure of
           Just why -> putStrLn ("   fails as it must: " <> why) >> return False

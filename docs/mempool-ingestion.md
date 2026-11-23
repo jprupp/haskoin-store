@@ -19,8 +19,8 @@ seconds while transactions come.
 ## Words used here
 
 The shared words (store, node, peer, fleet, the pool, the tip) and the
-four words for how sure we are (proved, checked, sampled, tested) are in
-[README.md](README.md).
+five words for how sure we are (by construction, proved, checked,
+sampled, tested) are in [README.md](README.md).
 
 | Word | What it means here |
 | --- | --- |
@@ -269,8 +269,8 @@ input, calls `step`, and carries out the outputs. It decides nothing.
 
 ## How each claim is established
 
-There are five levels of evidence, from strongest to weakest: "by
-construction", and the four words of [README.md](README.md). Each part
+There are five levels of evidence, from strongest to weakest: the five
+words of [README.md](README.md). Each part
 below says which claim has which today. "Tested" is never called proved,
 and what is not done yet is said.
 

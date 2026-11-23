@@ -89,6 +89,19 @@ a new transaction is told "late" and offered again, nothing is withdrawn
 or expired, no cached key is built or dropped, and the next block's move
 does not begin.
 
+This is not left to each writer. Every key of the pool and of the cache
+is named together with the key that holds the marks. Every write to such
+a key first asks Redis whether anything is marked:
+
+- if something is, the decision stops before it writes anything;
+- if nothing is, the decision is carried out only if that is still true
+  at that moment.
+
+The functions that a decision has to write with do this, so code that
+writes to the pool without asking cannot be written with them. Two
+decisions say, in one word, that they write among marks: the taking out
+itself, and the emptying of the whole pool.
+
 **2. Readers help.** A request that would read something a marked
 transaction touches is told which transactions those are, and is given
 nothing. The store takes them out at once, and reads again.
@@ -161,8 +174,26 @@ transactions are taken out. Before, they waited for the whole move.
 
 ## How it is known to be right
 
-It is **checked in small worlds, sampled and tested. It is not proved**
-([README.md](README.md), "How sure we are").
+Rule 1 holds **by construction**. Rules 2 and 3 are **checked in small
+worlds, sampled and tested. They are not proved** ([README.md](README.md),
+"How sure we are").
+
+**By construction.** A write to a key of the pool or of the cache asks
+first whether anything is marked (`guarded` in
+`Haskoin.Store.Fleet.Atomic.Keys`, `guarding` in
+`Haskoin.Store.Fleet.Atomic`). Three limits:
+
+- It covers the writes of decisions. The script that reads a cached key
+  also notes that the key was used, to rank it for eviction. That one
+  write is outside it, and changes nothing that a request reads.
+- A new key has to be named with the mark, in the one place where the
+  keys of the pool are named (`poolKeys`). A key named without it is not
+  guarded.
+- A decision can say that it writes among marks (`unguarded`). Two do.
+
+The checker below was run for each of seven writers with its own asking
+taken away: everything still holds, because the write underneath asks.
+With that taken away too, the checker fails for every one of them.
 
 **Checked.** A program goes through small worlds with the store's own
 code (`scripts/check-pool.sh`, half a minute). A world is five or six

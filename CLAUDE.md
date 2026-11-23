@@ -81,7 +81,12 @@ fails after its first write leaves Redis half changed. A decision imports
 `Haskoin.Store.Fleet.Atomic.Keys`, where a key has its kind in its type
 and a write of another kind does not compile, and never the writes of
 `Haskoin.Store.Fleet.Atomic`; a new key is named, with its kind, in the
-record of keys of its module.
+record of keys of its module. A key of the pool or of the cache is named
+with the key of the marks (`guarded`, as `poolKeys` does): every write
+to it then asks whether a move left transactions to take out, and stops
+the decision if so. A decision still asks for itself (`leavingHeld`),
+to answer something better than a failure. Only the taking out and the
+emptying of the pool are `unguarded`: do not add a third.
 
 A decision is carried out only if nothing that it read has changed, which
 makes it right and does not make it happen: one that reads much loses
@@ -202,8 +207,8 @@ follow, for their author too. `docs/tip-first.md` is the model:
   order is a numbered list, and a comparison a small table.
 - Say what is and why. How it was found belongs in the commit, unless it
   is the reason.
-- Say how a claim is known with the four words of `docs/README.md`:
-  proved, checked, sampled, tested.
+- Say how a claim is known with the five words of `docs/README.md`: by
+  construction, proved, checked, sampled, tested.
 - A new page is added to the table of `docs/README.md`.
 
 ## Line length

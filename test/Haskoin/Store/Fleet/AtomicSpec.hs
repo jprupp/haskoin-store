@@ -54,6 +54,24 @@ spec = do
       cannot [ZAdd z 1 "a", ZRem z "a"] (ZScore z "a") `shouldBe` False
       cannot [HDel "h1" "a", HSet "h1" "b" "1"] (Exists "h1") `shouldBe` False
       cannot [Wipe "h", HIncrBy "h1" "c1" 2] (HGet "h1" "c1") `shouldBe` False
+    it "writes to a key that a mark guards only while Redis has no mark, and depends on that" $ do
+      let mark = "m1"
+          marked = perform (HSet mark "t" "") emptyDb
+          writing :: (Monad m) => Atomic m ()
+          writing = guarding mark >> write (HSet "h1" "f" "v") >> write (HSet "h1" "g" "w")
+          after = perform (HSet "h1" "g" "w") . perform (HSet "h1" "f" "v")
+          inModel db = Backend {fetch = return . map (answer db), time = return 0}
+      -- no mark: written, and the decision depends on there being none
+      runPure 0 writing emptyDb `shouldBe` Right ((), after emptyDb)
+      case runIdentity (runAtomic (inModel emptyDb) writing) of
+        Decided () depends _ _ -> depends `shouldBe` [(Exists mark, Flag False)]
+        Stuck why -> expectationFailure (show why)
+      -- a mark: the decision is stopped, with nothing written
+      either heldByMark (const False) (runPure 0 writing marked) `shouldBe` True
+      -- a decision that says that it writes among marks does
+      runPure 0 (unguarded >> writing) marked `shouldBe` Right ((), after marked)
+      -- and the decision that wrote the mark itself goes on writing
+      runPure 0 (write (HSet mark "t" "") >> writing) emptyDb `shouldBe` Right ((), after marked)
     it "depends on what it asked, and not on what it only had fetched" $ do
       let decision :: (Monad m) => Atomic m ()
           decision = prefetch [Get "s1", Get "n1"] >> void (get "s1")
@@ -143,6 +161,19 @@ spec = do
                 commit conn told' `shouldReturn` True
                 Just [now] <- transact conn 1 (queries [asked'])
                 return (told'.result === now)
+      it "does not write to a key that a mark guards when the mark came after it was decided" $ \(conn, fresh) -> do
+        p <- fresh
+        let (mark, key) = (p <> "m1", p <> "h1")
+            writing :: (Monad m) => Atomic m ()
+            writing = guarding mark >> write (HSet key "f" "v")
+        planned <- plan conn writing
+        transact conn 1 (write (HSet mark "t" "")) `shouldReturn` Just ()
+        carry conn planned `shouldReturn` Left (Exists mark)
+        transact conn 1 (query (HGet key "f")) `shouldReturn` Just (Text Nothing)
+        -- decided with the mark there, it is stopped before it writes
+        stopped <- try (plan conn writing) :: IO (Either Failure (Planned ()))
+        either (const True) (const False) stopped `shouldBe` True
+        transact conn 1 (query (HGet key "f")) `shouldReturn` Just (Text Nothing)
       it "changes nothing when an answer that it depends on is no longer true" $ \(conn, fresh) -> do
         p <- fresh
         let (k, other, out) = (p <> "s1", p <> "s2", p <> "h1")

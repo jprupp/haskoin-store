@@ -462,6 +462,14 @@ undoes a block, which still removes everything in its own step.
   that has to read one. It does nothing for a transaction that is not
   marked. So two stores that take the same transaction out take it out
   once: the second finds no mark.
+- **No write gets by a mark.** Every key of the pool and of the cache
+  is named with the key of the marks (`guarded`, in `poolKeys`), and
+  every write to such a key asks first whether Redis has a mark
+  (`guarding`). With a mark, the decision stops before it writes.
+  Without one, it depends on there being none, as on any answer. Only
+  the taking out and the emptying of the pool write among marks
+  (`unguarded`). This is by construction: a decision has no other
+  function to write with.
 - **Every other writer gives way** (`leavingHeld`). Whatever else
   writes to the pool or to the cache asks whether there is a mark, and
   does nothing if there is: the offer, the withdrawal, the expiry, the

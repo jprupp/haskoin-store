@@ -56,11 +56,12 @@ A page lists the words of its own subject. These are the ones they share.
 
 ## How sure we are
 
-The pages use four words for how a claim is known, from strongest to
+The pages use five words for how a claim is known, from strongest to
 weakest. They are never mixed up.
 
 | Word | What was done |
 | --- | --- |
+| **by construction** | The code cannot be written any other way: the types, or the one function that everything goes through, leave no other possibility. |
 | **proved** | A tool (Liquid Haskell) checked it for every possible state and input. |
 | **checked** | A program went through every possible order of events in a small example. |
 | **sampled** | Random cases were tried, hundreds or thousands of them. The page says how many. |

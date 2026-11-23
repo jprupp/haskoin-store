@@ -41,6 +41,7 @@ module Haskoin.Store.Fleet.Pool.Decide
     poolKeys,
     entryTxs,
     entryOuts,
+    entryKey,
     entryOval,
     entryMeta,
     floorHeld,
@@ -164,51 +165,67 @@ poolKeys p tsize =
       recent = named (p <> "fleet:recent"),
       events = named (p <> "fleet:events"),
       xver = named (p <> "fleet:xver"),
-      spends = named (p <> "pool:spends"),
-      spender = named (p <> "pool:spender"),
-      body = named (p <> "pool:body"),
-      kids = family (p <> "pool:kids:"),
-      entries = named (p <> "pool:entries"),
-      time = named (p <> "pool:time"),
-      ids = named (p <> "pool:ids"),
-      atx = family (p <> "pool:atx:"),
-      aout = family (p <> "pool:aout:"),
-      aval = family (p <> "pool:aval:"),
-      aspent = family (p <> "pool:aspent:"),
-      asum = family (p <> "pool:asum:"),
-      tsum = family (p <> "pool:tsum:"),
-      acat = family (p <> "pool:acat:"),
-      chold = family (p <> "pool:chold:"),
-      ctx = family (p <> "pool:ctx:"),
-      cout = family (p <> "pool:cout:"),
-      cval = family (p <> "pool:cval:"),
-      csum = family (p <> "pool:csum:"),
-      rep = named (p <> "pool:rep"),
-      repby = family (p <> "pool:repby:"),
-      repat = named (p <> "pool:repat"),
-      lost = named (p <> "pool:lost"),
-      lostby = family (p <> "pool:lostby:"),
-      lostat = named (p <> "pool:lostat"),
-      leaving = named (p <> "pool:leaving"),
-      xtip = named (p <> "fx:tip"),
-      moving = named (p <> "fx:moving"),
-      beat = named (p <> "fx:beat"),
-      marked = named (p <> "fx:marked"),
-      watchers = family (p <> "fx:of:"),
+      spends = ours (p <> "pool:spends"),
+      spender = ours (p <> "pool:spender"),
+      body = ours (p <> "pool:body"),
+      kids = oursFamily (p <> "pool:kids:"),
+      entries = ours (p <> "pool:entries"),
+      time = ours (p <> "pool:time"),
+      ids = ours (p <> "pool:ids"),
+      atx = oursFamily (p <> "pool:atx:"),
+      aout = oursFamily (p <> "pool:aout:"),
+      aval = oursFamily (p <> "pool:aval:"),
+      aspent = oursFamily (p <> "pool:aspent:"),
+      asum = oursFamily (p <> "pool:asum:"),
+      tsum = oursFamily (p <> "pool:tsum:"),
+      acat = oursFamily (p <> "pool:acat:"),
+      chold = oursFamily (p <> "pool:chold:"),
+      ctx = oursFamily (p <> "pool:ctx:"),
+      cout = oursFamily (p <> "pool:cout:"),
+      cval = oursFamily (p <> "pool:cval:"),
+      csum = oursFamily (p <> "pool:csum:"),
+      rep = ours (p <> "pool:rep"),
+      repby = oursFamily (p <> "pool:repby:"),
+      repat = ours (p <> "pool:repat"),
+      lost = ours (p <> "pool:lost"),
+      lostby = oursFamily (p <> "pool:lostby:"),
+      lostat = ours (p <> "pool:lostat"),
+      leaving = named mark,
+      xtip = ours (p <> "fx:tip"),
+      moving = ours (p <> "fx:moving"),
+      beat = ours (p <> "fx:beat"),
+      marked = ours (p <> "fx:marked"),
+      watchers = oursFamily (p <> "fx:of:"),
       entry = p <> "fx:e:"
     }
+  where
+    -- Every key of the pool, and of the cache where it has what the pool
+    -- gives it, is guarded by the mark of the transactions that a move
+    -- left to be taken out: a decision that writes to one while Redis
+    -- has a mark is stopped ('guarded'). The keys of the fleet are not:
+    -- the tip, the leases and reports of the stores, the events.
+    mark = p <> "pool:leaving"
+    ours :: ByteString -> K kind
+    ours = guarded mark
+    oursFamily :: ByteString -> Family kind
+    oursFamily = guardedFamily mark
 
 -- | The lists of the entry of a cached key, what it keeps for each output,
 -- and its numbers, of which the pool gives it a version.
 entryTxs, entryOuts :: Keys -> ByteString -> K 'Sorted
-entryTxs k i = named (k.entry <> i <> ":txs")
-entryOuts k i = named (k.entry <> i <> ":outs")
+entryTxs k i = entryKey k (i <> ":txs")
+entryOuts k i = entryKey k (i <> ":outs")
 
 entryOval :: Keys -> ByteString -> K 'Hash
-entryOval k i = named (k.entry <> i <> ":oval")
+entryOval k i = entryKey k (i <> ":oval")
 
 entryMeta :: Keys -> ByteString -> K 'Counts
-entryMeta k i = named (k.entry <> i <> ":meta")
+entryMeta k i = entryKey k (i <> ":meta")
+
+-- | A key of an entry of the cache, by what follows the start of the
+-- entries in its name: guarded as the keys of the pool are ('poolKeys').
+entryKey :: Keys -> ByteString -> K kind
+entryKey k rest = guarded (keyName k.leaving) (k.entry <> rest)
 
 num :: (Show a) => a -> ByteString
 num = C.pack . show
@@ -605,6 +622,8 @@ leavingHeld k = exists k.leaving
 -- a request that would read one of them takes it out first.
 takeOut :: (Monad m) => Keys -> [ByteString] -> Atomic m Int
 takeOut k ts = do
+  -- the one decision that is made among marked transactions
+  unguarded
   ready <- ahead [thenField k.leaving t (maybe [] (going t)) | t <- ts]
   if ready then length . filter id <$> mapM one ts else return 0
   where
@@ -886,6 +905,8 @@ advance k saw target given bsize how path token = do
     -- the pool starts again, and a counter tells the stores to fill it
     -- again; the first tip of a fleet empties nothing.
     emptied at after = do
+      -- with its marks: nothing of the pool is left for them to guard
+      unguarded
       wipe (k.prefix <> "pool:")
       unless (B.null at) (incrBy k.restarts 1)
       settle True "" after
