@@ -370,8 +370,11 @@ Who owns what, between the move and the last transaction out:
 - **Everything else that writes the pool or the cache reads whether
   there is a mark, and does nothing if there is** (`leavingHeld`): the
   offer, the withdrawal, the expiry, the build, the drop and the
-  eviction of an entry, and the next move. Each is carried out only if
-  that answer still holds, as with any answer of a decision.
+  eviction of an entry, and the next move, from its first step: the
+  move of the cache that comes before it does not begin. Each is
+  carried out only if that answer still holds, as with any answer of a
+  decision. The property of the model has each of them tried between
+  two takings out, and fails when one of them is made not to wait.
 - **A read** goes by no marked transaction (`read.lua`, `xpub.lua`): it
   names those in its way, they are taken out, and it reads again.
 

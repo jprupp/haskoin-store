@@ -17,6 +17,7 @@ import Data.Functor.Identity (runIdentity)
 import Data.List (sort)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Sequence qualified as Seq
 import Data.Serialize (encode)
 import Data.Set qualified as Set
@@ -385,7 +386,7 @@ marking earlier during confirmed used order =
         ( [HSet "fleet:lease" "a" "900000", HSet "fleet:recent" "a" target]
             <> [SAdd ("fx:of:" <> address a) i | (a, ids) <- [(0, ["x1"]), (1, ["x1", "x2"]), (2, ["x2"])], i <- ids]
         )
-    pool = foldl (flip others) start earlier
+    pool = foldl (flip (others Nothing)) start earlier
     change =
       PoolChange
         []
@@ -411,21 +412,31 @@ marking earlier during confirmed used order =
     trying = cycle (Nothing : map Just during)
     -- the others try first, and change nothing; then some are taken out
     step (db, ok) (piece, other) =
-      let tried = maybe db (`others` db) other
+      let tried = maybe db (\o -> others (Just target) o db) other
        in (decided (D.takeOut k piece) tried, ok && (null (leaving db) || tried == db))
     decided :: (forall m. (Monad m) => Atomic m a) -> Db -> Db
     decided decision db = either (error . show) snd (runPure now decision db)
-    others :: PoolStep -> Db -> Db
-    others = \case
-      Give t inputs replaced ->
-        let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
-         in decided (D.offer k Nothing (map snd outs) (map block replaced) (txOf t (map fst outs)))
-      Take ts -> decided (D.withdraw k (map block ts))
-      Go _ dead done _ ->
-        decided (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
-          . decided (X.evict kx (length done))
-          . decided (X.drop kx "x1")
-          . decided (X.build kx "" "x3" (0, 0) 1 [added (sum dead)])
+    -- what the others decide, each with the tip as it is, so that what
+    -- holds them back while a transaction is marked is the mark and not
+    -- a tip that they do not know
+    others :: Maybe ByteString -> PoolStep -> Db -> Db
+    others tip = at (fromMaybe "" tip)
+      where
+        at seen = \case
+          Give t inputs replaced ->
+            let outs = [(out a i, ok) | (a, i, ok) <- nubOrdOn (\(a, i, _) -> (a, i)) inputs, a < t]
+             in decided (D.offer k tip (map snd outs) (map block replaced) (txOf t (map fst outs)))
+          Take ts -> decided (D.withdraw k (map block ts))
+          Go _ dead done _ ->
+            decided (D.expire k (toInteger (timeOf (sum dead))) (length done + 1))
+              . decided (X.evict kx (length done))
+              . decided (X.drop kx "x1")
+              . decided (X.build kx seen "x3" (0, 0) 1 [added (sum dead)])
+              -- a move of the cache that begins, writes a piece and is given
+              -- up: nothing of it while a transaction is marked
+              . decided (X.abort kx "other")
+              . decided (X.piece kx "other" seen [X.Piece (address (sum dead)) "" [] [] [] []])
+              . decided (X.begin kx "other" seen)
     added a = X.Addition {address = address a, path = "\0\0\0\0\0", balance = "", txs = [], outs = []}
     -- Redis with the events in no order, and with the version of an
     -- entry of the cache as whether it has one: which entry ends with the

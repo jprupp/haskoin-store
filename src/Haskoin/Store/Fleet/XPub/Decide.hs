@@ -327,6 +327,13 @@ abort k token = do
 -- | Begin a move of the tip under a token, from the tip that the store
 -- saw. Builds wait until it is done, so that every entry is one that the
 -- move brings along or one built after it.
+--
+-- It does not begin while the pool has what the move before it marked as
+-- leaving ('P.leavingHeld'), and says that another store is moving the
+-- tip, which is what the store has to do then: wait a turn. The pieces
+-- of a move write to the entries, and nothing but the taking out writes
+-- to the pool or to the cache until everything is out. The move would be
+-- refused at its end anyway, and its pieces dropped.
 begin :: (Monad m) => Keys -> ByteString -> ByteString -> Atomic m Began
 begin k token saw = do
   at <- fromMaybe "" <$> get k.fleet
@@ -334,7 +341,8 @@ begin k token saw = do
     then return TipElsewhere
     else do
       under' <- moving k
-      if isJust under' && under' /= Just token
+      busy <- P.leavingHeld k.pool
+      if busy || (isJust under' && under' /= Just token)
         then return OtherMoving
         else do
           set k.moving token
