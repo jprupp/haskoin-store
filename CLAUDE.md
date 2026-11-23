@@ -19,9 +19,10 @@
   again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 200 seconds in eight processes (65 before the
+- The tests take about 220 seconds in eight processes (65 before the
   tests of the mempool against real nodes, 160 before those of the
-  pool letting go after a move), against 140 to 210
+  pool letting go after a move, 200 before that of a Valkey emptied
+  under a store), against 140 to 210
   with every spec module in a process of its own. Most of it is
   `Haskoin.Store.IntegrationSpec`, whose five environments are groups at the
   top of the module, so that each runs in its own process; keep a new

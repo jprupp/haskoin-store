@@ -363,8 +363,8 @@ disturbance) keep the same rules and converge.
 
 The real programs are Bitcoin Core and Bitcoin Cash Node, in Podman.
 
-**The store end to end** (`Haskoin.Store.MempoolSpec`). In nine
-situations, on each node. In the first eight a store must end with
+**The store end to end** (`Haskoin.Store.MempoolSpec`). In ten
+situations, on each node. In the first nine a store must end with
 exactly the mempool of its node:
 
 1. it starts from nothing;
@@ -372,14 +372,27 @@ exactly the mempool of its node:
 3. it was away while transactions came, without a block;
 4. the same, with a block;
 5. its Valkey is stopped and started again under it (R2);
-6. its node takes chains while it finds blocks;
-7. its pool lost transactions that its node then takes children of (T6);
-8. its pool let go of transactions that its node still has (T7).
+6. its Valkey is emptied under it, as by `FLUSHALL` (R2);
+7. its node takes chains while it finds blocks;
+8. its pool lost transactions that its node then takes children of (T6);
+9. its pool let go of transactions that its node still has (T7).
 
-In the ninth its node never stops taking transactions while blocks come,
+In the tenth its node never stops taking transactions while blocks come,
 and the store must answer from each new block within seconds of it.
 
-The seventh and the eighth fail without their rule. On Bitcoin Core there are two
+The sixth has a limit of fifteen seconds, and is made so that only the
+store noticing the loss can meet it. A store also reads the mempool of
+its node by the clock, thirty seconds after a reading in which the node
+named something new. That reading alone brings a lost pool back. A
+store that was made unable to notice the loss had its pool again 26
+seconds after it was emptied. So the test waits for that reading
+first, and empties Valkey right after it. The test fails for a store
+that does not notice the loss, and for one that notices and does not
+read again: both were tried. The fifth allows two minutes, which the
+reading by the clock meets too: it shows that the store ends right,
+and not what brought it there.
+
+The eighth and the ninth fail without their rule. On Bitcoin Core there are two
 more:
 
 - The node replaces transactions by ones that pay more. The store has

@@ -48,7 +48,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (transpose)
+import Data.List (isInfixOf, transpose)
 import Data.Maybe (fromMaybe)
 import Data.Serialize (encode)
 import Data.Set qualified as Set
@@ -112,6 +112,8 @@ spec = do
           it "has what the block left in the mempool when it is back" (withBed kind (away True))
         on "A store whose Valkey is stopped and started again under it" $
           it "has the mempool of its node again, without being started again" (withBed kind valkeyRestart)
+        on "A store whose Valkey is emptied under it" $
+          it "says so, and has the mempool of its node again within fifteen seconds" (withBed kind valkeyFlush)
         on "A store whose pool let transactions go that its node still has" $
           it "has them again when it next reads the mempool of its node" (withBed kind letGo)
         on "A store whose pool lost transactions that its node then takes children of" $
@@ -347,6 +349,52 @@ valkeyRestart bed = do
     void (podman ["restart", "--time", "1", containerName bed.pod redisContainer.name])
     submit bed (map (chainOf 24) after)
     converges bed server 120
+
+-- | A store whose Valkey is emptied while it runs, as by @FLUSHALL@. Unlike
+-- 'valkeyRestart', Valkey goes on answering and the store keeps its
+-- connections: nothing fails, and only the epoch tells the store that the
+-- pool is gone ('Haskoin.Store.Fleet.Member.noteEpoch'). The store must
+-- say so, once, and have the mempool of its node again within fifteen
+-- seconds. Then the node takes as much again, which the store must take
+-- into the new pool.
+--
+-- A store reads the mempool of its node by the clock too, thirty seconds
+-- after a reading in which the node named something new. That reading
+-- brought the pool back, 26 seconds after it was emptied, in a store that
+-- had been made unable to notice the loss, and so within any limit that
+-- is safe for a slow machine. So the test waits for that reading before it
+-- empties the pool: the next one is then thirty seconds away or more, the
+-- node taking nothing meanwhile, and what brings the pool back in fifteen
+-- is the store noticing.
+valkeyFlush :: Bed -> IO ()
+valkeyFlush bed = do
+  roots <- fund bed 40
+  let (before, after) = splitAt 20 roots
+  withMember bed $ \_ server -> do
+    submit bed (map (chainOf 24) before)
+    converges bed server 60
+    byTheClock 280
+    flush bed
+    converges bed server 15
+    lost <- said "Redis lost its data"
+    lost `shouldBe` 1
+    submit bed (map (chainOf 24) after)
+    converges bed server 60
+  where
+    -- how many lines of the log of the store, above the level of
+    -- debugging, have these words
+    said :: String -> IO Int
+    said what = length . filter (what `isInfixOf`) . takeWhile (/= "--- at every level") <$> bed.logTail
+    -- wait for the second reading of the mempool of the node, the first
+    -- being that of when the node connected, for so many quarters of a
+    -- second
+    byTheClock :: Int -> IO ()
+    byTheClock n = do
+      readings <- said "for its mempool"
+      unless (readings >= 2) $
+        if n <= 0
+          then expectationFailure "The store did not read the mempool of its node a second time in 70 seconds"
+          else threadDelay 250000 >> byTheClock (n - 1)
 
 -- | A store that runs while its node takes chains and finds blocks at the
 -- same time, round after round: an announcement may reach the store while

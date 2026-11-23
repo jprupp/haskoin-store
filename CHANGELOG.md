@@ -246,6 +246,22 @@ whitelist it must now say what they grant (`--peer-permission`, or
     metrics of the web server and of the reads of the database, which
     the store sent and the README did not name, and what the statistics
     of `--statsd-aggregates` are called.
+  - **A test of a store whose Valkey is emptied while it runs**, as by
+    `FLUSHALL`, against Bitcoin Core and Bitcoin Cash Node
+    (`valkeyFlush` in `Haskoin.Store.MempoolSpec`). Valkey goes on
+    answering, so nothing fails, and only the epoch tells the store that
+    the pool is gone. The store must say so once, and have the mempool
+    of its node again within fifteen seconds, without being started
+    again. A store also reads the mempool of its node by the clock,
+    which alone brought the pool back after 26 seconds in a store made
+    unable to notice: the test empties Valkey right after that reading,
+    so that only the noticing meets its limit. It fails for a store
+    that does not notice, and for one that notices and does not read
+    again. Tried once on servers too, under stores answering the
+    public, none of which was started again: Bitcoin Cash and the
+    testnets had the mempool of their node again in under three
+    seconds, and Bitcoin, with 65,962 transactions, in 233
+    (`docs/fleet-mempool.md`).
   - **The tip moves at once, and the pool lets go of the block's
     transactions after it.** A move of the tip over a full block took
     what the block confirmed out of the pool in the same step: more than

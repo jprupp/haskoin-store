@@ -264,6 +264,28 @@ it gone or changed at its turn (`noteEpoch`) forgets its tip, and is
 unhealthy until the fleet has a tip again. The first turn sets one, since
 every live store reports. Then the store fills the pool again.
 
+This is tested against both nodes: a store whose Valkey is emptied
+while it runs says so once, and has the mempool of its node again
+within fifteen seconds, without being started again (`valkeyFlush` in
+`Haskoin.Store.MempoolSpec`).
+
+It was also tried once on servers, by hand, with a `FLUSHALL` under
+stores that were answering the public:
+
+| Store | Mempool of its node | Sources | Had it all again after |
+| --- | --- | --- | --- |
+| Bitcoin Cash, by discovery | 97 | 19 peers | 1.8 seconds |
+| Bitcoin Cash | 42 | its node | 2.7 seconds |
+| Bitcoin testnet4 | 23 | its node | 2.5 seconds |
+| Bitcoin | 65,962 | its node | 233 seconds |
+
+Each store said once that Redis lost its data, within a second and a
+half, and none was started again. The store of Bitcoin took 31 to 61
+transactions a second for the first minute and 1,284 a second at the
+end, with one core of the store busy all the time, its Redis at a sixth
+of a core and its node at a twelfth. Why it starts slowly is not known
+yet.
+
 ## Filling the pool again
 
 A store reads the whole mempool of its sources, again and again. Its
