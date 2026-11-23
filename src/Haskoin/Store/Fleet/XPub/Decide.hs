@@ -329,7 +329,7 @@ abort k token = do
 -- move brings along or one built after it.
 --
 -- It does not begin while the pool has what the move before it marked as
--- leaving ('P.leavingHeld'), and says that another store is moving the
+-- leaving ('Haskoin.Store.Fleet.Pool.Decide.leavingHeld'), and says that another store is moving the
 -- tip, which is what the store has to do then: wait a turn. The pieces
 -- of a move write to the entries, and nothing but the taking out writes
 -- to the pool or to the cache until everything is out. The move would be
