@@ -8,6 +8,10 @@ name: CI
 # regtest blocks from a mock peer and fails if the live heap grows by 1 MB or
 # more between blocks 1000 and 6000, which catches a message loop that
 # retains memory per message. The test suite runs with +RTS -T for it.
+#
+# The proofs of Liquid Haskell (proofs/) are a job of their own. Nothing
+# of the build of the store runs them: Liquid Haskell is a plugin of one
+# version of GHC, and proves a module when that GHC compiles it.
 
 on:
   push:
@@ -20,3 +24,49 @@ jobs:
     uses: jprupp/tools/.github/workflows/haskell-stack.yml@master
     with:
       apt-packages: librocksdb-dev libsecp256k1-dev pkg-config zlib1g-dev
+
+  proofs:
+    name: Liquid Haskell
+    runs-on: ubuntu-24.04
+    # The first run, and one after a change to the libraries, builds Liquid
+    # Haskell itself, which is long. With them from the cache the proofs
+    # take eighty seconds on a developer's machine.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The versions that proofs/cabal.project names: its GHC by name
+      - name: Set up GHC and cabal
+        id: setup
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: 9.12.4
+          cabal-version: 3.16.1.0
+
+      # The release of z3 that the proofs pass with, and not the one of
+      # Ubuntu, which is years older: what a solver finds changes with it.
+      - name: Install z3
+        env:
+          Z3: z3-5.4.1-x64-glibc-2.39
+          SHA256: b548bac48ef2452b4e09ea2945cf4b011d5f43fcf39e4799df268ee7e0769d85
+        run: |
+          curl --fail --location --silent --show-error --output z3.zip \
+            "https://github.com/Z3Prover/z3/releases/download/z3-5.4.1/$Z3.zip"
+          echo "$SHA256  z3.zip" | sha256sum --check
+          unzip -q z3.zip -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$Z3/bin" >> "$GITHUB_PATH"
+
+      # The libraries only, and never proofs/dist-newstyle: a module that
+      # is not compiled again is not proved again.
+      - name: Cache the libraries
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: proofs-${{ runner.os }}-${{ hashFiles('proofs/cabal.project*', 'proofs/*.cabal') }}
+
+      # A proof that fails can take all the memory there is before it says
+      # so. The limit is on the heap of GHC, in which Liquid Haskell runs:
+      # the proofs need a third of it.
+      - name: Prove
+        working-directory: proofs
+        run: cabal build --ghc-options="+RTS -M4g -RTS"

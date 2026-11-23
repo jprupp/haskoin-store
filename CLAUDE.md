@@ -122,7 +122,11 @@ each claim is established. The path is one pure machine,
   all the same, such as
   `systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=512M`:
   a run that the limit stops is a failure to look into, and not a
-  limit to raise. A function that is not exported and that nothing
+  limit to raise. CI runs it too, in a job of its own (`Liquid
+  Haskell` in `.github/workflows/ci.yml`), with the libraries of
+  `proofs/cabal.project.freeze` and the release of z3 named there: a
+  change of either is made in both places, after the proofs pass with
+  it here. A function that is not exported and that nothing
   calls is not checked. It checks the
   refinement types of `Haskoin.Store.Ingest.Ledger`, the only module that
   can change where a transaction id is, and that every function of the
