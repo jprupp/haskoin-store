@@ -268,12 +268,36 @@ It used to be offered all the same. That cost nothing while a few
 transactions came at a time. When a whole mempool comes at once, after
 Redis lost its data or when a store starts on a new pool, most
 transactions wait for another one, and the path offers one transaction
-at a time. A store of Bitcoin whose Redis had been emptied took 233
-seconds to have the 65,962 transactions of its node again: 31 to 61 a
-second for the first minute, and 1,284 a second at the end, when the
-times had grown far apart. The machine, given 65,000 transactions in
-chains of 24 at once, made 103,862 offers that the pool could only
-refuse, beside the 65,000 that it took.
+at a time. The machine, given 65,000 transactions in chains of 24 at
+once, made 103,862 offers that the pool could only refuse, beside the
+65,000 that it took.
+
+**What the runner does after every event costs the same whatever the
+mempool.** The runner says the state of the machine after each event:
+how many ids it knows, how many requests are out, how many
+transactions it holds. It counted the ids by making a set of them all.
+That is nothing for a hundred ids, and 0.8 milliseconds for 65,000, on
+a desktop, after each transaction that comes: time that grows with the
+square of a mempool. It is the size of a map now.
+
+This, and not the offers above, was why a store of Bitcoin took four
+minutes to have a whole mempool again. With requests out to its node
+all the time, it took in 380 transactions a second with a core busy,
+and its Redis was idle. It takes in 2,300 a second since. The futile
+offers were found first, by reasoning from the shape of the curve, and
+taking them out changed nothing that could be measured on the server:
+233 and 259 seconds. What found the cause was the store saying where
+its time went.
+
+**A busy path says where its time goes.** Every ten seconds in which
+the runner was busy for five or more, it says in its log how many
+events, offers and questions to the pool it went through, and the
+milliseconds spent in the machine, in offers, in questions, in sending
+requests, in saying its state and in waiting. An offer is split into
+what it reads before the pool decides: whether a block has the
+transaction, the outputs that it spends from the database, those from
+the pool, which are unspent, and the decision. From outside the store
+all of these look the same: a store that is busy.
 
 **A parent that the pool lacks is asked for** (`seek`), of every peer,
 when the pool says so. The pool has just said that it lacks the parent,

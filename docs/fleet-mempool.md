@@ -283,8 +283,17 @@ Each store said once that Redis lost its data, within a second and a
 half, and none was started again. The store of Bitcoin took 31 to 61
 transactions a second for the first minute and 1,284 a second at the
 end, with one core of the store busy all the time, its Redis at a sixth
-of a core and its node at a twelfth. Why it starts slowly is not known
-yet.
+of a core and its node at a twelfth.
+
+It was slow because of what the store did after each transaction that
+came: it counted the ids that it knew by making a set of them all
+([mempool-ingestion.md](mempool-ingestion.md)). Without that, a store
+of Bitcoin with an empty pool, which is the same work, had the 65,314
+transactions of its node after 87 seconds where it had taken 191: 294
+a second from the first seconds, and over 1,000 a second from the
+second minute. That was one store answering nobody. What remains is the
+offers, one at a time: nine of every ten seconds, a little under a
+millisecond each.
 
 ## Filling the pool again
 

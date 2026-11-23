@@ -315,7 +315,10 @@ ids s = Map.keysSet (places s)
 
 -- | How many ids the machine has a place for. It is said after every
 -- event, and @Set.size (ids s)@ makes a set of them all to count it: 0.8
--- milliseconds for 65,000 ids, after each transaction that comes.
+-- milliseconds for 65,000 ids on a desktop, after each transaction that
+-- comes. That was what a store of Bitcoin spent its time on while it took
+-- a whole mempool: it took in 380 transactions a second with a core
+-- busy, and 2,300 a second without it.
 idCount :: Ingest p h b -> Int
 idCount s = Map.size (places s)
 
@@ -722,11 +725,10 @@ onTick t acc0 = retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).lin
 -- Such a transaction is not offered when its time comes. The pool lacks
 -- what it spends from, and would only say so. A machine that offered it
 -- all the same, after two seconds, then four, then eight, spent most of
--- its offers on that when a whole mempool came at once: a store whose
--- Redis had lost its data had 39,000 transactions waiting for others of
--- the 65,000 of its node, offered each of them five or six times in two
--- minutes, one offer at a time, and took 233 seconds to have them all,
--- 31 to 61 a second for the first minute and 1,284 a second at the end.
+-- its offers on that when a whole mempool came at once, one offer at a
+-- time: given 65,000 transactions in chains of 24, it made 103,862 offers
+-- that the pool refused beside the 65,000 that it took, and a store
+-- filling an empty pool from Bitcoin Core made 44,000 beside 24,000.
 --
 -- One that it waits for and that has no place was given up, and nothing
 -- will wake the held one: that is what its time is for.

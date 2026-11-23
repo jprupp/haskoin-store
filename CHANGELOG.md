@@ -262,28 +262,19 @@ whitelist it must now say what they grant (`--peer-permission`, or
     testnets had the mempool of their node again in under three
     seconds, and Bitcoin, with 65,962 transactions, in 233
     (`docs/fleet-mempool.md`).
-  - **A store that takes a whole mempool at once offers each
-    transaction to the pool once.** A transaction that spends from one
-    that the store is still fetching waits for it, and was offered to
-    the pool all the same two seconds later, then four, eight and so
-    on, in case that one had been given up. The pool could only refuse
-    it. With a few transactions at a time that cost nothing. With a
-    whole mempool at once, after Redis lost its data or on a new pool,
-    most transactions wait for another, and the path offers one at a
-    time: a store of Bitcoin took 233 seconds to have the 65,962
-    transactions of its node again, 31 to 61 a second for the first
-    minute and 1,284 a second at the end. A held transaction is now
-    offered at its time only if one of those that it waits for has no
-    place any more, which is what the time is for
-    (`docs/mempool-ingestion.md`). Given 65,000 transactions in chains
-    of 24 at once, with a millisecond for each offer, the machine made
-    103,862 futile offers and took 169 seconds; it makes none now, and
-    takes the 65 seconds of the offers
-    (`Haskoin.Store.IngestSpec`, in three seconds). Against Bitcoin
-    Core with 24,000, a store with an empty pool made 44,000 futile
-    offers and had them all in 18 seconds; none and 13 seconds now. The
-    model checks the rule both ways, with a planted bug for each, and
-    Liquid Haskell passes.
+  - **A store of Bitcoin has a whole mempool again in a minute and a
+    half, where it took over three.** After each transaction that came,
+    the path into the pool said how many ids it knew, and counted them
+    by making a set of them all: 0.8 milliseconds for 65,000 on a
+    desktop, for each of 65,000 transactions. A store whose Redis had
+    lost its data, or that started on a new pool, took in 380
+    transactions a second with a core busy, its Redis idle and requests
+    out to its node all the time: 233 and 259 seconds on a server
+    answering the public, 191 on one answering nobody. The count is the
+    size of a map now, and the same store took in 2,300 a second and had
+    the 65,314 transactions of its node after 87 seconds, 294 a second
+    from the first seconds and over 1,000 from the second minute. What
+    remains is the offers, one at a time.
   - **A store that is slow to fill its pool says where its time goes.**
     Every ten seconds in which the path into the pool was busy for five
     or more, it says in its log how many events, offers and questions to
@@ -292,12 +283,26 @@ whitelist it must now say what they grant (`--peer-permission`, or
     saying its state, with the offers split into what each reads: whether
     a block has the transaction, the outputs that it spends from the
     database and from the pool, which of them are unspent, and the
-    pool's decision. Nothing outside the store could tell: a store of
-    Bitcoin took its first minute over a twentieth of a mempool with one
-    core busy and Redis idle, and the futile offers that the change
-    above removes turned out not to be why. The number of ids that the
-    store knows, said after every event, is no longer counted by making
-    a set of them all: 0.8 milliseconds for 65,000.
+    pool's decision. Nothing outside the store could tell. That line is
+    what found the count above, after a cause reasoned from the shape of
+    a curve had been wrong.
+  - **A store that takes a whole mempool at once offers each
+    transaction to the pool once.** A transaction that spends from one
+    that the store is still fetching waits for it, and was offered to
+    the pool all the same two seconds later, then four, eight and so
+    on, in case that one had been given up. The pool could only refuse
+    it. A held transaction is now offered at its time only if one of
+    those that it waits for has no place any more, which is what the
+    time is for (`docs/mempool-ingestion.md`). Given 65,000
+    transactions in chains of 24 at once, with a millisecond for each
+    offer, the machine made 103,862 futile offers and took 169 seconds;
+    it makes none now, and takes the 65 seconds of the offers
+    (`Haskoin.Store.IngestSpec`, in three seconds). Against Bitcoin
+    Core with 24,000, a store with an empty pool made 44,000 futile
+    offers and had them all in 18 seconds; none and 13 seconds now. On a
+    server with 65,000 it changed nothing that could be measured: this
+    was not what made the store slow there. The model checks the rule
+    both ways, with a planted bug for each, and Liquid Haskell passes.
   - **The tip moves at once, and the pool lets go of the block's
     transactions after it.** A move of the tip over a full block took
     what the block confirmed out of the pool in the same step: more than
