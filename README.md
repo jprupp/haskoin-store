@@ -1681,14 +1681,20 @@ move over a block of 4,000 of them, some in chains, as on Bitcoin. It
 prints the time of each pass over
 the decision, its answers and writes, the time for each of those in a
 pass, which is the number to compare between two builds, and what was
-allocated. Run it with `+RTS -T` for the last. With RIVALS, the block
+allocated. Run it with `+RTS -T -A64m`: `-T` for the last, and `-A64m`
+because a store runs with it. Without it the collector runs three
+hundred times in a move, and each time goes over the model of Redis,
+which a store does not have in its memory: the move then takes nearly
+three times as long, and most of what is timed is the collector. With
+RIVALS, the block
 is also in conflict with so many transactions of the pool, which leave
 with what spends from them.
 
 On a desktop of 2026 the move over 4,000 transactions of three inputs and
-three outputs is decided in about 1.1 seconds: four passes, one of which
-goes through the whole block, and about a microsecond and a kilobyte
-allocated for each answer or write of a pass. It took 4.4 seconds in
+three outputs is decided in about 0.8 seconds: four passes, one of which
+goes through the whole block and takes 0.66 seconds of them, for 94,000
+answers and 205,000 writes, which is about two microseconds for each in
+that pass. It took four times as long in
 eight passes, five of them through the block, before the move named its
 questions ahead and while the pool worked out which transactions could
 be replaced by fee (`docs/concurrency.md`, "The floor").

@@ -177,13 +177,18 @@ whitelist it must now say what they grant (`--peer-permission`, or
     decision also judges time by one clock, read at its start, where it
     read the clock again each time it asked Redis, and so found its own
     lease of ten seconds run out. A store says in its log when a move
-    took five seconds or more, since transactions wait meanwhile, and
+    took a second or more, since transactions wait meanwhile, and
     where the time went: reading the blocks, reading and writing the
     cache, deciding, the calls to Redis, carrying it out, and the
     garbage collector.
   - **`haskoin-store-bench decide`** times what the move of the tip over
     a block costs to decide, without Redis: each pass over the decision,
-    its answers and writes, and what it allocates.
+    its answers and writes, and what it allocates. Run it with
+    `+RTS -T -A64m`, as a store runs. The figures of this section were
+    measured without `-A64m`, where the collector goes over the model of
+    Redis three hundred times in a move: they compare one build with
+    another, and are more than twice what the move costs. With it the
+    move over 4,000 transactions is decided in 0.8 seconds.
   - **The move of the tip is gone through once.** It names what it will
     ask before it starts, in steps, where it found its questions as it
     went and was gone through from its start for each step: five times

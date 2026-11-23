@@ -243,7 +243,7 @@ key of its own, said from a thread of its own:
 A move that is not over in ten minutes has gone wrong, and its store
 stops saying that it is at it. A store whose move is refused five turns
 in a row says so in its log, at the level of a warning, with how long the
-last took and which answer had changed; one whose move took five seconds
+last took and which answer had changed; one whose move took a second
 or more says how long, since transactions wait meanwhile. Both say where
 the time went: the blocks read from the database, the cache read and
 written, the decision with how much of it was calls to Redis, the call

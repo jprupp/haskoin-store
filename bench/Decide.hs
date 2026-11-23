@@ -37,6 +37,12 @@
 -- on and its writes, and, with @+RTS -T@, how much it allocated and how
 -- long the garbage collector ran. The time for each question or write of
 -- a pass is the number to compare between two builds.
+--
+-- Run it with @+RTS -T -A64m@, as a store runs. With the allocation area
+-- that GHC gives by default the collector runs three hundred times in a
+-- move of 4,000 transactions, and each time goes over the model of Redis,
+-- which is in the memory of this program and not of a store: the move
+-- took 2.1 seconds then and 0.8 with it, on the same machine.
 module Decide (decideBench) where
 
 import Control.Exception (evaluate)

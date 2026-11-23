@@ -796,10 +796,12 @@ moveTip m = do
                 Way _ -> False
                 _ -> True
           when restarted $ wasEmptied m target "the shared mempool started again"
-          -- transactions wait for as long as a move takes, so a slow
-          -- one is said: half of the ten seconds that the floor lasts
-          -- without a word is slow
-          when (ended - began >= 5000000000) . m.config.note LevelInfo $
+          -- transactions wait for as long as a move takes, so one that
+          -- they notice is said, with where its time went. It was said
+          -- from five seconds: the move over a full block then came
+          -- under that, and nothing said what the two seconds or so
+          -- that were left of it were made of
+          when (ended - began >= 1000000000) . m.config.note LevelInfo $
             "The fleet tip moved to " <> blockName target <> " in " <> took <> ": " <> parts
           atomically (writeTVar m.refused 0)
           return True
