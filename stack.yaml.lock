@@ -54,15 +54,15 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    commit: 92387f529b98e07c3369acc80e3fff310dfcabe3
+    commit: c7c74c5f70bb61ea57b4192f6a72cc7eb7f32105
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: 560f32e3aa4eb60076db9d0e5c58bc70b74d4830ea981793014fb3d2646f3d64
-      size: 11737
+      sha256: 5b3b001bb5274a1d31693cd5387404fd63355b158c83d6cd765f4d1c6d0efeef
+      size: 11738
     version: 3.0.0
   original:
-    commit: 92387f529b98e07c3369acc80e3fff310dfcabe3
+    commit: c7c74c5f70bb61ea57b4192f6a72cc7eb7f32105
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785

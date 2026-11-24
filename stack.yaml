@@ -31,13 +31,11 @@ extra-deps:
   - rocksdb-query-0.7.0
   - nqe-0.7.0
   - git: https://github.com/jprupp/haskoin-core.git
-    commit: 92387f529b98e07c3369acc80e3fff310dfcabe3
+    commit: c7c74c5f70bb61ea57b4192f6a72cc7eb7f32105
   - git: https://github.com/jprupp/podman-test.git
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
   - git: https://github.com/jprupp/haskoin-node.git
     commit: 798edcd4dfcabedb8642364fb6eccdad406e904d
-  # The branch health-mempool: a health that reads the blocks only, and
-  # says whether the mempool is filling.
   - git: https://github.com/jprupp/haskoin-store-data.git
     commit: 75c5ac1ac721a0ddee266cfd97ed9c5103ceeee0
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to

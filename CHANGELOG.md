@@ -284,7 +284,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
     `docs/mempool-ingestion.md`, with two checks in the model and a
     planted bug for each; its first version took the first names of a
     source for its answer, which the model found wrong at once. Both
-    changes need haskoin-store-data's branch `health-mempool`.
+    changes need haskoin-store-data's master.
   - **A node as a peer, through its RPC and its ZeroMQ socket**
     (`--node-rpc` with `--node-zmq`, `NODE_ZMQ`; `docs/node-peer.md`).
     The peer-to-peer protocol is made for strangers: a node names what
@@ -337,7 +337,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
       starts and when the peer connects, and in `/health`, as a
       sentence in the new `warnings` and in `text`. A warning decides
       nothing: `ok` and the status stay as they are. It needs
-      haskoin-store-data's branch `health-mempool`.
+      haskoin-store-data's master.
     - The web server no longer reads the RPC as a source of its own
       (`nodeFeedLoop`): the node peer is that source.
     - The node of `--node-rpc` is a node of the operator with
