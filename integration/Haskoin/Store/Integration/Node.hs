@@ -71,7 +71,16 @@ import Haskoin.Store.Integration.Image (bchnBin, coreBin, testImage)
 import Haskoin.Store.Web (unixSocketManager)
 import Network.HTTP.Client (Manager, newManager)
 import Network.Wreq qualified as Wreq
-import Test.Podman (Address (..), ContainerSpec (..), Endpoint (..), Pod, address, container, containerName)
+import Test.Podman
+  ( Address (..),
+    ContainerSpec (..),
+    Endpoint (..),
+    Pod,
+    address,
+    container,
+    containerName,
+    socketInside,
+  )
 import Test.Podman.Command (podman)
 
 -- | Which node software.
@@ -152,7 +161,9 @@ nodeNetwork BitcoinCashNode = bchRegTest
 -- ("Haskoin.Store.Integration.Image"): its chain is in a tmpfs of 512 MiB,
 -- it may use 1 GiB of memory, and its caches and mempool are kept small.
 -- Its RPC and peer-to-peer ports are bridged to the sockets @rpc@ and
--- @p2p@ of its pod.
+-- @p2p@ of its pod: neither node listens on a Unix socket for those. It
+-- publishes over ZeroMQ on the socket @zmq@ of its pod, which it makes
+-- itself.
 --
 -- Every peer is whitelisted, so that the store may ask for the mempool and
 -- gets transactions relayed without delay.
@@ -199,9 +210,10 @@ nodeContainerAt i kind =
           "-dbcache=16",
           "-maxmempool=16",
           -- the ids of the transactions that it takes and the hashes of
-          -- the blocks that become its tip, published over ZeroMQ
-          "-zmqpubhashtx=tcp://0.0.0.0:" <> show zmqPort,
-          "-zmqpubhashblock=tcp://0.0.0.0:" <> show zmqPort
+          -- the blocks that become its tip, published over ZeroMQ on a
+          -- Unix socket that the node makes itself
+          "-zmqpubhashtx=" <> zmqAddress,
+          "-zmqpubhashblock=" <> zmqAddress
         ]
           <> case kind of
             -- releases of Bitcoin Cash Node stop serving RPC some months
@@ -211,13 +223,19 @@ nodeContainerAt i kind =
       endpoints =
         [ Bridged ("rpc" <> suffix i) rpcPort,
           Bridged ("p2p" <> suffix i) p2pPort,
-          Bridged ("zmq" <> suffix i) zmqPort
+          Native ("zmq" <> suffix i)
         ]
     }
   where
     rpcPort = 18443 + 10 * i
     p2pPort = 18444 + 10 * i
-    zmqPort = 18445 + 10 * i
+    -- The two nodes write a Unix socket differently. Bitcoin Core 32
+    -- takes @ipc:\/\/@ for a port that it cannot read, and does not
+    -- start: a node of a server did not, for 25 minutes, while these
+    -- tests gave both nodes a TCP port and a bridge.
+    zmqAddress = case kind of
+      BitcoinCore -> "unix:" <> socketInside ("zmq" <> suffix i)
+      BitcoinCashNode -> "ipc://" <> socketInside ("zmq" <> suffix i)
 
 -- | The same node without the whitelist: it treats the store as it treats
 -- any peer that connected to it. It announces transactions on its timer

@@ -163,13 +163,14 @@ A Unix socket works too, and the two sides write it differently:
 | Who | How the address is written |
 | --- | --- |
 | The store (`--node-zmq`) | `ipc:///run/node/zmq.sock` or `unix:/run/node/zmq.sock`: both mean the same |
-| Bitcoin Core 32 (`-zmqpub…`) | `unix:/run/node/zmq.sock`. Given `ipc:///…` it stops with "Invalid port specified" and does not start |
-| Bitcoin Cash Node (`-zmqpub…`) | `ipc:///run/node/zmq.sock` |
+| Bitcoin Core 32 (`-zmqpub…`) | `unix:/run/node/zmq.sock`. Given `ipc:///…` it says "Invalid port specified" and does not start |
+| Bitcoin Cash Node 29 (`-zmqpub…`) | `ipc:///run/node/zmq.sock` |
 
-What Bitcoin Core does with `ipc://` was seen on a server, where a node
-did not start for it. The tests here give both nodes a TCP address, so
-a node that publishes on a Unix socket is **not tested** in this
-repository.
+This is **tested**: in the tests each node publishes on a Unix socket
+that it makes itself, written as above, and Bitcoin Core was started
+with `ipc://` to see it refuse. Neither node listens on a Unix socket
+for its RPC or for its peers (both were tried), so for those the tests
+join a TCP port inside the container to a socket.
 
 Bitcoin Core has
 ZeroMQ only if it was built with it (`-DWITH_ZMQ=ON`); Bitcoin Cash
