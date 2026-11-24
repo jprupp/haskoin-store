@@ -292,7 +292,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
       three checks in the model, and five planted bugs that it finds.
       That a store comes to say `synced` is tested and not checked,
       also on both nodes while transactions come without a pause.
-    - Needs haskoin-store-data's branch `mempool-sync`.
+    - Needs haskoin-store-data's master.
   - **A source is read every minute at least**, where it was every ten
     minutes. While transactions come it is read every thirty seconds,
     as before.
