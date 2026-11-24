@@ -19,10 +19,11 @@
   again, and `stack bench` compiles with optimisation.
 - `haskell-dev` builds without optimisation. Never time the store with it:
   the benchmarks run with `stack bench`, as the README says.
-- The tests take about 265 seconds in eight processes (65 before the
+- The tests take about 335 seconds in eight processes (65 before the
   tests of the mempool against real nodes, 160 before those of the
   pool letting go after a move, 200 before that of a Valkey emptied
-  under a store, 220 before the worlds with strangers), against 140 to 210
+  under a store, 220 before the worlds with strangers, 265 before
+  the checks of a mempool that is filling), against 140 to 210
   with every spec module in a process of its own. Most of it is
   `Haskoin.Store.IntegrationSpec`, whose five environments are groups at the
   top of the module, so that each runs in its own process; keep a new
@@ -120,12 +121,12 @@ has to say there what differs and why.
 ## The path into the shared mempool
 
 `docs/mempool-ingestion.md` says what the path from a node's mempool to
-the pool must guarantee (T1 to T8), what it assumes (A1 to A9), and how
+the pool must guarantee (T1 to T9), what it assumes (A1 to A10), and how
 each claim is established. The path is one pure machine,
 `Haskoin.Store.Ingest`. A change to it is not done until:
 
 - `scripts/check-ingest.sh` passes: the model checker goes through every
-  order of events of its small worlds, in three minutes and a half, without building
+  order of events of its small worlds, in five minutes and a half, without building
   the store. A new rule of the machine gets a check in
   `Haskoin.Store.Ingest.Model`, and a planted bug that the check finds.
 - Liquid Haskell passes: `cabal build` in `proofs/`, with GHCup's GHC

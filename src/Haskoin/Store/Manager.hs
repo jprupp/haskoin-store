@@ -27,9 +27,11 @@ where
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry)
 import Control.Exception (throwIO)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM, forM_, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust, isNothing)
 import Data.Serialize (Serialize, decode)
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
@@ -63,11 +65,14 @@ import Haskoin.Node
     Node (..),
     NodeConfig (..),
     NodeEvent (..),
+    OnlinePeer (..),
+    Peer,
     PeerEvent (..),
     PeerMgr,
     Permissions,
     WithConnection,
     chainGetBest,
+    getPeers,
     judgeMessage,
     logAt,
     withNode,
@@ -122,7 +127,7 @@ import Haskoin.Store.Ingest.Run
     ingestTxSTM,
     withIngest,
   )
-import Haskoin.Store.NodePeer (NodePeer (..), nodePeerAddress, nodePeerConnect, nodePeerName)
+import Haskoin.Store.NodePeer (NodePeer (..), lacksZmq, nodePeerAddress, nodePeerConnect, nodePeerName)
 import Haskoin.Store.NodeRpc (nodeSession)
 import Haskoin.Store.NodeZmq (parseZmqAddress)
 import Haskoin.Store.Startup (connectRedis, explainDatabase)
@@ -233,9 +238,11 @@ data StoreConfig = StoreConfig
     -- | connect to peers using the function 'Haskoin.Node.withConnection'
     connect :: !(SockAddr -> WithConnection),
     -- | the RPC of a full node of the operator, its Unix socket if it has
-    -- one, and where that node publishes over ZeroMQ. With the RPC and
-    -- the ZeroMQ socket both, the node is one more peer of the store,
-    -- which needs no peer-to-peer connection ("Haskoin.Store.NodePeer").
+    -- one, and where that node publishes over ZeroMQ. With the RPC, the
+    -- node is one more peer of the store, which needs no peer-to-peer
+    -- connection ("Haskoin.Store.NodePeer"). The ZeroMQ socket is
+    -- expected with it: without it the node is asked every five seconds
+    -- for what the socket would announce, and the store warns of it.
     -- The web server has the RPC too, to publish through
     -- ('Haskoin.Store.Web.WebConfig').
     nodePeerRpc :: !(Maybe String),
@@ -282,7 +289,10 @@ withStore ::
   (Store -> IO a) ->
   IO a
 withStore cfg0 action = do
-  cfg <- withNodePeer cfg0
+  -- whether the node peer is the only node of the operator that is a
+  -- peer: asked of the peer manager, which is not there yet
+  alone <- newIORef (return True)
+  cfg <- withNodePeer (join (readIORef alone)) cfg0
   -- Redis first: a store cannot run without it, and finding out after the
   -- database opened and the node started only takes longer
   redis <- mapM connectRedis cfg.redis
@@ -292,6 +302,7 @@ withStore cfg0 action = do
         withPublisher $ \node_pub ->
           withSubscription node_pub $ \node_sub ->
             withNode (nodeCfg cfg db node_pub) $ \node -> do
+              writeIORef alone (onlyNodePeer cfg node)
               member <- storeMember cfg redis db
               withIngest (ingestCfg cfg node db member) $ \ingest ->
                 withBlockStore (blockStoreCfg cfg node pub db member ingest) $ \block_store ->
@@ -314,26 +325,61 @@ withStore cfg0 action = do
                               writes = writes
                             }
 
--- | The configuration of a store that has the RPC of a node and the
--- address of its ZeroMQ socket, with that node as one more of its peers
--- ("Haskoin.Store.NodePeer"): it is named among the peers that the store
--- was given, so that it is a node of the operator as they are, and a
--- connection to its address is a pipe in memory. Any other store is left
--- as it is.
+-- | The configuration of a store that has the RPC of a node, with that
+-- node as one more of its peers ("Haskoin.Store.NodePeer"): it is named
+-- among the peers that the store was given, and a connection to its
+-- address is a pipe in memory. Any other store is left as it is. With
+-- whether no other node of the operator is a peer of the store.
+--
+-- The address of its ZeroMQ socket is expected with it. A store without
+-- it has the peer all the same, which then asks the node every five
+-- seconds, and says so with a warning here and in its health.
 --
 -- An address of ZeroMQ that cannot be read stops the store, as any
 -- option that makes no sense does.
-withNodePeer :: StoreConfig -> IO StoreConfig
-withNodePeer cfg = case (cfg.nodePeerRpc, cfg.nodePeerZmq) of
-  (Just url, Just written) -> do
-    zmq <- either (throwIO . userError) return (parseZmqAddress written)
+withNodePeer :: IO Bool -> StoreConfig -> IO StoreConfig
+withNodePeer alone cfg = case cfg.nodePeerRpc of
+  Just url -> do
+    zmq <- forM cfg.nodePeerZmq (either (throwIO . userError) return . parseZmqAddress)
     session <- nodeSession cfg.nodePeerRpcSocket
-    let peer = NodePeer {net = cfg.net, session, url, zmq, logger = withSource "Node RPC" cfg.logger}
+    let logger = withSource "Node RPC" cfg.logger
+        peer = NodePeer {net = cfg.net, session, url, zmq, alone, logger}
         connect sa
           | sa == nodePeerAddress = nodePeerConnect peer
           | otherwise = cfg.connect sa
+    when (isNothing zmq) (logAt LevelWarn logger lacksZmq)
     return (cfg {initPeers = cfg.initPeers <> [nodePeerName], connect} :: StoreConfig)
-  _ -> return cfg
+  Nothing -> return cfg
+
+-- | Whether a peer is a node of the operator: the node that the store has
+-- through its RPC, always, and those that the store was given
+-- ('initPeers'), unless it was told that they are not ('foreignPeers').
+--
+-- A peer is known by its address, as haskoin-node names a peer, and the
+-- names of 'initPeers' are resolved here as haskoin-node resolves them
+-- ('toSockAddr'), each time that it is asked. A name that resolves to
+-- another address by then makes a node of the operator a stranger: what
+-- the store cannot verify of it comes late, and nothing is taken that
+-- should not be.
+ownPeer :: StoreConfig -> Peer -> IO Bool
+ownPeer cfg p
+  | isNodePeer p = return (isJust cfg.nodePeerRpc)
+  | cfg.foreignPeers = return False
+  | otherwise = do
+      given <- concat <$> mapM (toSockAddr cfg.net) cfg.initPeers
+      return (show p `elem` map show given)
+
+-- | Whether a peer is the node that the store has through its RPC.
+isNodePeer :: Peer -> Bool
+isNodePeer p = show p == show nodePeerAddress
+
+-- | Whether no node of the operator is a peer of the store now but the
+-- one that it has through its RPC: every other peer is a stranger, or
+-- there is none.
+onlyNodePeer :: StoreConfig -> Node -> IO Bool
+onlyNodePeer cfg node = do
+  peers <- getPeers node.peerMgr
+  not . or <$> mapM (ownPeer cfg . (.mailbox)) (filter (not . isNodePeer . (.mailbox)) peers)
 
 -- | Watch RocksDB for write stalls while an action runs
 -- ("Haskoin.Store.Database.Stalls"), and give the action the latest state.
@@ -491,15 +537,7 @@ blockStoreCfg cfg node pub db member ingest =
 -- the member of the fleet, whether the best block of the database is the
 -- best header of the node, which peers give their mempools when asked,
 -- as the model of each peer's node says ('judgeMessage'), and which are
--- nodes of the operator: those that the store was given ('initPeers'),
--- unless it was told that they are not ('foreignPeers').
---
--- A peer is known by its address, as haskoin-node names a peer, and the
--- names of 'initPeers' are resolved here as haskoin-node resolves them
--- ('toSockAddr'), each time a peer connects. A name that resolves to
--- another address by then makes a node of the operator a stranger: what
--- the store cannot verify of it comes late, and nothing is taken that
--- should not be.
+-- nodes of the operator ('ownPeer').
 ingestCfg :: StoreConfig -> Node -> DatabaseReader -> Maybe Member -> IngestConfig
 ingestCfg cfg node db member =
   IngestConfig
@@ -511,12 +549,7 @@ ingestCfg cfg node db member =
         top <- chainGetBest node.chain
         return (best == Just (headerHash top.header)),
       source = \p -> (== Allowed) <$> judgeMessage p MMempool,
-      own = \p ->
-        if cfg.foreignPeers
-          then return False
-          else do
-            given <- concat <$> mapM (toSockAddr cfg.net) cfg.initPeers
-            return (show p `elem` map show given),
+      own = ownPeer cfg,
       stats = cfg.stats,
       logger = withSource "Ingest" cfg.logger
     }

@@ -166,6 +166,26 @@ spec = do
           (s, _) = run' [Named 1 [8], Checked 1 [] [8], Body (Just 1) 8 [7], Offered 8 (Orphan [7])] own
       vouchedFor 8 s `shouldBe` True
       vouchedFor 7 s `shouldBe` True
+    it "says that the pool is filling until its source had the time to answer and nothing is on its way" $ do
+      -- the source was asked for its mempool when it connected
+      isFilling ready `shouldBe` True
+      isFilling (fst (run' [Tick 19999] ready)) `shouldBe` True
+      -- twenty seconds, and it named nothing: it has nothing
+      isFilling (fst (run' [Tick 20000] ready)) `shouldBe` False
+      -- what it named is on its way: asked of the pool, then fetched
+      let (asking, _) = run' [Named 1 [7], Tick 20000] ready
+      isFilling asking `shouldBe` True
+      let (fetching, _) = run' [Checked 1 [] [7]] asking
+      isFilling fetching `shouldBe` True
+      let (full, _) = run' [Body (Just 1) 7 [], Offered 7 Settled] fetching
+      isFilling full `shouldBe` False
+      -- and it stays so while transactions come and go
+      isFilling (fst (run' [Named 1 [8], Checked 1 [] [8]] full)) `shouldBe` False
+      -- until the pool loses what it had
+      isFilling (fst (run' [Emptied] full)) `shouldBe` True
+    it "is not said to be filling without a source, which it could not fill from" $ do
+      let alone = fst (run' [PeerUp 1 False, Synced True] (start defaultConfig 0)) :: Ingest Int Int [Int]
+      isFilling alone `shouldBe` False
   where
     ready :: Ingest Int Int [Int]
     ready = fst (run' [PeerUp 1 True, Synced True] (start defaultConfig 0))

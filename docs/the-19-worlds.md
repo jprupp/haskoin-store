@@ -39,8 +39,8 @@ data, a request times out. It tries each of those, and from each result asks
 the same question again, until it has visited every situation that can be
 reached.
 
-A world has between 500 and 430,000 such situations. All 26 together have
-about two and a quarter million, and going through them takes three
+A world has between 700 and 760,000 such situations. All 26 together have
+about three and a half million, and going through them takes five
 minutes and a half. There were 19 until the store told its own nodes from strangers,
 which is where the name of this page comes from.
 

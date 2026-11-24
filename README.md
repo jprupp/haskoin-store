@@ -162,8 +162,8 @@ haskoin-store --net btc --discover
 ```
 
 Give it either `--discover` or at least one `--peer`; with neither it turns
-discovery on by itself, unless it has your node as a peer through its RPC and
-its ZeroMQ socket (`--node-rpc` with `--node-zmq`). Data goes in a directory named after the network inside
+discovery on by itself, unless it has your node as a peer through its RPC
+(`--node-rpc`, which is meant to come with `--node-zmq`). Data goes in a directory named after the network inside
 `--dir`, so one data directory can hold several networks.
 
 It needs a Redis or Valkey server, at `redis://localhost:6379` unless
@@ -362,9 +362,9 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--target-delay` | `TARGET_DELAY` | `25` | Milliseconds that a thread ready to run may wait for a core before the limit comes down |
 | `--request-queue` | `REQUEST_QUEUE` | `64` | Long requests that may wait for a slot; more are refused with 429 |
 | `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
-| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to read the node's whole mempool from, as a source of the shared mempool; without it, or when it does not answer, transactions go to the peers, and the store reads the mempools of the peers that allow it |
+| `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to have that node as one more peer of the store: headers, blocks, transactions and the mempool come over it, and the store needs no peer-to-peer connection (`docs/node-peer.md`). Give `--node-zmq` with it: without it the store asks the node every five seconds, and warns of it in its log and in `/health`. Without `--node-rpc`, or when it does not answer, transactions go to the peers |
 | `--node-rpc-socket` | `NODE_RPC_SOCKET` | none | Unix socket to send the requests of `--node-rpc` through, in place of the host and port of its URL; the URL still gives the user and password. Neither node listens on one itself: it is something that joins it to the node, such as socat |
-| `--node-zmq` | `NODE_ZMQ` | none | Where the node of `--node-rpc` publishes over ZeroMQ, such as `tcp://127.0.0.1:28332` or `ipc:///run/node/zmq.sock`. Start the node with `-zmqpubhashtx` and `-zmqpubhashblock` at that address. The node is then one more peer of the store, through its RPC and this socket, and the store needs no other (`docs/node-peer.md`). It needs `--node-rpc` |
+| `--node-zmq` | `NODE_ZMQ` | none | Where the node of `--node-rpc` publishes over ZeroMQ, such as `tcp://127.0.0.1:28332` or `ipc:///run/node/zmq.sock`. Start the node with `-zmqpubhashtx` and `-zmqpubhashblock` at that address. The store then hears of a transaction and of a block as the node takes them, and does not have to ask (`docs/node-peer.md`). It needs `--node-rpc`, and is expected with it |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -408,8 +408,8 @@ fleet of one. Every key starts with `hs3:<network>:`.
 - **Filling the pool again** is reading the whole mempool of a
   **source**, which a store does when it starts, whenever it may have
   missed a transaction, when the pool lost what it had, and every ten
-  minutes. With `--node-rpc` the RPC of the node is a source, whatever the
-  node allows its peers. A peer is one when its node takes the request,
+  minutes. With `--node-rpc` the node is a peer through its RPC, and a
+  source, whatever the node allows its peers. A peer is one when its node takes the request,
   which a node closes the connection over unless it offers Bloom filters
   or whitelists the store with `mempool`. The store knows which from a
   model of each peer's node (`docs/fleet-mempool.md`): tell it what your
@@ -424,7 +424,12 @@ fleet of one. Every key starts with `hs3:<network>:`.
   one more peer, with no peer-to-peer connection to it: it asks it what
   it asks any peer, and the answers come from the RPC and from what the
   node publishes (`-zmqpubhashtx`, `-zmqpubhashblock`). It hears of a
-  transaction and of a block as the node takes them. That peer counts
+  transaction and of a block as the node takes them. With `--node-rpc`
+  alone the node is a peer too, and the store asks it every five
+  seconds for its best block and, while no other node of yours is a
+  peer, for its mempool. That works, costs the node a reading of its
+  whole mempool each time, and makes the store warn in its log and in
+  the `warnings` of `/health`: the two are meant to be given together. That peer counts
   in `/health`, it is a node of yours, and a store can run on it alone,
   with no `--peer` and no `--discover`. The ZeroMQ socket only
   publishes, has no password, and drops what a slow subscriber does not
@@ -448,7 +453,7 @@ fleet of one. Every key starts with `hs3:<network>:`.
 
   So a store with a node of yours among its peers misses nothing, and a
   store with only strangers shows a spend of a script when a block
-  confirms it. If the nodes that you give with `--peer` are not yours,
+  confirms it. The node of `--node-rpc` is a node of yours, always. If the nodes that you give with `--peer` are not yours,
   say so with `--foreign-peers`. Without this a stranger could show a
   wallet a payment that was never made. The store says in its log, of
   each peer that connects, which of the two it takes it for: check that
@@ -459,13 +464,41 @@ fleet of one. Every key starts with `hs3:<network>:`.
 
 ### Health check
 
+A store is healthy when it has the blocks of the network: its database
+keeps up with the headers, the best header is recent, it has enough
+peers, and its database takes writes. `/health` answers 503 otherwise.
+
+Nothing of the mempool decides it. A store that is at the head of the
+chain answers every request rightly from what it has. `/health` still
+says when the last transaction came and how many are asked for and not
+received, each with an `ok` of its own, and the health of the store does
+not depend on them.
+
+What to know of the mempool is in the `mempool` object of `/health`:
+
+| Field | What it says |
+| --- | --- |
+| `sources` | How many nodes the store can read a whole mempool from |
+| `filling` | Whether the mempool is still filling: the store has not yet read its sources and taken in all that they named, since it started or since Redis lost its data. It shows fewer unconfirmed transactions than its node meanwhile. True for twenty seconds at least after a start |
+| `known`, `held` | How many transactions are on their way to the mempool, and how many of them the store holds |
+| `dirty` | Whether the store gave something up and is about to read its sources again |
+
+To give a new store traffic only once its mempool is full, wait for
+`sources` of 1 or more and `filling` false.
+
+`/health` also has `warnings`, when there are any: what you should put
+right in how the store is set up, a sentence each. A warning decides
+nothing, and a store with warnings is as healthy as one without. There
+is one so far: the store has the RPC of its node (`--node-rpc`) and not
+its ZeroMQ socket (`--node-zmq`). The store logs the same as a warning.
+
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--max-lagging-blocks` | `MAX_LAGGING_BLOCKS` | `3` | Most blocks the index may lag behind the headers |
-| `--max-pending-txs` | `MAX_PENDING_TXS` | `10000` | Most transactions requested from peers and not received yet |
+| `--max-pending-txs` | `MAX_PENDING_TXS` | `10000` | Most transactions requested from peers and not received yet, for the check `pending-txs`, which does not decide the health of the store |
 | `--min-peers` | `MIN_PEERS` | `1` | Fewest connected peers |
 | `--block-timeout` | `BLOCK_TIMEOUT` | `14400` | Most seconds since the last block |
-| `--tx-timeout` | `TX_TIMEOUT` | `1800` | Most seconds since the last transaction |
+| `--tx-timeout` | `TX_TIMEOUT` | `1800` | Most seconds since the last transaction, for the check `last-tx`, which does not decide the health of the store |
 | `--health-check-interval` | `HEALTH_CHECK_INTERVAL` | `1` | Seconds between checks; there is one at each new block too |
 
 ### Metrics and logging

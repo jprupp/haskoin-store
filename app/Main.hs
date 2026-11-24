@@ -768,7 +768,8 @@ config c = do
           "NODE_RPC"
           ( unwords
               [ "Publish transactions over the JSON-RPC of this full node, and through the peers when it fails;",
-                "read the node's whole mempool over it, as a source of the shared mempool"
+                "have the node as a peer over it, for headers, blocks, transactions and the mempool.",
+                "Give --node-zmq with it: without it the node is asked every five seconds, with a warning"
               ]
           )
         <> value c.nodeRpc
@@ -789,7 +790,7 @@ config c = do
           ( unwords
               [ "Where the node of --node-rpc publishes over ZeroMQ (its -zmqpubhashtx and -zmqpubhashblock),",
                 "such as tcp://127.0.0.1:28332 or ipc:///run/node/zmq.sock: the store hears of a transaction",
-                "as the node takes it"
+                "and of a block as the node takes them. Expected with --node-rpc"
               ]
           )
         <> value c.nodeZmq
@@ -877,7 +878,8 @@ networkReader s =
 
 -- | Parse the command line and run the store. If no peers are given and discovery
 -- is off, discovery is turned on, unless the store has its node as a peer
--- through its RPC and its ZeroMQ socket (@--node-rpc@ with @--node-zmq@).
+-- through its RPC (@--node-rpc@, which is meant to come with
+-- @--node-zmq@).
 --
 -- A mistake of configuration, or something that the store needs and does
 -- not find (Redis, a free port, a database that no other store holds), is
@@ -906,9 +908,9 @@ main = handle startupError $ do
     ("", _) -> misconfigured "--tls-key needs --tls-cert: give both, or neither for plain HTTP"
     (_, "") -> misconfigured "--tls-cert needs --tls-key: give both, or neither for plain HTTP"
     (certificate, key) -> checkReadable "--tls-cert" certificate >> checkReadable "--tls-key" key
-  -- a store that has its node through its RPC and its ZeroMQ socket has a
-  -- peer, and needs no other
-  if null c.peers && not c.discover && (null c.nodeRpc || null c.nodeZmq)
+  -- a store that has its node through its RPC has a peer, and needs no
+  -- other
+  if null c.peers && not c.discover && null c.nodeRpc
     then run $ let Config {..} = c in Config {discover = True, ..}
     else run c
   where

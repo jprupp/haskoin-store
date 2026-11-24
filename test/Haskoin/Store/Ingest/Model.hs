@@ -67,6 +67,7 @@ module Haskoin.Store.Ingest.Model
   )
 where
 
+import Control.Monad (when)
 import Data.Foldable (toList)
 import Data.List (intercalate, sortOn)
 import Data.Map.Strict (Map)
@@ -148,6 +149,9 @@ data Node = Node
   { has :: !(Set H),
     -- | what it named to the store on this connection
     told :: !(Set H),
+    -- | what it named when it was last asked for its mempool, and has had
+    -- ever since
+    answered :: !(Set H),
     online :: !Bool,
     source :: !Bool
   }
@@ -205,7 +209,7 @@ initial sc =
     { machine = start sc.config 0,
       nodes =
         Map.fromList
-          [ (p, Node (if p `elem` sc.liars then Set.fromList sc.forged else Set.empty) Set.empty False src)
+          [ (p, Node (if p `elem` sc.liars then Set.fromList sc.forged else Set.empty) Set.empty Set.empty False src)
           | (p, src) <- sc.peers
           ],
       pool = Set.empty,
@@ -320,6 +324,29 @@ feed sc input w = do
               Nothing -> True
               _ -> False
     _ -> return ()
+  -- T9: the store does not say that its pool is full before it is. When
+  -- the machine stops saying that the pool is filling, no request for a
+  -- mempool is on its way to a source, and the pool has decided on all
+  -- that each source named when it was last asked and has had ever since.
+  --
+  -- The machine takes a source to have answered when as long passed as
+  -- a request is given (A10). A world in which requests get no answer in
+  -- time breaks that on purpose, and is not held to this.
+  when (Timeouts `notElem` sc.disturbances && isFilling before && not (isFilling after) && hasSource after) $ do
+    check "the pool is said to be full while a source has not answered for its mempool" $
+      and [MSweep `notElem` toList q | (p, q) <- Map.toList w.toNode, sourceHere p]
+    check "the pool is said to be full and lacks a transaction that a source named and has" $
+      and
+        [ Set.filter (`Set.member` node.answered) (dueOf sc w p node) `Set.isSubsetOf` Set.union (settled w) (unread p)
+        | (p, node) <- Map.toList w.nodes,
+          sourceHere p
+        ]
+  -- and a pool that lost what it had is filling again
+  case input of
+    Emptied ->
+      check "the pool lost what it had and is not said to be filling" $
+        isFilling after || not (hasSource after)
+    _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
     [] -> return ()
@@ -331,6 +358,9 @@ feed sc input w = do
   return w' {machine = rebase (horizon sc) after}
   where
     check what ok = if ok then Right () else Left (what <> ", after " <> show input)
+    sourceHere p = maybe False (\n -> n.online && n.source) (Map.lookup p w.nodes)
+    -- what a peer named in messages that the store has not read
+    unread p = Set.fromList (concat [hs | MInv hs <- maybe [] toList (Map.lookup p w.toStore)])
     doubted h = case placeOf h (fst (step parentsOf input w.machine)) of
       Just (Held _ _ (Doubted _)) -> True
       _ -> False
@@ -415,7 +445,7 @@ nodeReads sc p msg w = case Map.lookup p w.nodes of
       | Set.null node.has -> w
       | otherwise ->
           w
-            { nodes = Map.insert p node {told = Set.union node.told node.has} w.nodes,
+            { nodes = Map.insert p node {told = Set.union node.told node.has, answered = node.has} w.nodes,
               -- A5: parents before children, unless the world is one
               -- that breaks it
               toStore = Map.adjust (|> MInv (sortOn inOrder (Set.toAscList node.has))) p w.toStore
@@ -455,7 +485,7 @@ disturbed sc w
               all (\x -> Set.member x everywhere || Set.member x w.confirmed) ps
             ]
               <> [ ( "the node drops " <> show h,
-                     Right w {nodes = Map.map (\n -> n {has = Set.difference n.has (family h)}) w.nodes}
+                     Right w {nodes = Map.map (\n -> without (family h) n) w.nodes}
                    )
                  | h <- Set.toList everywhere
                  ]
@@ -469,7 +499,7 @@ disturbed sc w
               all (\x -> Set.member x node.has || Set.member x w.confirmed) ps
             ]
               <> [ ( "the node of peer " <> show p <> " drops " <> show h,
-                     Right w {nodes = Map.insert p node {has = Set.difference node.has (family h)} w.nodes}
+                     Right w {nodes = Map.insert p (without (family h) node) w.nodes}
                    )
                  | (p, node) <- Map.toList w.nodes,
                    h <- Set.toList node.has
@@ -480,7 +510,7 @@ disturbed sc w
               w
                 { confirmed = Set.insert h w.confirmed,
                   pool = Set.delete h w.pool,
-                  nodes = Map.map (\n -> n {has = Set.delete h n.has}) w.nodes
+                  nodes = Map.map (without (Set.singleton h)) w.nodes
                 }
           )
         | h <- Set.toList everywhere,
@@ -494,7 +524,7 @@ disturbed sc w
               sc
               (PeerDown p)
               w
-                { nodes = Map.insert p node {online = False, told = Set.empty} w.nodes,
+                { nodes = Map.insert p node {online = False, told = Set.empty, answered = Set.empty} w.nodes,
                   toNode = Map.insert p Seq.empty w.toNode,
                   toStore = Map.insert p Seq.empty w.toStore
                 }
@@ -525,6 +555,8 @@ disturbed sc w
           Set.notMember h (settled w),
           all (`Set.member` settled w) ps
         ]
+    -- a node no longer has some transactions
+    without gone n = n {has = Set.difference n.has gone, answered = Set.difference n.answered gone}
     -- a transaction and all that spends from it
     family h = close (Set.singleton h)
       where
@@ -575,23 +607,26 @@ converged sc w
   | sc.oneNode && not (or [node.online | (p, node) <- Map.toList w.nodes, p `notElem` sc.feeds]) = True
   | otherwise =
       and
-        [ due p node `Set.isSubsetOf` settled w
+        [ dueOf sc w p node `Set.isSubsetOf` settled w
         | (p, node) <- Map.toList w.nodes,
           node.online,
           node.source
         ]
+
+-- | What the pool must have of what a source has. A node of the operator
+-- is taken at its word: all that it has. Of a stranger, what the store
+-- can verify: not what is forged, not what it cannot verify unless a node
+-- of the operator that is there has it too, and nothing that spends from
+-- either.
+dueOf :: Scenario -> World -> P -> Node -> Set H
+dueOf sc w p node
+  | p `elem` sc.owned = node.has
+  | otherwise = Set.filter (not . barred) node.has
   where
-    -- A node of the operator is taken at its word: all that it has. Of a
-    -- stranger, what the store can verify: not what is forged, not what
-    -- it cannot verify unless a node of the operator that is there has it
-    -- too, and nothing that spends from either.
-    due p node
-      | p `elem` sc.owned = node.has
-      | otherwise = Set.filter (not . barred) node.has
     barred h = h `elem` held || any barred (Map.findWithDefault [] h sc.txs)
     held = sc.forged <> [h | h <- sc.scripts, Set.notMember h vouchable]
     vouchable =
-      Set.unions [node.has | (p, node) <- Map.toList w.nodes, p `elem` sc.owned, node.online, node.source]
+      Set.unions [n.has | (q, n) <- Map.toList w.nodes, q `elem` sc.owned, n.online, n.source]
         `Set.union` settled w
 
 -- | Go through every state of a scenario. In each: the rules of every

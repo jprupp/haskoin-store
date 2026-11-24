@@ -88,6 +88,7 @@ import Haskoin.Store.IntegrationSpec
     webConfig,
     withTestLog,
   )
+import Haskoin.Store.NodePeer (fresh)
 import Haskoin.Store.Startup (redisConnectInfo)
 import Network.HTTP.Client (HttpException)
 import System.IO (hPutStrLn, stderr)
@@ -97,6 +98,11 @@ import Test.Podman (ContainerSpec (..), Pod, PodSpec (..), containerName, pod, p
 
 spec :: Spec
 spec = do
+  describe "What a node without a ZeroMQ socket is taken to have announced" $
+    it "is what its mempool has that it had not at the last reading, in the order of the node" $ do
+      fresh (Set.fromList "abd") "dcbea" `shouldBe` "ce"
+      fresh Set.empty "cab" `shouldBe` "cab"
+      fresh (Set.fromList "abc") "" `shouldBe` ""
   usable <- runIO podmanUsable
   case usable of
     Left why -> describe "The mempool of a store and that of its node" $ it "are the same" (pendingWith why)
@@ -128,15 +134,21 @@ spec = do
         on "A store whose only peer is its node through its RPC and its ZeroMQ socket, when the node stops" $
           it "has no peer and says so, and has its node again when the node goes on" $
             withBed kind (nodeStops . \bed -> bed {viaRpc = True, viaZmq = True})
+        on "A store whose only peer is its node through its RPC, with no ZeroMQ socket" $
+          it "warns of it, and has what its node takes and finds within twelve seconds, three times over" $
+            withBed kind (polls . \bed -> bed {viaRpc = True})
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
       describe "A store whose only peer is a node of somebody else, on Bitcoin Core" $
-        it "takes of it what it can verify, and not what it cannot" (withBed BitcoinCore strangers)
+        it "takes of it what it can verify, and not what it cannot" (withBed BitcoinCore (strangers False))
       -- Bitcoin Cash Node names what it takes to a peer that it
       -- whitelists as fast as it takes it
       describe "A store whose node takes transactions faster than it names them, on Bitcoin Core" $
         it "has them within the time of a reading of the node's mempool, and not at the node's pace" $
           withBed BitcoinCore burst
+      describe "A store with a node of somebody else and the RPC of its own, on Bitcoin Core" $
+        it "takes at the word of its own node what it cannot verify of the other" $
+          withBed BitcoinCore (strangers True . \bed -> bed {viaRpc = True})
       describe "A store that hears what its node publishes over ZeroMQ, on Bitcoin Core" $
         it "has what the node takes as fast as the node takes it, with no reading of its mempool" $
           withBed BitcoinCore (hears . \bed -> bed {viaRpc = True, viaZmq = True})
@@ -169,7 +181,26 @@ fromNothing :: Bed -> IO ()
 fromNothing bed = do
   roots <- fund bed 40
   submit bed (map (chainOf 24) roots)
-  withMember bed $ \_ server -> converges bed server 90
+  withMember bed $ \_ server -> do
+    -- its health says that its mempool is filling, from the moment that
+    -- it has a source
+    filling server True 20
+    converges bed server 90
+    -- it has every block: it is healthy, whether it says so of its
+    -- mempool yet or not
+    (_, health) <- getJSON server "/health"
+    field "ok" health `shouldBe` Just (Bool True)
+    -- and within the time that a node is given to answer, it says that
+    -- its mempool is full
+    filling server False 120
+  where
+    -- until the health of the store says so of its mempool
+    filling server want seconds = do
+      (_, health) <- getJSON server "/health"
+      unless ((field "mempool" health >>= field "filling") == Just (Bool want)) $
+        if seconds <= (0 :: Int)
+          then expectationFailure ("The store does not come to say that its mempool is filling: " <> show want)
+          else threadDelay 500000 >> filling server want (seconds - 1)
 
 -- | The experiment that was made on the server: a store whose database is
 -- at the tip of its node, started with an empty pool on a node with a
@@ -265,10 +296,48 @@ alone bed = withRamDir $ \dir -> do
     converges bed server 120
     (_, health) <- getJSON server "/health"
     (field "peers" health >>= field "count") `shouldBe` Just (Number 1)
+    -- with both, there is nothing to put right
+    field "warnings" health `shouldBe` Nothing
     submit bed (map (chainOf 4) after)
     converges bed server 30
     void (generateTo bed.node 1 bed.miner)
     converges bed server 30
+
+-- | A store that is given no peer at all, and the RPC of its node with
+-- no ZeroMQ socket (@--node-rpc@ alone). The node is its one peer all the
+-- same, and nothing announces: the peer asks the node every five seconds
+-- for its best block and for its mempool ("Haskoin.Store.NodePeer"). Its
+-- health is good, and warns that the socket is missing.
+--
+-- The store reads the mempool of a source by the clock too, thirty
+-- seconds after a reading in which something new was named, and that
+-- reading would bring one batch within any limit. So three batches go in
+-- thirteen seconds apart, each with twelve seconds to be in the store:
+-- readings thirty seconds apart cannot fall in all three. With the peer
+-- asking every sixty seconds, this test failed.
+polls :: Bed -> IO ()
+polls bed = withRamDir $ \dir -> do
+  roots <- fund bed 30
+  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+    converges bed server 120
+    (_, health) <- getJSON server "/health"
+    (field "peers" health >>= field "count") `shouldBe` Just (Number 1)
+    field "ok" health `shouldBe` Just (Bool True)
+    case field "warnings" health of
+      Just v@(Array _) | [String w] <- arr v -> T.unpack w `shouldSatisfy` isInfixOf "ZeroMQ"
+      other -> expectationFailure ("Expected one warning, and the health says: " <> show other)
+    forM_ (batches roots) $ \batch -> do
+      from <- getPOSIXTime
+      submit bed (map (chainOf 2) batch)
+      converges bed server 12
+      took <- subtract from <$> getPOSIXTime
+      threadDelay (max 0 (round ((13 - took) * 1000000)))
+    void (generateTo bed.node 1 bed.miner)
+    converges bed server 12
+  where
+    batches hs = case splitAt 10 hs of
+      (some, []) -> [some | not (null some)]
+      (some, rest) -> some : batches rest
 
 -- | The same store when its node stops in its tracks, as a node that
 -- hangs: the pipe to the peer is in memory and never breaks, and the
@@ -488,8 +557,8 @@ valkeyRestart bed = do
 --
 -- The same store with the peer as a node of its operator takes both, as
 -- every other test of this module has it.
-strangers :: Bed -> IO ()
-strangers bed = withRamDir $ \dir -> do
+strangers :: Bool -> Bed -> IO ()
+strangers vouched bed = withRamDir $ \dir -> do
   let foreign' c = c {foreignPeers = True} :: StoreConfig
       address = case scriptToAddressBS bed.net lock >>= maybe (Left "no text") Right . addrToText bed.net of
         Right a -> a
@@ -507,13 +576,20 @@ strangers bed = withRamDir $ \dir -> do
     let spending = spend (OutPoint hash index) [TxOut 990000 lock]
     send bed spending
     let spent = txHashToHex (txHash spending)
-    -- the store has the first within seconds, and never the second
     has server paid 30
-    threadDelay 5000000
-    pool server `shouldReturn` Set.singleton paid
-    Set.fromList <$> rawMempool bed.node `shouldReturn` Set.fromList [paid, spent]
-    (_, health) <- getJSON server "/health"
-    (field "mempool" health >>= field "held") `shouldBe` Just (Number 1)
+    if vouched
+      then do
+        -- the node of the operator, through its RPC, names both: the
+        -- store has the second too, on its word
+        has server spent 30
+        pool server `shouldReturn` Set.fromList [paid, spent]
+      else do
+        -- the store has the first within seconds, and never the second
+        threadDelay 5000000
+        pool server `shouldReturn` Set.singleton paid
+        Set.fromList <$> rawMempool bed.node `shouldReturn` Set.fromList [paid, spent]
+        (_, health) <- getJSON server "/health"
+        (field "mempool" health >>= field "held") `shouldBe` Just (Number 1)
     return (paid, spent)
   -- the same store, told nothing of the kind: the peer is a node of its
   -- operator, and what it took is taken
@@ -885,13 +961,16 @@ withMemberOf change bed dir f =
       withAsync (runWebSocket (web store) sock) $ \running ->
         link running >> f store server
   where
-    -- with the node as a peer through its RPC and its ZeroMQ socket
+    -- with the node as a peer through its RPC, and its ZeroMQ socket
+    -- where the bed has it
+    -- the node is then one peer more
     heard c
-      | bed.viaZmq =
+      | bed.viaRpc =
           c
-            { nodePeerRpc = Just bed.node.url,
+            { maxPeers = c.maxPeers + 1,
+              nodePeerRpc = Just bed.node.url,
               nodePeerRpcSocket = Just bed.node.rpcSocket,
-              nodePeerZmq = Just bed.node.zmq
+              nodePeerZmq = if bed.viaZmq then Just bed.node.zmq else Nothing
             }
       | otherwise = c
     web store

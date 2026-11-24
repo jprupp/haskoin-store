@@ -36,8 +36,10 @@ extra-deps:
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
   - git: https://github.com/jprupp/haskoin-node.git
     commit: 798edcd4dfcabedb8642364fb6eccdad406e904d
+  # The branch health-mempool: a health that reads the blocks only, and
+  # says whether the mempool is filling.
   - git: https://github.com/jprupp/haskoin-store-data.git
-    commit: 463732224a36bd7aec75d2a76a39a173ee6b2e97
+    commit: 75c5ac1ac721a0ddee266cfd97ed9c5103ceeee0
   # Warp keeps the timeout of each connection in time-manager. From 0.3 to
   # 0.3.2, the version in the snapshot, every pause, resume and tickle edits
   # GHC's one timer queue, and Warp does a pause and a resume around every

@@ -94,6 +94,7 @@ release of a node that changes one of them is noticed.
 | A7 | A node that has a transaction has those that it spends from, unless a block has confirmed them. Asked for one of them that it never named to the peer, Bitcoin Core sends it, and Bitcoin Cash Node says `notfound`, though it has it. Neither drops the peer for asking. |
 | A8 | A node names transactions to a peer no faster than it chooses to. Bitcoin Core 32 names about five hundred at once and then seventy every five seconds, fourteen a second, even to a peer that it whitelists. Bitcoin Cash Node 29 names 800 at once to a peer that it whitelists. Asked for its mempool, a node names all of it at once (A2). |
 | A9 | A node of the operator ran every script of what it names or sends: the store takes its word. A stranger may name and send anything, a forged transaction too. |
+| A10 | A node that is asked for its mempool names it within the time that a request is given, twenty seconds. Nothing in the protocol says that it has named all of it: it names it in as many messages as it takes, and in none when it has nothing. |
 | F1 | The RPC of a node is a source as a peer is one. `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from. `getrawtransaction` gives a transaction, or the error -5 for one that the node does not have. Any other answer, or none, says nothing of what the node has. |
 | F2 | A node publishes over ZeroMQ the id of each transaction that it takes, as it takes it, and again when a block that has it becomes the tip; and the hash of that block. Each topic has a counter that goes up by one with each message. The socket only publishes: a subscriber that is late or slow misses messages, and can tell from the counter that it did, not which. |
 | R1 | A Redis script runs alone, start to end. |
@@ -172,6 +173,14 @@ The model checker has a world that shows this, and that world must fail.
    names it, or for twenty minutes. If the store verifies every
    signature of it, it is taken.
 
+9. **T9, a store does not say that its mempool is full before it is.**
+   A store says in `/health` whether its mempool is still filling. It
+   says so from its start, and again when the pool lost what it had,
+   until every source was asked for its mempool and had the time to
+   answer (A10), none owes a reading, and the pool has decided on all
+   that they named. This is something that the store says, and nothing
+   that it does depends on it: its health least of all.
+
 ## What is not promised
 
 - **The RPC as the only source, and no peer connected to that node.** A
@@ -217,6 +226,10 @@ The model checker has a world that shows this, and that world must fail.
   gives it up as forged. It is back when a peer names it again, at the
   next reading at the latest. A node of the operator that names it
   vouches for it, and then nothing is looked at.
+- **A node that takes longer than twenty seconds to name its mempool.**
+  The store then says that its mempool is full before that node has
+  answered (A10). What the node names afterwards is taken in as always:
+  only what the store said was early.
 - **Time.** T3 bounds steps, not seconds. A node or a Redis that answers
   slowly makes the store slow, never wrong. One bound in seconds is
   kept, by a test and not by a proof: while transactions come, a source
@@ -291,6 +304,13 @@ RPC ([node-peer.md](node-peer.md)). Nothing of the machine changes: to
 it this is a peer that is a source and a node of the operator, as a
 peer that the node whitelists already is.
 
+With the RPC alone the node is that peer too. Nothing publishes then,
+so the peer asks the node for its mempool every five seconds, while no
+other node of the operator is a peer of the store, and names what is
+new. To the machine this is a peer that names transactions at a pace
+of its own, which every peer does (A8): no rule of the machine speaks
+of it, and none changed.
+
 What may not have been heard, when the subscription is made or a
 counter skips, is named again with the whole mempool of the node. So
 ZeroMQ makes the store faster and never the only way that it hears.
@@ -342,6 +362,31 @@ transaction would wait for the clock.
 A transaction that is given up as forged, or for want of a voucher,
 does not make the store dirty: no reading of a stranger would bring
 anything else.
+
+**The store knows when it has caught up.** After a start, or after
+Redis lost its data, a store has blocks at once and its mempool a
+minute later, on Bitcoin. It is healthy all that time: it answers
+rightly from what it has. But somebody who gives it traffic, or looks
+at it, wants to know that it shows fewer transactions than its node. So
+the machine notes when it caught up (`isFilling`), and `/health` says
+it (`mempool.filling`).
+
+It has caught up when all of this is true at once:
+
+1. the store has the blocks of its nodes;
+2. it has a source, and each source was asked for its mempool at least
+   twenty seconds ago;
+3. no source owes a reading, and nothing was given up that a node may
+   still have;
+4. no question to the pool is on its way, and no transaction id has a
+   place.
+
+The twenty seconds are because nothing says when a node has finished
+naming its mempool (A10). A first version took the first names from a
+source for its answer, and the model found the fault at once: a node
+that announces a transaction while it is asked was taken to have
+answered. So a store says that it is filling for twenty seconds at
+least.
 
 **A transaction held for a parent is found by that parent.** It is tried
 when the parent settles, in place of every held transaction at every
@@ -455,7 +500,7 @@ of a function.
 A model checker in the test suite (`Haskoin.Store.Ingest.Model`) runs
 `step` itself in worlds of one to three transactions and one or two
 peers, with nodes that follow A1 to A7 and A9, through every order of
-events: 26 worlds, about 2,260,000 states.
+events: 26 worlds, about 3,650,000 states.
 [the-19-worlds.md](the-19-worlds.md) says in plain terms what a world
 is and how it is gone through.
 
@@ -471,6 +516,12 @@ is and how it is gone through.
   - at its time, a held transaction is not offered while every parent
     that it waits for has a place, and waits no longer when one of them
     has none;
+  - when the machine stops saying that the pool is filling, no request
+    for a mempool is on its way to a source, and the pool has decided
+    on all that each source named when it was last asked and has had
+    since; and a pool that lost what it had is filling again (T9). The
+    worlds in which requests get no answer in time break A10 on
+    purpose, and are not held to this;
   - a forged transaction is never offered as vouched for, and is given
     up; one that cannot be verified is held for a node of the operator
     and never ready meanwhile; and once such a node names or sends it,
@@ -512,6 +563,10 @@ is and how it is gone through.
   whose doubted transaction asks no reading comes to rest without what
   a node of the operator has. The first version of the rule had two of
   these faults, and the worlds found them.
+- **Filling.** Two more planted bugs: a machine that does not wait for
+  a source to answer says that the pool is full while a request for a
+  mempool is on its way, in 20 worlds; and one that does not start
+  again when the pool lost what it had fails the check of that.
 - **A world that must fail.** It breaks an assumption: a source that
   names a child first, with room for one id (A5). The search finds the
   store going round for ever there. The program of
@@ -692,8 +747,9 @@ never does (U1).
 - The runner (`Haskoin.Store.Ingest.Run`). It decides nothing: it turns
   messages into inputs and carries out outputs. It drops events of peers
   past a bound, and tells the machine so.
-- The thread that asks the RPC of the node, and the calls that it makes
-  (`ingestFeed`, `nodeFeed`, tested against both nodes).
+- The calls of the RPC of a node as a feed (`ingestFeed`, `nodeFeed`,
+  tested against both nodes). The store itself no longer starts one:
+  with the RPC it has the node as a peer.
 - The node as a peer through its RPC and its ZeroMQ socket
   (`Haskoin.Store.NodePeer`, `Haskoin.Store.NodeZmq`), tested against
   both nodes ([node-peer.md](node-peer.md) has the tests).

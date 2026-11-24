@@ -254,9 +254,10 @@ import Haskoin.Store.Fleet.Member
     setHealthy,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
-import Haskoin.Store.Ingest.Run (IngestState (..), ingestFeed, ingestNamedSTM, ingestState)
+import Haskoin.Store.Ingest.Run (IngestState (..), ingestNamedSTM, ingestState)
 import Haskoin.Store.Manager
-import Haskoin.Store.NodeRpc (nodeFeed, nodeOptions, unixSocketManager)
+import Haskoin.Store.NodePeer (lacksZmq)
+import Haskoin.Store.NodeRpc (nodeOptions, unixSocketManager)
 import Haskoin.Store.NodeRpc qualified as NodeRpc
 import Haskoin.Store.Startup (explainListen, redisProblem)
 import Haskoin.Store.Web.Admission
@@ -478,19 +479,18 @@ data WebConfig = WebConfig
     -- | log every request, at the level of information ('logIt')
     accessLog :: !Bool,
     -- | URL of the JSON-RPC interface of a full node, with its user and
-    -- password, to publish transactions through ('sendNode') and to read
-    -- the node's whole mempool from, as a source of the path into the
-    -- shared mempool (@nodeFeedLoop@); 'Nothing' to publish through peers
-    -- only, and to read the mempools of the peers that allow it
+    -- password, to publish transactions through ('sendNode'); 'Nothing'
+    -- to publish through peers only. The store has it too, and has the
+    -- node as a peer through it ('Haskoin.Store.StoreConfig').
     nodeRpc :: !(Maybe String),
     -- | a Unix socket to send the requests of 'nodeRpc' through, in place of
     -- the host and port of its URL, which are not used then
     nodeRpcSocket :: !(Maybe FilePath),
     -- | where the node of 'nodeRpc' publishes over ZeroMQ
     -- (@-zmqpubhashtx@, @-zmqpubhashblock@), as the store was told
-    -- ('Haskoin.Store.StoreConfig'): with it the node is a peer of the
-    -- store ("Haskoin.Store.NodePeer"), and its RPC is not read as a
-    -- source of its own.
+    -- ('Haskoin.Store.StoreConfig'). It is expected with 'nodeRpc': a
+    -- web server that has the RPC and not this says so in the warnings
+    -- of @\/health@ ("Haskoin.Store.NodePeer").
     nodeZmq :: !(Maybe String),
     -- | a certificate and its private key, in files in PEM format, to
     -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
@@ -957,12 +957,11 @@ serveWeb config serve = do
             withAsync (supervise "Regulate" (regulate admission (reportControl metrics))) $ \_a6 ->
               withAsync (feedEvents st) $ \a3 ->
                 withAsync (supervise "Publish" (askingLoop st)) $ \_a4 ->
-                  withAsync (supervise "Node RPC" (nodeFeedLoop st)) $ \_a7 ->
-                    link a3 >> do
-                      let logged = logIt config.logger config.accessLog config.limits.slowRequest
-                          outer =
-                            webSocketEvents st . logged . dated date . anyOrigin . preflight . autohead . compressed
-                      serve . outer . cappedBody st $ app
+                  link a3 >> do
+                    let logged = logIt config.logger config.accessLog config.limits.slowRequest
+                        outer =
+                          webSocketEvents st . logged . dated date . anyOrigin . preflight . autohead . compressed
+                    serve . outer . cappedBody st $ app
   where
     priceUpdater session =
       unless config.noBlockchainInfo
@@ -2149,30 +2148,6 @@ askingLoop st = forever $ do
         Just _ -> return True
         Nothing -> maybe (return False) (\m -> isJust <$> memberPoolBody m h) own.fleet
     ask h = getPeers own.peerMgr >>= mapM_ (\op -> atomically (ingestNamedSTM op.mailbox [h] own.ingest))
-
--- | Give the path into the shared mempool the RPC of the store's node
--- (@--node-rpc@) as a source, for as long as the web server runs
--- ('ingestFeed', 'nodeFeed'): the path then reads the node's whole mempool
--- when the store starts, when it gave something up, when the pool lost
--- what it had, and every ten minutes, as it does of a peer that gives its
--- mempool. A store may have no such peer: Bitcoin Core answers only one
--- that it whitelists, or any when it serves Bloom filters, which it does
--- not by default. The RPC answers in any case.
---
--- This replaces a loop of the web server that read the RPC only after the
--- pool had been emptied, 2,000 transactions every two seconds, and took a
--- call that failed for an empty mempool.
---
--- A store that also has the address of the node's ZeroMQ socket
--- ('nodeZmq') has the node as a peer ("Haskoin.Store.NodePeer"), which is
--- a source and announces too: the RPC is then not read a second time
--- here.
-nodeFeedLoop :: WebState -> IO ()
-nodeFeedLoop st = case st.config.nodeZmq of
-  Just _ -> return ()
-  Nothing ->
-    forM_ st.config.nodeRpc $ \url ->
-      ingestFeed st.config.store.ingest (nodeFeed st.nodeSession url)
 
 -- GET Mempool / Events --
 
@@ -3933,13 +3908,14 @@ handleHealth st _ =
     -- ("Haskoin.Store.Database.Stalls"), and is the last state it read.
     -- How the store stands with the mempool of its nodes is what the path
     -- into the pool last said ("Haskoin.Store.Ingest.Run").
-    let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time} = h
+    let HealthCheck {blocks, lastBlock, lastTx, pendingTxs, peers, network, version, time, warnings} = h
         mempool =
           MempoolHealth
             { sources = fromIntegral path.sources,
               dirty = path.dirty,
               known = fromIntegral path.known,
-              held = fromIntegral path.held
+              held = fromIntegral path.held,
+              filling = path.filling
             }
     return HealthCheck {redis = Just up, database = Just database, mempool = Just mempool, ..}
 
@@ -4022,6 +3998,9 @@ healthCheck cfg = do
         redis = Nothing,
         database = Nothing,
         mempool = Nothing,
+        -- what the operator should put right, which decides nothing: a
+        -- node is expected with its RPC and its ZeroMQ socket both
+        warnings = [lacksZmq | isJust cfg.nodeRpc, isNothing cfg.nodeZmq],
         ..
       }
 
@@ -4382,8 +4361,6 @@ ailments h =
   T.intercalate ", " . concat $
     [ [shown (h.blocks.headers - h.blocks.blocks) <> " blocks behind the headers" | not (isOK h.blocks)],
       [shown h.lastBlock.age <> " seconds since the last block" | not (isOK h.lastBlock)],
-      [shown h.lastTx.age <> " seconds since the last transaction" | not (isOK h.lastTx)],
-      [shown h.pendingTxs.count <> " transactions requested from peers and not received" | not (isOK h.pendingTxs)],
       [shown h.peers.count <> " peers" | not (isOK h.peers)]
     ]
   where

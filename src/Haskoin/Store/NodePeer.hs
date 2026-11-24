@@ -2,11 +2,12 @@
 -- Module      : Haskoin.Store.NodePeer
 -- Copyright   : (c) Haskoin Developers
 -- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
 -- Stability   : experimental
 -- Portability : POSIX
 --
 -- A full node as a peer of the store, reached through its RPC and its
--- ZeroMQ socket and not through the peer-to-peer protocol (@--node-rpc@
+-- ZeroMQ socket and not through the peer-to-peer protocol (@--node-rpc@,
 -- with @--node-zmq@).
 --
 -- = The problem
@@ -65,6 +66,29 @@
 -- messages may have been lost, it names the whole mempool of the node, as
 -- an answer to @mempool@ does.
 --
+-- = Without the ZeroMQ socket
+--
+-- A node is meant to be given with both, and a store that has only the
+-- RPC says so, in its log and in its health. It is a peer all the same,
+-- and since the RPC announces nothing, the thread asks instead, every
+-- five seconds ('pollEvery'):
+--
+-- * for the best block of the node, which it announces if it is new;
+-- * for the ids of the mempool of the node, of which it names those that
+--   were not there the last time, as a node names what it just took.
+--
+-- It asks for the mempool only while no other node of the operator is a
+-- peer of the store ('alone'). Such a peer announces what the node takes,
+-- and reading the mempool beside it would say the same twice. While every
+-- other peer is a stranger, this reading is the only word of a node of
+-- the operator that the store gets, and a transaction that only strangers
+-- named waits for it ("Haskoin.Store.Ingest"): so it is asked for often.
+--
+-- A store without the socket is up to five seconds behind its node, and
+-- asks it for the ids of its whole mempool each time: some four megabytes
+-- of JSON for a mempool of sixty thousand transactions. That is the price
+-- of not giving the socket.
+--
 -- = What it does not do
 --
 -- It serves no addresses of other nodes, no filters and no compact
@@ -76,6 +100,9 @@ module Haskoin.Store.NodePeer
     nodePeerName,
     nodePeerAddress,
     nodePeerConnect,
+    lacksZmq,
+    pollEvery,
+    fresh,
   )
 where
 
@@ -93,7 +120,7 @@ import Control.Concurrent.STM
     writeTVar,
   )
 import Control.Exception (finally, throwIO)
-import Control.Monad (forM, forM_, forever, unless, void)
+import Control.Monad (forM, forM_, forever, unless, void, when)
 import Data.Aeson qualified as A
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Bits ((.|.))
@@ -101,8 +128,10 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Foldable (toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes, listToMaybe)
+import Data.Maybe (catMaybes, isNothing, listToMaybe)
 import Data.Serialize (decode, encode, putByteString, putWord32be, putWord32le, runGet, runPut)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Haskoin
@@ -146,15 +175,19 @@ import Network.Wreq.Session (Session)
 import System.Random (randomIO)
 
 -- | What the peer needs: the network, the RPC of the node and its
--- ZeroMQ socket.
+-- ZeroMQ socket, if it was given.
 data NodePeer = NodePeer
   { net :: !Network,
     -- | the HTTP client of the RPC ('Haskoin.Store.NodeRpc.nodeSession')
     session :: !Session,
     -- | the URL of the RPC, with its user and password
     url :: !String,
-    -- | where the node publishes
-    zmq :: !ZmqAddress,
+    -- | where the node publishes, or 'Nothing' for a node whose RPC is
+    -- all that the store has: it is then asked every 'pollEvery'
+    zmq :: !(Maybe ZmqAddress),
+    -- | whether no other node of the operator is a peer of the store now:
+    -- the mempool of a node without a ZeroMQ socket is read only then
+    alone :: !(IO Bool),
     logger :: !Logger
   }
 
@@ -173,8 +206,21 @@ data Event
   = -- | bytes of the store, or the end of them
     Bytes !(Maybe ByteString)
   | Said !Heard
-  | -- | time to ask the node for its best block
+  | -- | time to ask the node for its best block and, without a ZeroMQ
+    -- socket, for its mempool
     Poll
+
+-- | How often a node without a ZeroMQ socket is asked for its best block
+-- and for its mempool, in microseconds: five seconds. It is how far such
+-- a store is behind its node.
+pollEvery :: Int
+pollEvery = 5000000
+
+-- | Of the ids of a mempool, those that were not there the last time, in
+-- the order that the node gave them: what a node that announces would
+-- have named since.
+fresh :: (Ord h) => Set h -> [h] -> [h]
+fresh before = filter (`Set.notMember` before)
 
 -- | A connection to the peer: a pipe in memory, served until the store
 -- closes it or the node fails.
@@ -192,8 +238,12 @@ nodePeerConnect cfg act = do
       source q = liftIO (atomically (readTBQueue q)) >>= maybe (return ()) (\b -> yield b >> source q)
       -- whatever ends the serving, the store reads the end of the pipe
       served = serve cfg toStore events `finally` atomically (writeTBQueue toStore Nothing)
-      hearing = hearNode cfg.zmq (atomically . writeTBQueue events . Said)
-      polling = forever (threadDelay 30000000 >> atomically (writeTBQueue events Poll))
+      -- without a socket there is nothing to hear, and no end of it
+      hearing = case cfg.zmq of
+        Just zmq -> hearNode zmq (atomically . writeTBQueue events . Said)
+        Nothing -> forever (threadDelay maxBound)
+      wait = if isNothing cfg.zmq then pollEvery else 30000000
+      polling = forever (threadDelay wait >> atomically (writeTBQueue events Poll))
   race_ (act conduits) (race_ served (race_ hearing polling))
 
 -- | Answer the store until it closes the pipe. Any failure of the RPC ends
@@ -202,6 +252,8 @@ serve :: NodePeer -> TBQueue (Maybe ByteString) -> TBQueue Event -> IO ()
 serve cfg toStore events = do
   buffer <- newIORef B.empty
   announced <- newTVarIO Nothing
+  -- the mempool of the node as it was last read
+  named <- newIORef Set.empty
   let send m = atomically (writeTBQueue toStore (Just (runPut (putMessage cfg.net m))))
       -- a message whose payload is here already, as the node gave it
       sendRaw name payload = atomically (writeTBQueue toStore (Just (framed cfg.net name payload)))
@@ -218,13 +270,33 @@ serve cfg toStore events = do
             before <- readIORef buffer
             let (messages, rest) = split cfg.net (before <> bytes)
             writeIORef buffer rest
-            mapM_ (answer cfg send sendRaw) messages
+            mapM_ (answer cfg send sendRaw whole) messages
             loop
           Said (HeardTxs hs) -> send (MInv (Inv [InvVector InvTx h.get | h <- hs])) >> loop
           Said (HeardBlock b) -> announce b >> loop
           -- something was not heard: all that the node has is named
-          Said Missed -> mempool cfg send >> best >>= announce >> loop
-          Poll -> best >>= announce >> loop
+          Said Missed -> whole >> best >>= announce >> loop
+          Poll -> do
+            best >>= announce
+            quiet <- if isNothing cfg.zmq then cfg.alone else return False
+            when quiet news
+            loop
+      -- every transaction of the mempool of the node
+      whole = do
+        hs <- mempool cfg
+        writeIORef named (Set.fromList hs)
+        naming hs
+      -- those that the node took since its mempool was last read
+      news = do
+        hs <- mempool cfg
+        before <- readIORef named
+        writeIORef named (Set.fromList hs)
+        naming (fresh before hs)
+      -- as many to a message as a node names
+      naming hs = forM_ (pieces hs) $ \some -> send (MInv (Inv [InvVector InvTx h.get | h <- some]))
+      pieces hs
+        | null hs = []
+        | otherwise = take 50000 hs : pieces (drop 50000 hs)
       best =
         call cfg "getbestblockhash" [] >>= \case
           A.String t | Just b <- hexToBlockHash t -> return b
@@ -232,8 +304,8 @@ serve cfg toStore events = do
   loop
 
 -- | What the node answers to a message of the store.
-answer :: NodePeer -> (Message -> IO ()) -> (ByteString -> ByteString -> IO ()) -> Message -> IO ()
-answer cfg send sendRaw = \case
+answer :: NodePeer -> (Message -> IO ()) -> (ByteString -> ByteString -> IO ()) -> IO () -> Message -> IO ()
+answer cfg send sendRaw whole = \case
   MVersion _ -> do
     height <-
       call cfg "getblockcount" [] >>= \case
@@ -259,7 +331,9 @@ answer cfg send sendRaw = \case
           relay = True
         }
     send MVerAck
-    logAt LevelInfo cfg.logger "The node is a peer of the store through its RPC and its ZeroMQ socket"
+    case cfg.zmq of
+      Just _ -> logAt LevelInfo cfg.logger "The node is a peer of the store through its RPC and its ZeroMQ socket"
+      Nothing -> logAt LevelWarn cfg.logger lacksZmq
   -- A ping is answered once the node has answered a call: the store
   -- tells a peer that is there from one that is not by its pongs, and
   -- this thread would answer for a node that is gone.
@@ -280,7 +354,7 @@ answer cfg send sendRaw = \case
       (_, Right other) -> unexpected "getrawtransaction" other
     unless (null (catMaybes lacking)) $
       send (MNotFound (NotFound [InvVector InvTx h.get | h <- catMaybes lacking]))
-  MMempool -> mempool cfg send
+  MMempool -> whole
   -- a transaction that the store relays for a client: the node judges it
   MTx tx -> void (call' cfg "sendrawtransaction" [A.String (encodeHex (encode tx))])
   -- the rest asks for nothing that the store waits for
@@ -291,21 +365,23 @@ answer cfg send sendRaw = \case
 peerLabel :: ByteString
 peerLabel = "/node-rpc/"
 
--- | Name every transaction of the mempool of the node, as many to a
--- message as a node names.
-mempool :: NodePeer -> (Message -> IO ()) -> IO ()
-mempool cfg send =
+-- | What a store says, in its log and in its health, when it has the RPC
+-- of its node and not its ZeroMQ socket.
+lacksZmq :: Text
+lacksZmq =
+  "The store has the RPC of its node and not its ZeroMQ socket (--node-zmq): \
+  \it asks the node every five seconds for what the socket would announce at once"
+
+-- | The ids of the mempool of the node.
+mempool :: NodePeer -> IO [TxHash]
+mempool cfg =
   call cfg "getrawmempool" [] >>= \case
-    A.Array a | Just hs <- mapM hash (toList a) -> forM_ (pieces hs) $ \some ->
-      send (MInv (Inv [InvVector InvTx h.get | h <- some]))
+    A.Array a | Just hs <- mapM hash (toList a) -> return hs
     other -> unexpected "getrawmempool" other
   where
     hash = \case
       A.String t -> hexToTxHash t
       _ -> Nothing
-    pieces hs
-      | null hs = []
-      | otherwise = take 50000 hs : pieces (drop 50000 hs)
 
 -- | The headers of the chain of the node after the first block of a
 -- locator that is in it, two thousand at most, as a node answers

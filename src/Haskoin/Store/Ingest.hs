@@ -106,6 +106,7 @@ module Haskoin.Store.Ingest
     pending,
     holding,
     isDirty,
+    isFilling,
     vouchedFor,
     hasSource,
     sourceCount,
@@ -256,7 +257,14 @@ data Ingest p h b = Ingest
     -- the time to give them up
     doubts :: !(Set (Tick, h)),
     -- | whether something was given up that a node may still have
-    dirty :: !Bool
+    dirty :: !Bool,
+    -- | whether the machine has, since it started or since the pool lost
+    -- what it had, read its sources and seen the pool decide on all that
+    -- they named ('isFilling')
+    caughtUp :: !Bool,
+    -- | how many questions to the pool about what a peer named have no
+    -- answer yet: ids that have no place, and may get one
+    checking :: !Int
   }
   deriving (Eq, Ord, Show)
 
@@ -320,7 +328,9 @@ start config now =
       later = Set.empty,
       vouched = Set.empty,
       doubts = Set.empty,
-      dirty = False
+      dirty = False,
+      caughtUp = False,
+      checking = 0
     }
 
 -- | The places of the ids.
@@ -362,6 +372,43 @@ holding s = heldOf s.ledger
 isDirty :: Ingest p h b -> Bool
 isDirty s = s.dirty || any (\l -> l.source && l.owed) (Map.elems s.links)
 
+-- | Whether the pool is still filling: the machine has a source, and has
+-- not yet read its sources and seen the pool decide on all that they
+-- named, since it started or since the pool lost what it had. A store
+-- shows fewer transactions than its node meanwhile.
+--
+-- It is what a store says in its health, and nothing in the machine
+-- depends on it. A store with no source has nothing to fill from, and is
+-- not said to be filling: its health says that it has no source.
+isFilling :: Ingest p h b -> Bool
+isFilling s = hasSource s && not s.caughtUp
+
+-- | Note that the machine caught up, when it did: it is in sync, it has a
+-- source, every source was asked for its mempool and had the time to
+-- answer, none owes a reading, nothing was given up that a node may still
+-- have, no question to the pool is on its way, and no id has a place.
+--
+-- Nothing in the protocol says that the answer of a source is all there.
+-- A node names its mempool in as many messages as it takes, and in none
+-- when it has nothing; and what it names while it is asked may be a
+-- transaction that it just took, and no part of the answer. So a source
+-- has answered when as long passed as a request is given: a node that
+-- named nothing by then is taken to have nothing. The ids that it named
+-- are then on their way, and the machine has caught up when none is
+-- left. A store therefore says that it is filling for that long at
+-- least, twenty seconds, after it starts.
+settleUp :: Ingest p h b -> Ingest p h b
+settleUp s
+  | s.caughtUp = s
+  | s.synced && not (null sources) && all answered sources && not s.dirty && s.checking == 0 && Map.null (places s) =
+      s {caughtUp = True}
+  | otherwise = s
+  where
+    sources = filter (\l -> l.source) (Map.elems s.links)
+    answered l = case l.swept of
+      Just at -> not l.owed && s.now - at >= s.config.patience
+      Nothing -> False
+
 -- | Whether a peer gives its whole mempool when asked. Without one, what
 -- the store misses stays missed.
 hasSource :: Ingest p h b -> Bool
@@ -386,7 +433,7 @@ step ::
 step parents input s0 =
   let (s1, o1) = react parents input s0
       (s2, o2) = pump s1
-   in (s2, o1 <> o2)
+   in (settleUp s2, o1 <> o2)
 
 -- | A machine and what it has said so far, newest first.
 type Acc p h b = (Ingest p h b, [Output p h b])
@@ -440,20 +487,22 @@ react parents input s = case input of
             -- operator to name: a node still has it, and theirs may
             again h st = if doubted st h then oweOwn st else st
             (s', fresh) = foldl' one (s, []) hs
-         in (s', [Check p (reverse fresh) | not (null fresh)])
+         in if null fresh then (s', []) else (s' {checking = s'.checking + 1}, [Check p (reverse fresh)])
     -- a peer that the machine does not know: it cannot be asked
     | otherwise -> (s, [])
   Body from h b -> done (body parents from h b (s, []))
   Missing p hs -> done (foldl' (unanswered NodeHasNot False p) (s, []) hs)
   Checked p settled unsettled ->
-    done (foldl' (unsettled' p) (foldl' settle (s, []) settled) unsettled)
+    done (foldl' (unsettled' p) (foldl' settle (answeredCheck s, []) settled) unsettled)
   Unchecked _ hs ->
-    done (foldl' (\acc h -> if known h acc then acc else forget Unjudged h acc) (s, []) hs)
+    done (foldl' (\acc h -> if known h acc then acc else forget Unjudged h acc) (answeredCheck s, []) hs)
   Offered h v -> done (offered h v (s, []))
-  Emptied -> (s {dirty = True}, [])
+  Emptied -> (s {dirty = True, caughtUp = False}, [])
   where
     done (s', outs) = (s', reverse outs)
     known h (s', _) = Map.member h (places s')
+    -- one question to the pool fewer is on its way
+    answeredCheck st = st {checking = max 0 (st.checking - 1)}
 
 -- | One more peer named an id that has a place.
 also :: (Ord p, Ord h) => p -> h -> Ingest p h b -> Ingest p h b

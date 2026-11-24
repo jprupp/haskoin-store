@@ -351,10 +351,15 @@ paths:
       description: |
         Whether this server is ready to answer, for load balancers and monitoring.
 
-        The status is **200** when every check passes and **503** when one fails;
-        the body is the same either way and says which check failed. A server that is
-        still catching up with the network answers 503, so a load balancer stops
-        sending it traffic until its answers are current.
+        The status is **200** when the server has the blocks of the network
+        and **503** when it has not; the body is the same either way and says
+        which check failed. A server that is still catching up with the blocks
+        of the network answers 503, so a load balancer stops sending it traffic
+        until its answers are current.
+
+        The state of the mempool does not decide it: a server at the head of
+        the chain is healthy. Whether its mempool is still filling, as after a
+        start, is said in `mempool.filling`.
 
         A server that cannot reach its Redis answers **503** too, with the
         header `Haskoin-Degraded: redis` and `"redis": {"ok": false}` in the
@@ -428,6 +433,7 @@ paths:
                   dirty: false
                   known: 0
                   held: 0
+                  filling: false
                   text: >-
                     The store has 1 source to read a whole mempool from again, which it
                     does when it may have missed a transaction.
@@ -501,6 +507,7 @@ paths:
                   dirty: false
                   known: 0
                   held: 0
+                  filling: false
                   text: >-
                     The store has 1 source to read a whole mempool from again, which it
                     does when it may have missed a transaction.
@@ -6840,8 +6847,19 @@ components:
     HealthCheck:
       type: object
       description: |
-        The result of the latest health check. `ok` is true when every check passes.
-        The limits are set by the operator of the server.
+        The result of the latest health check. `ok` is true when the server
+        has the blocks of the network: `blocks`, `last-block`, `peers` and
+        `database` pass. The limits are set by the operator of the server.
+
+        Nothing of the mempool decides it. A server that is at the head of the
+        chain answers every request rightly from what it has, whatever the
+        state of its mempool. The checks `last-tx` and `pending-txs` are made
+        and say whether they pass, each with its own `ok`, and `ok` here does
+        not depend on them. What to know of the mempool is in `mempool`:
+        `filling` says whether it is still filling.
+
+        `warnings`, when there are any, are not checks either: `ok` and the
+        status do not depend on them.
       required:
         - blocks
         - last-block
@@ -6870,12 +6888,14 @@ components:
         last-tx:
           description: |
             Age of the newest unconfirmed transaction (or block, if newer). A busy
-            network sends transactions all the time, so silence means trouble.
+            network sends transactions all the time, so silence may mean
+            trouble. It does not decide `ok` of the server.
           allOf:
             - $ref: '#/components/schemas/TimeHealth'
         pending-txs:
           description: |
-            Transactions requested from peers and not received yet.
+            Transactions requested from peers and not received yet. It does
+            not decide `ok` of the server.
           allOf:
             - $ref: '#/components/schemas/MaxHealth'
         peers:
@@ -6989,6 +7009,7 @@ components:
             - dirty
             - known
             - held
+            - filling
             - text
           properties:
             sources:
@@ -7015,10 +7036,34 @@ components:
               description: |
                 Transactions held: being offered, or waiting for one that they
                 spend from.
+            filling:
+              type: boolean
+              description: |
+                Whether the shared mempool is still filling. It is true while
+                the server has a source and has not yet read its sources and
+                taken in all that they named, since it started or since the
+                shared mempool lost what it had: the server then shows fewer
+                unconfirmed transactions than its node has. It stays true for
+                twenty seconds at least after a start, the time that a node is
+                given to name its mempool. A server with no source has nothing
+                to fill from, and this is false of it. The server is healthy
+                either way: wait for `sources` of 1 or more and `filling` false
+                before giving a new server traffic, if unconfirmed
+                transactions matter to you.
             text:
               type: string
               description: |
                 The same in words.
+        warnings:
+          type: array
+          description: |
+            What the operator of the server should put right in how it is set
+            up, a sentence each, for people. Left out when there is none. A
+            warning decides nothing of `ok`. There is one so far: the server
+            has the RPC of its node and not its ZeroMQ socket, and asks the
+            node every five seconds for what the socket would announce.
+          items:
+            type: string
         net:
           type: string
           description: |

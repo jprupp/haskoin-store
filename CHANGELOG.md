@@ -262,6 +262,29 @@ whitelist it must now say what they grant (`--peer-permission`, or
     testnets had the mempool of their node again in under three
     seconds, and Bitcoin, with 65,962 transactions, in 233
     (`docs/fleet-mempool.md`).
+  - **A store at the head of the chain is healthy, whatever the state of
+    its mempool.** `ok` of `/health`, and its status, no longer depend
+    on the two checks that look at transactions: `last-tx`, that one
+    came lately, and `pending-txs`, that few are asked for and not
+    received. A store that had every block was unhealthy, and taken out
+    of service, when its node went quiet or while it fetched a large
+    mempool. Both checks are still made and still say whether they
+    pass. `--tx-timeout` and `--max-pending-txs` set their limits as
+    before, and no longer decide anything.
+  - **`/health` says whether the mempool is still filling**
+    (`mempool.filling`). After a start, or after Redis lost its data, a
+    store has its blocks at once and its mempool a minute later, on
+    Bitcoin: it is healthy meanwhile and shows fewer unconfirmed
+    transactions than its node. The field is true until every source
+    was asked for its mempool and had twenty seconds to answer, none
+    owes a reading, and the pool has decided on all that they named. A
+    deploy that waited for `/health` gave a store traffic 70 seconds
+    before its mempool was full: it can wait for `sources` of 1 or more
+    and `filling` false. In the machine of the path as T9 of
+    `docs/mempool-ingestion.md`, with two checks in the model and a
+    planted bug for each; its first version took the first names of a
+    source for its answer, which the model found wrong at once. Both
+    changes need haskoin-store-data's branch `health-mempool`.
   - **A node as a peer, through its RPC and its ZeroMQ socket**
     (`--node-rpc` with `--node-zmq`, `NODE_ZMQ`; `docs/node-peer.md`).
     The peer-to-peer protocol is made for strangers: a node names what
@@ -297,8 +320,29 @@ whitelist it must now say what they grant (`--peer-permission`, or
       where the peer-to-peer protocol alone is late. Not tested: a
       first sync of a real chain this way, which takes one RPC call for
       each block.
-    - With `--node-zmq` the RPC is no longer read as a source of its
-      own beside the peer.
+    - **The RPC alone makes the node a peer too** (`--node-rpc` without
+      `--node-zmq`). Nothing publishes then, so the peer asks the node
+      every five seconds: for its best block, and, while no other node
+      of the operator is a peer of the store, for the ids of its
+      mempool, of which it names those that are new. While every other
+      peer is a stranger, that keeps the store at most five seconds
+      behind a node that it trusts. Such a store runs with no
+      peer-to-peer connection as well, and discovery is not turned on
+      for it. Tested against both nodes (`polls`: three batches and a
+      block, each there within twelve seconds, which fails when the
+      peer asks every sixty). Not measured: what asking a mempool of
+      sixty thousand transactions every five seconds costs the node.
+    - **A store that has the RPC and not the ZeroMQ socket warns of
+      it**: the two are expected together. In the log, when the store
+      starts and when the peer connects, and in `/health`, as a
+      sentence in the new `warnings` and in `text`. A warning decides
+      nothing: `ok` and the status stay as they are. It needs
+      haskoin-store-data's branch `health-mempool`.
+    - The web server no longer reads the RPC as a source of its own
+      (`nodeFeedLoop`): the node peer is that source.
+    - The node of `--node-rpc` is a node of the operator with
+      `--foreign-peers` too, which speaks of the nodes of `--peer`. It
+      was taken for a stranger.
   - **A stranger is not taken at its word.** A store verifies no script:
     it takes a transaction because a node took it. It did so of every
     peer, and a peer found by discovery is anybody: it could send a

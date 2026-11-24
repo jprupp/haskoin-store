@@ -130,11 +130,12 @@ everything that happens, in the order of one queue:
 
 The machine decides. The runner carries out.
 
-When the store has the RPC of its node, the RPC is one more place to
-read the node's mempool from, with a thread of its own, the feed
-(`ingestFeed`). To the machine the feed is a peer. It comes when the web
-server starts, goes when a call fails, and comes again, as a new peer,
-when it is tried again. The feed decides nothing either: it makes the
+The runner can also be given a feed (`ingestFeed`): something that is
+no peer and that a whole mempool can be read from, with a thread of its
+own. The store starts none since it has the node of its RPC as a peer
+(`Haskoin.Store.NodePeer`). To the machine a feed is a peer. It comes
+when it is started, goes when a call fails, and comes again, as a new
+peer, when it is tried again. The feed decides nothing either: it makes the
 calls that the machine asked for, and puts the answers in the queue of
 events.
 

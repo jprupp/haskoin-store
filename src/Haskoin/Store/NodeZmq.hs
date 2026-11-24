@@ -134,7 +134,10 @@ parseZmqAddress s
     -- written in brackets
     tcp rest = case break (== ':') (reverse rest) of
       (port, ':' : host)
-        | Just n <- readMaybe (reverse port), n > 0, n < (65536 :: Int), not (null host) ->
+        | Just n <- readMaybe (reverse port),
+          n > 0,
+          n < (65536 :: Int),
+          not (null host) ->
             Right (ZmqTcp (unbracket (reverse host)) n)
       _ -> Left ("No host and port in the address of ZeroMQ: " <> s)
     unbracket h = case h of

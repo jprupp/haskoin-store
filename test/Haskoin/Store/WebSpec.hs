@@ -89,7 +89,8 @@ well =
       time = 0,
       redis = Nothing,
       database = Nothing,
-      mempool = Nothing
+      mempool = Nothing,
+      warnings = []
     }
 
 spec :: Spec
