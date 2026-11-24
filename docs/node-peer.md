@@ -158,7 +158,20 @@ Start the node with the two topics, at one address:
 -zmqpubhashtx=tcp://127.0.0.1:28332 -zmqpubhashblock=tcp://127.0.0.1:28332
 ```
 
-A Unix socket works too (`ipc:///run/node/zmq.sock`). Bitcoin Core has
+A Unix socket works too, and the two sides write it differently:
+
+| Who | How the address is written |
+| --- | --- |
+| The store (`--node-zmq`) | `ipc:///run/node/zmq.sock` or `unix:/run/node/zmq.sock`: both mean the same |
+| Bitcoin Core 32 (`-zmqpub…`) | `unix:/run/node/zmq.sock`. Given `ipc:///…` it stops with "Invalid port specified" and does not start |
+| Bitcoin Cash Node (`-zmqpub…`) | `ipc:///run/node/zmq.sock` |
+
+What Bitcoin Core does with `ipc://` was seen on a server, where a node
+did not start for it. The tests here give both nodes a TCP address, so
+a node that publishes on a Unix socket is **not tested** in this
+repository.
+
+Bitcoin Core has
 ZeroMQ only if it was built with it (`-DWITH_ZMQ=ON`); Bitcoin Cash
 Node has it unless it was built without.
 
