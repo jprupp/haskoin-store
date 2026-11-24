@@ -95,6 +95,7 @@ release of a node that changes one of them is noticed.
 | A8 | A node names transactions to a peer no faster than it chooses to. Bitcoin Core 32 names about five hundred at once and then seventy every five seconds, fourteen a second, even to a peer that it whitelists. Bitcoin Cash Node 29 names 800 at once to a peer that it whitelists. Asked for its mempool, a node names all of it at once (A2). |
 | A9 | A node of the operator ran every script of what it names or sends: the store takes its word. A stranger may name and send anything, a forged transaction too. |
 | F1 | The RPC of a node is a source as a peer is one. `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from. `getrawtransaction` gives a transaction, or the error -5 for one that the node does not have. Any other answer, or none, says nothing of what the node has. |
+| F2 | A node publishes over ZeroMQ the id of each transaction that it takes, as it takes it, and again when a block that has it becomes the tip; and the hash of that block. Each topic has a counter that goes up by one with each message. The socket only publishes: a subscriber that is late or slow misses messages, and can tell from the counter that it did, not which. |
 | R1 | A Redis script runs alone, start to end. |
 | R2 | Redis may lose all its data, and the store finds out (the epoch). It may be away for any time. |
 | U1 | The runner gives every connection a name of its own, never used again. In haskoin-node a connection is a peer of its own. |
@@ -280,6 +281,23 @@ reader instead would stop its blocks too.
 
 **A window for each peer.** It grows while the peer answers and shrinks
 when it does not, in place of a fixed number.
+
+**A node that publishes is a peer.** The RPC of a node names nothing by
+itself, and a node names to a peer at its own pace (A8). With the RPC
+and the address of the node's ZeroMQ socket (`--node-rpc`,
+`--node-zmq`) the store has the node as one more peer, which announces
+what the node publishes as the node takes it (F2) and answers from the
+RPC ([node-peer.md](node-peer.md)). Nothing of the machine changes: to
+it this is a peer that is a source and a node of the operator, as a
+peer that the node whitelists already is.
+
+What may not have been heard, when the subscription is made or a
+counter skips, is named again with the whole mempool of the node. So
+ZeroMQ makes the store faster and never the only way that it hears.
+
+The ids come in runs, a thousand at most, since a block that becomes
+the tip publishes every transaction that it has at once. The pool has
+nearly all of those, and says so in one question.
 
 **A stranger is not taken at its word.** The store verifies no
 transaction that a peer sends. It takes what its node took, since the
@@ -550,7 +568,7 @@ read again: both were tried. The fifth allows two minutes, which the
 reading by the clock meets too: it shows that the store ends right,
 and not what brought it there.
 
-The eighth and the ninth fail without their rule. On Bitcoin Core there are three
+The eighth and the ninth fail without their rule. On Bitcoin Core there are four
 more:
 
 - The only peer of the store is a node of somebody else
@@ -560,6 +578,12 @@ more:
   and says in `/health` that it holds one transaction. Told that the
   peer is a node of its operator, the same store has both (T8).
 
+- The store has the node as a peer twice, over the peer-to-peer
+  protocol and through its RPC and its ZeroMQ socket. The node takes
+  800 transactions in a few seconds, twice. The store has them all
+  within five seconds of the last, with no reading of the mempool: a
+  reading may fall in one burst and cannot fall in both. With the
+  peer-to-peer protocol alone it is late, and the test fails (F2).
 - The node replaces transactions by ones that pay more. The store has
   the replacements and nothing of what they replaced.
 - The node takes 2,500 transactions in a few seconds. The store has them
@@ -670,6 +694,9 @@ never does (U1).
   past a bound, and tells the machine so.
 - The thread that asks the RPC of the node, and the calls that it makes
   (`ingestFeed`, `nodeFeed`, tested against both nodes).
+- The node as a peer through its RPC and its ZeroMQ socket
+  (`Haskoin.Store.NodePeer`, `Haskoin.Store.NodeZmq`), tested against
+  both nodes ([node-peer.md](node-peer.md) has the tests).
 - The two functions of the member that ask the pool and offer to it
   (`memberSettled`, `memberOffer`). What an offer finds of a
   transaction that is not vouched for is tested against a real pool,

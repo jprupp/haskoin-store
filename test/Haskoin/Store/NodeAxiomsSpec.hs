@@ -21,15 +21,16 @@
 -- checked is what the node does and not what the store makes of it.
 module Haskoin.Store.NodeAxiomsSpec (spec) where
 
-import Control.Concurrent.Async (async, wait)
+import Control.Concurrent (newEmptyMVar, putMVar, takeMVar, threadDelay)
+import Control.Concurrent.Async (async, wait, withAsync)
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (elemIndex, sort)
 import Data.Maybe (mapMaybe)
-import Data.Serialize (runGet, runPut)
+import Data.Serialize (encode, runGet, runPut)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -49,6 +50,7 @@ import Haskoin
     VarString (..),
     Version (..),
     doubleSHA256,
+    encodeHex,
     getMessage,
     putMessage,
     sockToHostAddress,
@@ -59,6 +61,7 @@ import Haskoin.Store.Ingest.Run (Feed (..))
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.MempoolSpec (Bed (..), bare, chainOf, fund, send, submit, withBed, withBedOf)
 import Haskoin.Store.NodeRpc (RpcFailure (..), nodeFeed, nodeSession)
+import Haskoin.Store.NodeZmq (ZmqMessage (..), parseZmqAddress, zmqSubscribe)
 import Network.Socket (SockAddr (..), Socket, close)
 import Network.Socket.ByteString (recv, sendAll)
 import System.Timeout (timeout)
@@ -88,9 +91,62 @@ spec = do
       on "asked for its mempool over its RPC" $
         it "gives all of it, the transactions asked for, and its word for one that it has not" $
           withBed kind overRpc
+      on "publishes over ZeroMQ" $
+        it "the id of each transaction that it takes and the hash of each new tip, with a counter (F2)" $
+          withBed kind publishes
   where
     name BitcoinCore = "Bitcoin Core"
     name BitcoinCashNode = "Bitcoin Cash Node"
+
+-- | F2. A subscriber of the node's ZeroMQ socket hears the id of a
+-- transaction when the node takes it, and again when a block that has it
+-- becomes the tip; and the hash of that block. The ids and the hash are
+-- in the order in which the RPC writes them. Each topic has a counter that
+-- goes up by one with each message, which is how a subscriber knows that
+-- it lost one.
+--
+-- The store reads this with a client of its own
+-- ("Haskoin.Store.NodeZmq"), so this is also the test of that client
+-- against the library of ZeroMQ that the nodes are built with.
+publishes :: Bed -> IO ()
+publishes bed = do
+  roots <- fund bed 2
+  heard <- newIORef []
+  ready <- newEmptyMVar
+  where' <- either fail return (parseZmqAddress bed.node.zmq)
+  let listen = zmqSubscribe where' ["hashtx", "hashblock"] (putMVar ready ()) (\m -> modifyIORef' heard (m :))
+      of' t = filter ((== t) . (.topic)) . reverse <$> readIORef heard
+      -- until so many messages of a topic were heard, for ten seconds
+      until' t n = do
+        r <- timeout 10000000 (awaiting t n)
+        maybe (expectationFailure ("Not " <> show n <> " messages of " <> show t)) return r
+      awaiting t n = do
+        got <- of' t
+        if length got >= n then return () else threadDelay 100000 >> awaiting t n
+  withAsync listen $ \_ -> do
+    timeout 10000000 (takeMVar ready) >>= maybe (expectationFailure "No subscription to the node") return
+    -- a publisher takes a moment to act on a subscription
+    threadDelay 1000000
+    case concatMap (chainOf 1) roots of
+      [a, b] -> do
+        send bed a
+        send bed b
+        until' "hashtx" 2
+        taken <- of' "hashtx"
+        -- as the RPC writes an id: the reverse of its bytes
+        sort (map (.body) taken) `shouldBe` sort [B.reverse (encode (txHash t)) | t <- [a, b]]
+        block : _ <- generateTo bed.node 1 bed.miner
+        until' "hashblock" 1
+        tips <- of' "hashblock"
+        map (encodeHex . (.body)) tips `shouldBe` [block]
+        -- the block has both, and a coinbase: each is published again
+        until' "hashtx" 5
+        all' <- of' "hashtx"
+        length (filter ((`elem` map (.body) taken) . (.body)) all') `shouldBe` 4
+        -- each message is the one after the last of its topic
+        let numbers = map (.number) all'
+        zipWith (-) (drop 1 numbers) numbers `shouldSatisfy` all (== 1)
+      _ -> expectationFailure "Not two transactions"
 
 -- | A1. The node takes one transaction, a peer connects, and the node
 -- takes another: the peer is told of the second once, and of the first

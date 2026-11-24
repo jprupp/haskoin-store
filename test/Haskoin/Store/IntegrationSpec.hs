@@ -485,6 +485,9 @@ storeConfig net logger dir redisURL peer granted =
       blockPing = 5,
       maxPeerLife = 48 * 3600,
       connect = withConnection,
+      nodePeerRpc = Nothing,
+      nodePeerRpcSocket = Nothing,
+      nodePeerZmq = Nothing,
       stats = Nothing,
       bloom = True,
       maxOpenFiles = Just 256,
@@ -519,6 +522,7 @@ webConfig logger store =
       accessLog = False,
       nodeRpc = Nothing,
       nodeRpcSocket = Nothing,
+      nodeZmq = Nothing,
       tls = Nothing,
       logger = logger
     }

@@ -162,7 +162,8 @@ haskoin-store --net btc --discover
 ```
 
 Give it either `--discover` or at least one `--peer`; with neither it turns
-discovery on by itself. Data goes in a directory named after the network inside
+discovery on by itself, unless it has your node as a peer through its RPC and
+its ZeroMQ socket (`--node-rpc` with `--node-zmq`). Data goes in a directory named after the network inside
 `--dir`, so one data directory can hold several networks.
 
 It needs a Redis or Valkey server, at `redis://localhost:6379` unless
@@ -363,6 +364,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--request-wait` | `REQUEST_WAIT` | `1` | Seconds that a long request may wait for a slot; then it is refused with 429 |
 | `--node-rpc` | `NODE_RPC` | none | JSON-RPC URL of a full node, such as `http://user:password@127.0.0.1:8332/`, to publish transactions through, and to read the node's whole mempool from, as a source of the shared mempool; without it, or when it does not answer, transactions go to the peers, and the store reads the mempools of the peers that allow it |
 | `--node-rpc-socket` | `NODE_RPC_SOCKET` | none | Unix socket to send the requests of `--node-rpc` through, in place of the host and port of its URL; the URL still gives the user and password. Neither node listens on one itself: it is something that joins it to the node, such as socat |
+| `--node-zmq` | `NODE_ZMQ` | none | Where the node of `--node-rpc` publishes over ZeroMQ, such as `tcp://127.0.0.1:28332` or `ipc:///run/node/zmq.sock`. Start the node with `-zmqpubhashtx` and `-zmqpubhashblock` at that address. The node is then one more peer of the store, through its RPC and this socket, and the store needs no other (`docs/node-peer.md`). It needs `--node-rpc` |
 | `--def-item-count` | `DEF_ITEM_COUNT` | `100` | Items in a list when no `limit` is given |
 | `--xpub-gap` | `XPUB_GAP` | `32` | Unused addresses kept after the last used one of each chain of an xpub; payments further away are not seen |
 | `--xpub-gap-init` | `XPUB_GAP_INIT` | `20` | Addresses looked at for an xpub with no transactions; an xpub with none used among them counts as unused |
@@ -413,6 +415,23 @@ fleet of one. Every key starts with `hs3:<network>:`.
   model of each peer's node (`docs/fleet-mempool.md`): tell it what your
   nodes grant with `--peer-permission`. A store with no source says so in
   `/health`.
+- **Your node as a peer, through its RPC and its ZeroMQ socket.** The
+  peer-to-peer protocol is made for strangers: a node names what it
+  takes to a peer at its own pace, Bitcoin Core about fourteen a second
+  after a first batch, so that in a burst a store is behind its node
+  until it next reads the mempool, every thirty seconds. With
+  `--node-rpc` and `--node-zmq` together, the store has that node as
+  one more peer, with no peer-to-peer connection to it: it asks it what
+  it asks any peer, and the answers come from the RPC and from what the
+  node publishes (`-zmqpubhashtx`, `-zmqpubhashblock`). It hears of a
+  transaction and of a block as the node takes them. That peer counts
+  in `/health`, it is a node of yours, and a store can run on it alone,
+  with no `--peer` and no `--discover`. The ZeroMQ socket only
+  publishes, has no password, and drops what a slow subscriber does not
+  read: keep it on the machine of the node, and the store reads the
+  mempool again whenever something may have been lost. The store speaks
+  the protocol itself, and needs no ZeroMQ library.
+  [docs/node-peer.md](docs/node-peer.md) has the whole of it.
 - <a id="whose-word-is-taken"></a>**Whose word is taken.** A store
   verifies no script: it takes a transaction because a node took it.
   That is right of a node of yours, and the store takes the nodes of

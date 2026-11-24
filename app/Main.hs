@@ -42,6 +42,7 @@ import Haskoin.Store
   )
 import Haskoin.Store.Common (loopForever)
 import Haskoin.Store.Database.Stalls (defaultBackgroundJobs)
+import Haskoin.Store.NodeZmq (parseZmqAddress)
 import Haskoin.Store.Runtime (runtimeMetrics)
 import Haskoin.Store.Startup (StartupError (..), checkReadable, makeDataDirectory)
 import Haskoin.Store.Web.Listen (parseMode, systemdSocket, withUnixSocket)
@@ -148,6 +149,7 @@ data Config = Config
     accessLog :: !Bool,
     nodeRpc :: !String,
     nodeRpcSocket :: !String,
+    nodeZmq :: !String,
     tlsCert :: !String,
     tlsKey :: !String,
     bloom :: !Bool,
@@ -252,6 +254,8 @@ defConfig = do
     env "NODE_RPC" "" pure
   nodeRpcSocket <-
     env "NODE_RPC_SOCKET" "" pure
+  nodeZmq <-
+    env "NODE_ZMQ" "" pure
   bloom <-
     env "BLOOM" True parseBool
   noWeb <-
@@ -776,6 +780,19 @@ config c = do
           "NODE_RPC_SOCKET"
           "Send the requests of --node-rpc through this Unix socket, in place of the host and port of its URL"
         <> value c.nodeRpcSocket
+  nodeZmq <-
+    strOption $
+      metavar "ADDRESS"
+        <> long "node-zmq"
+        <> helpEnv
+          "NODE_ZMQ"
+          ( unwords
+              [ "Where the node of --node-rpc publishes over ZeroMQ (its -zmqpubhashtx and -zmqpubhashblock),",
+                "such as tcp://127.0.0.1:28332 or ipc:///run/node/zmq.sock: the store hears of a transaction",
+                "as the node takes it"
+              ]
+          )
+        <> value c.nodeZmq
   tlsCert <-
     strOption $
       metavar "FILE"
@@ -859,7 +876,8 @@ networkReader s =
     Nothing -> Left ("--net " <> s <> ": unknown network; use one of " <> intercalate ", " (map (.name) allNets))
 
 -- | Parse the command line and run the store. If no peers are given and discovery
--- is off, discovery is turned on.
+-- is off, discovery is turned on, unless the store has its node as a peer
+-- through its RPC and its ZeroMQ socket (@--node-rpc@ with @--node-zmq@).
 --
 -- A mistake of configuration, or something that the store needs and does
 -- not find (Redis, a free port, a database that no other store holds), is
@@ -874,12 +892,23 @@ main = handle startupError $ do
   -- the cache of xpubs cannot be turned off: its size is all that is set
   when (c.redisMaxXPubs < 1) $
     misconfigured "--redis-max-xpubs (or REDIS_MAX_XPUBS) must be at least 1"
+  -- the ZeroMQ socket announces, and what it announces is fetched over
+  -- the RPC: one without the other is no peer
+  when (not (null c.nodeZmq) && null c.nodeRpc) $
+    misconfigured . T.unwords $
+      [ "--node-zmq (or NODE_ZMQ) needs --node-rpc (or NODE_RPC):",
+        "what the node publishes is fetched over its RPC"
+      ]
+  when (not (null c.nodeZmq)) $
+    either (misconfigured . T.pack) (const (return ())) (parseZmqAddress c.nodeZmq)
   case (c.tlsCert, c.tlsKey) of
     ("", "") -> return ()
     ("", _) -> misconfigured "--tls-key needs --tls-cert: give both, or neither for plain HTTP"
     (_, "") -> misconfigured "--tls-cert needs --tls-key: give both, or neither for plain HTTP"
     (certificate, key) -> checkReadable "--tls-cert" certificate >> checkReadable "--tls-key" key
-  if null c.peers && not c.discover
+  -- a store that has its node through its RPC and its ZeroMQ socket has a
+  -- peer, and needs no other
+  if null c.peers && not c.discover && (null c.nodeRpc || null c.nodeZmq)
     then run $ let Config {..} = c in Config {discover = True, ..}
     else run c
   where
@@ -951,6 +980,9 @@ run cfg =
             blockPing = fromIntegral cfg.blockPing,
             maxPeerLife = fromIntegral cfg.maxPeerLife,
             connect = withConnection,
+            nodePeerRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
+            nodePeerRpcSocket = if null cfg.nodeRpcSocket then Nothing else Just cfg.nodeRpcSocket,
+            nodePeerZmq = if null cfg.nodeZmq then Nothing else Just cfg.nodeZmq,
             stats = stats,
             bloom = cfg.bloom,
             maxOpenFiles = if cfg.maxOpenFiles > 0 then Just cfg.maxOpenFiles else Nothing,
@@ -1000,6 +1032,7 @@ run cfg =
               accessLog = cfg.accessLog,
               nodeRpc = if null cfg.nodeRpc then Nothing else Just cfg.nodeRpc,
               nodeRpcSocket = if null cfg.nodeRpcSocket then Nothing else Just cfg.nodeRpcSocket,
+              nodeZmq = if null cfg.nodeZmq then Nothing else Just cfg.nodeZmq,
               -- both or neither, which 'main' checked
               tls = case (cfg.tlsCert, cfg.tlsKey) of
                 ("", _) -> Nothing

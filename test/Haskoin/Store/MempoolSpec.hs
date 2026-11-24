@@ -41,7 +41,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (forConcurrently_, link, withAsync)
-import Control.Exception (throwIO, try)
+import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..))
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -91,6 +91,7 @@ import Haskoin.Store.IntegrationSpec
 import Haskoin.Store.Startup (redisConnectInfo)
 import Network.HTTP.Client (HttpException)
 import System.IO (hPutStrLn, stderr)
+import System.Timeout (timeout)
 import Test.Hspec
 import Test.Podman (ContainerSpec (..), Pod, PodSpec (..), containerName, pod, podman, podmanUsable, withPod)
 
@@ -121,6 +122,12 @@ spec = do
           it "asks its node for them, and has them and their children" (withBed kind bereft)
         on "A store whose node takes chains while it finds blocks" $
           it "has every transaction that no block confirmed" (withBed kind busy)
+        on "A store whose only peer is its node through its RPC and its ZeroMQ socket" $
+          it "has its blocks, its mempool, what the node takes next and its next block, with no other connection" $
+            withBed kind (alone . \bed -> bed {viaRpc = True, viaZmq = True})
+        on "A store whose only peer is its node through its RPC and its ZeroMQ socket, when the node stops" $
+          it "has no peer and says so, and has its node again when the node goes on" $
+            withBed kind (nodeStops . \bed -> bed {viaRpc = True, viaZmq = True})
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
       describe "A store whose only peer is a node of somebody else, on Bitcoin Core" $
@@ -130,6 +137,9 @@ spec = do
       describe "A store whose node takes transactions faster than it names them, on Bitcoin Core" $
         it "has them within the time of a reading of the node's mempool, and not at the node's pace" $
           withBed BitcoinCore burst
+      describe "A store that hears what its node publishes over ZeroMQ, on Bitcoin Core" $
+        it "has what the node takes as fast as the node takes it, with no reading of its mempool" $
+          withBed BitcoinCore (hears . \bed -> bed {viaRpc = True, viaZmq = True})
       -- Bitcoin Cash Node replaces nothing by fee
       describe "A store whose node replaces transactions by ones that pay more, on Bitcoin Core" $
         it "has the replacements, and nothing of what they replaced" (withBed BitcoinCore outbid)
@@ -235,6 +245,117 @@ burst bed = do
     converges bed server 60
     submit bed (map (chainOf 1) roots)
     converges bed server 60
+
+-- | A store that is given no peer at all, and the RPC of its node with
+-- the address of its ZeroMQ socket (@--node-rpc@, @--node-zmq@): the
+-- node is its one peer, through those two ("Haskoin.Store.NodePeer"),
+-- and there is no connection of the peer-to-peer protocol.
+--
+-- It starts from nothing on a node that has 150 blocks and a mempool.
+-- It must have the blocks, which come over the RPC; the mempool, which
+-- the node names when asked; what the node takes after that, which the
+-- node publishes; and the block that the node finds then, which it
+-- publishes too. Its health says that it has one peer.
+alone :: Bed -> IO ()
+alone bed = withRamDir $ \dir -> do
+  roots <- fund bed 40
+  let (before, after) = splitAt 20 roots
+  submit bed (map (chainOf 4) before)
+  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+    converges bed server 120
+    (_, health) <- getJSON server "/health"
+    (field "peers" health >>= field "count") `shouldBe` Just (Number 1)
+    submit bed (map (chainOf 4) after)
+    converges bed server 30
+    void (generateTo bed.node 1 bed.miner)
+    converges bed server 30
+
+-- | The same store when its node stops in its tracks, as a node that
+-- hangs: the pipe to the peer is in memory and never breaks, and the
+-- thread at its other end could answer for a node that is gone. It
+-- answers a ping only once the node answered a call, so the store finds
+-- its peer silent and lets it go, as it does of any peer: its health
+-- says that it has none. When the node goes on, the store has it as a
+-- peer again, with what the node took meanwhile.
+nodeStops :: Bed -> IO ()
+nodeStops bed = withRamDir $ \dir -> do
+  roots <- fund bed 20
+  let (before, after) = splitAt 10 roots
+      quick c = c {initPeers = [], peerTimeout = 10} :: StoreConfig
+  withMemberOf quick bed dir $ \_ server -> do
+    submit bed (map (chainOf 4) before)
+    converges bed server 120
+    freezeNode bed.pod 0 bed.node.kind
+    peers server 0 90 `finally` thawNode bed.pod 0 bed.node.kind
+    submit bed (map (chainOf 4) after)
+    peers server 1 90
+    converges bed server 90
+  where
+    -- until the health of the store says that it has so many peers
+    peers server n seconds = do
+      (_, health) <- getJSON server "/health"
+      unless ((field "peers" health >>= field "count") == Just (Number n)) $
+        if seconds <= (0 :: Int)
+          then expectationFailure ("The store does not come to have " <> show n <> " peers")
+          else threadDelay 1000000 >> peers server n (seconds - 1)
+
+-- | A store that has its node as a peer twice, over the peer-to-peer
+-- protocol and through its RPC and its ZeroMQ socket (@--node-rpc@,
+-- @--node-zmq@), while the node takes hundreds of transactions in a few
+-- seconds, twice.
+--
+-- Bitcoin Core names to a peer about five hundred at once and then
+-- fourteen a second (A8), so that a store that only listens to its peer
+-- is behind for as long as a burst lasts, until it reads the mempool of
+-- its node, every thirty seconds. Over ZeroMQ the node publishes the id
+-- of each transaction as it takes it (F2), and the store fetches it over
+-- the RPC: it has them all within five seconds of the last.
+--
+-- A reading of the mempool would bring them too, and one may fall in any
+-- five seconds. So the test looks at two bursts, which are less than
+-- thirty seconds apart: a reading cannot fall in both. In one of them at
+-- least the store must have had everything with no reading, and in none
+-- may it be late without one.
+hears :: Bed -> IO ()
+hears bed = withRamDir $ \dir -> do
+  roots <- fund bed 1600
+  -- two peers: the node over the peer-to-peer protocol, and the same node
+  -- through its RPC and its ZeroMQ socket
+  withMemberOf (\c -> c {maxPeers = 2} :: StoreConfig) bed dir $ \_ server -> do
+    converges bed server 60
+    both server 90
+    let (first, second) = splitAt 800 roots
+    rounds <- mapM (round' server) [first, second]
+    -- a round that a reading fell in says nothing, and both cannot be
+    filter fst rounds `shouldSatisfy` (not . null)
+    [late | (True, late) <- rounds] `shouldSatisfy` all not
+  where
+    -- whether no reading fell in the round, and whether the store was
+    -- then late
+    round' server some = do
+      before <- readings
+      submit bed (map (chainOf 1) some)
+      inTime <- timeout 5000000 (awaitSame server)
+      after <- readings
+      -- whatever happened, the store ends with the mempool of its node
+      converges bed server 60
+      return (after == before, inTime == Nothing)
+    -- until the store has its two peers
+    both server seconds = do
+      (_, health) <- getJSON server "/health"
+      unless ((field "peers" health >>= field "count") == Just (Number 2)) $
+        if seconds <= (0 :: Int)
+          then expectationFailure "The store does not come to have two peers"
+          else threadDelay 1000000 >> both server (seconds - 1)
+    awaitSame server = do
+      node <- Set.fromList <$> rawMempool bed.node
+      (_, m) <- getJSON server "/mempool?limit=1000000"
+      let ours = Set.fromList [t | String t <- case m of v@(Array _) -> arr v; _ -> []]
+      unless (node == ours) (threadDelay 200000 >> awaitSame server)
+    -- how many times the store asked a source for its whole mempool
+    readings = do
+      said <- takeWhile (/= "--- at every level") <$> bed.logTail
+      return (length (filter (\l -> "for its mempool" `isInfixOf` l || "Reading the mempool" `isInfixOf` l) said))
 
 -- | A node that takes chains of transactions, and then, for the first of
 -- each chain, another that spends the same output and pays more: it
@@ -702,6 +823,8 @@ data Bed = Bed
     granted :: !Permissions,
     -- | whether the stores of the bed are given the RPC of the node
     viaRpc :: !Bool,
+    -- | and hears what the node publishes over ZeroMQ
+    viaZmq :: !Bool,
     logger :: !Logger,
     -- | the last lines of the log of the stores of the bed
     logTail :: !(IO [String])
@@ -737,6 +860,7 @@ withBedOf nodeSpec kind go =
             redisURL = Valkey.redisURL p,
             granted = grantedBy True kind,
             viaRpc = False,
+            viaZmq = False,
             logger,
             logTail
           }
@@ -756,16 +880,26 @@ withMemberIn = withMemberOf id
 -- | 'withMemberIn', with the configuration of the store changed.
 withMemberOf :: (StoreConfig -> StoreConfig) -> Bed -> FilePath -> (Store -> Server -> IO a) -> IO a
 withMemberOf change bed dir f =
-  withStore (change (storeConfig bed.net bed.logger dir bed.redisURL bed.node.peer bed.granted)) $ \store ->
+  withStore (change (heard (storeConfig bed.net bed.logger dir bed.redisURL bed.node.peer bed.granted))) $ \store ->
     listening $ \(sock, server) ->
       withAsync (runWebSocket (web store) sock) $ \running ->
         link running >> f store server
   where
+    -- with the node as a peer through its RPC and its ZeroMQ socket
+    heard c
+      | bed.viaZmq =
+          c
+            { nodePeerRpc = Just bed.node.url,
+              nodePeerRpcSocket = Just bed.node.rpcSocket,
+              nodePeerZmq = Just bed.node.zmq
+            }
+      | otherwise = c
     web store
       | bed.viaRpc =
           (webConfig bed.logger store)
             { nodeRpc = Just bed.node.url,
-              nodeRpcSocket = Just bed.node.rpcSocket
+              nodeRpcSocket = Just bed.node.rpcSocket,
+              nodeZmq = if bed.viaZmq then Just bed.node.zmq else Nothing
             } ::
             WebConfig
       | otherwise = webConfig bed.logger store

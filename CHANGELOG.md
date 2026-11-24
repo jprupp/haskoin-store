@@ -262,6 +262,43 @@ whitelist it must now say what they grant (`--peer-permission`, or
     testnets had the mempool of their node again in under three
     seconds, and Bitcoin, with 65,962 transactions, in 233
     (`docs/fleet-mempool.md`).
+  - **A node as a peer, through its RPC and its ZeroMQ socket**
+    (`--node-rpc` with `--node-zmq`, `NODE_ZMQ`; `docs/node-peer.md`).
+    The peer-to-peer protocol is made for strangers: a node names what
+    it takes to a peer at its own pace, Bitcoin Core about fourteen a
+    second after a first batch, and in a burst a store was behind until
+    it next read the mempool, every thirty seconds. Somebody who runs
+    the node has its RPC, which answers anything, and its ZeroMQ
+    socket, which says what the node takes as it takes it.
+    - With both, the store has that node as one more peer
+      (`Haskoin.Store.NodePeer`): a pipe in memory, with a thread at
+      the other end that answers the messages of the peer-to-peer
+      protocol from the RPC (headers, blocks, transactions, the
+      mempool) and announces what the node publishes (`hashtx`,
+      `hashblock`, which both Bitcoin Core and Bitcoin Cash Node have).
+      Nothing else of the store changes: the node counts as a peer in
+      `/health`, it is a node of the operator, and it is a source.
+    - A store can run on it alone, with no `--peer` and no
+      `--discover`: discovery is no longer turned on for such a store.
+    - Both connections are the peer. If the RPC fails or the socket
+      closes, the peer is gone; a ping is answered only once the node
+      answered a call, so a node that hangs is a peer that is silent;
+      and the node is asked for its best block every thirty seconds, in
+      case the socket went quiet. When messages may have been lost, the
+      whole mempool is named.
+    - The store speaks the protocol of ZeroMQ itself (ZMTP 3.0,
+      `Haskoin.Store.NodeZmq`), with no library of the system. A Unix
+      socket works as an address (`ipc://PATH`).
+    - Tested against both nodes: the subscriber; a store with no other
+      peer that has 150 blocks, the mempool, what the node takes next
+      and its next block; the same store when its node hangs and goes
+      on; and on Bitcoin Core, 800 transactions that the node took in
+      seconds, there within five seconds of the last with no reading,
+      where the peer-to-peer protocol alone is late. Not tested: a
+      first sync of a real chain this way, which takes one RPC call for
+      each block.
+    - With `--node-zmq` the RPC is no longer read as a source of its
+      own beside the peer.
   - **A stranger is not taken at its word.** A store verifies no script:
     it takes a transaction because a node took it. It did so of every
     peer, and a peer found by discovery is anybody: it could send a

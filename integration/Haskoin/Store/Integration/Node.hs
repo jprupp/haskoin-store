@@ -90,7 +90,10 @@ data Node = Node
     manager :: !Manager,
     -- | the peer of the store: the Unix socket of the peer-to-peer
     -- interface, as @unix:PATH@
-    peer :: !String
+    peer :: !String,
+    -- | where the node publishes what it takes over ZeroMQ, as the
+    -- address that a subscriber is given: @ipc:\/\/PATH@
+    zmq :: !String
   }
 
 -- | The node of a pod that runs 'nodeContainer' or 'strangerContainer'.
@@ -102,6 +105,7 @@ nodeAt :: Int -> NodeKind -> Pod -> IO Node
 nodeAt i kind p = do
   rpcSocket <- socketOf ("rpc" <> suffix i)
   p2pSocket <- socketOf ("p2p" <> suffix i)
+  zmqSocket <- socketOf ("zmq" <> suffix i)
   manager <- newManager (unixSocketManager rpcSocket)
   return
     Node
@@ -109,7 +113,8 @@ nodeAt i kind p = do
         url = "http://test:test@localhost/",
         rpcSocket,
         manager,
-        peer = "unix:" <> p2pSocket
+        peer = "unix:" <> p2pSocket,
+        zmq = "ipc://" <> zmqSocket
       }
   where
     socketOf e = case address p e of
@@ -192,18 +197,27 @@ nodeContainerAt i kind =
           "-txindex=1",
           "-fallbackfee=0.0002",
           "-dbcache=16",
-          "-maxmempool=16"
+          "-maxmempool=16",
+          -- the ids of the transactions that it takes and the hashes of
+          -- the blocks that become its tip, published over ZeroMQ
+          "-zmqpubhashtx=tcp://0.0.0.0:" <> show zmqPort,
+          "-zmqpubhashblock=tcp://0.0.0.0:" <> show zmqPort
         ]
           <> case kind of
             -- releases of Bitcoin Cash Node stop serving RPC some months
             -- after they come out unless told not to
             BitcoinCashNode -> ["-expire=0"]
             BitcoinCore -> [],
-      endpoints = [Bridged ("rpc" <> suffix i) rpcPort, Bridged ("p2p" <> suffix i) p2pPort]
+      endpoints =
+        [ Bridged ("rpc" <> suffix i) rpcPort,
+          Bridged ("p2p" <> suffix i) p2pPort,
+          Bridged ("zmq" <> suffix i) zmqPort
+        ]
     }
   where
     rpcPort = 18443 + 10 * i
     p2pPort = 18444 + 10 * i
+    zmqPort = 18445 + 10 * i
 
 -- | The same node without the whitelist: it treats the store as it treats
 -- any peer that connected to it. It announces transactions on its timer

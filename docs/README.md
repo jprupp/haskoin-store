@@ -24,6 +24,7 @@ Read these three, in this order. Together they are the whole design.
 | [tip-first.md](tip-first.md) | What happens to the mempool when a block arrives, and how is it checked? (`scripts/check-pool.sh`) |
 | [fleet-mempool.md](fleet-mempool.md) | How does a transaction get into the shared mempool, stay there, and leave? |
 | [mempool-ingestion.md](mempool-ingestion.md) | How does a store end up with exactly the mempool of its node, and how do we know? |
+| [node-peer.md](node-peer.md) | How can a store take everything from my own node, through its RPC and its ZeroMQ socket, with no peer-to-peer connection? |
 | [the-19-worlds.md](the-19-worlds.md) | How is that path checked for every order in which things can happen? (`scripts/check-ingest.sh`) |
 | [concurrency.md](concurrency.md) | What runs at the same time, who may change what, and why does nothing break? |
 | [xpub-indexing.md](xpub-indexing.md) | How are the questions about an extended public key answered fast? |

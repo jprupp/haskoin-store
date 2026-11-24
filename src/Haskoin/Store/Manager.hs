@@ -26,6 +26,7 @@ where
 
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry)
+import Control.Exception (throwIO)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
@@ -121,6 +122,9 @@ import Haskoin.Store.Ingest.Run
     ingestTxSTM,
     withIngest,
   )
+import Haskoin.Store.NodePeer (NodePeer (..), nodePeerAddress, nodePeerConnect, nodePeerName)
+import Haskoin.Store.NodeRpc (nodeSession)
+import Haskoin.Store.NodeZmq (parseZmqAddress)
 import Haskoin.Store.Startup (connectRedis, explainDatabase)
 import Haskoin.Store.XPub.Service (XPubConfig (..))
 import NQE
@@ -228,6 +232,15 @@ data StoreConfig = StoreConfig
     maxPeerLife :: !NominalDiffTime,
     -- | connect to peers using the function 'Haskoin.Node.withConnection'
     connect :: !(SockAddr -> WithConnection),
+    -- | the RPC of a full node of the operator, its Unix socket if it has
+    -- one, and where that node publishes over ZeroMQ. With the RPC and
+    -- the ZeroMQ socket both, the node is one more peer of the store,
+    -- which needs no peer-to-peer connection ("Haskoin.Store.NodePeer").
+    -- The web server has the RPC too, to publish through
+    -- ('Haskoin.Store.Web.WebConfig').
+    nodePeerRpc :: !(Maybe String),
+    nodePeerRpcSocket :: !(Maybe FilePath),
+    nodePeerZmq :: !(Maybe String),
     -- | StatsD
     stats :: !(Maybe Stats),
     -- | Bloom filters on the column families that are read by key
@@ -268,7 +281,8 @@ withStore ::
   StoreConfig ->
   (Store -> IO a) ->
   IO a
-withStore cfg action = do
+withStore cfg0 action = do
+  cfg <- withNodePeer cfg0
   -- Redis first: a store cannot run without it, and finding out after the
   -- database opened and the node started only takes longer
   redis <- mapM connectRedis cfg.redis
@@ -299,6 +313,27 @@ withStore cfg action = do
                               connect = cfg.connect,
                               writes = writes
                             }
+
+-- | The configuration of a store that has the RPC of a node and the
+-- address of its ZeroMQ socket, with that node as one more of its peers
+-- ("Haskoin.Store.NodePeer"): it is named among the peers that the store
+-- was given, so that it is a node of the operator as they are, and a
+-- connection to its address is a pipe in memory. Any other store is left
+-- as it is.
+--
+-- An address of ZeroMQ that cannot be read stops the store, as any
+-- option that makes no sense does.
+withNodePeer :: StoreConfig -> IO StoreConfig
+withNodePeer cfg = case (cfg.nodePeerRpc, cfg.nodePeerZmq) of
+  (Just url, Just written) -> do
+    zmq <- either (throwIO . userError) return (parseZmqAddress written)
+    session <- nodeSession cfg.nodePeerRpcSocket
+    let peer = NodePeer {net = cfg.net, session, url, zmq, logger = withSource "Node RPC" cfg.logger}
+        connect sa
+          | sa == nodePeerAddress = nodePeerConnect peer
+          | otherwise = cfg.connect sa
+    return (cfg {initPeers = cfg.initPeers <> [nodePeerName], connect} :: StoreConfig)
+  _ -> return cfg
 
 -- | Watch RocksDB for write stalls while an action runs
 -- ("Haskoin.Store.Database.Stalls"), and give the action the latest state.

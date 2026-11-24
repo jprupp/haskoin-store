@@ -486,6 +486,12 @@ data WebConfig = WebConfig
     -- | a Unix socket to send the requests of 'nodeRpc' through, in place of
     -- the host and port of its URL, which are not used then
     nodeRpcSocket :: !(Maybe FilePath),
+    -- | where the node of 'nodeRpc' publishes over ZeroMQ
+    -- (@-zmqpubhashtx@, @-zmqpubhashblock@), as the store was told
+    -- ('Haskoin.Store.StoreConfig'): with it the node is a peer of the
+    -- store ("Haskoin.Store.NodePeer"), and its RPC is not read as a
+    -- source of its own.
+    nodeZmq :: !(Maybe String),
     -- | a certificate and its private key, in files in PEM format, to
     -- serve HTTPS instead of HTTP; 'Nothing' for HTTP, which is the
     -- default
@@ -2156,10 +2162,17 @@ askingLoop st = forever $ do
 -- This replaces a loop of the web server that read the RPC only after the
 -- pool had been emptied, 2,000 transactions every two seconds, and took a
 -- call that failed for an empty mempool.
+--
+-- A store that also has the address of the node's ZeroMQ socket
+-- ('nodeZmq') has the node as a peer ("Haskoin.Store.NodePeer"), which is
+-- a source and announces too: the RPC is then not read a second time
+-- here.
 nodeFeedLoop :: WebState -> IO ()
-nodeFeedLoop st =
-  forM_ st.config.nodeRpc $ \url ->
-    ingestFeed st.config.store.ingest (nodeFeed st.nodeSession url)
+nodeFeedLoop st = case st.config.nodeZmq of
+  Just _ -> return ()
+  Nothing ->
+    forM_ st.config.nodeRpc $ \url ->
+      ingestFeed st.config.store.ingest (nodeFeed st.nodeSession url)
 
 -- GET Mempool / Events --
 

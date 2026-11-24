@@ -216,6 +216,9 @@ storeConfig net dir redis blocks mock logger cache buffer =
       blockPing = 5,
       maxPeerLife = 48 * 3600,
       connect = mockPeer blocks mock net ad,
+      nodePeerRpc = Nothing,
+      nodePeerRpcSocket = Nothing,
+      nodePeerZmq = Nothing,
       stats = Nothing,
       bloom = True,
       maxOpenFiles = Nothing,
@@ -252,6 +255,7 @@ webConfig store port =
       tls = Nothing,
       nodeRpc = Nothing,
       nodeRpcSocket = Nothing,
+      nodeZmq = Nothing,
       logger = quiet
     }
 
