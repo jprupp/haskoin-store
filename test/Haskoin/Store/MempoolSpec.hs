@@ -137,6 +137,10 @@ spec = do
         on "A store whose only peer is its node through its RPC, with no ZeroMQ socket" $
           it "warns of it, and has what its node takes and finds within twelve seconds, three times over" $
             withBed kind (polls . \bed -> bed {viaRpc = True})
+        forM_ [False, True] $ \zmq ->
+          on ("A store that never has a peer, from no chain at all, with the RPC of its node" <> withZmq zmq) $
+            it "has a chain of more than 2,500 blocks, the mempool, and what the node finds and takes next" $
+              withBed kind (noPeerEver . \bed -> bed {viaRpc = True, viaZmq = zmq})
         on "A store that starts while its node takes transactions without a pause" $
           it "says that its mempool is in sync while they still come" (withBed kind underTraffic)
         on "A store whose node never stops taking transactions" $
@@ -170,6 +174,7 @@ spec = do
     name BitcoinCore = "Bitcoin Core"
     name BitcoinCashNode = "Bitcoin Cash Node"
     withBlock block = if block then ", and a block while it is away" else ""
+    withZmq zmq = if zmq then " and its ZeroMQ socket" else " alone"
     -- the node grants the store nothing, and the store has its RPC
     rpcOnly bed = bed {granted = Set.empty, viaRpc = True}
 
@@ -334,6 +339,40 @@ alone bed = withRamDir $ \dir -> do
     converges bed server 30
     void (generateTo bed.node 1 bed.miner)
     converges bed server 30
+
+-- | A store that never connects to a peer: it is given none, discovery
+-- is off, and all that it has is the RPC of its node, with the node's
+-- ZeroMQ socket or without. It starts with no chain at all, on a node
+-- whose chain is longer than what a node gives of headers in one answer,
+-- two thousand: the other tests of such a store have 150 blocks, and
+-- never ask for headers a second time.
+--
+-- It must have every block, then the mempool, then the next block and
+-- the next transactions, and say all along that it has one peer: the
+-- node, through its RPC.
+noPeerEver :: Bed -> IO ()
+noPeerEver bed = withRamDir $ \dir -> do
+  roots <- fund bed 20
+  let (before, after) = splitAt 10 roots
+  -- 2,400 more blocks, in pieces that the RPC answers in time
+  forM_ [1 :: Int .. 6] $ \_ -> void (generateTo bed.node 400 bed.miner)
+  submit bed (map (chainOf 4) before)
+  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+    converges bed server 600
+    (_, health) <- getJSON server "/health"
+    let count name = field "blocks" health >>= field name
+    count "blocks" `shouldBe` count "headers"
+    count "blocks" `shouldSatisfy` \case
+      Just (Number n) -> n > 2500
+      _ -> False
+    field "ok" health `shouldBe` Just (Bool True)
+    (field "peers" health >>= field "count") `shouldBe` Just (Number 1)
+    standing server "synced" 120
+    void (generateTo bed.node 1 bed.miner)
+    submit bed (map (chainOf 4) after)
+    converges bed server 30
+    (_, later') <- getJSON server "/health"
+    (field "peers" later' >>= field "count") `shouldBe` Just (Number 1)
 
 -- | A store that is given no peer at all, and the RPC of its node with
 -- no ZeroMQ socket (@--node-rpc@ alone). The node is its one peer all the

@@ -20,9 +20,10 @@ RPC treats that node as one more peer. The store asks it what it asks
 any peer, and a small thread answers from the RPC and from what the
 node publishes.
 
-Such a store needs no peer-to-peer connection at all: headers, blocks,
+Such a store needs no peer-to-peer connection at all, from its first
+start with no chain to a store that follows the tip: headers, blocks,
 transactions and the mempool come over the RPC, and what is new is
-heard over ZeroMQ. It may have peers all the same, to that node or to
+heard over ZeroMQ, or asked for every five seconds without it. It may have peers all the same, to that node or to
 others.
 
 The two are meant to be given together. A store that has the RPC and
@@ -209,9 +210,11 @@ like any other.
 | `hears`, Bitcoin Core | With the node as a peer both ways, the store has 800 transactions that the node took in seconds within five seconds of the last, with no reading of the mempool; with the peer-to-peer protocol alone it is late |
 | `polls`, both nodes | A store with the RPC alone and no other peer has one peer, is healthy, and warns of the missing socket. Three batches of transactions thirteen seconds apart, and then a block, are each in the store within twelve seconds. With the thread asking every sixty seconds the test fails |
 | `strangers True`, Bitcoin Core | A store told that its peer is a stranger, with the RPC of its own node, takes on the word of its node what it cannot verify of the stranger |
+| `noPeerEver`, both nodes, with the ZeroMQ socket and without | A store that never has a peer, started with no chain at all, has a chain of more than 2,500 blocks, which is more than a node gives of headers in one answer; then the mempool, the next block and the next transactions. It says all along that it has one peer |
 | `fresh`, a pure function | What is named is what the mempool has that it had not the last time, in the order of the node |
 
-Not tested: a first sync of a real chain this way, a node that is down
+Not tested: a first sync of a real chain this way, which has hundreds
+of thousands of blocks and not thousands; a node that is down
 and not only hanging, a ZeroMQ socket that goes quiet, the cost of
 asking a large mempool every five seconds, and that the mempool is
 **not** asked for while another node of the operator is a peer.

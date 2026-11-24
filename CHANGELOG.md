@@ -343,6 +343,11 @@ whitelist it must now say what they grant (`--peer-permission`, or
       block, each there within twelve seconds, which fails when the
       peer asks every sixty). Not measured: what asking a mempool of
       sixty thousand transactions every five seconds costs the node.
+    - **A store can run without ever connecting to a peer**, from no
+      chain at all: with the RPC of its node, and its ZeroMQ socket or
+      not. Tested on both nodes, each way, on a chain of more than
+      2,500 blocks, which is more than a node gives of headers in one
+      answer (`noPeerEver`). Not tested on a real chain.
     - **A store that has the RPC and not the ZeroMQ socket warns of
       it**: the two are expected together. In the log, when the store
       starts and when the peer connects, and in `/health`, as a
