@@ -343,6 +343,19 @@ whitelist it must now say what they grant (`--peer-permission`, or
     - The node of `--node-rpc` is a node of the operator with
       `--foreign-peers` too, which speaks of the nodes of `--peer`. It
       was taken for a stranger.
+  - **The peers that the operator gave are kept** (`--peer`, and the
+    node of `--node-rpc`). They are the ones whose word the store takes,
+    and the only reason for one to have no connection is now that it
+    takes none. From haskoin-node's branch `sticky-peers`:
+    - never dropped for its age: `--max-peer-life` is for peers found by
+      discovery;
+    - tried again every ten seconds at most when its connection ends,
+      for ever, where it waited up to ten minutes;
+    - a slot kept for it while it is away: with `--discover`, peers
+      found on the network filled every slot meanwhile, and the node of
+      the operator found none when it came back.
+    Tested in haskoin-node, the first against both nodes. Not tested end
+    to end: a store with discovery whose own node is away.
   - **A stranger is not taken at its word.** A store verifies no script:
     it takes a transaction because a node took it. It did so of every
     peer, and a peer found by discovery is anybody: it could send a

@@ -334,7 +334,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
 | `--block-ping` | `BLOCK_PING` | `5` | Seconds that a peer has to answer a ping to be asked for blocks, unless none answers in time |
-| `--max-peer-life` | `MAX_PEER_LIFE` | `172800` | Seconds after which a peer is dropped, so connections rotate |
+| `--max-peer-life` | `MAX_PEER_LIFE` | `172800` | Seconds after which a peer is dropped, so connections rotate. Not the peers of `--peer`, which are kept |
 | `--block-window` | `BLOCK_WINDOW` | `64` | Blocks to request from the syncing peer at a time |
 
 ### Mempool
@@ -450,6 +450,13 @@ fleet of one. Every key starts with `hs3:<network>:`.
   | Every signature verifies | Takes it |
   | A signature does not verify, it spends more than it has, or its tokens come from nowhere | Refuses it, with all that spends from it (`ingest.given_up.forged`) |
   | It spends a coin locked by a script, such as a multisig wallet | Holds it until a node of yours names it, for twenty minutes, and does not show it (`ingest.given_up.not_vouched`) |
+
+  The peers that you give are kept. A peer of `--peer`, and the node of
+  `--node-rpc`, is never dropped for its age, is tried again every ten
+  seconds at most when its connection ends, for as long as it takes,
+  and has a slot kept for it meanwhile: with `--discover` too, a peer
+  found on the network never takes the place of one of yours. The only
+  reason for one of them to have no connection is that it takes none.
 
   So a store with a node of yours among its peers misses nothing, and a
   store with only strangers shows a spend of a script when a block

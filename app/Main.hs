@@ -681,7 +681,7 @@ config c = do
     option auto $
       metavar "SECONDS"
         <> long "max-peer-life"
-        <> helpEnv "MAX_PEER_LIFE" "Maximum peer connection time"
+        <> helpEnv "MAX_PEER_LIFE" "Longest connection to a peer found by discovery; the peers of --peer are kept"
         <> showDefault
         <> value c.maxPeerLife
   maxPeers <-
