@@ -1208,6 +1208,15 @@ instance Monoid OfferCost where
 --
 -- Unless the pool has it already: another store of the fleet, whose node
 -- vouched for it, was first.
+--
+-- A coinbase that is not in the chain of the store is
+-- 'Haskoin.Store.Ingest.Forged' whoever named it. Only a block has a
+-- coinbase, and no mempool. A node of the operator names one all the same:
+-- when a block stops being part of its chain it publishes the ids of the
+-- transactions of that block over ZeroMQ, the coinbase too, and it gives
+-- the coinbase when asked, since it keeps the block. A store took it on
+-- the word of its node, and showed an unconfirmed transaction that could
+-- never confirm.
 memberOfferTimed :: Member -> Bool -> UnixTime -> Tx -> IO (I.Verdict TxHash, OfferCost)
 memberOfferTimed m vouched time tx = do
   cost <- newIORef mempty
@@ -1235,6 +1244,8 @@ memberOffer' timed m vouched time tx =
     Just tip -> fmap (fromMaybe I.Again) . withViewAt m.views tip $ \at ->
       timed (\d -> mempty {askedBlock = d}) (Q.getTxData at h) >>= \case
         Just td | not td.deleted -> return I.Settled
+        -- only a block has a coinbase: no mempool does, whoever named it
+        _ | any ((== nullOutPoint) . (.outpoint)) tx.inputs -> return I.Forged
         _ -> do
           let pool = redisPool m.db.net m.redis m.keys (encode tip) (return ())
           found <- forM (zip [0 :: Int ..] tx.inputs) (spent at pool)

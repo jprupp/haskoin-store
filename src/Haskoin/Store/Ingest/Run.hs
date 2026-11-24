@@ -592,10 +592,18 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
             Just k -> return (run {peers = Map.delete k run.peers}, [PeerDown k])
             Nothing -> return (run, [])
           Names p hs -> return (run, [Named k hs | Just k <- [keyOf run p]])
-          Came from tx -> return (run, [Body (keyOf run from) (txHash tx) tx])
+          Came from tx
+            -- Only a block has a coinbase, and no mempool: one is not
+            -- taken in, whoever sent it. A node gives the coinbase of a
+            -- block that is no longer in its chain, and publishes its id
+            -- when it takes the block back ("Haskoin.Store.NodePeer"). To
+            -- the machine the peer does not have it, as if it had said so.
+            | coinbase tx -> return (run, [Missing k [txHash tx] | Just k <- [keyOf run from]])
+            | otherwise -> return (run, [Body (keyOf run from) (txHash tx) tx])
           Lacks p hs -> return (run, [Missing k hs | Just k <- [keyOf run p]])
           Look -> return (run, [])
           PoolLost -> return (run, [Emptied])
+    coinbase tx = any ((== nullOutPoint) . (.outpoint)) tx.inputs
     droppable = \case
       Names {} -> True
       Came {} -> True

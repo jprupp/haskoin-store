@@ -127,6 +127,12 @@ publishes bed = do
     timeout 10000000 (takeMVar ready) >>= maybe (expectationFailure "No subscription to the node") return
     -- a publisher takes a moment to act on a subscription
     threadDelay 1000000
+    -- A node publishes a block a moment after it finds it, and the last
+    -- block that paid for this test may be published only now: on a Unix
+    -- socket the subscription is there at once, and it was heard, where
+    -- behind a bridge of TCP it never was. What came so far is not what
+    -- the test sends.
+    writeIORef heard []
     case concatMap (chainOf 1) roots of
       [a, b] -> do
         send bed a

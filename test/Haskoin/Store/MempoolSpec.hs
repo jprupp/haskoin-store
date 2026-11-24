@@ -141,6 +141,9 @@ spec = do
           on ("A store that never has a peer, from no chain at all, with the RPC of its node" <> withZmq zmq) $
             it "has a chain of more than 2,500 blocks, the mempool, and what the node finds and takes next" $
               withBed kind (noPeerEver . \bed -> bed {viaRpc = True, viaZmq = zmq})
+        on "A store that hears of the coinbase of a block that its node took back" $
+          it "does not show it as an unconfirmed transaction" $
+            withBed kind (staleCoinbase . \bed -> bed {viaRpc = True, viaZmq = True})
         on "A store that starts while its node takes transactions without a pause" $
           it "says that its mempool is in sync while they still come" (withBed kind underTraffic)
         on "A store whose node never stops taking transactions" $
@@ -339,6 +342,53 @@ alone bed = withRamDir $ \dir -> do
     converges bed server 30
     void (generateTo bed.node 1 bed.miner)
     converges bed server 30
+
+-- | A node publishes over ZeroMQ the id of every transaction of a block
+-- that stops being part of its chain, the coinbase too, as it does of one
+-- that it takes into its mempool. The others go back to its mempool. The
+-- coinbase goes nowhere: only its block had it. And the node still gives
+-- it when asked, since it keeps the block.
+--
+-- A store that had the node as a peer through its RPC and its ZeroMQ
+-- socket took such a coinbase on the word of its node, and showed it as
+-- an unconfirmed transaction that would never confirm: two of them, on
+-- every store of a testnet of a server, for as long as nothing emptied
+-- the pool.
+--
+-- The node here is told to take its last block back, and finds two
+-- others in its place. The store must end with the mempool of its node,
+-- which does not have the coinbase.
+staleCoinbase :: Bed -> IO ()
+staleCoinbase bed = withRamDir $ \dir -> do
+  roots <- fund bed 4
+  submit bed (map (chainOf 2) roots)
+  other <-
+    rpc bed.node "getnewaddress" [] >>= \case
+      String a -> return a
+      v -> fail ("Unexpected answer to getnewaddress: " <> show v)
+  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+    converges bed server 120
+    -- Two good blocks at one height, as when two miners find one each.
+    -- The node is made to forget the first while it finds the second,
+    -- paid to another address or it would be the same block, and to
+    -- remember the first again. It saw that one first, and goes back to
+    -- it: it takes the second back, which stays a block that it has and
+    -- gives, and publishes the ids of its transactions, the coinbase
+    -- among them.
+    first <- generateTo bed.node 1 bed.miner
+    converges bed server 30
+    forM_ first $ \b -> void (rpc bed.node "invalidateblock" [String b])
+    -- the store stays on the first: the second is no more work
+    second <- generateTo bed.node 1 other
+    forM_ first $ \b -> void (rpc bed.node "reconsiderblock" [String b])
+    bestBlockHash bed.node >>= \best -> [best] `shouldBe` first
+    second `shouldNotBe` first
+    -- the store follows once that chain is the longer
+    void (generateTo bed.node 1 other)
+    converges bed server 60
+    -- and it stays so: nothing comes late
+    threadDelay 5000000
+    converges bed server 10
 
 -- | A store that never connects to a peer: it is given none, discovery
 -- is off, and all that it has is the RPC of its node, with the node's

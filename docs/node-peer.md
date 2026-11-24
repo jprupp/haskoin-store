@@ -64,6 +64,15 @@ A transaction is published when the node takes it, and again when a
 block that has it becomes the tip. A block is published when it becomes
 the tip.
 
+A transaction is published a third time when its block stops being
+part of the chain of the node, as when another miner's block wins. The
+coinbase of that block is published too. It is in no mempool: only its
+block had it. But the node still gives it when asked, since it keeps
+the block. So the store takes no coinbase in when one arrives, whoever
+sent it, and never offers one to the pool. Before that rule, a store showed such a
+coinbase as an unconfirmed transaction that could never confirm
+(`staleCoinbase` in `Haskoin.Store.MempoolSpec`, both nodes).
+
 The store subscribes to `hashtx` and `hashblock` only: the two that
 both nodes have. It takes ids and not whole transactions, since a block
 would otherwise send every one of its transactions again in full.

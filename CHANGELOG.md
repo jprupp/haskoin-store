@@ -271,6 +271,20 @@ whitelist it must now say what they grant (`--peer-permission`, or
     mempool. Both checks are still made and still say whether they
     pass. `--tx-timeout` and `--max-pending-txs` set their limits as
     before, and no longer decide anything.
+  - **A store no longer shows the coinbase of a block that its node
+    took back.** A node publishes over ZeroMQ the ids of the
+    transactions of a block that stops being part of its chain, the
+    coinbase too, and gives that coinbase when asked, since it keeps
+    the block. A store with its node as a peer through the RPC and
+    ZeroMQ took it on the word of its node: an unconfirmed transaction
+    that could never confirm, until something emptied the pool. Two
+    were seen on each store of a testnet of a server, after a
+    reorganisation of two blocks. A coinbase is no longer taken in
+    when it arrives, whoever sent it: to the path into the pool, the
+    peer does not have it. And one that is not in the chain of the
+    store is never offered to the pool. Tested against both
+    nodes, with a test that failed before (`staleCoinbase`). One that
+    is in a pool already stays there until the pool is emptied.
   - **`/health` says how the mempool stands, in one word**
     (`mempool.sync`): `syncing`, `synced` or `unknown`. After a start,
     or after Redis lost its data, a store has its blocks at once and
