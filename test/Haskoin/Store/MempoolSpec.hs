@@ -40,7 +40,7 @@ module Haskoin.Store.MempoolSpec
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (forConcurrently_, link, withAsync)
+import Control.Concurrent.Async (forConcurrently_, link, poll, withAsync)
 import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..))
@@ -137,6 +137,8 @@ spec = do
         on "A store whose only peer is its node through its RPC, with no ZeroMQ socket" $
           it "warns of it, and has what its node takes and finds within twelve seconds, three times over" $
             withBed kind (polls . \bed -> bed {viaRpc = True})
+        on "A store that starts while its node takes transactions without a pause" $
+          it "says that its mempool is in sync while they still come" (withBed kind underTraffic)
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
       describe "A store whose only peer is a node of somebody else, on Bitcoin Core" $
@@ -182,25 +184,55 @@ fromNothing bed = do
   roots <- fund bed 40
   submit bed (map (chainOf 24) roots)
   withMember bed $ \_ server -> do
-    -- its health says that its mempool is filling, from the moment that
-    -- it has a source
-    filling server True 20
+    -- its health says that its mempool is syncing, from the moment that
+    -- it has its node to read
+    standing server "syncing" 20
     converges bed server 90
     -- it has every block: it is healthy, whether it says so of its
     -- mempool yet or not
     (_, health) <- getJSON server "/health"
     field "ok" health `shouldBe` Just (Bool True)
     -- and within the time that a node is given to answer, it says that
-    -- its mempool is full
-    filling server False 120
-  where
-    -- until the health of the store says so of its mempool
-    filling server want seconds = do
-      (_, health) <- getJSON server "/health"
-      unless ((field "mempool" health >>= field "filling") == Just (Bool want)) $
-        if seconds <= (0 :: Int)
-          then expectationFailure ("The store does not come to say that its mempool is filling: " <> show want)
-          else threadDelay 500000 >> filling server want (seconds - 1)
+    -- its mempool is in sync
+    standing server "synced" 120
+
+-- | Wait, for so many half seconds, until the health of a store says this
+-- of its mempool: @syncing@, @synced@ or @unknown@.
+standing :: Server -> Text -> Int -> IO ()
+standing server want halves = do
+  (_, health) <- getJSON server "/health"
+  let says = field "mempool" health >>= field "sync"
+  unless (says == Just (String want)) $
+    if halves <= 0
+      then
+        expectationFailure . unwords $
+          ["The store does not come to say that its mempool is", T.unpack want <> ":", "it says", show says]
+      else threadDelay 500000 >> standing server want (halves - 1)
+
+-- | A store that starts while its node takes transactions, and goes on
+-- taking them: some sixty a second, as in 'unceasing'. Its health must
+-- come to say that its mempool is in sync while they still come.
+--
+-- The machine says so at a moment when nothing that a node of the
+-- operator named is on its way. On a node that is quiet there is such a
+-- moment as soon as the first reading is in. This is the test that there
+-- is one on a node that is not.
+underTraffic :: Bed -> IO ()
+underTraffic bed = do
+  roots <- fund bed 200
+  let slowly tx = send bed tx >> threadDelay 60000
+      lanes n xs = [[x | (i, x) <- zip [0 :: Int ..] xs, i `mod` n == l] | l <- [0 .. n - 1]]
+      trickle = forConcurrently_ (lanes 4 (map (chainOf 24) roots)) (mapM_ slowly . concat)
+  withAsync trickle $ \sending -> do
+    link sending
+    threadDelay 2000000
+    withMember bed $ \_ server -> do
+      standing server "synced" 120
+      -- they were still coming when it said so
+      poll sending >>= \case
+        Nothing -> return ()
+        Just _ ->
+          expectationFailure "The node had stopped taking transactions before the store said that it was in sync"
 
 -- | The experiment that was made on the server: a store whose database is
 -- at the tip of its node, started with an empty pool on a node with a
@@ -586,6 +618,9 @@ strangers vouched bed = withRamDir $ \dir -> do
       else do
         -- the store has the first within seconds, and never the second
         threadDelay 5000000
+        -- among strangers it cannot tell how its mempool stands, also
+        -- while it holds what it cannot verify
+        standing server "unknown" 1
         pool server `shouldReturn` Set.singleton paid
         Set.fromList <$> rawMempool bed.node `shouldReturn` Set.fromList [paid, spent]
         (_, health) <- getJSON server "/health"

@@ -308,7 +308,7 @@ the peers whose node gives its mempool when asked. It reads them:
 - when the pool lost what it had, after a loss of Redis or a restart;
 - thirty seconds after a reading, if a peer named a transaction since
   then that the pool did not have; otherwise after twice the last wait,
-  up to ten minutes ([mempool-ingestion.md](mempool-ingestion.md)).
+  up to one minute ([mempool-ingestion.md](mempool-ingestion.md)).
 
 The store asks the pool about each id first, and does not fetch what the
 pool has. So reading a mempool that the pool already has costs the list of

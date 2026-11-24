@@ -102,16 +102,16 @@ spec = do
       let (s2, _) = run' (came 2) (at 30000 s1)
       readings 59999 s2 `shouldBe` []
       readings 60000 s2 `shouldBe` [()]
-      -- none comes: thirty, then a minute, two, four, eight, and ten for good
-      let times = [90000, 150000, 270000, 510000, 990000, 1590000, 2190000]
+      -- none comes: thirty seconds, and then a minute for good
+      let times = [90000, 150000, 210000, 270000, 330000]
           quiet = scanl (flip at) (at 60000 s2) times
       forM_ (zip quiet times) $ \(s, t) -> do
         readings (t - 1) s `shouldBe` []
         readings t s `shouldBe` [()]
       -- and thirty seconds after one comes again
       let (s4, _) = run' (came 3) (last quiet)
-      readings (2190000 + 29999) s4 `shouldBe` []
-      readings (2190000 + 30000) s4 `shouldBe` [()]
+      readings (330000 + 29999) s4 `shouldBe` []
+      readings (330000 + 30000) s4 `shouldBe` [()]
     it "asks a peer for no more than its window, which grows as the peer answers" $ do
       let (s, outs) = run [Named 1 [1 .. 100], Checked 1 [] [1 .. 100]]
       [length hs | Get _ hs <- outs] `shouldBe` [16]
@@ -166,29 +166,67 @@ spec = do
           (s, _) = run' [Named 1 [8], Checked 1 [] [8], Body (Just 1) 8 [7], Offered 8 (Orphan [7])] own
       vouchedFor 8 s `shouldBe` True
       vouchedFor 7 s `shouldBe` True
-    it "says that the pool is filling until its source had the time to answer and nothing is on its way" $ do
-      -- the source was asked for its mempool when it connected
-      isFilling ready `shouldBe` True
-      isFilling (fst (run' [Tick 19999] ready)) `shouldBe` True
+    it "says that the pool is syncing until its node had the time to answer and nothing is on its way" $ do
+      -- the node was asked for its mempool when it connected
+      standing ours `shouldBe` PoolSyncing
+      standing (fst (run' [Tick 19999] ours)) `shouldBe` PoolSyncing
       -- twenty seconds, and it named nothing: it has nothing
-      isFilling (fst (run' [Tick 20000] ready)) `shouldBe` False
+      standing (fst (run' [Tick 20000] ours)) `shouldBe` PoolSynced
       -- what it named is on its way: asked of the pool, then fetched
-      let (asking, _) = run' [Named 1 [7], Tick 20000] ready
-      isFilling asking `shouldBe` True
+      let (asking, _) = run' [Named 1 [7], Tick 20000] ours
+      standing asking `shouldBe` PoolSyncing
       let (fetching, _) = run' [Checked 1 [] [7]] asking
-      isFilling fetching `shouldBe` True
+      standing fetching `shouldBe` PoolSyncing
       let (full, _) = run' [Body (Just 1) 7 [], Offered 7 Settled] fetching
-      isFilling full `shouldBe` False
+      standing full `shouldBe` PoolSynced
       -- and it stays so while transactions come and go
-      isFilling (fst (run' [Named 1 [8], Checked 1 [] [8]] full)) `shouldBe` False
+      standing (fst (run' [Named 1 [8], Checked 1 [] [8]] full)) `shouldBe` PoolSynced
       -- until the pool loses what it had
-      isFilling (fst (run' [Emptied] full)) `shouldBe` True
-    it "is not said to be filling without a source, which it could not fill from" $ do
+      standing (fst (run' [Emptied] full)) `shouldBe` PoolSyncing
+    it "cannot tell how the pool stands without a node of the operator that gives its mempool" $ do
       let alone = fst (run' [PeerUp 1 False, Synced True] (start defaultConfig 0)) :: Ingest Int Int [Int]
-      isFilling alone `shouldBe` False
+      standing alone `shouldBe` PoolUnknown
+      -- a stranger that gives its mempool is nothing to measure against
+      standing ready `shouldBe` PoolUnknown
+      standing (fst (run' [Tick 60000] ready)) `shouldBe` PoolUnknown
+      -- nor a node of the operator that does not give it
+      standing (fst (run' [Own 1] alone)) `shouldBe` PoolUnknown
+    it "is in sync while a stranger's transaction is held for a node of the operator to name it" $ do
+      -- peer 2 is a stranger, whose transaction the store cannot verify:
+      -- it is held for twenty minutes, and is no part of what the pool
+      -- should have. A store among strangers said that it was filling
+      -- for as long as one was held.
+      let both = fst (run' [PeerUp 2 True, Tick 20000] ours)
+      standing both `shouldBe` PoolSynced
+      let held = fst (run' [Named 2 [7], Checked 2 [] [7], Body (Just 2) 7 [], Offered 7 Unverified] both)
+      holding held `shouldBe` 1
+      standing held `shouldBe` PoolSynced
+      -- the same from a start: the held transaction does not keep the
+      -- store from being in sync
+      let waiting = [PeerUp 2 True, Named 2 [7], Checked 2 [] [7], Body (Just 2) 7 [], Offered 7 Unverified]
+      standing (fst (run' (waiting <> [Tick 20000]) ours)) `shouldBe` PoolSynced
+    it "is in sync when its node is read more often than a request is given" $ do
+      -- read at 0 and after ten seconds: at twenty it is twenty seconds
+      -- since the first reading, and ten since the last. Counted from the
+      -- last, a node read this often never answered.
+      let brisk = defaultConfig {sweepGap = 5000, sweepFast = 5000}
+          often = fst (run' [PeerUp 1 True, Own 1, Synced True] (start brisk 0)) :: Ingest Int Int [Int]
+          (s, outs) = run' [Tick 10000, Tick 20000] often
+      length [() | Sweep _ <- outs] `shouldBe` 1
+      standing s `shouldBe` PoolSynced
+    it "does not stay in sync when its last node of the operator goes" $ do
+      let synced = fst (run' [Tick 20000] ours)
+      standing synced `shouldBe` PoolSynced
+      let gone = fst (run' [PeerDown 1] synced)
+      standing gone `shouldBe` PoolUnknown
+      -- back, it has not read what the node took meanwhile
+      standing (fst (run' [PeerUp 1 True, Own 1] gone)) `shouldBe` PoolSyncing
   where
     ready :: Ingest Int Int [Int]
     ready = fst (run' [PeerUp 1 True, Synced True] (start defaultConfig 0))
+    -- the same, with the peer a node of the operator
+    ours :: Ingest Int Int [Int]
+    ours = fst (run' [Own 1] ready)
     run = flip run' ready
     run' inputs s0 = foldl' (\(s, outs) i -> let (s', o) = step id i s in (s', outs <> o)) (s0, []) inputs
 

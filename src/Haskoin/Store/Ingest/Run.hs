@@ -218,9 +218,9 @@ data IngestState = IngestState
     -- | how many peers give their whole mempool when asked. With none,
     -- what the store misses stays missed until a block has it.
     sources :: !Int,
-    -- | whether the pool is still filling
-    -- ('Haskoin.Store.Ingest.isFilling')
-    filling :: !Bool
+    -- | how the pool stands with the mempools of the nodes of the
+    -- operator ('Haskoin.Store.Ingest.standing')
+    standing :: !Standing
   }
   deriving (Eq, Show)
 
@@ -399,7 +399,7 @@ withIngest cfg action = do
   events <- newTQueueIO
   waiting <- newTVarIO 0
   dropped <- newTVarIO 0
-  state <- newTVarIO (IngestState 0 0 0 False 0 False)
+  state <- newTVarIO (IngestState 0 0 0 False 0 PoolUnknown)
   metrics <- mapM newMetrics cfg.stats
   feeds <- newTVarIO 0
   now <- milliseconds
@@ -669,7 +669,7 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
                 held = holding m,
                 dirty = isDirty m,
                 sources = sourceCount m,
-                filling = isFilling m
+                standing = Haskoin.Store.Ingest.standing m
               }
       atomically (writeTVar ing.state st)
       forM_ metrics $ \x -> do

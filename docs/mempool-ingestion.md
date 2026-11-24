@@ -173,11 +173,20 @@ The model checker has a world that shows this, and that world must fail.
    names it, or for twenty minutes. If the store verifies every
    signature of it, it is taken.
 
-9. **T9, a store does not say that its mempool is full before it is.**
-   A store says in `/health` whether its mempool is still filling. It
-   says so from its start, and again when the pool lost what it had,
-   until every source was asked for its mempool and had the time to
-   answer (A10), none owes a reading, and the pool has decided on all
+9. **T9, a store does not say that its mempool is in sync before it
+   is.** A store says in `/health` how its mempool stands with the
+   mempools of the nodes of its operator, in one word:
+
+   | Word | What it means |
+   | --- | --- |
+   | `syncing` | The store has a node of its operator to read a whole mempool from, and has not yet read it and taken in all that it named |
+   | `synced` | It has |
+   | `unknown` | The store has no such node, only strangers or nobody, and cannot tell |
+
+   It says `syncing` from its start, and again when the pool lost what
+   it had, until every node of the operator was asked for its mempool
+   and had the time to answer (A10), the store has not since missed
+   anything that such a node may have, and the pool has decided on all
    that they named. This is something that the store says, and nothing
    that it does depends on it: its health least of all.
 
@@ -185,7 +194,7 @@ The model checker has a world that shows this, and that world must fail.
 
 - **The RPC as the only source, and no peer connected to that node.** A
   transaction that the node takes is in the pool at the next reading of
-  the RPC, every ten minutes, and not before. The RPC announces nothing,
+  the RPC, every minute, and not before. The RPC announces nothing,
   and no peer is there to be told. With a peer connected, T3 holds: the
   peer is told of what the node takes, and what the node took before the
   peer connected is read from the RPC when the peer connects.
@@ -210,7 +219,7 @@ The model checker has a world that shows this, and that world must fail.
   kept (T7). A fleet with one node for each network, as most are, has no
   such conflict.
 - **A transaction with no children that the store lost** without knowing
-  it is back at the next reading of the source, every ten minutes, and
+  it is back at the next reading of the source, every minute, and
   not before. Nothing spends from it, so nothing asks for it (T6).
 - **What only strangers have and the store cannot verify.** A store
   runs no scripts. A spend of a coin locked by a script, such as a
@@ -260,7 +269,7 @@ and T3 true from any state. A source is read:
 2. when the store is dirty;
 3. thirty seconds after a reading, if a peer named a transaction that
    the pool lacked since that reading;
-4. after twice the last wait if no peer did, up to ten minutes.
+4. after twice the last wait if no peer did, up to one minute.
 
 The period used to be ten minutes whatever happened. A server was then
 thousands of transactions behind its node for minutes whenever the node
@@ -368,25 +377,41 @@ Redis lost its data, a store has blocks at once and its mempool a
 minute later, on Bitcoin. It is healthy all that time: it answers
 rightly from what it has. But somebody who gives it traffic, or looks
 at it, wants to know that it shows fewer transactions than its node. So
-the machine notes when it caught up (`isFilling`), and `/health` says
-it (`mempool.filling`).
+the machine notes when it caught up (`standing`), and `/health` says
+it in one word (`mempool.sync`).
 
-It has caught up when all of this is true at once:
+The pool is measured against the nodes of the operator only. What a
+stranger names is not what the pool should have: a stranger may name
+what no honest node took, and keep quiet about what every node has. So
+a store with no node of its operator that gives its mempool says
+`unknown`.
+
+Otherwise it has caught up, and says `synced`, when all of this is true
+at once:
 
 1. the store has the blocks of its nodes;
-2. it has a source, and each source was asked for its mempool at least
-   twenty seconds ago;
-3. no source owes a reading, and nothing was given up that a node may
-   still have;
-4. no question to the pool is on its way, and no transaction id has a
-   place.
+2. each node of the operator was asked for its mempool at least twenty
+   seconds ago, counted from the first reading since the store last may
+   have missed something of it;
+3. nothing was given up that a node may still have;
+4. no question to the pool is on its way, and nothing that a node of
+   the operator vouched for has a place.
 
 The twenty seconds are because nothing says when a node has finished
-naming its mempool (A10). A first version took the first names from a
-source for its answer, and the model found the fault at once: a node
-that announces a transaction while it is asked was taken to have
-answered. So a store says that it is filling for twenty seconds at
-least.
+naming its mempool (A10). So a store says `syncing` for twenty seconds
+at least.
+
+Three earlier versions of this rule were wrong, and each is a reason
+for a line above:
+
+| What the rule said | What was wrong | How it was found |
+| --- | --- | --- |
+| A source has answered when it names something | A node that announces a transaction while it is asked was taken to have answered | The model, at once |
+| Nothing at all has a place, with every source counted | A transaction that only strangers named and that the store cannot verify keeps its place for twenty minutes. A store among strangers said that it was filling for ever | A store with only strangers, in service. No world of the model had a stranger's transaction held while the store settled |
+| Twenty seconds since the last reading | A node that is read again for a stranger's transaction to be vouched for started the count again | An example of the spec, before it shipped |
+
+It was a boolean, `filling`, for a few hours. With only strangers
+neither value is true, which is why it is a word now.
 
 **A transaction held for a parent is found by that parent.** It is tried
 when the parent settles, in place of every held transaction at every
@@ -500,7 +525,7 @@ of a function.
 A model checker in the test suite (`Haskoin.Store.Ingest.Model`) runs
 `step` itself in worlds of one to three transactions and one or two
 peers, with nodes that follow A1 to A7 and A9, through every order of
-events: 26 worlds, about 3,650,000 states.
+events: 27 worlds, about 3,040,000 states.
 [the-19-worlds.md](the-19-worlds.md) says in plain terms what a world
 is and how it is gone through.
 
@@ -516,12 +541,14 @@ is and how it is gone through.
   - at its time, a held transaction is not offered while every parent
     that it waits for has a place, and waits no longer when one of them
     has none;
-  - when the machine stops saying that the pool is filling, no request
-    for a mempool is on its way to a source, and the pool has decided
-    on all that each source named when it was last asked and has had
-    since; and a pool that lost what it had is filling again (T9). The
-    worlds in which requests get no answer in time break A10 on
-    purpose, and are not held to this;
+  - when the machine starts to say that the pool is in sync, no request
+    for a mempool is on its way to a node of the operator, and the pool
+    has decided on all that each such node named when it was last asked
+    and has had since; it says that it cannot tell exactly when no node
+    of the operator that gives its mempool is connected; and a pool
+    that lost what it had is not in sync (T9). The worlds in which
+    requests get no answer in time break A10 on purpose, and are not
+    held to the first;
   - a forged transaction is never offered as vouched for, and is given
     up; one that cannot be verified is held for a node of the operator
     and never ready meanwhile; and once such a node names or sends it,
@@ -563,10 +590,15 @@ is and how it is gone through.
   whose doubted transaction asks no reading comes to rest without what
   a node of the operator has. The first version of the rule had two of
   these faults, and the worlds found them.
-- **Filling.** Two more planted bugs: a machine that does not wait for
-  a source to answer says that the pool is full while a request for a
-  mempool is on its way, in 20 worlds; and one that does not start
-  again when the pool lost what it had fails the check of that.
+- **In sync.** Five more planted bugs, each found: a machine that does
+  not wait for a node to answer; one that stays in sync when the pool
+  lost what it had; one that measures the pool against strangers; one
+  that does not look at what is on its way; and one that does not
+  start the count again when it may have missed something. These
+  checks say that the store does not say `synced` too soon. That it
+  does come to say it is **not checked** by the model: it is tested, in
+  examples of the spec, and against both nodes with transactions
+  coming without a pause (`underTraffic`).
 - **A world that must fail.** It breaks an assumption: a source that
   names a child first, with room for one id (A5). The search finds the
   store going round for ever there. The program of

@@ -407,8 +407,8 @@ fleet of one. Every key starts with `hs3:<network>:`.
   blocks, the stores fill it again too.
 - **Filling the pool again** is reading the whole mempool of a
   **source**, which a store does when it starts, whenever it may have
-  missed a transaction, when the pool lost what it had, and every ten
-  minutes. With `--node-rpc` the node is a peer through its RPC, and a
+  missed a transaction, when the pool lost what it had, and every
+  minute at least. With `--node-rpc` the node is a peer through its RPC, and a
   source, whatever the node allows its peers. A peer is one when its node takes the request,
   which a node closes the connection over unless it offers Bloom filters
   or whitelists the store with `mempool`. The store knows which from a
@@ -486,12 +486,13 @@ What to know of the mempool is in the `mempool` object of `/health`:
 | Field | What it says |
 | --- | --- |
 | `sources` | How many nodes the store can read a whole mempool from |
-| `filling` | Whether the mempool is still filling: the store has not yet read its sources and taken in all that they named, since it started or since Redis lost its data. It shows fewer unconfirmed transactions than its node meanwhile. True for twenty seconds at least after a start |
+| `sync` | How the mempool stands with the mempools of your nodes, in one word. `syncing`: the store has not yet read your node and taken in all that it named, since it started or since Redis lost its data, and shows fewer unconfirmed transactions than the node meanwhile; for twenty seconds at least after a start. `synced`: it has. `unknown`: the store has no node of yours to read a whole mempool from, only strangers or nobody, and cannot tell |
 | `known`, `held` | How many transactions are on their way to the mempool, and how many of them the store holds |
 | `dirty` | Whether the store gave something up and is about to read its sources again |
 
 To give a new store traffic only once its mempool is full, wait for
-`sources` of 1 or more and `filling` false.
+`sync` to say `synced`. A store that has only strangers for peers never
+says it: what a stranger names is nothing to measure a mempool against.
 
 `/health` also has `warnings`, when there are any: what you should put
 right in how the store is set up, a sentence each. A warning decides

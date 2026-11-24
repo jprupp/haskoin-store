@@ -106,7 +106,8 @@ module Haskoin.Store.Ingest
     pending,
     holding,
     isDirty,
-    isFilling,
+    Standing (..),
+    standing,
     vouchedFor,
     hasSource,
     sourceCount,
@@ -187,7 +188,7 @@ data Config = Config
 -- request given twenty seconds and an orphan twenty minutes, offered again
 -- after two seconds and then twice as long each time, and a reading of the
 -- sources at most every ten seconds, every thirty while transactions
--- come, and at least every ten minutes.
+-- come, and at least every minute.
 defaultConfig :: Config
 defaultConfig =
   Config
@@ -199,7 +200,7 @@ defaultConfig =
       orphanLife = 1200000,
       retry = 2000,
       sweepGap = 10000,
-      sweepEvery = 600000,
+      sweepEvery = 60000,
       sweepFast = 30000
     }
 
@@ -228,7 +229,12 @@ data Link h = Link
     -- its mempool was asked for
     lively :: !Bool,
     -- | whether it is a node of the operator, which is taken at its word
-    own :: !Bool
+    own :: !Bool,
+    -- | when its mempool was first asked for since the store last may
+    -- have missed something of it ('missed'): a reading from which
+    -- nothing is known to be missing, and which is whole once the peer
+    -- had the time to answer ('standing')
+    since :: !(Maybe Tick)
   }
   deriving (Eq, Ord, Show)
 
@@ -259,8 +265,8 @@ data Ingest p h b = Ingest
     -- | whether something was given up that a node may still have
     dirty :: !Bool,
     -- | whether the machine has, since it started or since the pool lost
-    -- what it had, read its sources and seen the pool decide on all that
-    -- they named ('isFilling')
+    -- what it had, read the nodes of the operator and seen the pool
+    -- decide on all that they named ('standing')
     caughtUp :: !Bool,
     -- | how many questions to the pool about what a peer named have no
     -- answer yet: ids that have no place, and may get one
@@ -372,21 +378,41 @@ holding s = heldOf s.ledger
 isDirty :: Ingest p h b -> Bool
 isDirty s = s.dirty || any (\l -> l.source && l.owed) (Map.elems s.links)
 
--- | Whether the pool is still filling: the machine has a source, and has
--- not yet read its sources and seen the pool decide on all that they
--- named, since it started or since the pool lost what it had. A store
--- shows fewer transactions than its node meanwhile.
---
--- It is what a store says in its health, and nothing in the machine
--- depends on it. A store with no source has nothing to fill from, and is
--- not said to be filling: its health says that it has no source.
-isFilling :: Ingest p h b -> Bool
-isFilling s = hasSource s && not s.caughtUp
+-- | How the pool stands with the mempools of the nodes of the operator.
+data Standing
+  = -- | no node of the operator gives its mempool: the machine cannot
+    -- tell. What strangers name says nothing of what the pool should
+    -- have: a stranger may name what no honest node took, and keep quiet
+    -- about what every node has.
+    PoolUnknown
+  | -- | the machine has not yet read the nodes of the operator and seen
+    -- the pool decide on all that they named, since it started or since
+    -- the pool lost what it had: the store shows fewer transactions than
+    -- its node
+    PoolSyncing
+  | -- | it has
+    PoolSynced
+  deriving (Eq, Ord, Show)
 
--- | Note that the machine caught up, when it did: it is in sync, it has a
--- source, every source was asked for its mempool and had the time to
--- answer, none owes a reading, nothing was given up that a node may still
--- have, no question to the pool is on its way, and no id has a place.
+-- | How the pool stands with the mempools of the nodes of the operator,
+-- a t'Standing'. It is what a store says in its health, and nothing in
+-- the machine depends on it.
+standing :: Ingest p h b -> Standing
+standing s
+  | null (trusted s) = PoolUnknown
+  | s.caughtUp = PoolSynced
+  | otherwise = PoolSyncing
+
+-- | The peers that are nodes of the operator and give their mempools:
+-- those whose mempool the pool is measured against.
+trusted :: Ingest p h b -> [Link h]
+trusted s = filter (\l -> l.source && l.own) (Map.elems s.links)
+
+-- | Note that the machine caught up, when it did: it is in sync, a node
+-- of the operator gives its mempool, each such node was asked for it and
+-- had the time to answer, none owes a reading, nothing was given up that
+-- a node may still have, no question to the pool is on its way, and
+-- nothing that a node of the operator vouched for has a place.
 --
 -- Nothing in the protocol says that the answer of a source is all there.
 -- A node names its mempool in as many messages as it takes, and in none
@@ -395,19 +421,42 @@ isFilling s = hasSource s && not s.caughtUp
 -- has answered when as long passed as a request is given: a node that
 -- named nothing by then is taken to have nothing. The ids that it named
 -- are then on their way, and the machine has caught up when none is
--- left. A store therefore says that it is filling for that long at
+-- left. A store therefore says that it is syncing for that long at
 -- least, twenty seconds, after it starts.
+--
+-- The time is counted from the first reading since the store last may
+-- have missed something of the node ('since', 'missed'), and not from
+-- the last reading: a node that is read more often than a request is
+-- given would otherwise never have answered. A reading that is owed for
+-- a node of the operator to vouch for what a stranger named ('oweOwn')
+-- does not start the count again: nothing of the node was missed, and a
+-- store that strangers kept naming such transactions to would never
+-- have caught up.
+--
+-- Only what a node of the operator vouched for counts. A transaction
+-- that only strangers named, and that the store cannot verify, keeps
+-- its place for twenty minutes, and is no part of what the pool should
+-- have: a store among strangers said that it was filling for as long
+-- as one was held, which was always.
+--
+-- A machine that loses its last node of the operator has not caught up
+-- when one is back: what that node took meanwhile is not known.
 settleUp :: Ingest p h b -> Ingest p h b
 settleUp s
+  | null nodes = if s.caughtUp then s {caughtUp = False} else s
   | s.caughtUp = s
-  | s.synced && not (null sources) && all answered sources && not s.dirty && s.checking == 0 && Map.null (places s) =
-      s {caughtUp = True}
+  | s.synced && all answered nodes && not s.dirty && s.checking == 0 && Set.null s.vouched = s {caughtUp = True}
   | otherwise = s
   where
-    sources = filter (\l -> l.source) (Map.elems s.links)
-    answered l = case l.swept of
-      Just at -> not l.owed && s.now - at >= s.config.patience
+    nodes = trusted s
+    answered l = case l.since of
+      Just at -> s.now - at >= s.config.patience
       Nothing -> False
+
+-- | The store may have missed something that a source has: it owes a
+-- reading, and what it read before is no longer all that the source has.
+missed :: Link h -> Link h
+missed l = l {owed = True, since = Nothing}
 
 -- | Whether a peer gives its whole mempool when asked. Without one, what
 -- the store misses stays missed.
@@ -456,7 +505,8 @@ react parents input s = case input of
                   owed = False,
                   every = max s.config.sweepGap s.config.sweepFast,
                   lively = False,
-                  own = False
+                  own = False,
+                  since = Nothing
                 }
             -- A node names to a peer nothing that it took before the peer
             -- connected (A1). A peer that is a source is asked for its
@@ -471,7 +521,7 @@ react parents input s = case input of
             -- sent at once, and all that spent from them waiting.
             others
               | src = s.links
-              | otherwise = Map.map (\l -> if l.source then l {owed = True} else l) s.links
+              | otherwise = Map.map (\l -> if l.source then missed l else l) s.links
          in (s {links = Map.insert p link others}, [])
   Own p -> (s {links = Map.adjust (\l -> l {own = True}) p s.links}, [])
   PeerDown p -> done (peerDown p (s, []))
@@ -994,7 +1044,7 @@ requests p s = case Map.lookup p s.links of
 -- the shortest wait if a peer named one that the pool lacked since the
 -- last reading, and after twice the last wait if none did, up to the
 -- longest. A store of a network where nothing happens reads a mempool
--- that does not change every ten minutes, and one of a network that
+-- that does not change every minute, and one of a network that
 -- never rests every thirty seconds.
 sweep :: (Ord p) => Ingest p h b -> (Ingest p h b, [Output p h b])
 sweep s0
@@ -1004,7 +1054,11 @@ sweep s0
         map Sweep due
       )
   where
-    asked l = l {swept = Just s.now, owed = False, lively = False, every = after l}
+    asked l = l {swept = Just s.now, owed = False, lively = False, every = after l, since = first l}
+    -- the first reading since something may have been missed
+    first l = case l.since of
+      Nothing -> Just s.now
+      at -> at
     -- the wait until the next reading that nothing else asks for
     after l
       | l.lively = max s.config.sweepGap s.config.sweepFast
@@ -1014,7 +1068,7 @@ sweep s0
     -- with a source to read, what was given up becomes what each owes
     s
       | s0.dirty && any (.source) (Map.elems s0.links) =
-          s0 {dirty = False, links = Map.map (\l -> if l.source then l {owed = True} else l) s0.links}
+          s0 {dirty = False, links = Map.map (\l -> if l.source then missed l else l) s0.links}
       | otherwise = s0
     due = [p | (p, l) <- Map.toList s.links, l.source, wants l]
     wants l = case l.swept of
@@ -1123,5 +1177,12 @@ rebase bound s =
     }
   where
     rel t = max (negate bound) (t - s.now)
-    link l = l {queue = times l.queue, asks = times l.asks, swept = rel <$> l.swept}
+    link l = l {queue = times l.queue, asks = times l.asks, swept = rel <$> l.swept, since = first <$> l.since}
+    -- 'since' is only asked whether it is as long ago as a request is
+    -- given, and not at all by a machine that caught up, which forgets it
+    -- before it asks again ('missed'): longer ago is all the same
+    first t
+      | s.caughtUp = long
+      | otherwise = max long (t - s.now)
+    long = negate s.config.patience
     times = Set.map (\(t, h) -> (rel t, h))

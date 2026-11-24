@@ -358,8 +358,8 @@ paths:
         until its answers are current.
 
         The state of the mempool does not decide it: a server at the head of
-        the chain is healthy. Whether its mempool is still filling, as after a
-        start, is said in `mempool.filling`.
+        the chain is healthy. How its mempool stands, as after a start, is
+        said in one word in `mempool.sync`.
 
         A server that cannot reach its Redis answers **503** too, with the
         header `Haskoin-Degraded: redis` and `"redis": {"ok": false}` in the
@@ -433,7 +433,7 @@ paths:
                   dirty: false
                   known: 0
                   held: 0
-                  filling: false
+                  sync: synced
                   text: >-
                     The store has 1 source to read a whole mempool from again, which it
                     does when it may have missed a transaction.
@@ -507,7 +507,7 @@ paths:
                   dirty: false
                   known: 0
                   held: 0
-                  filling: false
+                  sync: synced
                   text: >-
                     The store has 1 source to read a whole mempool from again, which it
                     does when it may have missed a transaction.
@@ -6856,7 +6856,7 @@ components:
         state of its mempool. The checks `last-tx` and `pending-txs` are made
         and say whether they pass, each with its own `ok`, and `ok` here does
         not depend on them. What to know of the mempool is in `mempool`:
-        `filling` says whether it is still filling.
+        `sync` says in one word how it stands.
 
         `warnings`, when there are any, are not checks either: `ok` and the
         status do not depend on them.
@@ -7009,7 +7009,7 @@ components:
             - dirty
             - known
             - held
-            - filling
+            - sync
             - text
           properties:
             sources:
@@ -7036,20 +7036,32 @@ components:
               description: |
                 Transactions held: being offered, or waiting for one that they
                 spend from.
-            filling:
-              type: boolean
+            sync:
+              type: string
+              enum:
+                - syncing
+                - synced
+                - unknown
               description: |
-                Whether the shared mempool is still filling. It is true while
-                the server has a source and has not yet read its sources and
-                taken in all that they named, since it started or since the
-                shared mempool lost what it had: the server then shows fewer
-                unconfirmed transactions than its node has. It stays true for
-                twenty seconds at least after a start, the time that a node is
-                given to name its mempool. A server with no source has nothing
-                to fill from, and this is false of it. The server is healthy
-                either way: wait for `sources` of 1 or more and `filling` false
-                before giving a new server traffic, if unconfirmed
-                transactions matter to you.
+                How the shared mempool stands with the mempools of the nodes
+                of the operator of the server, in one word.
+
+                `syncing`: the server has such a node to read a whole mempool
+                from, and has not yet read it and taken in all that it named,
+                since it started or since the shared mempool lost what it had.
+                It then shows fewer unconfirmed transactions than its node
+                has. It says so for twenty seconds at least after a start, the
+                time that a node is given to name its mempool.
+
+                `synced`: it has.
+
+                `unknown`: the server has no node of its operator to read a
+                whole mempool from, only peers that it does not trust or
+                nobody, and cannot tell.
+
+                The server is healthy in all three: wait for `synced` before
+                giving a new server traffic, if unconfirmed transactions
+                matter to you.
             text:
               type: string
               description: |

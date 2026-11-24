@@ -254,6 +254,7 @@ import Haskoin.Store.Fleet.Member
     setHealthy,
   )
 import Haskoin.Store.Fleet.Redis (FleetEvent (..))
+import Haskoin.Store.Ingest (Standing (..))
 import Haskoin.Store.Ingest.Run (IngestState (..), ingestNamedSTM, ingestState)
 import Haskoin.Store.Manager
 import Haskoin.Store.NodePeer (lacksZmq)
@@ -3915,7 +3916,10 @@ handleHealth st _ =
               dirty = path.dirty,
               known = fromIntegral path.known,
               held = fromIntegral path.held,
-              filling = path.filling
+              sync = case path.standing of
+                PoolUnknown -> MempoolUnknown
+                PoolSyncing -> MempoolSyncing
+                PoolSynced -> MempoolSynced
             }
     return HealthCheck {redis = Just up, database = Just database, mempool = Just mempool, ..}
 

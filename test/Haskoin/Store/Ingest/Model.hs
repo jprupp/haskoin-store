@@ -324,28 +324,37 @@ feed sc input w = do
               Nothing -> True
               _ -> False
     _ -> return ()
-  -- T9: the store does not say that its pool is full before it is. When
-  -- the machine stops saying that the pool is filling, no request for a
-  -- mempool is on its way to a source, and the pool has decided on all
-  -- that each source named when it was last asked and has had ever since.
+  -- T9: the store does not say that its pool has the mempool of its nodes
+  -- before it has. When the machine starts to say so, no request for a
+  -- mempool is on its way to a node of the operator, and the pool has
+  -- decided on all that each such node named when it was last asked and
+  -- has had ever since.
   --
   -- The machine takes a source to have answered when as long passed as
   -- a request is given (A10). A world in which requests get no answer in
   -- time breaks that on purpose, and is not held to this.
-  when (Timeouts `notElem` sc.disturbances && isFilling before && not (isFilling after) && hasSource after) $ do
-    check "the pool is said to be full while a source has not answered for its mempool" $
-      and [MSweep `notElem` toList q | (p, q) <- Map.toList w.toNode, sourceHere p]
-    check "the pool is said to be full and lacks a transaction that a source named and has" $
+  when (Timeouts `notElem` sc.disturbances && standing before /= PoolSynced && standing after == PoolSynced) $ do
+    check "the pool is said to be in sync while a node of the operator has not answered for its mempool" $
+      and [MSweep `notElem` toList q | (p, q) <- Map.toList w.toNode, trustedHere p]
+    check "the pool is said to be in sync and lacks a transaction that a node of the operator named and has" $
       and
-        [ Set.filter (`Set.member` node.answered) (dueOf sc w p node) `Set.isSubsetOf` Set.union (settled w) (unread p)
+        [ Set.filter (`Set.member` node.answered) node.has `Set.isSubsetOf` Set.union (settled w) (unread p)
         | (p, node) <- Map.toList w.nodes,
-          sourceHere p
+          trustedHere p
         ]
-  -- and a pool that lost what it had is filling again
+  -- it says so only of a node of the operator that gives its mempool:
+  -- what strangers name says nothing of what the pool should have
+  --
+  -- A peer connects one step before the machine is told whose it is:
+  -- between the two it is a stranger to the machine, and this is not asked.
   case input of
-    Emptied ->
-      check "the pool lost what it had and is not said to be filling" $
-        isFilling after || not (hasSource after)
+    PeerUp p _ | p `elem` sc.owned -> return ()
+    _ ->
+      check "the pool is said to be in sync, or syncing, with no node of the operator to measure it against" $
+        (standing after == PoolUnknown) == not (or [trustedHere p | p <- Map.keys w.nodes])
+  -- and a pool that lost what it had is not in sync
+  case input of
+    Emptied -> check "the pool lost what it had and is still said to be in sync" (standing after /= PoolSynced)
     _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
@@ -358,7 +367,8 @@ feed sc input w = do
   return w' {machine = rebase (horizon sc) after}
   where
     check what ok = if ok then Right () else Left (what <> ", after " <> show input)
-    sourceHere p = maybe False (\n -> n.online && n.source) (Map.lookup p w.nodes)
+    -- a node of the operator that is connected and gives its mempool
+    trustedHere p = p `elem` sc.owned && maybe False (\n -> n.online && n.source) (Map.lookup p w.nodes)
     -- what a peer named in messages that the store has not read
     unread p = Set.fromList (concat [hs | MInv hs <- maybe [] toList (Map.lookup p w.toStore)])
     doubted h = case placeOf h (fst (step parentsOf input w.machine)) of
@@ -827,6 +837,11 @@ scenarios =
       { owned = [2],
         scripts = [1]
       },
+    -- T9: the pool is measured against the node of the operator, and is
+    -- not in sync after it lost what it had
+    (world "a stranger and a node of the operator, a pool that loses what it had" one both losing small)
+      { owned = [2]
+      },
     -- one node with two connections, so that the two have one mempool:
     -- a peer that is a stranger, and the RPC, which is the operator's
     (world "the same, and a transaction that spends from it" chain both [Mempools] small)
@@ -857,6 +872,7 @@ scenarios =
       }
   ]
   where
+    losing = [Mempools, PoolEmptied]
     world name txs peers disturbances config =
       Scenario
         { name,

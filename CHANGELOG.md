@@ -271,20 +271,31 @@ whitelist it must now say what they grant (`--peer-permission`, or
     mempool. Both checks are still made and still say whether they
     pass. `--tx-timeout` and `--max-pending-txs` set their limits as
     before, and no longer decide anything.
-  - **`/health` says whether the mempool is still filling**
-    (`mempool.filling`). After a start, or after Redis lost its data, a
-    store has its blocks at once and its mempool a minute later, on
-    Bitcoin: it is healthy meanwhile and shows fewer unconfirmed
-    transactions than its node. The field is true until every source
-    was asked for its mempool and had twenty seconds to answer, none
-    owes a reading, and the pool has decided on all that they named. A
-    deploy that waited for `/health` gave a store traffic 70 seconds
-    before its mempool was full: it can wait for `sources` of 1 or more
-    and `filling` false. In the machine of the path as T9 of
-    `docs/mempool-ingestion.md`, with two checks in the model and a
-    planted bug for each; its first version took the first names of a
-    source for its answer, which the model found wrong at once. Both
-    changes need haskoin-store-data's master.
+  - **`/health` says how the mempool stands, in one word**
+    (`mempool.sync`): `syncing`, `synced` or `unknown`. After a start,
+    or after Redis lost its data, a store has its blocks at once and
+    its mempool a minute later, on Bitcoin: it is healthy meanwhile and
+    shows fewer unconfirmed transactions than its node. A deploy that
+    waited for `/health` gave a store traffic 70 seconds before its
+    mempool was full: it can wait for `synced`.
+    - The mempool is measured against the nodes of the operator only.
+      It is `syncing` until each was asked for its mempool and had
+      twenty seconds to answer, the store has missed nothing of it
+      since, and the pool has decided on all that they named. A store
+      with no such node says `unknown`: what a stranger names is
+      nothing to measure a mempool against.
+    - It was a boolean, `filling`, for a few hours, measured against
+      every source. A store whose peers were all strangers said that it
+      was filling for ever: a transaction that it could not verify kept
+      its place for twenty minutes, and another came before it left.
+    - In the machine of the path as T9 of `docs/mempool-ingestion.md`:
+      three checks in the model, and five planted bugs that it finds.
+      That a store comes to say `synced` is tested and not checked,
+      also on both nodes while transactions come without a pause.
+    - Needs haskoin-store-data's branch `mempool-sync`.
+  - **A source is read every minute at least**, where it was every ten
+    minutes. While transactions come it is read every thirty seconds,
+    as before.
   - **A node as a peer, through its RPC and its ZeroMQ socket**
     (`--node-rpc` with `--node-zmq`, `NODE_ZMQ`; `docs/node-peer.md`).
     The peer-to-peer protocol is made for strangers: a node names what
