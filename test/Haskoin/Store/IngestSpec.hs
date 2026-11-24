@@ -166,6 +166,23 @@ spec = do
           (s, _) = run' [Named 1 [8], Checked 1 [] [8], Body (Just 1) 8 [7], Offered 8 (Orphan [7])] own
       vouchedFor 8 s `shouldBe` True
       vouchedFor 7 s `shouldBe` True
+    it "takes nothing of a peer in until the store first has its blocks, and reads its source when it has" $ do
+      let cold = fst (run' [PeerUp 1 True, Own 1] (start defaultConfig 0)) :: Ingest Int Int [Int]
+          (s, outs) = run' [Named 1 [7], Body (Just 1) 8 [], Tick 30000] cold
+      outs `shouldBe` []
+      idCount s `shouldBe` 0
+      -- it has them: the source is asked for its mempool, which has all
+      -- that its node has now
+      let (s1, outs1) = run' [Synced True] s
+      [p | Sweep p <- outs1] `shouldBe` [1]
+      -- and what is named from then on is asked of the pool
+      [hs | Check _ hs <- snd (run' [Named 1 [7]] s1)] `shouldBe` [[7]]
+      -- a block behind for a moment, it still keeps what is named, and
+      -- asks no peer for it until it has the block
+      let (s2, outs2) = run' [Synced False, Named 1 [9], Checked 1 [] [9]] s1
+      idCount s2 `shouldBe` 1
+      [() | Get _ _ <- outs2] `shouldBe` []
+      [hs | Get _ hs <- snd (run' [Synced True] s2)] `shouldBe` [[9]]
     it "says that the pool is syncing until its node had the time to answer and nothing is on its way" $ do
       -- the node was asked for its mempool when it connected
       standing ours `shouldBe` PoolSyncing

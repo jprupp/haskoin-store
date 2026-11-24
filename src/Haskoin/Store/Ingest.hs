@@ -244,6 +244,9 @@ data Ingest p h b = Ingest
     now :: !Tick,
     -- | whether the store has the blocks of its nodes
     synced :: !Bool,
+    -- | whether it ever had them, since it started: until then nothing
+    -- that a peer names or sends is taken in ('react')
+    begun :: !Bool,
     -- | where each id is, and how many transactions are held: what
     -- only "Haskoin.Store.Ingest.Ledger" can change
     ledger :: !(Ledger p h b),
@@ -326,6 +329,7 @@ start config now =
     { config,
       now,
       synced = False,
+      begun = False,
       ledger = newLedger (max 0 config.room) (max 0 config.heldRoom),
       links = Map.empty,
       waiters = Map.empty,
@@ -445,11 +449,11 @@ settleUp :: Ingest p h b -> Ingest p h b
 settleUp s
   | null nodes = if s.caughtUp then s {caughtUp = False} else s
   | s.caughtUp = s
-  | s.synced && all answered nodes && not s.dirty && s.checking == 0 && Set.null s.vouched = s {caughtUp = True}
+  | s.synced && all heard nodes && not s.dirty && s.checking == 0 && Set.null s.vouched = s {caughtUp = True}
   | otherwise = s
   where
     nodes = trusted s
-    answered l = case l.since of
+    heard l = case l.since of
       Just at -> s.now - at >= s.config.patience
       Nothing -> False
 
@@ -525,7 +529,25 @@ react parents input s = case input of
          in (s {links = Map.insert p link others}, [])
   Own p -> (s {links = Map.adjust (\l -> l {own = True}) p s.links}, [])
   PeerDown p -> done (peerDown p (s, []))
-  Synced b -> (s {synced = b}, [])
+  Synced b -> (s {synced = b, begun = s.begun || b}, [])
+  -- Until the store first has the blocks of its nodes, nothing that a
+  -- peer names or sends is taken in. The store could not place it: the
+  -- pool decides on a transaction from the outputs that it spends, and
+  -- those are in blocks that the store has not yet. And by the time that
+  -- it has them, most of what was named is in a block. A store that took
+  -- 160,000 blocks in half an hour fetched what its node named
+  -- meanwhile, held thousands of transactions that it could not place,
+  -- and gave them up for seven minutes after it had its blocks.
+  --
+  -- Nothing is lost by it: a source has not been asked for its mempool
+  -- yet, and is asked when the store has its blocks ('sweep'), which
+  -- names all that its node has then.
+  --
+  -- A store that had its blocks and is a block behind for a moment goes
+  -- on as before: it keeps what is named, and asks for nothing until it
+  -- has the block ('pump').
+  Named _ _ | not s.begun -> (s, [])
+  Body (Just _) _ _ | not s.begun -> (s, [])
   Named p hs
     | Map.member p s.links ->
         -- what has a place is named by one more peer; the rest is asked

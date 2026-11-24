@@ -204,6 +204,21 @@ store speaks the protocol of ZeroMQ itself and needs no library for it.
   that follows the tip it does not matter.
 - Each ping costs the node a call.
 
+A first sync was measured once, on a server, on the fourth test network
+of Bitcoin (163,000 blocks), with a store that had no peer and an empty
+database:
+
+| What the store had | Time to every block | The node meanwhile |
+| --- | --- | --- |
+| The RPC and the ZeroMQ socket | 34.6 minutes | 6 to 14% of one core |
+| The RPC alone | 31.0 minutes | about 9% of one core, 25% at most |
+
+The store used about 1.8 cores of its own. At the tip, the store with
+the RPC alone asked the node for its best block and for its mempool
+once every four to five seconds. These are two runs, not a benchmark,
+and the main network has six times the blocks, most of them far
+larger: it was not tried.
+
 ## How it is known
 
 All of it is **tested** against Bitcoin Core and Bitcoin Cash Node in
@@ -222,8 +237,8 @@ like any other.
 | `noPeerEver`, both nodes, with the ZeroMQ socket and without | A store that never has a peer, started with no chain at all, has a chain of more than 2,500 blocks, which is more than a node gives of headers in one answer; then the mempool, the next block and the next transactions. It says all along that it has one peer |
 | `fresh`, a pure function | What is named is what the mempool has that it had not the last time, in the order of the node |
 
-Not tested: a first sync of a real chain this way, which has hundreds
-of thousands of blocks and not thousands; a node that is down
+Not tested in this repository: a first sync of a real chain this way,
+which was measured once on a server (above); a node that is down
 and not only hanging, a ZeroMQ socket that goes quiet, the cost of
 asking a large mempool every five seconds, and that the mempool is
 **not** asked for while another node of the operator is a peer.

@@ -30,7 +30,7 @@ import Control.Exception (throwIO)
 import Control.Monad (forM, forM_, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as C
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
 import Data.Serialize (Serialize, decode)
 import Data.String.Conversions (cs)
@@ -72,6 +72,7 @@ import Haskoin.Node
     Permissions,
     WithConnection,
     chainGetBest,
+    chainHasHeaders,
     getPeers,
     judgeMessage,
     logAt,
@@ -304,7 +305,9 @@ withStore cfg0 action = do
             withNode (nodeCfg cfg db node_pub) $ \node -> do
               writeIORef alone (onlyNodePeer cfg node)
               member <- storeMember cfg redis db
-              withIngest (ingestCfg cfg node db member) $ \ingest ->
+              -- whether the store ever had the blocks of its nodes
+              begun <- newIORef False
+              withIngest (ingestCfg begun cfg node db member) $ \ingest ->
                 withBlockStore (blockStoreCfg cfg node pub db member ingest) $ \block_store ->
                   withAsync (nodeForwarder block_store ingest pub node_sub) $ \fwd -> do
                     link fwd
@@ -535,19 +538,36 @@ blockStoreCfg cfg node pub db member ingest =
 
 -- | What the path into the pool needs of the store ("Haskoin.Store.Ingest.Run"):
 -- the member of the fleet, whether the best block of the database is the
--- best header of the node, which peers give their mempools when asked,
+-- best header of the node, and the first time whether the node has the
+-- headers of its peers too, which peers give their mempools when asked,
 -- as the model of each peer's node says ('judgeMessage'), and which are
 -- nodes of the operator ('ownPeer').
-ingestCfg :: StoreConfig -> Node -> DatabaseReader -> Maybe Member -> IngestConfig
-ingestCfg cfg node db member =
+ingestCfg :: IORef Bool -> StoreConfig -> Node -> DatabaseReader -> Maybe Member -> IngestConfig
+ingestCfg begun cfg node db member =
   IngestConfig
     { net = cfg.net,
       config = defaultConfig,
       member,
+      -- The first time, the headers too: while the node still takes
+      -- them, two thousand at a time, the database catches up with the
+      -- last of those that it has again and again, and is at no tip. Not
+      -- whether the chain is in sync, which also asks for a block of
+      -- the last two hours: a network where none was found has a tip.
+      --
+      -- Only the first time. A store that had its blocks and has no
+      -- peer for a moment, or a peer that owes it headers, is in sync
+      -- when its database is at its best header, as it always was.
       inSync = do
         best <- Q.getBestBlock db
         top <- chainGetBest node.chain
-        return (best == Just (headerHash top.header)),
+        let level = best == Just (headerHash top.header)
+        had <- readIORef begun
+        if had || not level
+          then return level
+          else do
+            headers <- chainHasHeaders node.chain
+            when headers (writeIORef begun True)
+            return headers,
       source = \p -> (== Allowed) <$> judgeMessage p MMempool,
       own = ownPeer cfg,
       stats = cfg.stats,

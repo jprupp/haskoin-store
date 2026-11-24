@@ -301,6 +301,33 @@ be the RPC of that node, read a moment before.
 bytes, cheap to drop when the source is read again. Blocking a peer's
 reader instead would stop its blocks too.
 
+**Nothing is taken in before the store has its blocks.** A store that
+starts with no chain, or far behind, hears of new transactions all the
+while that it takes its blocks. It cannot place one: the pool decides
+on a transaction from the outputs that it spends, and those are in
+blocks that the store has not yet. And most of what is named is in a
+block by the time that the store has them.
+
+So until the store first has the blocks of its nodes, the machine keeps
+nothing that a peer names or sends, and asks for nothing. When it has
+them, it reads its sources, which name all that their nodes have then.
+Nothing is lost: no source had been read yet.
+
+"Has the blocks" means two things together, the first time: the store
+awaits headers from none of its peers, and its database is at the last
+header. The headers come two thousand at a time, and the database
+catches up with the last one that the store has again and again while
+they come. It does not mean that the last block is recent: a network
+where no block was found for hours has a tip all the same.
+
+A store that had its blocks and is one block behind for a moment is
+another matter. It keeps what is named, and asks for nothing until it
+has the block, as before.
+
+Before this rule, a store that took 160,000 blocks in half an hour
+fetched what its node named meanwhile, held thousands of transactions,
+and gave them up for seven minutes after it had its blocks.
+
 **A window for each peer.** It grows while the peer answers and shrinks
 when it does not, in place of a fixed number.
 
@@ -549,6 +576,8 @@ is and how it is gone through.
     that lost what it had is not in sync (T9). The worlds in which
     requests get no answer in time break A10 on purpose, and are not
     held to the first;
+  - until the store first has its blocks, nothing that a peer names or
+    sends gets a place, and nothing is asked for it;
   - a forged transaction is never offered as vouched for, and is given
     up; one that cannot be verified is held for a node of the operator
     and never ready meanwhile; and once such a node names or sends it,
@@ -590,6 +619,13 @@ is and how it is gone through.
   whose doubted transaction asks no reading comes to rest without what
   a node of the operator has. The first version of the rule had two of
   these faults, and the worlds found them.
+- **Before the blocks.** Two planted bugs, each found: a machine that
+  keeps what a peer names before the store has its blocks, and one that
+  never notes that the store has them. A third is **not** found: a
+  machine that keeps what a peer sends unasked before the blocks. No
+  node of the worlds sends what it was not asked for, so the checker
+  cannot see it. That half of the rule is tested, by an example of the
+  spec.
 - **In sync.** Five more planted bugs, each found: a machine that does
   not wait for a node to answer; one that stays in sync when the pool
   lost what it had; one that measures the pool against strangers; one

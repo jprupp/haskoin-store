@@ -175,7 +175,9 @@ data World = World
     toNode :: !(Map P (Seq ToNode)),
     toStore :: !(Map P (Seq ToStore)),
     asked :: !(Seq Op),
-    inSync :: !Bool
+    inSync :: !Bool,
+    -- | whether the store ever had the blocks of its nodes
+    hadBlocks :: !Bool
   }
   deriving (Eq, Ord, Show)
 
@@ -217,7 +219,8 @@ initial sc =
       toNode = Map.fromList [(p, Seq.empty) | (p, _) <- sc.peers],
       toStore = Map.fromList [(p, Seq.empty) | (p, _) <- sc.peers],
       asked = Seq.empty,
-      inSync = False
+      inSync = False,
+      hadBlocks = False
     }
 
 -- | Give the machine an input: check what the step did against the rules
@@ -244,10 +247,13 @@ feed sc input w = do
     Set.union (ids before) learned == Set.union (ids after) gone
   check "an id is said to have left and is still there" $
     Set.null (Set.intersection (ids after) gone)
-  -- T1 for what a peer names: it has a place or the pool is asked
+  -- T1 for what a peer names: it has a place or the pool is asked, once
+  -- the store has had its blocks. Before that nothing of a peer is taken
+  -- in, which is checked below.
   case input of
     Named p hs
-      | Just (Just _) <- Just (windowOf p before) ->
+      | w.hadBlocks,
+        Just (Just _) <- Just (windowOf p before) ->
           check "a named id has no place and the pool is not asked" $
             all (\h -> Set.member h (ids after) || h `elem` concat [cs | Check _ cs <- outs]) hs
     _ -> return ()
@@ -356,6 +362,15 @@ feed sc input w = do
   case input of
     Emptied -> check "the pool lost what it had and is still said to be in sync" (standing after /= PoolSynced)
     _ -> return ()
+  -- Until the store first has its blocks, nothing that a peer names or
+  -- sends is taken in, and nothing is asked for it.
+  let untaken =
+        check "something of a peer was taken in before the store had its blocks" $
+          ids after == ids before && null outs
+  case input of
+    Named _ _ | not w.hadBlocks -> untaken
+    Body (Just _) _ _ | not w.hadBlocks -> untaken
+    _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
     [] -> return ()
@@ -438,7 +453,7 @@ calm sc w = if null moves then idle else moves
                 ]
               else [("the pool lacks parents of " <> show h, feed sc (Offered h (Orphan missing)) w {asked = rest})]
       _ -> []
-    resync = [("the store is in sync", feed sc (Synced True) w {inSync = True}) | not w.inSync]
+    resync = [("the store is in sync", feed sc (Synced True) w {inSync = True, hadBlocks = True}) | not w.inSync]
     -- time passes only when nothing else can happen: a second at a time
     idle = [("a second passes", feed sc (Tick 1) w)]
     storeReads p = \case

@@ -402,12 +402,26 @@ staleCoinbase bed = withRamDir $ \dir -> do
 -- node, through its RPC.
 noPeerEver :: Bed -> IO ()
 noPeerEver bed = withRamDir $ \dir -> do
-  roots <- fund bed 20
-  let (before, after) = splitAt 10 roots
+  roots <- fund bed 60
+  let (before, rest) = splitAt 10 roots
+      (during, after) = splitAt 40 rest
   -- 2,400 more blocks, in pieces that the RPC answers in time
   forM_ [1 :: Int .. 6] $ \_ -> void (generateTo bed.node 400 bed.miner)
   submit bed (map (chainOf 4) before)
+  top <-
+    rpc bed.node "getblockcount" [] >>= \case
+      Number n -> return n
+      v -> fail ("Unexpected answer to getblockcount: " <> show v)
   withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+    -- While it has not every block, the store takes no transaction in:
+    -- it could not place one, and most would be in a block by the time
+    -- that it could. The node goes on taking some meanwhile, which it
+    -- announces or names when read. A store on a server fetched and
+    -- held thousands while it took its blocks, and gave them up for
+    -- minutes after it had them.
+    early <- catchingUp server top (concatMap (chainOf 1) during) []
+    length early `shouldSatisfy` (> 5)
+    [n | n <- early, n /= Number 0] `shouldBe` []
     converges bed server 600
     (_, health) <- getJSON server "/health"
     let count name = field "blocks" health >>= field name
@@ -423,6 +437,29 @@ noPeerEver bed = withRamDir $ \dir -> do
     converges bed server 30
     (_, later') <- getJSON server "/health"
     (field "peers" later' >>= field "count") `shouldBe` Just (Number 1)
+  where
+    -- how many transactions the store said were on their way, each time
+    -- that it was looked at before it had every block, with the node
+    -- taking one more transaction at each look
+    --
+    -- The count is read first and the height after it, from the best
+    -- block of the database: a store that is behind at the second look
+    -- was behind at the first. The height in the health of a store is
+    -- read once a second, and was a block behind a store that had them
+    -- all and had begun.
+    catchingUp server top txs seen = do
+      (_, health) <- getJSON server "/health"
+      (_, best) <- getJSON server "/block/best?notx=true"
+      let blocks = field "height" best
+          known = fromMaybe Null (field "mempool" health >>= field "known")
+      if blocks == Just (Number top)
+        then return (reverse seen)
+        else do
+          txs' <- case txs of
+            tx : more -> send bed tx >> return more
+            [] -> return []
+          threadDelay 100000
+          catchingUp server top txs' (known : seen)
 
 -- | A store that is given no peer at all, and the RPC of its node with
 -- no ZeroMQ socket (@--node-rpc@ alone). The node is its one peer all the

@@ -271,6 +271,23 @@ whitelist it must now say what they grant (`--peer-permission`, or
     mempool. Both checks are still made and still say whether they
     pass. `--tx-timeout` and `--max-pending-txs` set their limits as
     before, and no longer decide anything.
+  - **A store takes no mempool transaction in until it has the
+    blocks.** While it takes its blocks, a store hears of new
+    transactions and cannot place one: what they spend is in blocks
+    that it has not yet. A store that took 160,000 blocks in half an
+    hour fetched what its node named meanwhile, held thousands, and
+    gave them up for seven minutes after it had its blocks, saying
+    `syncing` all that time. Until a store first has its blocks, the
+    path into the pool now keeps nothing that a peer names or sends
+    and asks for nothing; then it reads its sources. And a store first
+    has its blocks only once its node has the headers of its peers
+    (`chainHasHeaders`, from haskoin-node's branch `headers-idle`): the
+    database caught up with the last header again and again while the
+    headers came, two thousand at a time. A rule of the machine (`begun`), with a check
+    in the model and two planted bugs that it finds; that a transaction
+    sent unasked is not kept either is tested by an example and not
+    checked; tested against both nodes on
+    a chain of 2,500 blocks, with a test that failed before.
   - **A store no longer shows the coinbase of a block that its node
     took back.** A node publishes over ZeroMQ the ids of the
     transactions of a block that stops being part of its chain, the
