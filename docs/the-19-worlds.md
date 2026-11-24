@@ -1,4 +1,4 @@
-# The 19 worlds
+# The worlds of the checker
 
 How the path of a transaction into the shared mempool is checked, in plain
 terms. [mempool-ingestion.md](mempool-ingestion.md) has the path itself,
@@ -39,8 +39,10 @@ data, a request times out. It tries each of those, and from each result asks
 the same question again, until it has visited every situation that can be
 reached.
 
-A world has between 5,000 and 200,000 such situations. All 19 together have
-about a million, and going through them takes about a minute.
+A world has between 500 and 430,000 such situations. All 26 together have
+about two and a quarter million, and going through them takes three
+minutes and a half. There were 19 until the store told its own nodes from strangers,
+which is where the name of this page comes from.
 
 ## What is checked in every situation
 
@@ -50,8 +52,10 @@ about a million, and going through them takes about a minute.
 4. From this situation, if nothing more goes wrong, the store always ends up
    with everything its node has. It never gets stuck and never goes round in
    circles.
+5. A forged transaction is never offered to the pool as one that a node of
+   the operator took.
 
-## Why 19
+## Why 26
 
 Each world pairs a small set of transactions with one or two kinds of
 trouble, so that every kind of trouble meets every other somewhere.
@@ -64,8 +68,10 @@ trouble, so that every kind of trouble meets every other somewhere.
 | 3 | two kinds of trouble together |
 | 2 | two peers, or two sources |
 | 2 | one node reached both by its RPC and as a peer |
+| 4 | a stranger and a node of the operator, with a transaction that the store cannot verify: alone, with blocks, with one that spends from it, and with nobody to vouch for it |
+| 3 | a stranger that has forged transactions, with and without a node of the operator beside it |
 
-There is also a twentieth world that is **supposed to fail**. It breaks one of
+There is also one more world that is **supposed to fail**. It breaks one of
 the assumptions about nodes on purpose, to prove that the checker can see a
 failure at all.
 
@@ -100,7 +106,7 @@ it in seven steps, every time.
 | --- | --- |
 | By construction | a transaction id is in exactly one place: the places are the values of one map |
 | Proved, for every state and input | nothing leaves in silence; the two bounds on memory; every step ends |
-| Checked, every order of events in small worlds | the 19 worlds: the rules above, and that the store always converges |
+| Checked, every order of events in small worlds | the 26 worlds: the rules above, and that the store always converges |
 | Sampled | thousands of random runs of a larger world, which is weaker |
 | Tested against real nodes | a store that must end with exactly its node's mempool, in a dozen situations |
 

@@ -89,6 +89,9 @@ data Hold h
     Waiting !(Set h) !Tick
   | -- | the next tick, after an offer that could not be judged
     Later
+  | -- | a node of the operator to name it, until this time: the store
+    -- could not verify it, and only strangers named it
+    Doubted !Tick
   deriving (Eq, Ord, Show)
 
 -- | What the runner is to do.
@@ -128,6 +131,12 @@ data Reason
     WaitedTooLong
   | -- | the pool could not say whether it had decided on it
     Unjudged
+  | -- | it is no transaction that a node takes: a signature of it does
+    -- not verify, or it spends more than it has
+    IsForged
+  | -- | the store could not verify it, and no node of the operator named
+    -- it
+    NotVouched
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- What Liquid Haskell is told of maps: their keys and their size, and
@@ -287,6 +296,7 @@ retime f (Ledger room heldRoom places held) = Ledger room heldRoom (mMap place p
     place (Asked p t ps) = Asked p (f t) ps
     place (Held b since hold) = Held b (f since) (waits hold)
     waits (Waiting ps t) = Waiting ps (f t)
+    waits (Doubted t) = Doubted (f t)
     waits other = other
 
 -- | The one way out: an id loses its place, and an output says so and how,

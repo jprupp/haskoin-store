@@ -143,6 +143,10 @@ data IngestConfig = IngestConfig
     -- source: what the model of its node says
     -- ('Haskoin.Node.judgeMessage')
     source :: !(Peer -> IO Bool),
+    -- | whether a peer is a node of the operator, which is taken at its
+    -- word ("Haskoin.Store.Ingest"). A feed always is: the operator gave
+    -- the store the RPC of that node.
+    own :: !(Peer -> IO Bool),
     stats :: !(Maybe Stats),
     logger :: !Logger
   }
@@ -382,6 +386,8 @@ reasonName = \case
   PeerGone -> "peer_gone"
   WaitedTooLong -> "waited_too_long"
   Unjudged -> "unjudged"
+  IsForged -> "forged"
+  NotVouched -> "not_vouched"
 
 -- | Run the path into the pool while an action runs, and give the action
 -- the way to tell it what happens.
@@ -479,7 +485,8 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
             ms o.readDb <> ", outputs from the pool",
             ms o.readPool <> ", which are unspent",
             ms o.readUnspent <> ", the pool's decision",
-            ms o.decided <> "), questions",
+            ms o.decided <> ", looking at what strangers sent",
+            ms o.judged <> "), questions",
             ms c.inChecks <> ", sending",
             ms c.inSends <> ", saying its state",
             ms c.inPublish <> ", waiting",
@@ -556,17 +563,28 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
         when (droppable e) (atomically (modifyTVar' ing.waiting (subtract 1)))
         case e of
           PeerCame p -> do
-            src <- case p of
+            (src, ours) <- case p of
               Wire peer -> do
                 src <- cfg.source peer
                 unless src . say LevelInfo . T.unwords $
                   [ "Peer " <> shown peer <> " does not give its mempool when asked:",
                     "what the store misses of it stays missed"
                   ]
-                return src
-              -- a feed is nothing but a source
-              Fed {} -> return True
-            return (run {peers = Map.insert run.next p run.peers, next = run.next + 1}, [PeerUp run.next src])
+                ours <- cfg.own peer
+                -- said for each peer, so that an operator sees that the
+                -- store knows its node: a node taken for a stranger
+                -- shows late what the store cannot verify
+                say LevelInfo $
+                  if ours
+                    then "Peer " <> shown peer <> " is a node of the operator: what it names is taken at its word"
+                    else "Peer " <> shown peer <> " is a stranger: what only strangers name is verified first"
+                return (src, ours)
+              -- a feed is nothing but a source, of a node of the operator
+              Fed {} -> return (True, True)
+            return
+              ( run {peers = Map.insert run.next p run.peers, next = run.next + 1},
+                PeerUp run.next src : [Own run.next | ours]
+              )
           PeerLeft p -> case keyOf run p of
             Just k -> return (run {peers = Map.delete k run.peers}, [PeerDown k])
             Nothing -> return (run, [])
@@ -592,9 +610,9 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
         _ <- evaluate (length said)
         next' <- evaluate next
         return (next', said)
-      answers <- concat <$> mapM (perform peers failing lostNow) outs
+      answers <- concat <$> mapM (perform m' peers failing lostNow) outs
       drive peers failing lostNow m' (is <> answers)
-    perform peers failing lostNow = \case
+    perform m peers failing lostNow = \case
       Get k hs -> timed (\c d -> c {inSends = c.inSends + d}) $ do
         forM_ (Map.lookup k peers) $ \case
           Wire p -> MGetData (GetData [InvVector kind h.get | h <- hs]) `sendMessage` p
@@ -623,7 +641,7 @@ loopWith costs saidAt cfg ing metrics run0 t0 = go False t0 run0
             time <- round <$> getPOSIXTime
             (verdict, parts) <-
               timed (\c d -> c {inOffers = c.inOffers + d, offersMade = c.offersMade + 1}) $
-                memberOfferTimed member time tx `catchAny` \e -> do
+                memberOfferTimed member (vouchedFor h m) time tx `catchAny` \e -> do
                   writeIORef failing True
                   say LevelDebug ("Could not offer " <> shown h <> " to the pool: " <> shown e)
                   return (Again, mempty)

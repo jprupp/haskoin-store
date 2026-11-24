@@ -467,6 +467,7 @@ storeConfig net logger dir redisURL peer granted =
     { maxPeers = 1,
       initPeers = [peer],
       peerPermissions = granted,
+      foreignPeers = False,
       discover = False,
       db = dir,
       net = net,
@@ -2148,7 +2149,7 @@ multisigTest env = do
                 <> [H.OP_2, H.OP_NUMEQUAL]
           internal = H.derivePubKey (secret '\x0e')
           tree = H.TaprootOutput {internalKey = internal, mast = Just (H.MASTLeaf H.tapscriptLeafVersion leaf)}
-      (coin, out) <- payScript env (H.taprootScriptOutput tree)
+      (coin, out) <- payScript env (either error id (H.taprootScriptOutput tree))
       unsigned <- spendingTo env coin
       let leafOf = Just (H.leafHash H.tapscriptLeafVersion leaf, 0xffffffff)
       digest <- right (H.taprootSigHash unsigned [out] 0 H.sigHashDefault Nothing leafOf)
@@ -2160,7 +2161,7 @@ multisigTest env = do
                   -- an item for each key, that of the last key first
                   stack = [sign (secrets !! 2), "", sign (head secrets)],
                   script = leaf,
-                  extIsOdd = odd (H.keyParity (H.taprootOutputKey tree)),
+                  extIsOdd = odd (H.keyParity (either error id (H.taprootOutputKey tree))),
                   leafVersion = H.tapscriptLeafVersion,
                   internalKey = internal,
                   control = [],

@@ -100,6 +100,15 @@ data Scenario = Scenario
     -- announces and is no source, and a source that does not announce.
     oneNode :: Bool,
     feeds :: [P],
+    -- | the peers that are nodes of the operator: the others are
+    -- strangers
+    owned :: [P],
+    -- | the transactions that are forged, which no honest node takes, and
+    -- the peers that have them all the same, from the start
+    forged :: [H],
+    liars :: [P],
+    -- | the transactions that are good and that the store cannot verify
+    scripts :: [H],
     -- | whether a source names a transaction __before__ those that it
     -- spends from, against A5: for the world that shows what A5 is needed
     -- for ('withoutOrder'), and for no world that has to pass
@@ -150,7 +159,8 @@ data ToNode = MGet ![H] | MSweep
 data ToStore = MInv ![H] | MTx !H | MNotFound ![H]
   deriving (Eq, Ord, Show)
 
-data Op = OCheck !P ![H] | OOffer !H !B
+-- | A question to the pool, or an offer with whether it is vouched for.
+data Op = OCheck !P ![H] | OOffer !H !B !Bool
   deriving (Eq, Ord, Show)
 
 data World = World
@@ -193,7 +203,11 @@ initial :: Scenario -> World
 initial sc =
   World
     { machine = start sc.config 0,
-      nodes = Map.fromList [(p, Node Set.empty Set.empty False src) | (p, src) <- sc.peers],
+      nodes =
+        Map.fromList
+          [ (p, Node (if p `elem` sc.liars then Set.fromList sc.forged else Set.empty) Set.empty False src)
+          | (p, src) <- sc.peers
+          ],
       pool = Set.empty,
       confirmed = Set.empty,
       toNode = Map.fromList [(p, Seq.empty) | (p, _) <- sc.peers],
@@ -279,6 +293,33 @@ feed sc input w = do
             any (`Set.notMember` ids before) (Set.toList ps)
           ]
     _ -> return ()
+  -- T8: a stranger is not taken at its word. What a node of the operator
+  -- names or sends is no longer held for one to name it.
+  case input of
+    Named p hs
+      | p `elem` sc.owned ->
+          check "a node of the operator named a transaction that is still held for one to name it" $
+            and [not (doubted h) | h <- hs]
+    Body (Just p) h _
+      | p `elem` sc.owned,
+        Just (Just _) <- Just (windowOf p before) ->
+          check "a node of the operator sent a transaction that is still held for one to name it" (not (doubted h))
+    -- what is forged is given up, and what cannot be verified is held for
+    -- a node of the operator, offered again if one named it meanwhile, or
+    -- given up for want of room: never offered as it is, and never ready
+    Offered h Forged
+      | Just (Held _ _ Offering) <- placeOf h before ->
+          check "a forged transaction is kept" (Set.notMember h (ids after))
+    Offered h Unverified
+      | Just (Held _ _ Offering) <- placeOf h before ->
+          check "a transaction that cannot be verified is not held for a node of the operator to name it" $
+            case placeOf h after of
+              Just (Held _ _ (Doubted _)) -> True
+              Just (Held _ _ Later) -> vouchedFor h after
+              Just (Held _ _ Offering) -> vouchedFor h after
+              Nothing -> True
+              _ -> False
+    _ -> return ()
   -- the invariant, which has the bounds of T2
   case wellFormed after of
     [] -> return ()
@@ -290,6 +331,9 @@ feed sc input w = do
   return w' {machine = rebase (horizon sc) after}
   where
     check what ok = if ok then Right () else Left (what <> ", after " <> show input)
+    doubted h = case placeOf h (fst (step parentsOf input w.machine)) of
+      Just (Held _ _ (Doubted _)) -> True
+      _ -> False
     -- the transactions that another spends from
     spentFrom = Set.fromList (concat (Map.elems sc.txs))
     send o x = case o of
@@ -307,7 +351,11 @@ feed sc input w = do
         check "asked the mempool of a peer that would drop the store for it" (node.online && node.source)
         return x {toNode = Map.adjust (|> MSweep) p x.toNode}
       Check p hs -> return x {asked = x.asked |> OCheck p hs}
-      Offer h b -> return x {asked = x.asked |> OOffer h b}
+      Offer h b -> do
+        -- T8: what is forged is never offered as a node took it
+        let vouched = vouchedFor h (fst (step parentsOf input w.machine))
+        check "a forged transaction is offered as vouched for" (not (vouched && h `elem` sc.forged))
+        return x {asked = x.asked |> OOffer h b vouched}
       Gone _ _ -> return x
 
 -- | The steps in which things go well, from a world.
@@ -333,7 +381,14 @@ calm sc w = if null moves then idle else moves
       OCheck p hs Seq.:<| rest ->
         let (yes, no) = (filter (`Set.member` settled w) hs, filter (`Set.notMember` settled w) hs)
          in [("the pool answers the check of " <> show hs, feed sc (Checked p yes no) w {asked = rest})]
-      OOffer h b Seq.:<| rest ->
+      -- the runner looks at what is not vouched for before it offers it
+      OOffer h _ False Seq.:<| rest
+        | h `elem` sc.forged ->
+            [("the store finds " <> show h <> " forged", feed sc (Offered h Forged) w {asked = rest})]
+        | h `elem` sc.scripts,
+          Set.notMember h (settled w) ->
+            [("the store cannot verify " <> show h, feed sc (Offered h Unverified) w {asked = rest})]
+      OOffer h b _ Seq.:<| rest ->
         let missing = filter (`Set.notMember` settled w) (parentsOf b)
          in if null missing
               then
@@ -394,6 +449,7 @@ disturbed sc w
         | sc.oneNode ->
             [ ("the node takes " <> show h, Right (foldl' (\x p -> arriveIn x p h) w (Map.keys w.nodes)))
             | (h, ps) <- Map.toList sc.txs,
+              h `notElem` sc.forged,
               Set.notMember h everywhere,
               Set.notMember h w.confirmed,
               all (\x -> Set.member x everywhere || Set.member x w.confirmed) ps
@@ -407,6 +463,7 @@ disturbed sc w
             [ ("the node of peer " <> show p <> " takes " <> show h, Right (arriveIn w p h))
             | (p, node) <- Map.toList w.nodes,
               (h, ps) <- Map.toList sc.txs,
+              h `notElem` sc.forged,
               Set.notMember h node.has,
               Set.notMember h w.confirmed,
               all (\x -> Set.member x node.has || Set.member x w.confirmed) ps
@@ -427,6 +484,7 @@ disturbed sc w
                 }
           )
         | h <- Set.toList everywhere,
+          h `notElem` sc.forged,
           all (`Set.member` w.confirmed) (Map.findWithDefault [] h sc.txs)
         ]
       Desyncs -> [("the store is out of sync", feed sc (Synced False) w {inSync = False}) | w.inSync]
@@ -447,7 +505,8 @@ disturbed sc w
       PoolFails -> case w.asked of
         OCheck p hs Seq.:<| rest ->
           [("the pool does not answer the check of " <> show hs, feed sc (Unchecked p hs) w {asked = rest})]
-        OOffer h _ Seq.:<| rest -> [("the pool does not judge " <> show h, feed sc (Offered h Again) w {asked = rest})]
+        OOffer h _ _ Seq.:<| rest ->
+          [("the pool does not judge " <> show h, feed sc (Offered h Again) w {asked = rest})]
         _ -> []
       PoolEmptied -> [("the pool loses what it had", feed sc Emptied w {pool = Set.empty}) | not (Set.null w.pool)]
       Timeouts ->
@@ -462,6 +521,7 @@ disturbed sc w
       OtherStores ->
         [ ("another store offers " <> show h <> " first", Right w {pool = Set.insert h w.pool})
         | (h, ps) <- Map.toList sc.txs,
+          h `notElem` sc.forged,
           Set.notMember h (settled w),
           all (`Set.member` settled w) ps
         ]
@@ -495,6 +555,7 @@ comes :: Scenario -> World -> [(String, Either String World)]
 comes sc w =
   [ ( "peer " <> show p <> " connects",
       feed sc (PeerUp p node.source) w {nodes = Map.insert p node {online = True} w.nodes}
+        >>= \x -> if p `elem` sc.owned then feed sc (Own p) x else Right x
     )
   | (p, node) <- Map.toList w.nodes,
     not node.online,
@@ -512,7 +573,26 @@ comes sc w =
 converged :: Scenario -> World -> Bool
 converged sc w
   | sc.oneNode && not (or [node.online | (p, node) <- Map.toList w.nodes, p `notElem` sc.feeds]) = True
-  | otherwise = and [node.has `Set.isSubsetOf` settled w | node <- Map.elems w.nodes, node.online, node.source]
+  | otherwise =
+      and
+        [ due p node `Set.isSubsetOf` settled w
+        | (p, node) <- Map.toList w.nodes,
+          node.online,
+          node.source
+        ]
+  where
+    -- A node of the operator is taken at its word: all that it has. Of a
+    -- stranger, what the store can verify: not what is forged, not what
+    -- it cannot verify unless a node of the operator that is there has it
+    -- too, and nothing that spends from either.
+    due p node
+      | p `elem` sc.owned = node.has
+      | otherwise = Set.filter (not . barred) node.has
+    barred h = h `elem` held || any barred (Map.findWithDefault [] h sc.txs)
+    held = sc.forged <> [h | h <- sc.scripts, Set.notMember h vouchable]
+    vouchable =
+      Set.unions [node.has | (p, node) <- Map.toList w.nodes, p `elem` sc.owned, node.online, node.source]
+        `Set.union` settled w
 
 -- | Go through every state of a scenario. In each: the rules of every
 -- step. From each, with only things going well: no way to go on for ever,
@@ -614,6 +694,10 @@ large =
       peers = [(1, True), (2, True), (3, False)],
       oneNode = False,
       feeds = [],
+      owned = [],
+      forged = [],
+      liars = [],
+      scripts = [],
       backwards = False,
       disturbances = [minBound .. maxBound],
       busy = 6,
@@ -653,6 +737,10 @@ withoutOrder =
       peers = [(1, True)],
       oneNode = False,
       feeds = [],
+      owned = [],
+      forged = [],
+      liars = [],
+      scripts = [],
       backwards = True,
       disturbances = [Mempools],
       busy = 2,
@@ -693,6 +781,44 @@ scenarios =
     (world "a chain of two, one node: its RPC and a peer that is no source" chain mixed [Mempools, PeerDrops] small)
       { oneNode = True,
         feeds = [1]
+      },
+    -- T8: peer 1 is a stranger and peer 2 a node of the operator. The
+    -- store cannot verify transaction 1, and 2 spends from it.
+    (world "a stranger and a node of the operator, a transaction that cannot be verified" one both wavering small)
+      { owned = [2],
+        scripts = [1]
+      },
+    (world "the same, with blocks" one both [Mempools, Blocks] small)
+      { owned = [2],
+        scripts = [1]
+      },
+    -- one node with two connections, so that the two have one mempool:
+    -- a peer that is a stranger, and the RPC, which is the operator's
+    (world "the same, and a transaction that spends from it" chain both [Mempools] small)
+      { owned = [2],
+        scripts = [1],
+        oneNode = True,
+        feeds = [2]
+      },
+    -- nobody to vouch for it: the store comes to rest without it, and
+    -- without what spends from it
+    (world "only a stranger, a transaction that the store cannot verify" chain [(1, True)] wavering small)
+      { scripts = [1]
+      },
+    -- the stranger has a forged transaction, and one that spends from it
+    (world "a stranger that lies, and a node of the operator" one both wavering small)
+      { owned = [2],
+        forged = [1],
+        liars = [1]
+      },
+    (world "the same, and a transaction that is good" pair both [Mempools] small)
+      { owned = [2],
+        forged = [1],
+        liars = [1]
+      },
+    (world "only a stranger, which lies, a pool that fails" three [(1, True)] [Mempools, PoolFails] small)
+      { forged = [1, 2],
+        liars = [1]
       }
   ]
   where
@@ -704,12 +830,21 @@ scenarios =
           peers,
           oneNode = False,
           feeds = [],
+          owned = [],
+          forged = [],
+          liars = [],
+          scripts = [],
           backwards = False,
           disturbances,
           busy = 2,
           limit = 1500000
         }
     mixed = [(1, True), (2, False)]
+    both = [(1, True), (2, True)]
+    wavering = [Mempools, PeerDrops]
+    -- a chain of two and a transaction by itself
+    three = Map.fromList [(1, []), (2, [1]), (3, [])]
+    pair = Map.fromList [(1, []), (2, [])]
     tight = small {room = 1, heldRoom = 1}
     two = small {heldRoom = 2, maxWindow = 3}
     one = Map.fromList [(1, [])]

@@ -328,6 +328,7 @@ in containers. Booleans in variables accept `true`/`false`, `yes`/`no`,
 | `--discover` | `DISCOVER` | off | Discover peers through DNS seeds and relayed addresses; on regtest it finds none, so name a `--peer` |
 | `-p`, `--peer` | `PEER` | none | Connect to `HOST[:PORT]`, or to the Unix socket `unix:PATH`; repeat for more, space-separated in `PEER` |
 | `--peer-permission` | `PEER_PERMISSIONS` | none | A permission that the nodes of `--peer` grant the store with `-whitelist` or `-whitebind`, by its name there: `mempool`, `noban`, `relay`, `forcerelay`, `download`, `bloomfilter`, `addr`; repeat for more, comma- or space-separated in `PEER_PERMISSIONS`. With `mempool`, the store asks them for their mempools when it starts and when the pool fills again |
+| `--foreign-peers` | `FOREIGN_PEERS` | off | The nodes of `--peer` are not yours. The store takes a node of yours at its word, and looks first at what only strangers name: it does not take a transaction that it cannot verify from them (see [Whose word is taken](#whose-word-is-taken)) |
 | `--max-peers` | `MAX_PEERS` | `20` | Most peers to connect to |
 | `--peer-timeout` | `PEER_TIMEOUT` | `30` | Seconds before a peer that is silent, or that owes blocks, is dropped |
 | `--block-stall` | `BLOCK_STALL` | `10` | Longest wait, in seconds, for a block from the syncing peer before another peer is asked too; a quick peer gets four of its recent gaps between blocks, at least 2 s |
@@ -412,6 +413,27 @@ fleet of one. Every key starts with `hs3:<network>:`.
   model of each peer's node (`docs/fleet-mempool.md`): tell it what your
   nodes grant with `--peer-permission`. A store with no source says so in
   `/health`.
+- <a id="whose-word-is-taken"></a>**Whose word is taken.** A store
+  verifies no script: it takes a transaction because a node took it.
+  That is right of a node of yours, and the store takes the nodes of
+  `--peer`, and the node of `--node-rpc`, for yours. Any other peer is a
+  stranger, as every peer found by `--discover` is. Of what only
+  strangers name, the store verifies what it can, which is every
+  signature of a coin locked to one key:
+
+  | A transaction that only strangers name | What the store does |
+  | --- | --- |
+  | Every signature verifies | Takes it |
+  | A signature does not verify, it spends more than it has, or its tokens come from nowhere | Refuses it, with all that spends from it (`ingest.given_up.forged`) |
+  | It spends a coin locked by a script, such as a multisig wallet | Holds it until a node of yours names it, for twenty minutes, and does not show it (`ingest.given_up.not_vouched`) |
+
+  So a store with a node of yours among its peers misses nothing, and a
+  store with only strangers shows a spend of a script when a block
+  confirms it. If the nodes that you give with `--peer` are not yours,
+  say so with `--foreign-peers`. Without this a stranger could show a
+  wallet a payment that was never made. The store says in its log, of
+  each peer that connects, which of the two it takes it for: check that
+  it knows your node.
 - **`/events` is the same stream on every store**, written to Redis with
   each change of the pool and each move of the tip.
 - **Xpubs** are cached for the whole fleet (`docs/xpub-indexing.md`).
@@ -1321,7 +1343,7 @@ The metrics of the fleet's cache:
 | Metric | Kind | Meaning |
 | --- | --- | --- |
 | `ingest.settled` | counter | Transactions that peers named and that the pool decided on, or already had |
-| `ingest.given_up.REASON` | counter | Transactions given up on their way to the pool, by reason: `node_has_not`, `unanswered`, `no_room`, `peer_gone`, `waited_too_long`, `unjudged` (`docs/mempool-ingestion.md`). All but the first make the server read its sources again |
+| `ingest.given_up.REASON` | counter | Transactions given up on their way to the pool, by reason: `node_has_not`, `unanswered`, `no_room`, `peer_gone`, `waited_too_long`, `unjudged`, `forged`, `not_vouched` (`docs/mempool-ingestion.md`). All but the first and the last two make the server read its sources again |
 | `ingest.dropped` | counter | Messages of peers dropped because the path into the pool was behind; the sources are read again |
 | `ingest.ids` | gauge | Transaction ids on their way to the pool: wanted, asked for, or held |
 | `ingest.pending` | gauge | Transactions asked of peers and not received, what `/health` counts |

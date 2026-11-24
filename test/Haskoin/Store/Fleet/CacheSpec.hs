@@ -22,7 +22,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.List (find, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Serialize (encode)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64, Word8)
@@ -55,6 +55,7 @@ import Haskoin
     scriptToAddressBS,
     txHash,
   )
+import Haskoin qualified as H
 import Haskoin.Store.Common (Limits (..), Start (..), StoreRead (..), sortTxs)
 import Haskoin.Store.Data
   ( BlockData (..),
@@ -126,6 +127,8 @@ spec = do
       it "counts as settled, for every member, what the pool has decided on" (`withBed` seenTest)
       it "offers again a transaction that left the pool and is sent again" (`withBed` resendTest)
       it "says which transaction an orphan waits for, and takes it after that one" (`withBed` orphanTest)
+      it "looks at what no node of the operator vouches for, and takes anything that one does" $
+        (`withBed` strangerTest)
       it "answers the tokens of the chain with what the pool does to them" (\r -> withBedOn bchRegTest r tokenTest)
       modifyMaxSuccess (const 10) $
         it "keeps every cached entry equal to the chain at the tip and the pool" $ \r ->
@@ -285,6 +288,49 @@ resendTest bed = do
   settle bed
   inPool bed first `shouldReturn` True
   inPool bed second `shouldReturn` False
+
+-- | A transaction that only strangers named is looked at before it is
+-- offered ('memberOfferTimed' with no voucher): one whose signature does
+-- not verify is forged, one that spends a coin locked by a script cannot
+-- be verified, and neither is in the pool after. One that spends a coin
+-- locked to a key, with the signature of that key, is taken.
+--
+-- The same transactions with a voucher are all taken, the forged one
+-- too: a node of the operator took them, and the store takes what its
+-- node takes. That is what became of every transaction, from any peer,
+-- before the store told its own nodes from strangers.
+strangerTest :: Bed -> IO ()
+strangerTest bed = do
+  coin : _ <- coins bed
+  now <- round <$> getPOSIXTime
+  let key = fromMaybe (error "No key") (H.secKey (B.replicate 31 0 <> "\x07"))
+      toKey = H.PayPKHash (H.addressHash (H.exportPubKey True (H.derivePubKey key)))
+      keyScript = H.encodeSerial toKey
+      -- pay to the hash of a script: only a node runs the script
+      toScript = "\xa9\x14" <> B.replicate 20 7 <> "\x87"
+      fund = spend [coin] [(keyScript, 100000), (keyScript, 100000), (toScript, 100000)]
+      out = OutPoint (txHash fund)
+      pay n = Tx 1 [TxIn (out n) "" maxBound] [TxOut 90000 script] [] 0
+      allOf = if isJust bed.net.sigHashForkId then H.setForkIdFlag H.sigHashAll else H.sigHashAll
+      sign n = either error id (H.signTx bed.net (pay n) [H.SigInput toKey 100000 (out n) allOf Nothing] [key])
+      good = sign 0
+      -- signed, and then made to pay a satoshi less
+      forged = (sign 1) {outputs = [TxOut 89999 script]} :: Tx
+      scripted = pay 2
+      offer vouched tx = fst <$> memberOfferTimed bed.a vouched now tx
+  settle bed
+  memberOffer bed.a now fund `shouldReturn` Settled
+  offer False forged `shouldReturn` Forged
+  offer False scripted `shouldReturn` Unverified
+  mapM (inPool bed) [forged, scripted] `shouldReturn` [False, False]
+  offer False good `shouldReturn` Settled
+  inPool bed good `shouldReturn` True
+  -- vouched for, they are taken as they are
+  offer True scripted `shouldReturn` Settled
+  offer True forged `shouldReturn` Settled
+  mapM (inPool bed) [forged, scripted] `shouldReturn` [True, True]
+  -- and what the pool has is not doubted, whoever names it again
+  offer False scripted `shouldReturn` Settled
 
 -- | A transaction offered before the one that it spends from is an
 -- orphan, and the member says which transaction it lacks: what the path

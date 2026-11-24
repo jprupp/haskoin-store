@@ -262,6 +262,42 @@ whitelist it must now say what they grant (`--peer-permission`, or
     testnets had the mempool of their node again in under three
     seconds, and Bitcoin, with 65,962 transactions, in 233
     (`docs/fleet-mempool.md`).
+  - **A stranger is not taken at its word.** A store verifies no script:
+    it takes a transaction because a node took it. It did so of every
+    peer, and a peer found by discovery is anybody: it could send a
+    spend of somebody's coins with a signature that does not verify,
+    and the store showed it, as a payment that was never made or as
+    coins spent that were not. A test offers such a transaction as the
+    store offered every one: it is taken.
+    - The store now takes the nodes of `--peer`, and the node of
+      `--node-rpc`, for nodes of its operator, and takes their word as
+      before. `--foreign-peers` (`FOREIGN_PEERS`) says that the nodes
+      of `--peer` are not.
+    - What only strangers name is looked at before it is offered. If
+      every signature of a coin locked to one key verifies, it is
+      taken. If one does not, or it spends more than it has, or its
+      tokens come from nowhere, it is given up with all that spends
+      from it (`ingest.given_up.forged`). If it spends a coin locked by
+      a script, which only a full node can judge, it is held until a
+      node of the operator names it, twenty minutes at most, and not
+      shown meanwhile (`ingest.given_up.not_vouched`).
+    - So a store with a node of its operator among its peers misses
+      nothing, and one with only strangers shows a spend of a script
+      when a block confirms it.
+    - The checks are in haskoin-core (`Haskoin.Transaction.Judge`,
+      `judgeRelayed`), with those of `POST /transactions`, which moved
+      there from this package: they say nothing of a store, and other
+      programs can use them. Only what no node can take is refused: a
+      rule of relay is the node's own.
+    - The rule is in the machine of the path (T8 of
+      `docs/mempool-ingestion.md`), and the model has seven worlds for
+      it, 26 in all, with five planted bugs that it finds; its first
+      version had two of them. Liquid Haskell passes. Tested with real
+      signatures against a real pool, and against Bitcoin Core: a store
+      whose only peer is a stranger takes what the wallet of the node
+      signed and not what a script spends, and takes both once the peer
+      is a node of its operator.
+    - It builds on haskoin-core's branch `judge-transactions`.
   - **A store of Bitcoin has a whole mempool again in a minute and a
     half, where it took over three.** After each transaction that came,
     the path into the pool said how many ids it knew, and counted them

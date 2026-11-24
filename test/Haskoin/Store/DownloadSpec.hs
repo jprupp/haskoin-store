@@ -184,6 +184,7 @@ withStoreOf nodes seen stall go =
         { maxPeers = 8,
           initPeers = map (.peer) nodes,
           peerPermissions = mempty,
+          foreignPeers = False,
           discover = False,
           db = dir,
           net = net,

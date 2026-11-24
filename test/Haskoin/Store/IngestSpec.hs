@@ -132,6 +132,40 @@ spec = do
       let (_, last') = run' [Missing 1 [1], Tick 16000] s'
       [h | Gone h (GaveUp NodeHasNot) <- last'] `shouldBe` [1]
       [h | Offer h _ <- last'] `shouldBe` [2 :: Int]
+    it "holds what a stranger sent and the store cannot verify until a node of the operator names it" $ do
+      -- peer 1 is a stranger, and what it sent is not vouched for
+      let (s, outs) = run [Named 1 [7], Checked 1 [] [7], Body (Just 1) 7 []]
+      [h | Offer h _ <- outs] `shouldBe` [7 :: Int]
+      vouchedFor 7 s `shouldBe` False
+      -- the store cannot verify it: held, and not offered when time passes
+      let (doubting, more) = run' [Offered 7 Unverified, Tick 1000, Tick 2000] s
+      [h | Offer h _ <- more] `shouldBe` []
+      placeOf 7 doubting `shouldSatisfy` \case
+        Just (Held _ _ (Doubted _)) -> True
+        _ -> False
+      -- peer 2, a node of the operator, names it: offered again, as
+      -- vouched for
+      let (named, last') = run' [PeerUp 2 True, Own 2, Named 2 [7]] doubting
+      [h | Offer h _ <- last'] `shouldBe` [7]
+      vouchedFor 7 named `shouldBe` True
+    it "gives up what nobody vouched for after twenty minutes, and reads no source for it" $ do
+      let (s, _) = run [Named 1 [7], Checked 1 [] [7], Body (Just 1) 7 [], Offered 7 Unverified]
+          (later', outs) = run' [Tick 1199000, Tick 1201000] s
+      [h | Gone h (GaveUp NotVouched) <- outs] `shouldBe` [7 :: Int]
+      isDirty later' `shouldBe` False
+    it "gives up a forged transaction with all that waits for it, and reads no source for them" $ do
+      -- 8 spends from 7, and waits for it
+      let came = [Named 1 [7, 8], Checked 1 [] [7, 8], Body (Just 1) 8 [7], Body (Just 1) 7 []]
+          (s, outs) = run' [Offered 7 Forged] (fst (run came))
+      [h | Gone h (GaveUp IsForged) <- outs] `shouldBe` [7, 8 :: Int]
+      isDirty s `shouldBe` False
+    it "takes a node of the operator at its word, for what it sends and for what that spends from" $ do
+      -- peer 1 is a node of the operator; 8 spends from 7, which the pool
+      -- lacks and nobody named
+      let own = fst (run' [Own 1] ready)
+          (s, _) = run' [Named 1 [8], Checked 1 [] [8], Body (Just 1) 8 [7], Offered 8 (Orphan [7])] own
+      vouchedFor 8 s `shouldBe` True
+      vouchedFor 7 s `shouldBe` True
   where
     ready :: Ingest Int Int [Int]
     ready = fst (run' [PeerUp 1 True, Synced True] (start defaultConfig 0))

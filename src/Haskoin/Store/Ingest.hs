@@ -64,6 +64,14 @@
 --   for__ (@seek@), of every peer, at once. It is not waited for: nothing
 --   says that it will come by itself.
 --
+-- * __A stranger is not taken at its word.__ A peer is a node of the
+--   operator ('Own'), or a stranger. What a node of the operator names or
+--   sends is /vouched for/, and the pool takes it as the node did. What
+--   only strangers named is looked at by the runner before it is offered:
+--   forged, it is given up ('Forged'); if the store cannot tell, it is
+--   held until a node of the operator names it, or given up
+--   ('Unverified', 'Doubted').
+--
 -- = What the runner does
 --
 -- 'step' takes an 'Input' and gives 'Output's. The runner turns messages
@@ -98,6 +106,7 @@ module Haskoin.Store.Ingest
     pending,
     holding,
     isDirty,
+    vouchedFor,
     hasSource,
     sourceCount,
     windowOf,
@@ -216,7 +225,9 @@ data Link h = Link
     every :: !Tick,
     -- | whether a peer named a transaction that the pool lacked, since
     -- its mempool was asked for
-    lively :: !Bool
+    lively :: !Bool,
+    -- | whether it is a node of the operator, which is taken at its word
+    own :: !Bool
   }
   deriving (Eq, Ord, Show)
 
@@ -238,6 +249,12 @@ data Ingest p h b = Ingest
     ready :: !(Set h),
     -- | those held whose offer could not be judged
     later :: !(Set h),
+    -- | the ids with a place that a node of the operator named or sent,
+    -- or that such a transaction spends from
+    vouched :: !(Set h),
+    -- | those held that wait for a node of the operator to name them, by
+    -- the time to give them up
+    doubts :: !(Set (Tick, h)),
     -- | whether something was given up that a node may still have
     dirty :: !Bool
   }
@@ -249,6 +266,8 @@ data Input p h b
     Tick !Tick
   | -- | a peer connected; whether it is a source
     PeerUp !p !Bool
+  | -- | a peer that is there is a node of the operator
+    Own !p
   | -- | a peer is gone
     PeerDown !p
   | -- | whether the store has the blocks of its nodes
@@ -278,6 +297,12 @@ data Verdict h
     Orphan ![h]
   | -- | it could not say: ask again
     Again
+  | -- | not offered: no node takes it. A signature of it does not verify,
+    -- or it spends more than it has. Only of what is not vouched for.
+    Forged
+  | -- | not offered: the store cannot verify it, and no node of the
+    -- operator named it
+    Unverified
   deriving (Eq, Ord, Show)
 
 -- | A machine with nothing in it and no peer, at a time.
@@ -293,6 +318,8 @@ start config now =
       tries = Set.empty,
       ready = Set.empty,
       later = Set.empty,
+      vouched = Set.empty,
+      doubts = Set.empty,
       dirty = False
     }
 
@@ -381,7 +408,8 @@ react parents input s = case input of
                   swept = Nothing,
                   owed = False,
                   every = max s.config.sweepGap s.config.sweepFast,
-                  lively = False
+                  lively = False,
+                  own = False
                 }
             -- A node names to a peer nothing that it took before the peer
             -- connected (A1). A peer that is a source is asked for its
@@ -398,6 +426,7 @@ react parents input s = case input of
               | src = s.links
               | otherwise = Map.map (\l -> if l.source then l {owed = True} else l) s.links
          in (s {links = Map.insert p link others}, [])
+  Own p -> (s {links = Map.adjust (\l -> l {own = True}) p s.links}, [])
   PeerDown p -> done (peerDown p (s, []))
   Synced b -> (s {synced = b}, [])
   Named p hs
@@ -405,8 +434,11 @@ react parents input s = case input of
         -- what has a place is named by one more peer; the rest is asked
         -- of the pool before it gets one
         let one (st, new) h
-              | Map.member h (places st) = (also p h st, new)
+              | Map.member h (places st) = (again h (vouchBy p h (also p h st)), new)
               | otherwise = (st, h : new)
+            -- a stranger names again what is held for a node of the
+            -- operator to name: a node still has it, and theirs may
+            again h st = if doubted st h then oweOwn st else st
             (s', fresh) = foldl' one (s, []) hs
          in (s', [Check p (reverse fresh) | not (null fresh)])
     -- a peer that the machine does not know: it cannot be asked
@@ -455,7 +487,17 @@ unwant h ms s = s {links = Map.foldlWithKey' out s.links ms}
 forget :: (Ord p, Ord h) => Reason -> h -> Acc p h b -> Acc p h b
 forget why h acc =
   let (s, said) = leave h (GaveUp why) acc
-   in (s {dirty = s.dirty || why /= NodeHasNot}, said)
+   in (s {dirty = s.dirty || mayHave why}, said)
+  where
+    -- A node may have what was given up for any reason but these. It
+    -- said itself that it has it not; no node takes what is forged; and
+    -- what was not vouched for is named again by a node of the operator
+    -- that has it, at its next reading, with no need to ask for one.
+    mayHave = \case
+      NodeHasNot -> False
+      IsForged -> False
+      NotVouched -> False
+      _ -> True
 
 -- | The one way out of the machine: the id loses its place, the indexes
 -- that mention it are put right, and an output says how it left. An id
@@ -465,7 +507,7 @@ leave :: (Ord p, Ord h) => h -> End -> Acc p h b -> Acc p h b
 leave h end (s, said) =
   let s' = unplace h s
       (ledger, said') = L.leave h end s'.ledger said
-   in (s' {ledger}, said')
+   in (s' {ledger, vouched = Set.delete h s'.vouched}, said')
 
 -- | Take an id out of every index that its place puts it in. Its place
 -- is for the caller to change or to delete.
@@ -491,8 +533,71 @@ unhold h hold s = case hold of
         waiters = foldl' (\w p -> Map.update (nonEmpty . Set.delete h) p w) s.waiters ps
       }
   Later -> s {later = Set.delete h s.later}
+  Doubted t -> s {doubts = Set.delete (t, h) s.doubts}
   where
     nonEmpty x = if Set.null x then Nothing else Just x
+
+-- | Whether a node of the operator named or sent a transaction, or one
+-- that spends from it: the runner offers such a transaction as the node
+-- took it, and looks first at any other.
+vouchedFor :: (Ord h) => h -> Ingest p h b -> Bool
+vouchedFor h s = Set.member h s.vouched
+
+-- | A peer named or sent a transaction that has a place: if the peer is
+-- a node of the operator, the transaction is vouched for.
+vouchBy :: (Ord p, Ord h) => p -> h -> Ingest p h b -> Ingest p h b
+vouchBy p h s = case Map.lookup p s.links of
+  Just l | isOwn l -> vouch h s
+  _ -> s
+
+-- | Whether a peer is a node of the operator.
+isOwn :: Link h -> Bool
+isOwn l = l.own
+
+-- | A transaction that has a place is vouched for, and with it every
+-- transaction that it waits for, and that those wait for: a node that
+-- took a transaction took what it spends from, or a block has it. One
+-- that was held to be vouched for is ready to offer.
+vouch :: (Ord h) => h -> Ingest p h b -> Ingest p h b
+vouch h s = foldl' one s (awaited h s)
+  where
+    one st x = case Map.lookup x (places st) of
+      Just (Held _ _ hold@(Doubted _)) -> makeReady x (unhold x hold st) {vouched = Set.insert x st.vouched}
+      Just _ -> st {vouched = Set.insert x st.vouched}
+      Nothing -> st
+
+-- | A transaction, those that it waits for, and those that they wait
+-- for, to the end.
+awaited :: (Ord h) => h -> Ingest p h b -> [h]
+awaited h s = closure (\x -> case Map.lookup x (places s) of Just (Held _ _ (Waiting ps _)) -> ps; _ -> Set.empty) h
+
+-- | A transaction, those that wait for it, and those that wait for
+-- them, to the end.
+family :: (Ord h) => h -> Ingest p h b -> [h]
+family h s = closure (\x -> Map.findWithDefault Set.empty x s.waiters) h
+
+-- | All that is reached from one by a relation. It ends: each round
+-- takes what the last one found and was not found before, of a set that
+-- only grows, among the ids of the machine.
+closure :: (Ord h) => (h -> Set h) -> h -> [h]
+closure next h = Set.toList (fst (until (Set.null . snd) grow (Set.singleton h, Set.singleton h)))
+  where
+    grow (seen, frontier) =
+      let found = Set.unions (map next (Set.toList frontier)) `Set.difference` seen
+       in (Set.union seen found, found)
+
+-- | An id got a place: it is vouched for if a transaction that waits for
+-- it is.
+inherit :: (Ord h) => h -> Ingest p h b -> Ingest p h b
+inherit h s
+  | any (\c -> Set.member c s.vouched) (Set.toList (Map.findWithDefault Set.empty h s.waiters)) = vouch h s
+  | otherwise = s
+
+-- | Give up a transaction and all that waits for it, for one reason:
+-- what spends from a transaction that no node takes, or that nobody
+-- vouches for, is no better than it.
+disown :: (Ord p, Ord h) => Reason -> h -> Acc p h b -> Acc p h b
+disown why h acc@(s, _) = foldl' (\a c -> forget why c a) acc (family h s)
 
 -- | The pool has decided on an id: it leaves, whether it had a place or
 -- was only being checked, and what waited for it is ready.
@@ -519,9 +624,9 @@ unsettled' :: (Ord p, Ord h) => p -> Acc p h b -> h -> Acc p h b
 unsettled' p acc@(s, said) h
   -- the peer left while the pool was asked: it cannot be asked for it
   | Map.notMember p s.links = if Map.member h (places s) then acc else forget PeerGone h acc
-  | Map.member h (places s) = (also p h s, said)
+  | Map.member h (places s) = (vouchBy p h (also p h s), said)
   | otherwise = case L.put h (Wanted (Map.singleton p s.now)) s.ledger of
-      Just ledger -> (told (queued p h s {ledger}), said)
+      Just ledger -> (vouchBy p h (inherit h (told (queued p h s {ledger}))), said)
       Nothing -> forget NoRoom h acc
 
 -- | A peer named a transaction that the pool lacks: transactions are
@@ -574,18 +679,26 @@ grown p s = s {links = Map.adjust (\l -> l {window = min s.config.maxWindow (l.w
 -- spends from and that the machine is still getting.
 body :: (Ord p, Ord h) => (b -> [h]) -> Maybe p -> h -> b -> Acc p h b -> Acc p h b
 body parents from h b acc@(s, said) = case Map.lookup h (places s) of
-  Just (Held {}) -> acc
+  -- held already: a node of the operator that sends it vouches for it
+  Just (Held {}) -> (sent s, said)
   Just (Asked q _ _) -> hold (credit q (unplace h s))
   Just _ -> hold (unplace h s)
   Nothing -> hold s
   where
+    -- vouched for before it came: so is what it now waits for
+    again st = if Set.member h st.vouched then vouch h st else st
+    -- the transaction has a place: its sender vouches for it, if it is a
+    -- node of the operator
+    sent st = case from of
+      Just p -> vouchBy p h st
+      Nothing -> st
     -- the peer that was asked answered, if it is the one that sent this
     credit q st = if from == Just q then grown q st else st
     -- the body is held if the ledger has room: for one more id if this
     -- one is new, and for one more body
     hold st = case holdAs st of
       Just (how, indexed)
-        | Just ledger <- L.put h (Held b st.now how) st.ledger -> (indexed {ledger}, said)
+        | Just ledger <- L.put h (Held b st.now how) st.ledger -> (sent (inherit h (again indexed {ledger})), said)
       _ -> gone st
     -- what the body waits for, with the indexes that say so
     holdAs st
@@ -602,7 +715,7 @@ body parents from h b acc@(s, said) = case Map.lookup h (places s) of
 -- offered as they come. With every body waiting for another that had no
 -- room, nothing would ever be offered.
 mayWait :: Ingest p h b -> Bool
-mayWait s = Set.size s.tries < s.config.heldRoom - 1
+mayWait s = Set.size s.tries + Set.size s.doubts < s.config.heldRoom - 1
 
 -- | A held transaction is ready to offer.
 makeReady :: (Ord h) => h -> Ingest p h b -> Ingest p h b
@@ -632,13 +745,28 @@ offered h v acc@(s, said) = case Map.lookup h (places s) of
           waits
             | Set.null waits -> again
             | mayWait s ->
-                let (t, s') = waiting h since waits (foldl' seek s waits)
+                let (t, s') = waiting h since waits (foldl' (sought h) s waits)
                  in (edit (rehold h (Waiting waits t)) s', said)
             | otherwise -> forget NoRoom h acc
     Again -> again
+    Forged -> disown IsForged h acc
+    Unverified
+      -- a node of the operator named it since it was offered: offered
+      -- again, as vouched for
+      | Set.member h s.vouched -> again
+      | mayDoubt s ->
+          let t = since + s.config.orphanLife
+           in (oweOwn (edit (rehold h (Doubted t)) s) {doubts = Set.insert (t, h) s.doubts}, said)
+      | otherwise -> disown NotVouched h acc
   _ -> acc
   where
     again = ((edit (rehold h Later) s) {later = Set.insert h s.later}, said)
+
+-- | Whether one more transaction may be held for a node of the operator
+-- to name it: as 'mayWait', never the last of the room for bodies, with
+-- those that wait for others counted too.
+mayDoubt :: Ingest p h b -> Bool
+mayDoubt = mayWait
 
 -- | The pool lacks a transaction that a held one spends from. If the
 -- machine has no place for it, it is wanted of every peer, since now, as
@@ -663,10 +791,18 @@ seek :: (Ord p, Ord h) => Ingest p h b -> h -> Ingest p h b
 seek s p
   | Map.member p (places s) || Set.null peers = s
   | otherwise = case L.put p (Wanted (Map.fromSet (const s.now) peers)) s.ledger of
-      Just ledger -> foldl' (\st q -> queued q p st) s {ledger} peers
+      Just ledger -> inherit p (foldl' (\st q -> queued q p st) s {ledger} peers)
       Nothing -> s
   where
     peers = Map.keysSet s.links
+
+-- | 'seek' what a held transaction spends from, and vouch for it if the
+-- held one is vouched for: a node that took a transaction took what it
+-- spends from, or a block has it.
+sought :: (Ord p, Ord h) => h -> Ingest p h b -> h -> Ingest p h b
+sought child s p =
+  let s' = seek s p
+   in if Set.member child s'.vouched then vouch p s' else s'
 
 -- | A peer is gone: what was asked of it is wanted of the others, and
 -- what only it named is given up.
@@ -692,8 +828,14 @@ peerDown p (s, said)
 -- | What the time brings: requests that waited too long, and held
 -- transactions to offer again or to give up.
 onTick :: (Ord p, Ord h) => Tick -> Acc p h b -> Acc p h b
-onTick t acc0 = retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).links)))
+onTick t acc0 = undoubted (retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).links))))
   where
+    -- held transactions that no node of the operator named in time:
+    -- those whose time it is now, each once
+    undoubted acc@(s0, _) = foldl' doubt1 acc (takeWhile ((<= t) . fst) (Set.toAscList s0.doubts))
+    doubt1 acc@(s, said) (at, h) = case Map.lookup h (places s) of
+      Just (Held _ _ (Doubted _)) -> disown NotVouched h acc
+      _ -> (s {doubts = Set.delete (at, h) s.doubts}, said)
     -- the requests of a peer that are out for longer than the patience:
     -- those that are so now, each once, so that this ends whatever the
     -- indexes say
@@ -713,7 +855,10 @@ onTick t acc0 = retried (laterOnes (foldl' overdue acc0 (Map.keys (fst acc0).lin
     retried acc@(s0, _) = foldl' retry1 acc (takeWhile ((<= t) . fst) (Set.toAscList s0.tries))
     retry1 acc@(s, said) (at, h) = case Map.lookup h (places s) of
       Just (Held _ since hold@(Waiting ps _))
-        | t - since > s.config.orphanLife -> forget WaitedTooLong h acc
+        | t - since > s.config.orphanLife ->
+            -- what it waited for is itself held for a node of the
+            -- operator to name it: no reading of a source brings that
+            if any (doubted s) (Set.toList ps) then disown NotVouched h acc else forget WaitedTooLong h acc
         | onTheirWay ps s -> (putOff h at since ps s, said)
         | otherwise -> (makeReady h (unhold h hold s), said)
       _ -> (s {tries = Set.delete (at, h) s.tries}, said)
@@ -742,6 +887,20 @@ putOff :: (Ord h) => h -> Tick -> Tick -> Set h -> Ingest p h b -> Ingest p h b
 putOff h at since ps s =
   let (t, s') = waiting h since ps s {tries = Set.delete (at, h) s.tries}
    in edit (rehold h (Waiting ps t)) s'
+
+-- | The sources that are nodes of the operator owe a reading. A node
+-- that has a transaction names it when its mempool is read, and one whose
+-- RPC is all that the store has of it names nothing by itself: a
+-- transaction that waits for such a node to name it would wait for the
+-- clock.
+oweOwn :: Ingest p h b -> Ingest p h b
+oweOwn s = s {links = Map.map (\l -> if l.own && l.source then l {owed = True} else l) s.links}
+
+-- | Whether a transaction is held for a node of the operator to name it.
+doubted :: (Ord h) => Ingest p h b -> h -> Bool
+doubted s h = case Map.lookup h (places s) of
+  Just (Held _ _ (Doubted _)) -> True
+  _ -> False
 
 -- | What the machine can do as it is: read its sources if something is
 -- owed or it is time, request what is wanted within the windows, and
@@ -845,7 +1004,10 @@ wellFormed s =
       ],
       ["a peer that is gone is still named" | ps <- namers, not (ps `Set.isSubsetOf` Map.keysSet s.links)],
       ["an id that nobody named is waiting to be asked for" | Wanted ms <- map snd placed, Map.null ms],
-      ["every body held waits for another" | s.config.heldRoom > 0, Set.size s.tries >= s.config.heldRoom],
+      [ "every body held waits for another, or to be vouched for"
+      | s.config.heldRoom > 0,
+        Set.size s.tries + Set.size s.doubts >= s.config.heldRoom
+      ],
       [ "the ids to ask a peer for are not those wanted of it"
       | (p, l) <- Map.toList s.links,
         l.queue /= Set.fromList [(t, h) | (h, Wanted ms) <- placed, Just t <- [Map.lookup p ms]]
@@ -863,6 +1025,18 @@ wellFormed s =
       [ "the times to offer again are not those of what waits"
       | s.tries /= Set.fromList [(t, h) | (h, Held _ _ (Waiting _ t)) <- placed]
       ],
+      [ "the times to give up what is doubted are not those of what is doubted"
+      | s.doubts /= Set.fromList [(t, h) | (h, Held _ _ (Doubted t)) <- placed]
+      ],
+      ["an id without a place is vouched for" | not (s.vouched `Set.isSubsetOf` placedIds)],
+      ["a transaction that is vouched for is doubted" | (h, Held _ _ (Doubted _)) <- placed, Set.member h s.vouched],
+      [ "a transaction that is vouched for waits for one that has a place and is not"
+      | (h, Held _ _ (Waiting ps _)) <- placed,
+        Set.member h s.vouched,
+        p <- Set.toList ps,
+        Set.member p placedIds,
+        Set.notMember p s.vouched
+      ],
       ["a transaction waits for nothing" | Held _ _ (Waiting ps _) <- map snd placed, Set.null ps],
       [ "the index of what waits for a transaction is wrong"
       | s.waiters
@@ -874,6 +1048,7 @@ wellFormed s =
   where
     -- the places, read once
     placed = Map.toList (places s)
+    placedIds = Set.fromList (map fst placed)
     namers =
       concat
         [ case place of
@@ -894,7 +1069,8 @@ rebase bound s =
     { now = 0,
       ledger = retime rel s.ledger,
       links = Map.map link s.links,
-      tries = Set.map (\(t, h) -> (rel t, h)) s.tries
+      tries = Set.map (\(t, h) -> (rel t, h)) s.tries,
+      doubts = Set.map (\(t, h) -> (rel t, h)) s.doubts
     }
   where
     rel t = max (negate bound) (t - s.now)

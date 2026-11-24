@@ -114,6 +114,7 @@ data Config = Config
     discover :: !Bool,
     peers :: ![String],
     peerPermissions :: ![Permission],
+    foreignPeers :: !Bool,
     version :: !Bool,
     debug :: !Bool,
     maxPendingTxs :: !Int,
@@ -185,6 +186,8 @@ defConfig = do
     env "PEER" [] (pure . words)
   peerPermissions <-
     env "PEER_PERMISSIONS" [] (mapM parsePermission . words . map (\x -> if x == ',' then ' ' else x))
+  foreignPeers <-
+    env "FOREIGN_PEERS" False parseBool
   debug <-
     env "DEBUG" False parseBool
   maxPendingTxs <-
@@ -431,6 +434,16 @@ config c = do
                     "as they name it (as many as they grant): mempool to ask them for their mempools"
                   ]
               )
+  foreignPeers <-
+    flag c.foreignPeers True $
+      long "foreign-peers"
+        <> helpEnv
+          "FOREIGN_PEERS"
+          ( unwords
+              [ "The nodes of --peer are not the operator's own: a transaction that only they name",
+                "and that the store cannot verify is not taken"
+              ]
+          )
   version <-
     switch $
       long "version"
@@ -913,6 +926,7 @@ run cfg =
           { maxPeers = cfg.maxPeers,
             initPeers = cfg.peers,
             peerPermissions = Set.fromList cfg.peerPermissions,
+            foreignPeers = cfg.foreignPeers,
             discover = cfg.discover,
             db = dir </> "db",
             net = net,

@@ -72,6 +72,7 @@ import Haskoin.Node
     withNode,
     withSource,
   )
+import Haskoin.Node.Address (toSockAddr)
 import Haskoin.Store.BlockStore
   ( BlockStore,
     BlockStoreConfig (..),
@@ -183,6 +184,12 @@ data StoreConfig = StoreConfig
     -- @-whitelist@ or @-whitebind@, such as 'Haskoin.Node.PermMempool', which lets the
     -- store ask them for their mempools ('Haskoin.Node.NodeConfig')
     peerPermissions :: !Permissions,
+    -- | whether the nodes of 'initPeers' are nodes of somebody else. They
+    -- are taken for nodes of the operator otherwise, and the store takes
+    -- what such a node took: a transaction that only strangers named is
+    -- looked at first, and not taken if the store cannot verify it
+    -- ("Haskoin.Store.Ingest").
+    foreignPeers :: !Bool,
     -- | discover new peers
     discover :: !Bool,
     -- | RocksDB database path
@@ -447,8 +454,17 @@ blockStoreCfg cfg node pub db member ingest =
 
 -- | What the path into the pool needs of the store ("Haskoin.Store.Ingest.Run"):
 -- the member of the fleet, whether the best block of the database is the
--- best header of the node, and which peers give their mempools when asked,
--- as the model of each peer's node says ('judgeMessage').
+-- best header of the node, which peers give their mempools when asked,
+-- as the model of each peer's node says ('judgeMessage'), and which are
+-- nodes of the operator: those that the store was given ('initPeers'),
+-- unless it was told that they are not ('foreignPeers').
+--
+-- A peer is known by its address, as haskoin-node names a peer, and the
+-- names of 'initPeers' are resolved here as haskoin-node resolves them
+-- ('toSockAddr'), each time a peer connects. A name that resolves to
+-- another address by then makes a node of the operator a stranger: what
+-- the store cannot verify of it comes late, and nothing is taken that
+-- should not be.
 ingestCfg :: StoreConfig -> Node -> DatabaseReader -> Maybe Member -> IngestConfig
 ingestCfg cfg node db member =
   IngestConfig
@@ -460,6 +476,12 @@ ingestCfg cfg node db member =
         top <- chainGetBest node.chain
         return (best == Just (headerHash top.header)),
       source = \p -> (== Allowed) <$> judgeMessage p MMempool,
+      own = \p ->
+        if cfg.foreignPeers
+          then return False
+          else do
+            given <- concat <$> mapM (toSockAddr cfg.net) cfg.initPeers
+            return (show p `elem` map show given),
       stats = cfg.stats,
       logger = withSource "Ingest" cfg.logger
     }

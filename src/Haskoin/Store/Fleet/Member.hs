@@ -124,7 +124,7 @@ import Control.Concurrent.STM
     stateTVar,
     writeTVar,
   )
-import Control.Exception (Exception, handle, throwIO)
+import Control.Exception (Exception, evaluate, handle, throwIO)
 import Control.Monad (filterM, forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -201,6 +201,7 @@ import Haskoin.Store.XPub.Indexer
   )
 import Haskoin.Store.XPub.Lock (Lock (..), defaultLockConfig, redisLock)
 import Haskoin.Store.XPub.Service (Backend (..), Session (..), XPubs (..))
+import Haskoin.Transaction.Judge (judgeRelayed)
 import System.IO (fixIO)
 import System.Metrics.StatsD
   ( StatCounter,
@@ -1154,7 +1155,7 @@ memberSettled m hs =
 -- took in one second was offered child first and took as many rounds as
 -- it had transactions.
 memberOffer :: Member -> UnixTime -> Tx -> IO (I.Verdict TxHash)
-memberOffer m time tx = fst <$> memberOfferTimed m time tx
+memberOffer m time tx = fst <$> memberOfferTimed m True time tx
 
 -- | Where the time of offers went, in nanoseconds: what the path into the
 -- pool says in its log when it is busy
@@ -1171,19 +1172,44 @@ data OfferCost = OfferCost
     -- | asking the database which of them are unspent
     readUnspent :: !Word64,
     -- | the decision of the pool
-    decided :: !Word64
+    decided :: !Word64,
+    -- | looking at a transaction that no node of the operator vouches
+    -- for: its signatures, mostly
+    judged :: !Word64
   }
   deriving (Eq, Show)
 
 instance Semigroup OfferCost where
-  OfferCost a b c d e <> OfferCost a' b' c' d' e' = OfferCost (a + a') (b + b') (c + c') (d + d') (e + e')
+  OfferCost a b c d e f <> OfferCost a' b' c' d' e' f' =
+    OfferCost (a + a') (b + b') (c + c') (d + d') (e + e') (f + f')
 
 instance Monoid OfferCost where
-  mempty = OfferCost 0 0 0 0 0
+  mempty = OfferCost 0 0 0 0 0 0
 
--- | 'memberOffer', with where its time went.
-memberOfferTimed :: Member -> UnixTime -> Tx -> IO (I.Verdict TxHash, OfferCost)
-memberOfferTimed m time tx = do
+-- | 'memberOffer', with where its time went, of a transaction that a node
+-- of the operator vouches for or not
+-- ('Haskoin.Store.Ingest.vouchedFor').
+--
+-- A transaction that is vouched for is offered as it is: a node of the
+-- operator took it, and the store takes what its node takes. One that
+-- only strangers named is looked at first
+-- ('Haskoin.Transaction.Judge.judgeRelayed'), once the outputs that it
+-- spends are all there:
+--
+-- * 'Haskoin.Store.Ingest.Forged', if no node could have taken it: a
+--   signature of a coin locked to one key does not verify, it spends more
+--   than it has, or its tokens come from nowhere. A stranger could
+--   otherwise show a wallet a payment that is not there, or a spend of
+--   its coins.
+--
+-- * 'Haskoin.Store.Ingest.Unverified', if it spends a coin locked by a
+--   script: only a full node can say whether it is good, and the store
+--   runs no scripts. It is not offered on the word of a stranger.
+--
+-- Unless the pool has it already: another store of the fleet, whose node
+-- vouched for it, was first.
+memberOfferTimed :: Member -> Bool -> UnixTime -> Tx -> IO (I.Verdict TxHash, OfferCost)
+memberOfferTimed m vouched time tx = do
   cost <- newIORef mempty
   let timed :: (Word64 -> OfferCost) -> IO a -> IO a
       timed part act = do
@@ -1192,17 +1218,18 @@ memberOfferTimed m time tx = do
         t1 <- getMonotonicTimeNSec
         modifyIORef' cost (<> part (t1 - t0))
         return r
-  verdict <- memberOffer' timed m time tx
+  verdict <- memberOffer' timed m vouched time tx
   (,) verdict <$> readIORef cost
 
 -- | The offer itself, given what times each of its parts.
 memberOffer' ::
   (forall a. (Word64 -> OfferCost) -> IO a -> IO a) ->
   Member ->
+  Bool ->
   UnixTime ->
   Tx ->
   IO (I.Verdict TxHash)
-memberOffer' timed m time tx =
+memberOffer' timed m vouched time tx =
   readTVarIO m.tip >>= \case
     Nothing -> return I.Again
     Just tip -> fmap (fromMaybe I.Again) . withViewAt m.views tip $ \at ->
@@ -1213,32 +1240,49 @@ memberOffer' timed m time tx =
           found <- forM (zip [0 :: Int ..] tx.inputs) (spent at pool)
           case lefts found of
             [] -> do
-              unspent <- timed (\d -> mempty {readUnspent = d}) $
-                forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
-                  isJust <$> Q.getUnspent at p
-              let td =
-                    TxData
-                      { block = MemRef time,
-                        tx,
-                        prevs = IntMap.fromList (catMaybes (rights found)),
-                        deleted = False,
-                        rbf = False,
-                        timestamp = time,
-                        spenders = IntMap.empty
-                      }
-                  offer = poolOffer m.redis m.keys 32 (Just (encode tip)) (poolTx m.db.net td) unspent
-                  answered second = \case
-                    Taken -> return I.Settled
-                    Known -> return I.Settled
-                    Orphan outs -> return (I.Orphan (nub [(op :: OutPoint).hash | Right op <- map decode outs]))
-                    Late -> return I.Again
-                    Conflict rivals
-                      | not second -> offer rivals >>= answered True
-                      | otherwise -> return I.Again
-              timed (\d -> mempty {decided = d}) (offer [] >>= answered False)
+              doubt <-
+                if vouched
+                  then return Nothing
+                  else timed (\d -> mempty {judged = d}) (evaluate (stranger (rights found)))
+              case doubt of
+                -- what the pool has is not doubted: a node of the operator
+                -- of another store of the fleet vouched for it
+                Just verdict -> do
+                  has <- memberSettled m [h]
+                  return (if has == Just [True] then I.Settled else verdict)
+                Nothing -> do
+                  unspent <- timed (\d -> mempty {readUnspent = d}) $
+                    forM [i.outpoint | i <- tx.inputs, i.outpoint /= nullOutPoint] $ \p ->
+                      isJust <$> Q.getUnspent at p
+                  let td =
+                        TxData
+                          { block = MemRef time,
+                            tx,
+                            prevs = IntMap.fromList (catMaybes (rights found)),
+                            deleted = False,
+                            rbf = False,
+                            timestamp = time,
+                            spenders = IntMap.empty
+                          }
+                      offer = poolOffer m.redis m.keys 32 (Just (encode tip)) (poolTx m.db.net td) unspent
+                      answered second = \case
+                        Taken -> return I.Settled
+                        Known -> return I.Settled
+                        Orphan outs -> return (I.Orphan (nub [(op :: OutPoint).hash | Right op <- map decode outs]))
+                        Late -> return I.Again
+                        Conflict rivals
+                          | not second -> offer rivals >>= answered True
+                          | otherwise -> return I.Again
+                  timed (\d -> mempty {decided = d}) (offer [] >>= answered False)
             missing -> return (I.Orphan (nub missing))
   where
     h = txHash tx
+    -- what is wrong with a transaction that only strangers named, given
+    -- the outputs that it spends, if anything is
+    stranger prevs = case judgeRelayed m.db.net tx [TxOut value script | Just (_, Prev script value) <- prevs] of
+      Left _ -> Just I.Forged
+      Right (Just _) -> Just I.Unverified
+      Right Nothing -> Nothing
     -- the output that an input spends, from the view at the tip or from
     -- the pool, or the transaction that should have it
     spent at pool (n, i)

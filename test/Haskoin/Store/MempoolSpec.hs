@@ -55,7 +55,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Database.Redis qualified as Redis
 import Haskoin
   ( Network,
@@ -69,9 +69,10 @@ import Haskoin
     hexToTxHash,
     scriptToAddressBS,
     txHash,
+    txHashToHex,
   )
 import Haskoin.Node (Logger, Permissions)
-import Haskoin.Store (Store, WebConfig (..), cachePrefix, runWebSocket, withStore)
+import Haskoin.Store (Store, StoreConfig (..), WebConfig (..), cachePrefix, runWebSocket, withStore)
 import Haskoin.Store.Fleet.Redis (fleetKeys, poolWithdraw)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Temp (withRamDir)
@@ -122,6 +123,8 @@ spec = do
           it "has every transaction that no block confirmed" (withBed kind busy)
         on "A store whose node never stops taking transactions" $
           it "answers from each new block within seconds of it" (withBed kind unceasing)
+      describe "A store whose only peer is a node of somebody else, on Bitcoin Core" $
+        it "takes of it what it can verify, and not what it cannot" (withBed BitcoinCore strangers)
       -- Bitcoin Cash Node names what it takes to a peer that it
       -- whitelists as fast as it takes it
       describe "A store whose node takes transactions faster than it names them, on Bitcoin Core" $
@@ -349,6 +352,66 @@ valkeyRestart bed = do
     void (podman ["restart", "--time", "1", containerName bed.pod redisContainer.name])
     submit bed (map (chainOf 24) after)
     converges bed server 120
+
+-- | A store that was told that its peer is a node of somebody else
+-- (@--foreign-peers@), and so has no node of its operator: it takes of
+-- the peer only what it can verify.
+--
+-- The wallet of the node pays an output: a transaction that spends coins
+-- locked to one key each, with their signatures, which the store verifies
+-- and takes. A transaction then spends that output, which is locked by a
+-- script, as all the chains of these tests are: the node runs the script
+-- and takes it, and the store, which runs none, does not take it on the
+-- word of a stranger. So the store ends with the first and without the
+-- second, and says in its health that it holds one transaction.
+--
+-- The same store with the peer as a node of its operator takes both, as
+-- every other test of this module has it.
+strangers :: Bed -> IO ()
+strangers bed = withRamDir $ \dir -> do
+  let foreign' c = c {foreignPeers = True} :: StoreConfig
+      address = case scriptToAddressBS bed.net lock >>= maybe (Left "no text") Right . addrToText bed.net of
+        Right a -> a
+        Left e -> error ("No address for the script: " <> e)
+  (verified, scripted) <- withMemberOf foreign' bed dir $ \_ server -> do
+    converges bed server 60
+    -- from the wallet of the node, signed by its keys
+    paid <- sendTo bed.node address 1000000
+    paying <- getRawTx bed.node paid
+    let index = case [n | o <- maybe [] arr (field "vout" paying), isLock o, Just (Number n) <- [field "n" o]] of
+          [n] -> round n :: Word32
+          _ -> error "The wallet did not pay the script once"
+    hash <- maybe (fail "Not a transaction id") return (hexToTxHash paid)
+    -- and what spends it, by a script
+    let spending = spend (OutPoint hash index) [TxOut 990000 lock]
+    send bed spending
+    let spent = txHashToHex (txHash spending)
+    -- the store has the first within seconds, and never the second
+    has server paid 30
+    threadDelay 5000000
+    pool server `shouldReturn` Set.singleton paid
+    Set.fromList <$> rawMempool bed.node `shouldReturn` Set.fromList [paid, spent]
+    (_, health) <- getJSON server "/health"
+    (field "mempool" health >>= field "held") `shouldBe` Just (Number 1)
+    return (paid, spent)
+  -- the same store, told nothing of the kind: the peer is a node of its
+  -- operator, and what it took is taken
+  withMemberIn bed dir $ \_ server -> do
+    has server scripted 60
+    pool server `shouldReturn` Set.fromList [verified, scripted]
+  where
+    isLock o = (field "scriptPubKey" o >>= textField "hex") == Just (encodeHex lock)
+    pool server = do
+      (_, m) <- getJSON server "/mempool?limit=1000000"
+      return (Set.fromList [t | String t <- case m of v@(Array _) -> arr v; _ -> []])
+    has server h seconds = do
+      got <- pool server
+      if Set.member h got
+        then return ()
+        else
+          if seconds <= (0 :: Int)
+            then expectationFailure ("The store does not have " <> T.unpack h)
+            else threadDelay 1000000 >> has server h (seconds - 1)
 
 -- | A store whose Valkey is emptied while it runs, as by @FLUSHALL@. Unlike
 -- 'valkeyRestart', Valkey goes on answering and the store keeps its
@@ -688,8 +751,12 @@ flush bed = do
 -- | A store of the bed with its web server, on a database in a folder,
 -- while an action runs.
 withMemberIn :: Bed -> FilePath -> (Store -> Server -> IO a) -> IO a
-withMemberIn bed dir f =
-  withStore (storeConfig bed.net bed.logger dir bed.redisURL bed.node.peer bed.granted) $ \store ->
+withMemberIn = withMemberOf id
+
+-- | 'withMemberIn', with the configuration of the store changed.
+withMemberOf :: (StoreConfig -> StoreConfig) -> Bed -> FilePath -> (Store -> Server -> IO a) -> IO a
+withMemberOf change bed dir f =
+  withStore (change (storeConfig bed.net bed.logger dir bed.redisURL bed.node.peer bed.granted)) $ \store ->
     listening $ \(sock, server) ->
       withAsync (runWebSocket (web store) sock) $ \running ->
         link running >> f store server

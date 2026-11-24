@@ -39,6 +39,12 @@ sampled, tested) are in [README.md](README.md).
 | **orphan** | A held transaction (the **child**) that spends from one that the pool lacks (its **parent**). |
 | **seek** | To ask every peer for a parent that the pool lacks (`seek`). |
 | **given up** | Let go by the machine before it is settled, with a reason. |
+| **node of the operator** | A node that the person who runs the store also runs: the peers given with `--peer`, and the node whose RPC the store has. |
+| **stranger** | Any other peer: one found by discovery, or a peer of `--peer` when the store was told that those are not its operator's (`--foreign-peers`). |
+| **vouched for** | A transaction that a node of the operator named or sent, or that such a transaction spends from. |
+| **forged** | A transaction that no node can have taken: a signature of a coin locked to one key does not verify, it spends more than it has, or its tokens come from nowhere. |
+| **doubted** | Held until a node of the operator names it: the store cannot verify it, and only strangers named it. |
+| **locked by a script** | Said of a coin that is spent by running a small program of Bitcoin, which only a full node does: a multisig wallet, a channel. Not the Lua scripts of Redis. A coin **locked to one key** needs no program: the store verifies its signature. |
 | **dirty** | Something was given up that a node may still have, and no source was read since. |
 | **room** | The most ids that the machine keeps a place for, and the most transactions that it holds. |
 | **window** | The most requests that the store has out to one peer at once. |
@@ -87,6 +93,7 @@ release of a node that changes one of them is noticed.
 | A6 | A node drops transactions from its mempool without saying so: confirmed, replaced, evicted, expired. |
 | A7 | A node that has a transaction has those that it spends from, unless a block has confirmed them. Asked for one of them that it never named to the peer, Bitcoin Core sends it, and Bitcoin Cash Node says `notfound`, though it has it. Neither drops the peer for asking. |
 | A8 | A node names transactions to a peer no faster than it chooses to. Bitcoin Core 32 names about five hundred at once and then seventy every five seconds, fourteen a second, even to a peer that it whitelists. Bitcoin Cash Node 29 names 800 at once to a peer that it whitelists. Asked for its mempool, a node names all of it at once (A2). |
+| A9 | A node of the operator ran every script of what it names or sends: the store takes its word. A stranger may name and send anything, a forged transaction too. |
 | F1 | The RPC of a node is a source as a peer is one. `getrawmempool` gives the id of **every** transaction in the mempool, each after those that it spends from. `getrawtransaction` gives a transaction, or the error -5 for one that the node does not have. Any other answer, or none, says nothing of what the node has. |
 | R1 | A Redis script runs alone, start to end. |
 | R2 | Redis may lose all its data, and the store finds out (the epoch). It may be away for any time. |
@@ -155,6 +162,15 @@ The model checker has a world that shows this, and that world must fail.
    not whether the fleet saw it before. A store never turns away a
    transaction that its own node holds for something that it remembers.
 
+8. **T8, a stranger is not taken at its word.** What a node of the
+   operator named or sent is taken as that node took it. What only
+   strangers named is looked at first, once the outputs that it spends
+   are there. If it is forged it is given up, with all that spends from
+   it. If the store cannot verify it, because it spends a coin locked by
+   a script, it is not taken: it is held until a node of the operator
+   names it, or for twenty minutes. If the store verifies every
+   signature of it, it is taken.
+
 ## What is not promised
 
 - **The RPC as the only source, and no peer connected to that node.** A
@@ -186,6 +202,20 @@ The model checker has a world that shows this, and that world must fail.
 - **A transaction with no children that the store lost** without knowing
   it is back at the next reading of the source, every ten minutes, and
   not before. Nothing spends from it, so nothing asks for it (T6).
+- **What only strangers have and the store cannot verify.** A store
+  runs no scripts. A spend of a coin locked by a script, such as a
+  multisig wallet or a channel, is a normal transaction, and the store
+  cannot tell a good one from a forged one. From a stranger it is not
+  taken, nor is anything that spends from it. A store whose only peers
+  are strangers shows such a transaction when a block confirms it, and
+  not before. A store with a node of its operator misses nothing: that
+  node names it too.
+- **A stranger that answers first with a bad copy.** With SegWit, the id
+  of a transaction does not cover its signatures. A stranger can send a
+  real transaction with a signature that does not verify, and the store
+  gives it up as forged. It is back when a peer names it again, at the
+  next reading at the latest. A node of the operator that names it
+  vouches for it, and then nothing is looked at.
 - **Time.** T3 bounds steps, not seconds. A node or a Redis that answers
   slowly makes the store slow, never wrong. One bound in seconds is
   kept, by a test and not by a proof: while transactions come, a source
@@ -250,6 +280,50 @@ reader instead would stop its blocks too.
 
 **A window for each peer.** It grows while the peer answers and shrinks
 when it does not, in place of a fixed number.
+
+**A stranger is not taken at its word.** The store verifies no
+transaction that a peer sends. It takes what its node took, since the
+node ran every script. That is right of a node of the operator, and it
+was done of every peer. A peer found by discovery is anybody: it could
+send a spend of somebody's coins with a signature that does not verify,
+and the store showed it, as a payment to a wallet that was never made
+or as coins spent that were not.
+
+So the machine knows which peers are nodes of the operator (`Own`), and
+which transactions those vouch for. The runner looks at any other
+transaction before it offers it (`judgeRelayed` of haskoin-core, in
+`memberOfferTimed`), when the outputs that it spends are there:
+
+| What the store finds | What becomes of it |
+| --- | --- |
+| Every signature verifies | Offered, as any transaction |
+| It is forged | Given up, with all that waits for it (`Forged`) |
+| It spends a coin locked by a script | Held until a node of the operator names it, twenty minutes at most (`Unverified`, `Doubted`) |
+
+Only what no node can take is called forged, whatever the policy of a
+node: a rule of relay, such as the smallest output, is the node's own,
+and a transaction that some node relays is not refused for it.
+
+Three things follow from "a node that took a transaction took what it
+spends from":
+
+- What a vouched transaction waits for is vouched for too, to the end
+  of the chain.
+- An id that gets a place while a vouched transaction waits for it is
+  vouched for.
+- What waits for a forged or a doubted transaction is given up with it,
+  for the same reason. Given up later for having waited too long, it
+  would have the sources read again, and they would name the same
+  transactions again, for ever.
+
+A doubted transaction makes the sources that are nodes of the operator
+owe a reading, and so does a stranger that names it again. A node whose
+RPC is all that the store has of it names nothing by itself, and the
+transaction would wait for the clock.
+
+A transaction that is given up as forged, or for want of a voucher,
+does not make the store dirty: no reading of a stranger would bring
+anything else.
 
 **A transaction held for a parent is found by that parent.** It is tried
 when the parent settles, in place of every held transaction at every
@@ -328,7 +402,7 @@ and what is not done yet is said.
 
 ### Proved for every state and every input
 
-By Liquid Haskell (`proofs/`, `cabal build` there, eighty seconds and
+By Liquid Haskell (`proofs/`, `cabal build` there, two minutes and
 1.3 GiB of memory at most). CI runs it at every push, as the job
 "Liquid Haskell".
 
@@ -362,9 +436,10 @@ of a function.
 
 A model checker in the test suite (`Haskoin.Store.Ingest.Model`) runs
 `step` itself in worlds of one to three transactions and one or two
-peers, with nodes that follow A1 to A7, through every order of events:
-19 worlds, about 990,000 states. [the-19-worlds.md](the-19-worlds.md)
-says in plain terms what a world is and how it is gone through.
+peers, with nodes that follow A1 to A7 and A9, through every order of
+events: 26 worlds, about 2,260,000 states.
+[the-19-worlds.md](the-19-worlds.md) says in plain terms what a world
+is and how it is gone through.
 
 - **In every state:**
   - nothing leaves in silence, and what a peer names has a place or is
@@ -377,7 +452,13 @@ says in plain terms what a world is and how it is gone through.
     there is a peer and room (T6);
   - at its time, a held transaction is not offered while every parent
     that it waits for has a place, and waits no longer when one of them
-    has none.
+    has none;
+  - a forged transaction is never offered as vouched for, and is given
+    up; one that cannot be verified is held for a node of the operator
+    and never ready meanwhile; and once such a node names or sends it,
+    it is held for that no longer (T8). The invariant has the rest: no
+    transaction is both vouched for and doubted, and a vouched
+    transaction waits for none that has a place and is not vouched for.
 - **From every state, with nothing more going wrong:** every run ends,
   and ends with the mempool of every connected source in the pool (T3).
 - **Five planted bugs** in `step`, one for each kind of check, are each
@@ -400,6 +481,19 @@ says in plain terms what a world is and how it is gone through.
   own, as the store did, fails in 2 worlds. One that never offers it at
   its time, and so leaves it waiting for a parent that was given up,
   fails in 13.
+- **Strangers.** Seven worlds have a stranger, with or without a node
+  of the operator beside it: a transaction that the store cannot
+  verify, alone and with one that spends from it, and a stranger that
+  has forged transactions. In them the store must end with all that a
+  node of the operator has, and of a stranger only what it can verify.
+  Five more planted bugs: a machine that lets any peer vouch offers a
+  forged transaction as vouched for; one that does not wake a doubted
+  transaction when a node of the operator names it leaves it held; one
+  that keeps a forged transaction; one that gives up a doubted
+  transaction without what waits for it goes round for ever; and one
+  whose doubted transaction asks no reading comes to rest without what
+  a node of the operator has. The first version of the rule had two of
+  these faults, and the worlds found them.
 - **A world that must fail.** It breaks an assumption: a source that
   names a child first, with room for one id (A5). The search finds the
   store going round for ever there. The program of
@@ -456,8 +550,15 @@ read again: both were tried. The fifth allows two minutes, which the
 reading by the clock meets too: it shows that the store ends right,
 and not what brought it there.
 
-The eighth and the ninth fail without their rule. On Bitcoin Core there are two
+The eighth and the ninth fail without their rule. On Bitcoin Core there are three
 more:
+
+- The only peer of the store is a node of somebody else
+  (`--foreign-peers`). The wallet of the node pays an output, with the
+  signatures of its keys, and a transaction spends that output by a
+  script. The store has the first within seconds, never has the second,
+  and says in `/health` that it holds one transaction. Told that the
+  peer is a node of its operator, the same store has both (T8).
 
 - The node replaces transactions by ones that pay more. The store has
   the replacements and nothing of what they replaced.
@@ -570,7 +671,19 @@ never does (U1).
 - The thread that asks the RPC of the node, and the calls that it makes
   (`ingestFeed`, `nodeFeed`, tested against both nodes).
 - The two functions of the member that ask the pool and offer to it
-  (`memberSettled`, `memberOffer`).
+  (`memberSettled`, `memberOffer`). What an offer finds of a
+  transaction that is not vouched for is tested against a real pool,
+  with real signatures (`strangerTest` in
+  `Haskoin.Store.Fleet.CacheSpec`): a forged one and one that spends by
+  a script are not taken, one signed by the key of its coin is, and
+  all three are taken when vouched for.
+- What haskoin-core says of a signature (`judgeInputs`, tested there),
+  and which peers are nodes of the operator: those of `--peer`, known
+  by their address. A name that resolves to another address when a
+  peer connects makes that node a stranger, so that what the store
+  cannot verify of it comes late; nothing is taken that should not be.
+- That a node of the operator is honest (A9). In a fleet, what the
+  node of one store vouches for is in the pool of all.
 - The pool itself. [concurrency.md](concurrency.md), "Decisions in one
   step", says how its changes are made one step and how that is checked.
 - GHC's runtime.

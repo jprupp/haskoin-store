@@ -200,6 +200,7 @@ storeConfig net dir redis blocks mock logger cache buffer =
       -- socket, so that no address or port of the machine is named
       initPeers = ["unix:mock-peer"],
       peerPermissions = mempty,
+      foreignPeers = False,
       discover = False,
       db = dir,
       net = net,
