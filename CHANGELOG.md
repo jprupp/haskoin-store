@@ -281,7 +281,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
     path into the pool now keeps nothing that a peer names or sends
     and asks for nothing; then it reads its sources. And a store first
     has its blocks only once its node has the headers of its peers
-    (`chainHasHeaders`, from haskoin-node's branch `headers-idle`): the
+    (`chainHasHeaders`, from haskoin-node's master): the
     database caught up with the last header again and again while the
     headers came, two thousand at a time. A rule of the machine (`begun`), with a check
     in the model and two planted bugs that it finds; that a transaction
