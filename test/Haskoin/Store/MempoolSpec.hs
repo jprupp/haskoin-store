@@ -41,6 +41,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (forConcurrently_, link, poll, withAsync)
+import Control.Concurrent.STM (atomically)
 import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value (..))
@@ -72,8 +73,11 @@ import Haskoin
     txHashToHex,
   )
 import Haskoin.Node (Logger, Permissions)
-import Haskoin.Store (Store, StoreConfig (..), WebConfig (..), cachePrefix, runWebSocket, withStore)
+import Haskoin.Store (Store (..), StoreConfig (..), WebConfig (..), cachePrefix, runWebSocket, withStore)
+import Haskoin.Store.Data (BlockData (..))
+import Haskoin.Store.Database.Query qualified as Q
 import Haskoin.Store.Fleet.Redis (fleetKeys, poolWithdraw)
+import Haskoin.Store.Ingest.Run (IngestState (..), ingestState)
 import Haskoin.Store.Integration.Node
 import Haskoin.Store.Integration.Temp (withRamDir)
 import Haskoin.Store.Integration.Valkey (redisContainer)
@@ -412,16 +416,16 @@ noPeerEver bed = withRamDir $ \dir -> do
     rpc bed.node "getblockcount" [] >>= \case
       Number n -> return n
       v -> fail ("Unexpected answer to getblockcount: " <> show v)
-  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \_ server -> do
+  withMemberOf (\c -> c {initPeers = []} :: StoreConfig) bed dir $ \store server -> do
     -- While it has not every block, the store takes no transaction in:
     -- it could not place one, and most would be in a block by the time
     -- that it could. The node goes on taking some meanwhile, which it
     -- announces or names when read. A store on a server fetched and
     -- held thousands while it took its blocks, and gave them up for
     -- minutes after it had them.
-    early <- catchingUp server top (concatMap (chainOf 1) during) []
+    early <- catchingUp store (round top) (concatMap (chainOf 1) during) []
     length early `shouldSatisfy` (> 5)
-    [n | n <- early, n /= Number 0] `shouldBe` []
+    filter (/= 0) early `shouldBe` []
     converges bed server 600
     (_, health) <- getJSON server "/health"
     let count name = field "blocks" health >>= field name
@@ -438,28 +442,32 @@ noPeerEver bed = withRamDir $ \dir -> do
     (_, later') <- getJSON server "/health"
     (field "peers" later' >>= field "count") `shouldBe` Just (Number 1)
   where
-    -- how many transactions the store said were on their way, each time
-    -- that it was looked at before it had every block, with the node
-    -- taking one more transaction at each look
+    -- how many transaction ids the path into the pool had a place for,
+    -- each time that it was looked at before the database had every
+    -- block, with the node taking one more transaction at each look
     --
-    -- The count is read first and the height after it, from the best
-    -- block of the database: a store that is behind at the second look
-    -- was behind at the first. The height in the health of a store is
-    -- read once a second, and was a block behind a store that had them
-    -- all and had begun.
-    catchingUp server top txs seen = do
-      (_, health) <- getJSON server "/health"
-      (_, best) <- getJSON server "/block/best?notx=true"
-      let blocks = field "height" best
-          known = fromMaybe Null (field "mempool" health >>= field "known")
-      if blocks == Just (Number top)
+    -- Both are read from the store itself, the count first and the best
+    -- block of the database after it: a database that is behind at the
+    -- second look was behind at the first. They are not read from the web
+    -- server. It answers at the tip of the fleet, which moves after the
+    -- database: in two runs of twelve it still said a lower block, the
+    -- first of the chain in one, when the database had them all and the
+    -- store had begun. And the height in its health is read once a second.
+    catchingUp :: Store -> Int -> [Tx] -> [Int] -> IO [Int]
+    catchingUp store top txs seen = do
+      path <- atomically (ingestState store.ingest)
+      height <-
+        Q.getBestBlock store.db >>= \case
+          Nothing -> return 0
+          Just h -> maybe 0 (fromIntegral . (.height)) <$> Q.getBlock store.db h
+      if height == top
         then return (reverse seen)
         else do
           txs' <- case txs of
             tx : more -> send bed tx >> return more
             [] -> return []
           threadDelay 100000
-          catchingUp server top txs' (known : seen)
+          catchingUp store top txs' (path.known : seen)
 
 -- | A store that is given no peer at all, and the RPC of its node with
 -- no ZeroMQ socket (@--node-rpc@ alone). The node is its one peer all the

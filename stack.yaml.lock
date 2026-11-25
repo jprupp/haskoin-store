@@ -54,48 +54,48 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
-    commit: c7c74c5f70bb61ea57b4192f6a72cc7eb7f32105
+    commit: b2449f23bb6e15f1729d199ea091969026b54b70
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: 5b3b001bb5274a1d31693cd5387404fd63355b158c83d6cd765f4d1c6d0efeef
+      sha256: 20307745d4b3464053c11902e5d1e01c5c06581ce73ac875c80da8d26494818b
       size: 11738
     version: 3.0.0
   original:
-    commit: c7c74c5f70bb61ea57b4192f6a72cc7eb7f32105
+    commit: b2449f23bb6e15f1729d199ea091969026b54b70
     git: https://github.com/jprupp/haskoin-core.git
 - completed:
-    commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
+    commit: 923fc08d57b29f0dbd7ff37080b3c0f1df619d04
     git: https://github.com/jprupp/podman-test.git
     name: podman-test
     pantry-tree:
-      sha256: 8cd08bcc7317035b4068d075bc669ede1b2fc20a351cc7c4c158ca64b03cc613
+      sha256: 8cc3b220ceec5e11798f1fc0275fb1e1d8d43bcb241791f3b8f13a4b4c5fd48f
       size: 960
     version: 0.1.0
   original:
-    commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
+    commit: 923fc08d57b29f0dbd7ff37080b3c0f1df619d04
     git: https://github.com/jprupp/podman-test.git
 - completed:
-    commit: a2dddfc77dd31b1b94428cf604114c3580fcaccb
+    commit: b071056ca868ef2b5a0cf89313ad9c095618585d
     git: https://github.com/jprupp/haskoin-node.git
     name: haskoin-node
     pantry-tree:
-      sha256: 762e1c8e31b4ced741de0a0c9fc20d02c9d5c495404f8f9b51ac6b2b55404f48
+      sha256: 1c60ee34c058e261785e1b446b96ad7f463973ae5706f8f20e7a8919ddb9f899
       size: 3516
     version: 2.7.0
   original:
-    commit: a2dddfc77dd31b1b94428cf604114c3580fcaccb
+    commit: b071056ca868ef2b5a0cf89313ad9c095618585d
     git: https://github.com/jprupp/haskoin-node.git
 - completed:
-    commit: 68451fb8e31412a496512fbff16f766f11506cab
+    commit: 6575da5f36524b9783fa48943304aba988ce50cf
     git: https://github.com/jprupp/haskoin-store-data.git
     name: haskoin-store-data
     pantry-tree:
-      sha256: 7f3daa715fec61ea7f45b93467c583912520298d43fa0f632f7497be98202734
+      sha256: 13fea68ade79805f40e64566275df2e8fce977a9525c525e00366fb6be51b1b0
       size: 1263
     version: 4.0.0
   original:
-    commit: 68451fb8e31412a496512fbff16f766f11506cab
+    commit: 6575da5f36524b9783fa48943304aba988ce50cf
     git: https://github.com/jprupp/haskoin-store-data.git
 - completed:
     hackage: time-manager-0.4.2@sha256:18b4b2304eca880948a42e6bc677ae0a7fcba6afdef8522d0125f202bca19087,1550

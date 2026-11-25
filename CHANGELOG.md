@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-11-22
+## [2.0.0] - 2026-11-25
 
 This release brings the tokens of Bitcoin Cash (CashTokens,
 `docs/cashtokens.md`): the store reads the tokens of every output, keeps the
@@ -281,7 +281,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
     path into the pool now keeps nothing that a peer names or sends
     and asks for nothing; then it reads its sources. And a store first
     has its blocks only once its node has the headers of its peers
-    (`chainHasHeaders`, from haskoin-node's master): the
+    (`chainHasHeaders`, of haskoin-node 2.7.0): the
     database caught up with the last header again and again while the
     headers came, two thousand at a time. A rule of the machine (`begun`), with a check
     in the model and two planted bugs that it finds; that a transaction
@@ -323,7 +323,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
       three checks in the model, and five planted bugs that it finds.
       That a store comes to say `synced` is tested and not checked,
       also on both nodes while transactions come without a pause.
-    - Needs haskoin-store-data's master.
+    - Needs haskoin-store-data 4.0.0.
   - **A source is read every minute at least**, where it was every ten
     minutes. While transactions come it is read every thirty seconds,
     as before.
@@ -384,7 +384,7 @@ whitelist it must now say what they grant (`--peer-permission`, or
       starts and when the peer connects, and in `/health`, as a
       sentence in the new `warnings` and in `text`. A warning decides
       nothing: `ok` and the status stay as they are. It needs
-      haskoin-store-data's master.
+      haskoin-store-data 4.0.0.
     - The web server no longer reads the RPC as a source of its own
       (`nodeFeedLoop`): the node peer is that source.
     - The node of `--node-rpc` is a node of the operator with
