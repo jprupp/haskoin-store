@@ -140,6 +140,11 @@ whitelist it must now say what they grant (`--peer-permission`, or
   token endpoint, taken from a regtest chain.
 
 ### Changed
+- The tests accept fast-logger 3.3 (`>= 3.2.9 && < 3.4`), as haskoin-node
+  2.7.0 does for
+  [stackage#8183](https://github.com/commercialhaskell/stackage/issues/8183).
+  The store logs through haskoin-node, whose suite passes with 3.3.0. The
+  store's own suite was not run with it: `stack.yaml` builds with 3.2.9.
 - **The shared mempool is changed by decisions made in Haskell, each
   carried out in Redis in one step or not at all**
   (`Haskoin.Store.Fleet.Atomic`, `Haskoin.Store.Fleet.Pool.Decide`,
